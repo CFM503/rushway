@@ -5,7 +5,7 @@
 
 ## Current status
 
-**Overall engineering completion: ~31% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~32% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -17,13 +17,21 @@
 
 ## Latest continuous-pass work
 
+### CI dependency/toolchain compatibility fix
+- [x] First real GitHub Actions run `34700234965` reached Cargo but failed before compiling because `--locked` was used while no `Cargo.lock` existed.
+- [x] CI was changed to allow initial lockfile generation in commit `17b882ed9e79c7554a583caeca79af58dc3b063f`.
+- [x] Second run `34700492768` reached dependency resolution on Rust 1.82.0, then failed because the unconstrained `clap` dependency selected `clap_lex 1.1.0`, which requires Cargo's stabilized `edition2024` support unavailable in Cargo 1.82.0.
+- [x] Pinned `clap` to `=4.5.20` in commit `a4f86afbd0d23eb67208438c57d9a01e7c4710d8` so the project can retain its declared Rust 1.82 compatibility while avoiding the incompatible dependency resolution.
+- [ ] A new CI run for `a4f86afbd0d23eb67208438c57d9a01e7c4710d8` must complete before build/test status is marked successful.
+
 ### Runtime correctness fix
 - [x] Audited the current `src/runtime.rs` path before extending it.
 - [x] Found and fixed a concrete HTTP CONNECT dispatch bug: the runtime had checked for `G` even though an HTTP CONNECT request begins with `C`.
 - [x] Runtime now routes `C...` to the HTTP header reader/parser while preserving SOCKS5 `0x05` detection.
 - [ ] Runtime still needs actual compilation/test execution; this environment has no local Rust toolchain execution evidence.
 
-### Runtime slice currently present
+## Runtime slice currently present
+
 - [x] Local SOCKS5 no-auth TCP CONNECT front-end.
 - [x] Local HTTP CONNECT front-end.
 - [x] SOCKS5 static success response.
@@ -135,10 +143,11 @@ No build, test, interoperability, benchmark, platform artifact or Release is mar
 ## Exact verification status
 
 - Repository writes: confirmed.
-- Current main tip before this progress update: `0f0c6eba1292a185a60773e774f94f4ab07289ab` (HTTP CONNECT runtime dispatch fix).
+- Current main tip: `a4f86afbd0d23eb67208438c57d9a01e7c4710d8` (clap/Rust 1.82 dependency compatibility fix).
+- GitHub Actions run `34700492768`: **failed** at dependency manifest parsing because `clap_lex 1.1.0` required Cargo edition2024 support; no Rust source compilation occurred in that run.
 - Local `cargo test`: not run; no local Rust toolchain execution used.
 - Local `cargo build --release`: not run.
-- GitHub Actions: workflow definition exists, but no completed workflow evidence has been observed through the available status/run inspection.
+- New CI run after the clap pin: pending.
 
 ## Git continuity note
 
@@ -146,7 +155,7 @@ During the latest audit, several pre-existing work branches/refs were found. No 
 
 ## Next continuous sequence
 
-1. Use the repository's CI-capable environment to run `cargo test` and `cargo build --release`; fix every compiler/test failure found.
+1. Verify the new CI run after the clap pin; fix every compiler/test/build failure found.
 2. Finish exact SOCKS5 UDP relay/error lifecycle and HTTP CONNECT lifecycle against GoWay v1.8.4.
 3. Implement XOR compatibility.
 4. Implement WSS/TLS/SNI/FakeHost.
