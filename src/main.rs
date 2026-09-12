@@ -3,7 +3,7 @@ mod proxy;
 mod runtime;
 mod ws;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use runtime::RuntimeConfig;
 use std::path::PathBuf;
@@ -34,13 +34,28 @@ struct Args {
     connection_timeout: Option<u64>,
 }
 
+async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
+    let text = tokio::fs::read_to_string(&path).await?;
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    let mut cfg = RuntimeConfig::default();
+    if let Some(x) = v.get("proxy_host").or_else(|| v.get("proxyHost")).and_then(|x| x.as_str()) { cfg.proxy_host = x.into(); }
+    if let Some(x) = v.get("proxy_port").or_else(|| v.get("proxyPort")).and_then(|x| x.as_u64()) { cfg.proxy_port = u16::try_from(x).map_err(|_| anyhow!("proxy_port out of range"))?; }
+    if let Some(x) = v.get("upstream").or_else(|| v.get("upstreamUrl")).and_then(|x| x.as_str()) { cfg.upstream = Some(x.into()); }
+    if let Some(x) = v.get("key").and_then(|x| x.as_str()) { cfg.key = Some(x.into()); }
+    if let Some(x) = v.get("fakehost").or_else(|| v.get("fakeHost")).and_then(|x| x.as_str()) { cfg.fakehost = Some(x.into()); }
+    if let Some(x) = v.get("mux").and_then(|x| x.as_bool()) { cfg.mux = x; }
+    if let Some(x) = v.get("buffer_size").or_else(|| v.get("bufferSize")).and_then(|x| x.as_u64()) { cfg.buffer_size = usize::try_from(x).map_err(|_| anyhow!("buffer_size out of range"))?; }
+    if let Some(x) = v.get("connection_timeout").or_else(|| v.get("connectionTimeout")).and_then(|x| x.as_u64()) { cfg.connection_timeout = x; }
+    if let Some(x) = v.get("allow_open").or_else(|| v.get("allowOpen")).and_then(|x| x.as_bool()) { cfg.allow_open = x; }
+    tracing::info!(config = %path.display(), "configuration loaded");
+    Ok(cfg)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))).with_target(false).init();
     let args = Args::parse();
-    let mut cfg = if let Some(path) = args.config {
-        serde_json::from_str::<RuntimeConfig>(&tokio::fs::read_to_string(path).await?)?
-    } else { RuntimeConfig::default() };
+    let mut cfg = if let Some(path) = args.config { load_json(path).await? } else { RuntimeConfig::default() };
     if let Some(v) = args.port { cfg.proxy_port = v; }
     if let Some(v) = args.upstream { cfg.upstream = Some(v); }
     if let Some(v) = args.key { cfg.key = Some(v); }
