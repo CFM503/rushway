@@ -4,6 +4,7 @@ mod proxy;
 mod runtime;
 mod tls;
 mod ws;
+mod wss_client;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -14,26 +15,17 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(name = "rushway", version, about = "Rust forwarding service compatible with GoWay")]
 struct Args {
-    #[arg(short, long)]
-    config: Option<PathBuf>,
-    #[arg(short = 'p')]
-    port: Option<u16>,
-    #[arg(short = 'u', long = "up")]
-    upstream: Option<String>,
-    #[arg(short = 'k')]
-    key: Option<String>,
-    #[arg(long = "fakehost")]
-    fakehost: Option<String>,
-    #[arg(long = "mux", default_value_t = true)]
-    mux: bool,
-    #[arg(long = "no-mux", default_value_t = false)]
-    no_mux: bool,
-    #[arg(long = "allow-open", default_value_t = false)]
-    allow_open: bool,
-    #[arg(short = 'W')]
-    buffer_size: Option<usize>,
-    #[arg(long = "connection-timeout")]
-    connection_timeout: Option<u64>,
+    #[arg(short, long)] config: Option<PathBuf>,
+    #[arg(short = 'p')] port: Option<u16>,
+    #[arg(short = 'u', long = "up")] upstream: Option<String>,
+    #[arg(short = 'k')] key: Option<String>,
+    #[arg(long = "fakehost")] fakehost: Option<String>,
+    #[arg(long = "mux", default_value_t = true)] mux: bool,
+    #[arg(long = "no-mux", default_value_t = false)] no_mux: bool,
+    #[arg(long = "allow-open", default_value_t = false)] allow_open: bool,
+    #[arg(long = "verify-ssl", default_value_t = false)] verify_ssl: bool,
+    #[arg(short = 'W')] buffer_size: Option<usize>,
+    #[arg(long = "connection-timeout")] connection_timeout: Option<u64>,
 }
 
 async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
@@ -66,7 +58,14 @@ async fn main() -> Result<()> {
     if let Some(v) = args.connection_timeout { cfg.connection_timeout = v; }
     if args.no_mux { cfg.mux = false; } else { cfg.mux = args.mux; }
     if args.allow_open { cfg.allow_open = true; }
-    if cfg.upstream.is_some() { runtime::run_client(cfg).await } else { runtime::run_server(cfg).await }
+    if let Some(upstream) = cfg.upstream.as_deref() {
+        if upstream.starts_with("wss://") {
+            return wss_client::run_client_from_config(cfg, args.verify_ssl).await;
+        }
+        runtime::run_client(cfg).await
+    } else {
+        runtime::run_server(cfg).await
+    }
 }
 
 #[cfg(test)]
@@ -78,5 +77,10 @@ mod tests {
         let a = Args::parse_from(["rushway", "-p", "9192", "--up", "ws://127.0.0.1:8080/ws"]);
         assert_eq!(a.port, Some(9192));
         assert_eq!(a.upstream.as_deref(), Some("ws://127.0.0.1:8080/ws"));
+    }
+    #[test]
+    fn parses_verify_ssl() {
+        let a = Args::parse_from(["rushway", "--up", "wss://example.com/ws", "--verify-ssl"]);
+        assert!(a.verify_ssl);
     }
 }
