@@ -9,7 +9,7 @@
 
 **Stage 2 — GoWay v1.8.4 specification extraction: `[~]`**
 
-A verified intermediate specification has been added as `SPEC.md`.
+A verified intermediate specification exists in `SPEC.md`. Stage 3 has now started at the smallest safe protocol primitive: the MUX frame codec. It is implemented in `src/protocol.rs`, but it is **not yet marked complete because this session has not executed Cargo build/tests**.
 
 ## Completed project work
 
@@ -24,12 +24,12 @@ A verified intermediate specification has been added as `SPEC.md`.
 
 ### Stage 2 — GoWay v1.8.4 specification extraction `[~]`
 - [x] Identify stable compatibility commit: `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.
-- [x] Extract complete CLI option list visible in v1.8.4 main path.
+- [x] Extract main CLI options visible in v1.8.4 main path.
 - [x] Extract core Config fields and derived runtime resources.
 - [x] Confirm client/server selection: `-up` present = Client; omitted = Server.
 - [x] Confirm upstream schemes: `ws`, `wss`, `quic`, `quic+tls`.
 - [x] Confirm MUX command values and 7-byte frame header layout.
-- [x] Confirm MUX SYN/DATA/FIN/RST semantics at the frame level.
+- [x] Confirm MUX SYN/DATA/FIN/RST frame semantics.
 - [x] Confirm 8192-byte HTTP header limit and 64 MiB WebSocket frame limit.
 - [x] Confirm XOR compatibility primitive: SHA-256-derived repeating expanded key.
 - [x] Confirm pooled buffering/backpressure/lifecycle design at a high level.
@@ -45,23 +45,25 @@ A verified intermediate specification has been added as `SPEC.md`.
 - [ ] Extract all remaining tests and map them to Rust tests.
 - [ ] Reconcile every extracted behavior against `SPEC.md`.
 
-### Stage 3 — Rust core implementation `[ ]`
+### Stage 3 — Rust core implementation `[~]`
+- [~] Add MUX frame codec in `src/protocol.rs` using the verified 7-byte big-endian header.
+- [~] Add MUX command enum: SYN/DATA/FIN/RST.
+- [~] Add SYN payload codec: uint16 target length + target + optional initial data.
+- [~] Add protocol unit tests for round-trip and malformed frames. **Tests written; not executed yet.**
 - [ ] CLI/config compatibility.
-- [ ] Protocol frame encoding/decoding.
-- [ ] Crypto compatibility.
+- [ ] Crypto compatibility implementation.
 - [ ] WebSocket transport.
 - [ ] SOCKS5 + HTTP CONNECT front-end.
 - [ ] TCP forwarding.
-- [ ] MUX sessions/streams/backpressure.
+- [ ] MUX session/stream state machine, backpressure and cancellation.
 - [ ] TLS/SNI/fakehost behavior.
 - [ ] QUIC.
 - [ ] DNS resolver/cache.
 - [ ] Connection pooling/reuse/reconnect.
-- [ ] Cancellation/EOF/FIN/RST/error handling.
 - [ ] Statistics/logging/TUI where appropriate.
 
 ### Stage 4 — Compatibility and tests `[ ]`
-- [ ] Rust unit tests.
+- [ ] Rust unit tests executed successfully.
 - [ ] Rust integration tests.
 - [ ] GoWay Client ↔ RushWay Server.
 - [ ] RushWay Client ↔ GoWay Server.
@@ -99,8 +101,9 @@ A verified intermediate specification has been added as `SPEC.md`.
 
 ## Important compatibility findings
 
-- MUX header is 7 bytes: 4-byte big-endian stream ID + 1-byte command + 2-byte big-endian payload length.
-- SYN payload starts with a 2-byte target-address length, followed by target address and optional initial data.
+- MUX header is exactly 7 bytes: 4-byte big-endian stream ID + 1-byte command + 2-byte big-endian payload length.
+- Valid MUX commands are SYN `0x01`, DATA `0x02`, FIN `0x03`, RST `0x04`.
+- SYN payload starts with a 2-byte big-endian target-address length, followed by target address and optional initial data.
 - DATA is chunked because payload length is uint16.
 - FIN is the stream half-close/EOF signal; RST is abrupt reset/error.
 - Client MUX buffering is bounded; server stream delivery also uses bounded queues/backpressure.
@@ -114,27 +117,40 @@ A verified intermediate specification has been added as `SPEC.md`.
 
 ## Verification policy
 
-No cross-platform build, interoperability result, benchmark result, or Release is marked complete unless there is actual execution evidence. The current connector can write/read repository files but does not itself constitute evidence that Rust binaries compile or interoperate.
+No cross-platform build, interoperability result, benchmark result, or Release is marked complete unless there is actual execution evidence. Repository writes are not build/test evidence.
 
-## Current commit
+## Current commits
 
-Latest RushWay commit after this documentation step: `600829f0e6f12b16b8fd84e99c799635330238d6` (`SPEC.md`).
+- `8586161341bda9ff1f41b0e858fe4b305de6e4e8` — wire MUX protocol module into `main.rs`.
+- `005173e5cbdc3fce989495a3a4c98eac2dd01b57` — add `src/protocol.rs` MUX codec and unit tests.
+- This progress-document commit follows those changes.
 
-Previous project commits remain in history, including the initial Cargo/CLI skeleton and progress tracker.
+## Exact verification commands actually run in this work session
 
-## Exact commands actually run in this work session
+No local Rust/Cargo build was executed. No local Rust/Cargo test was executed. No GitHub Actions build/test was executed. Repository changes were written through GitHub's repository API.
 
-No local Rust/Cargo build was executed in this session. No GitHub Actions build was executed in this session. Repository changes were written through GitHub's repository API.
+The next verification command that must be run by a runtime-capable environment is:
+
+```text
+cargo test
+```
+
+Then, if successful:
+
+```text
+cargo build --release
+```
 
 ## Outstanding failures / limitations
 
-- Full `goway.go` extraction is not finished because the source is large and tool responses can be truncated.
+- Full `goway.go` extraction is not finished because the source is large and connector responses can be truncated.
 - Exact QUIC, pool, proxy parser, config-file and handshake details remain to be extracted.
-- RushWay core is still only the initial skeleton; it is not a functional GoWay replacement yet.
+- RushWay core is still not a functional GoWay replacement.
+- The new MUX codec has not yet been compiled or tested in this environment.
 
 ## Single recommended next step
 
-**Continue Stage 2:** extract the remaining GoWay v1.8.4 source in smaller verified sections, especially QUIC, WebSocket handshake, SOCKS5/HTTP, pools, config-file parsing and lifecycle, then reconcile the complete specification before substantial Rust implementation.
+**Continue Stage 2 and Stage 3 in lockstep:** first finish the exact GoWay v1.8.4 protocol extraction for WebSocket/SOCKS5/HTTP/QUIC/pools/config; then expand the Rust implementation from the verified MUX primitive. Do not declare the codec complete until `cargo test` passes.
 
 ## Future target
 
