@@ -1,3 +1,4 @@
+mod crypto;
 mod protocol;
 mod proxy;
 mod runtime;
