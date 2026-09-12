@@ -2,6 +2,7 @@ mod crypto;
 mod protocol;
 mod proxy;
 mod runtime;
+mod tls;
 mod ws;
 
 use anyhow::{anyhow, Result};
