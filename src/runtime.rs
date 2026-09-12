@@ -3,6 +3,7 @@
 //! Current path: local SOCKS5/HTTP CONNECT -> WebSocket -> MUX -> target TCP.
 //! TLS/QUIC/pooling/retry remain explicit follow-up layers.
 
+use crate::crypto::XorCipher;
 use crate::protocol::{MuxCommand, MuxFrame, SynPayload};
 use crate::proxy::{parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_success_response, TargetAddr, SOCKS5_CONNECT, SOCKS5_VERSION};
 use crate::ws::{build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers, validate_client_handshake_response, validate_server_handshake, write_frame};
@@ -38,6 +39,14 @@ struct StreamEntry { tx: mpsc::Sender<StreamCommand> }
 
 #[derive(Debug)]
 enum StreamCommand { Data(Vec<u8>), Fin, Reset }
+
+fn configured_cipher(key: &Option<String>) -> XorCipher {
+    XorCipher::new(key.as_deref().unwrap_or(""))
+}
+
+fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
+    cipher.apply(payload);
+}
 
 async fn dial_target(target: &TargetAddr, timeout_secs: u64) -> Result<TcpStream> {
     let addr = format!("{}:{}", target.host, target.port);
@@ -95,10 +104,34 @@ async fn handle_mux_server(stream: TcpStream, cfg: RuntimeConfig, request: Vec<u
     wr.write_all(&build_server_handshake_response(&key)).await?;
     wr.flush().await?;
     let writer = Arc::new(Mutex::new(wr));
-    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+    let cipher = configured_cipher(&cfg.key);
     let mut frame_buf = Vec::with_capacity(64 * 1024);
+
+    // GoWay v1.8.4 authenticates the MUX transport with one binary WS frame:
+    // client sends "MUX\n" (XOR transformed when -k is set), server answers
+    // "OK\n" with the same per-call XOR transform. MUX frames themselves stay
+    // untransformed. This must happen before the first SYN frame.
+    let Some((opcode, mut hello)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else {
+        bail!("missing MUX handshake");
+    };
+    if opcode != 2 {
+        bail!("invalid MUX handshake opcode");
+    }
+    transform_payload(&cipher, &mut hello);
+    if hello != b"MUX\n" {
+        bail!("invalid MUX handshake");
+    }
+    let mut ok = b"OK\n".to_vec();
+    transform_payload(&cipher, &mut ok);
+    {
+        let mut w = writer.lock().await;
+        write_frame(&mut *w, &ok, 2, false).await?;
+    }
+
+    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     loop {
-        let Some((_, payload)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
+        let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
+        if opcode != 2 { continue; }
         let frame = match MuxFrame::decode(&payload) { Ok(f) => f, Err(_) => continue };
         match frame.command {
             MuxCommand::Syn => {
@@ -146,7 +179,6 @@ async fn read_proxy_request(stream: &mut TcpStream) -> Result<(TargetAddr, Optio
         let parsed = parse_socks5_request(&req).map_err(|e| anyhow!(e.to_string()))?;
         Ok((parsed.target, Some(socks5_success_response().to_vec())))
     } else if first == b'C' {
-        // HTTP CONNECT starts with 'C'. The parser accepts both CRLFCRLF and LF LF.
         let mut buf = vec![first];
         let mut tail = read_http_headers(stream).await?;
         buf.append(&mut tail);
@@ -171,7 +203,25 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
     let writer = Arc::new(Mutex::new(wr));
+    let cipher = configured_cipher(&cfg.key);
     if let Some(reply) = socks_reply { local.write_all(&reply).await?; } else { local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?; }
+
+    // GoWay authentication/mode probe: encrypt only the standalone MUX hello,
+    // then require the encrypted OK response before sending stream frames.
+    let mut hello = b"MUX\n".to_vec();
+    transform_payload(&cipher, &mut hello);
+    {
+        let mut w = writer.lock().await;
+        write_frame(&mut *w, &hello, 2, true).await?;
+    }
+    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let Some((opcode, mut ok)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else {
+        bail!("upstream closed during MUX handshake");
+    };
+    if opcode != 2 { bail!("invalid MUX handshake response opcode"); }
+    transform_payload(&cipher, &mut ok);
+    if ok != b"OK\n" { bail!("upstream rejected MUX handshake"); }
+
     let id = next_id.max(1);
     let target_text = format!("{}:{}", target.host, target.port);
     let syn = SynPayload { target: target_text.into_bytes(), initial_data: Vec::new() };
@@ -194,9 +244,9 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
         }
         Result::<()>::Ok(())
     });
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
-        let Some((_, payload)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
+        let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
+        if opcode != 2 { continue; }
         let frame = MuxFrame::decode(&payload).map_err(|e| anyhow!(e.to_string()))?;
         if frame.stream_id != id { continue; }
         match frame.command {
