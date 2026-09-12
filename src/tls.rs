@@ -6,7 +6,8 @@
 //! plain `ws://` path is unchanged while WSS integration is completed.
 
 use anyhow::{anyhow, Context, Result};
-use rustls::{ClientConfig, RootCertStore, ServerName};
+use rustls::{ClientConfig, RootCertStore};
+use rustls::pki_types::ServerName;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
