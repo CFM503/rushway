@@ -5,7 +5,7 @@
 
 ## Current status
 
-**Overall engineering completion: ~46% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~47% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -22,9 +22,9 @@
 - [x] Linux release build passed in the same run.
 - [x] Windows x64 GNU build passed in the same run.
 - [x] Corrected-XOR CI run `34701378943` previously passed test, release and Windows jobs.
-- [ ] WSS integration is not yet CI-green.
-- [x] First WSS CI failure was diagnosed from run `34702708587`: Rust 1.82 attempted to resolve `zeroize 1.9.0`, which requires Cargo's unstable `edition2024` feature.
-- [x] Added direct `zeroize = "=1.7.0"` pin in commit `317dda882c7cd50303996cc4eb1b6ebcebad8aa0` to keep the Rust 1.82 toolchain compatible.
+- [x] WSS dependency compatibility was corrected for Rust 1.82: `zeroize = 1.7.0`, `jobserver = 0.1.32`.
+- [x] Rustls `ServerName` import was corrected to `rustls::pki_types::ServerName` in commit `c66ed87b3cc3030ea8eaa72655413dc9f77f50c3`.
+- [x] Full WSS implementation CI run `34702979646` passed Linux tests, Linux release build, and Windows x64 GNU build.
 
 ### XOR compatibility and runtime integration
 - [x] Previous Rust XOR implementation was audited against exact GoWay v1.8.4 `Crypto.TransformInPlace` semantics.
@@ -51,7 +51,7 @@
 - [x] Added `src/wss_client.rs` with actual WSS client forwarding: TLS -> WebSocket -> XOR MUX hello/OK -> MUX SYN/DATA/FIN/RST -> local SOCKS5/HTTP CONNECT.
 - [x] Added `--verify-ssl` CLI flag and WSS dispatch in `main.rs`.
 - [x] WSS path preserves plain `ws://` runtime as a separate path.
-- [ ] WSS CI after the Rust 1.82 dependency pin.
+- [x] Rust 1.82 WSS build/test/release verification is green in Actions run `34702979646`.
 - [ ] WSS UDP path.
 - [ ] Real WSS interoperability test.
 - [ ] Final SNI/FakeHost compatibility verification against GoWay.
@@ -73,7 +73,7 @@
 - [x] Remote MUX FIN -> local half-close.
 - [x] Remote MUX RST -> local connection termination.
 - [x] SOCKS5 UDP relay implementation slice.
-- [~] TLS/WSS client TCP forwarding path added; awaiting CI and live interoperability evidence.
+- [x] TLS/WSS client TCP forwarding path compiles and passes Linux/Windows CI.
 - [ ] WSS UDP.
 - [ ] Runtime QUIC.
 - [ ] Runtime connection pool/reuse/retry/dead-IP.
@@ -108,7 +108,7 @@
 - [x] SOCKS5 UDP relay implementation slice added and CI-verified for compilation/tests/builds.
 - [x] Rustls WSS client foundation added.
 - [x] WSS client TCP forwarding implementation added.
-- [ ] WSS CI verification after dependency fix.
+- [x] WSS CI verification completed successfully in run `34702979646`.
 - [ ] Full CLI/config parity.
 - [ ] WSS/SNI/FakeHost final verification.
 - [ ] MUX state/lifecycle hardening for high stream counts.
@@ -118,9 +118,9 @@
 - [ ] Statistics/logging/TUI compatibility where required.
 
 ## Stage 4 — Compatibility/tests `[ ]`
-- [x] Rust unit tests executed in CI for current UDP transport commit.
-- [x] Current Linux release build and Windows x64 build verified by run `34702137868`.
-- [ ] WSS CI verification.
+- [x] Rust unit tests executed in CI for current WSS implementation.
+- [x] Current Linux release build and Windows x64 build verified by run `34702979646`.
+- [x] WSS compilation/build verification.
 - [ ] GoWay Client -> RushWay Server.
 - [ ] RushWay Client -> GoWay Server.
 - [ ] GoWay/RushWay SOCKS5 TCP echo.
@@ -130,7 +130,7 @@
 - [ ] Slow/fast streams.
 - [ ] EOF/FIN/RST.
 - [ ] Disconnect/reconnect.
-- [ ] TLS/WSS.
+- [ ] Real TLS/WSS interoperability.
 - [ ] QUIC.
 - [ ] HTTP CONNECT.
 - [ ] Invalid arguments/config.
@@ -145,9 +145,9 @@
 ## Stage 6 — GitHub Actions `[~]`
 - [x] CI workflow definition exists for Rust 1.82 tests/release build.
 - [x] Windows x64 GNU build job definition exists.
-- [x] Linux Rust test + release build completed successfully in run `34702137868`.
-- [x] Windows x64 GNU build completed successfully in run `34702137868`.
-- [ ] Current WSS dependency-fix run must pass before marking WSS build green.
+- [x] Linux Rust test + release build completed successfully in run `34702979646`.
+- [x] Windows x64 GNU build completed successfully in run `34702979646`.
+- [x] WSS dependency/API compatibility fixes are CI-green.
 - [ ] Debian 12 build/package job.
 - [ ] KWRT/OpenWrt ARMv7 build/package job.
 - [ ] Release workflow.
@@ -180,18 +180,18 @@ No build, test, interoperability, benchmark, platform artifact or Release is mar
 
 ## Exact verification status
 
-- Latest fully green implementation verification: Actions run `34702137868` — Linux test **success**, Linux release build **success**, Windows x64 GNU build **success**.
-- WSS first integration run `34702708587`: **failure before compilation** because `zeroize 1.9.0` requires Cargo edition2024 support unavailable in Rust 1.82. This was diagnosed from the job log, not a source compile failure.
-- Dependency compatibility fix commit: `317dda882c7cd50303996cc4eb1b6ebcebad8aa0` pins `zeroize` to `1.7.0`.
+- Latest fully green implementation verification: Actions run `34702979646` — Linux test **success**, Linux release build **success**, Windows x64 GNU build **success**.
+- Previous WSS compile failure run `34702806288`: Rust 1.82 rejected `rustls::ServerName`; corrected in `c66ed87b3cc3030ea8eaa72655413dc9f77f50c3` using `rustls::pki_types::ServerName`.
+- The corrective WSS run `34702979646` is fully green.
 - Local `cargo test`: not run; no local Rust toolchain execution used.
 - Local `cargo build --release`: not run.
 - Actual GoWay ↔ RushWay interoperability: **not yet executed**, therefore not claimed.
 
 ## Next continuous sequence
 
-1. Verify commit `317dda882c7cd50303996cc4eb1b6ebcebad8aa0` with GitHub Actions and fix any actual Rust compile errors.
-2. Once green, review WSS client code for protocol correctness, especially TLS SNI, FakeHost/Host and proxy response behavior.
-3. Add WSS UDP only after WSS TCP is CI-green.
+1. Audit the now-CI-green WSS client against GoWay v1.8.4 for TLS SNI, Host/FakeHost, WebSocket headers and handshake response behavior.
+2. Add targeted WSS unit/integration coverage for certificate modes and handshake framing.
+3. Add WSS UDP only after WSS TCP behavior is reconciled.
 4. Reconcile UDP FRAG/error/close behavior against GoWay v1.8.4.
 5. Implement QUIC and exact pool/retry/dead-IP behavior.
 6. Add non-MUX and remaining CLI/config/DNS behavior.
