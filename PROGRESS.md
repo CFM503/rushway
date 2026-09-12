@@ -17,12 +17,14 @@
 
 ## Latest continuous-pass work
 
-### CI dependency/toolchain compatibility fix
+### CI dependency/toolchain compatibility fixes
 - [x] First real GitHub Actions run `34700234965` reached Cargo but failed before compiling because `--locked` was used while no `Cargo.lock` existed.
 - [x] CI was changed to allow initial lockfile generation in commit `17b882ed9e79c7554a583caeca79af58dc3b063f`.
-- [x] Second run `34700492768` reached dependency resolution on Rust 1.82.0, then failed because the unconstrained `clap` dependency selected `clap_lex 1.1.0`, which requires Cargo's stabilized `edition2024` support unavailable in Cargo 1.82.0.
-- [x] Pinned `clap` to `=4.5.20` in commit `a4f86afbd0d23eb67208438c57d9a01e7c4710d8` so the project can retain its declared Rust 1.82 compatibility while avoiding the incompatible dependency resolution.
-- [ ] A new CI run for `a4f86afbd0d23eb67208438c57d9a01e7c4710d8` must complete before build/test status is marked successful.
+- [x] Run `34700492768` reached dependency resolution on Rust 1.82.0, then failed because unconstrained `clap` selected `clap_lex 1.1.0`, requiring Cargo edition2024 support unavailable in Cargo 1.82.0.
+- [x] Pinned `clap` to `=4.5.20` in commit `a4f86afbd0d23eb67208438c57d9a01e7c4710d8`.
+- [x] The next run `34700616198` confirmed the clap issue was resolved: Cargo selected `clap_lex 0.7.7`, but then dependency resolution failed on `getrandom 0.4.3`, which was pulled by the unconstrained `tempfile` dev dependency and also requires edition2024 support.
+- [x] Pinned `tempfile` to `=3.13.0` in commit `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30` to keep the declared Rust 1.82 compatibility.
+- [ ] A new CI run for `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30` must complete before build/test status is marked successful.
 
 ### Runtime correctness fix
 - [x] Audited the current `src/runtime.rs` path before extending it.
@@ -143,11 +145,12 @@ No build, test, interoperability, benchmark, platform artifact or Release is mar
 ## Exact verification status
 
 - Repository writes: confirmed.
-- Current main tip: `a4f86afbd0d23eb67208438c57d9a01e7c4710d8` (clap/Rust 1.82 dependency compatibility fix).
-- GitHub Actions run `34700492768`: **failed** at dependency manifest parsing because `clap_lex 1.1.0` required Cargo edition2024 support; no Rust source compilation occurred in that run.
+- Current main tip: `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30` (tempfile/Rust 1.82 dependency compatibility fix).
+- GitHub Actions run `34700492768`: failed at dependency manifest parsing because `clap_lex 1.1.0` required Cargo edition2024 support.
+- GitHub Actions run `34700616198`: failed at dependency manifest parsing because `getrandom 0.4.3` required Cargo edition2024 support.
 - Local `cargo test`: not run; no local Rust toolchain execution used.
 - Local `cargo build --release`: not run.
-- New CI run after the clap pin: pending.
+- New CI run after the tempfile pin: pending.
 
 ## Git continuity note
 
@@ -155,7 +158,7 @@ During the latest audit, several pre-existing work branches/refs were found. No 
 
 ## Next continuous sequence
 
-1. Verify the new CI run after the clap pin; fix every compiler/test/build failure found.
+1. Verify the new CI run after the tempfile pin; fix every compiler/test/build failure found.
 2. Finish exact SOCKS5 UDP relay/error lifecycle and HTTP CONNECT lifecycle against GoWay v1.8.4.
 3. Implement XOR compatibility.
 4. Implement WSS/TLS/SNI/FakeHost.
