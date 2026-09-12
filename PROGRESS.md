@@ -9,7 +9,9 @@
 
 **Stage 2 — GoWay v1.8.4 specification extraction: `[~]`**
 
-A verified intermediate specification exists in `SPEC.md`. Stage 3 has now started at the smallest safe protocol primitive: the MUX frame codec. It is implemented in `src/protocol.rs`, but it is **not yet marked complete because this session has not executed Cargo build/tests**.
+**Stage 3 — Rust core implementation: `[~]`**
+
+The verified MUX primitive and an initial RFC6455 WebSocket frame codec are now in the repository. Neither is marked fully complete until compilation/tests and interoperability evidence exist.
 
 ## Completed project work
 
@@ -35,6 +37,7 @@ A verified intermediate specification exists in `SPEC.md`. Stage 3 has now start
 - [x] Confirm pooled buffering/backpressure/lifecycle design at a high level.
 - [x] Map v1.8.4 regression tests for header limit, PRNG lifecycle, target lifecycle, slow/fast/RST, 1000 streams and log-ring concurrency.
 - [x] Add `SPEC.md` with verified intermediate migration contract.
+- [~] Extract WebSocket framing behavior: complete non-fragmented data frames, 64 MiB limit, RFC6455 control-frame limits, masking/unmasking, Ping/Pong/Close handling, RFC6455 accept-key vector. **Handshake HTTP validation is still pending.**
 - [ ] Read all remaining sections of `goway.go` without truncation.
 - [ ] Extract exact WebSocket handshake/header validation behavior.
 - [ ] Extract exact SOCKS5 TCP/UDP behavior.
@@ -50,9 +53,15 @@ A verified intermediate specification exists in `SPEC.md`. Stage 3 has now start
 - [~] Add MUX command enum: SYN/DATA/FIN/RST.
 - [~] Add SYN payload codec: uint16 target length + target + optional initial data.
 - [~] Add protocol unit tests for round-trip and malformed frames. **Tests written; not executed yet.**
+- [~] Add RFC6455 frame codec in `src/ws.rs`.
+- [~] Add WebSocket accept-key calculation and RFC6455 test vector.
+- [~] Add WebSocket frame length encoding for 0..125, 126..65535 and 64-bit lengths.
+- [~] Add masking/unmasking and control-frame validation.
+- [~] Add Ping/Pong/Close handling to the frame reader.
+- [ ] Execute and pass Rust unit tests before marking these codecs complete.
 - [ ] CLI/config compatibility.
 - [ ] Crypto compatibility implementation.
-- [ ] WebSocket transport.
+- [ ] WebSocket HTTP handshake/client/server transport.
 - [ ] SOCKS5 + HTTP CONNECT front-end.
 - [ ] TCP forwarding.
 - [ ] MUX session/stream state machine, backpressure and cancellation.
@@ -113,17 +122,17 @@ A verified intermediate specification exists in `SPEC.md`. Stage 3 has now start
 - `-max-conn` default is 1000 and validated to 1..1,000,000.
 - `-W` default is 128 KiB; runtime buffer has a lower bound around 64 KiB and an upper bound around 12 MiB plus framing overhead.
 - Remote DNS falls back to system DNS on failure and caches successful results.
-- `-fakehost` affects CDN/reverse-proxy Host/SNI behavior and requires exact source-level treatment.
+- GoWay WebSocket framing rejects fragmented data/control frames, caps frames at 64 MiB, caps control payloads at 125 bytes, unmasks masked frames and treats Close as EOF; Ping is answered with Pong and Pong is discarded.
+- GoWay uses the RFC6455 accept-key formula: SHA-1(client key + RFC6455 GUID), Base64 encoded.
+- Exact WebSocket HTTP handshake/header behavior is not yet fully reconciled.
 
 ## Verification policy
 
 No cross-platform build, interoperability result, benchmark result, or Release is marked complete unless there is actual execution evidence. Repository writes are not build/test evidence.
 
-## Current commits
+## Current commit
 
-- `8586161341bda9ff1f41b0e858fe4b305de6e4e8` — wire MUX protocol module into `main.rs`.
-- `005173e5cbdc3fce989495a3a4c98eac2dd01b57` — add `src/protocol.rs` MUX codec and unit tests.
-- This progress-document commit follows those changes.
+`a462460a2557593ad59d884b214785672437273f` — WebSocket codec implementation/test cleanup.
 
 ## Exact verification commands actually run in this work session
 
@@ -146,11 +155,11 @@ cargo build --release
 - Full `goway.go` extraction is not finished because the source is large and connector responses can be truncated.
 - Exact QUIC, pool, proxy parser, config-file and handshake details remain to be extracted.
 - RushWay core is still not a functional GoWay replacement.
-- The new MUX codec has not yet been compiled or tested in this environment.
+- The new MUX and WebSocket codecs have not yet been compiled or tested in this environment.
 
 ## Single recommended next step
 
-**Continue Stage 2 and Stage 3 in lockstep:** first finish the exact GoWay v1.8.4 protocol extraction for WebSocket/SOCKS5/HTTP/QUIC/pools/config; then expand the Rust implementation from the verified MUX primitive. Do not declare the codec complete until `cargo test` passes.
+**Continue Stage 2 extraction:** finish exact WebSocket handshake validation and then extract SOCKS5 TCP/UDP + HTTP CONNECT behavior from the GoWay v1.8.4 baseline before building the proxy front-end.
 
 ## Future target
 
