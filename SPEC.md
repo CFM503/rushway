@@ -124,11 +124,11 @@ GoWay server requires an `Upgrade: websocket` header and extracts `Sec-WebSocket
 
 `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: <computed>\r\n\r\n`
 
-The accept value is SHA-1(client key + RFC6455 GUID), Base64 encoded. GoWay emits HTTP 400 when the required upgrade is missing. RushWay's current validator additionally checks the Connection token and request line for a safe functional handshake; interoperability testing must confirm that this stricter parsing does not reject any real v1.8.4 peer behavior.
+The accept value is SHA-1(client key + RFC6455 GUID), Base64 encoded. GoWay emits HTTP 400 when the required upgrade is missing.
 
 ### Handshake response validation
 
-The observed GoWay client strictly expects status `101`. It distinguishes common failures including `200`, `301/302/307/308`, `400`, `403`, `404`, `502`, `503`, and `504`. RushWay implements these status classes and also validates `Upgrade`, `Connection`, and `Sec-WebSocket-Accept` against the request key.
+The observed GoWay client strictly expects status `101`. It distinguishes common failures including `200`, `301/302/307/308`, `400`, `403`, `404`, `502`, `503`, and `504`.
 
 ### Framing
 
@@ -140,14 +140,21 @@ RushWay's frame codec currently supports complete non-fragmented data frames, 64
 
 ## Proxy front-end
 
-The v1.8.4 integration tests exercise:
+The v1.8.4 integration tests exercise SOCKS5 TCP CONNECT, HTTP CONNECT, SOCKS5 UDP ASSOCIATE and TCP echo forwarding. The GoWay source also contains a static successful SOCKS5 response:
 
-- SOCKS5 TCP CONNECT
-- HTTP CONNECT
-- SOCKS5 UDP ASSOCIATE
-- TCP echo forwarding
+`05 00 00 01 00 00 00 00 00 00`
 
-The implementation also performs target-address handling, local/LAN blocking when enabled, optional remote DNS resolution, and connection limiting.
+and a static HTTP CONNECT success response:
+
+`HTTP/1.1 200 Connection Established\r\n\r\n`.
+
+The v1.8.4 test suite explicitly starts SOCKS5 with `[VER=5, NMETHODS=1, METHOD=0=no-auth]` and then tests CONNECT. UDP ASSOCIATE is separately exercised end-to-end against a UDP echo server. Truncated UDP-associate reads were hardened with strict `io.ReadFull` error/EOF checks in the v1.8.4 source. citeturn432file0turn418file0
+
+The GoWay/PyWay lineage confirms the SOCKS5 no-auth greeting response is `05 00`; address types include IPv4, domain and IPv6, and the UDP datagram envelope is RFC1928-style reserved bytes + FRAG + ATYP + address + port + payload. RushWay now has isolated parsers for the SOCKS5 greeting, CONNECT/UDP ASSOCIATE request, UDP datagram envelope and HTTP CONNECT authority. These are **parser primitives, not the forwarding implementation**. citeturn434file0turn431file3
+
+HTTP CONNECT requests are expected to be read until a complete header terminator rather than assuming one TCP read contains the complete request. The v1.8.4 changelog specifically records support for `\r\n\r\n` / `\n\n` framing with the 8192-byte header limit. The integration test uses the form `CONNECT 127.0.0.1:<port> HTTP/1.1` with a Host header. citeturn418file0turn420file4
+
+**Important extraction status:** exact GoWay `goway.go` parser/control-flow code for every SOCKS5 error reply, UDP relay lifecycle, HTTP method/error mapping and target-resolution path is still being extracted. Do not mark this section fully complete until those exact branches are reconciled.
 
 ## DNS
 
@@ -206,8 +213,8 @@ GoWay v1.8.4 uses `quic-go` and exposes QUIC upstream schemes. RushWay must inve
 
 ## Specification status
 
-This file remains an **intermediate verified baseline**. The WebSocket handshake behavior is now substantially extracted and mirrored, but the full source inventory is not complete. Remaining sections include SOCKS5/HTTP parsing, QUIC, pools/retry/dead-IP, JSON/config behavior, remaining tests, and browser-profile parity.
+This file remains an **intermediate verified baseline**. WebSocket functional behavior is substantially extracted. SOCKS5/HTTP front-end wire shapes and test coverage are now documented and isolated Rust parser primitives exist, but exact GoWay control-flow/error branches and UDP relay lifecycle remain to be reconciled.
 
 ## Next action
 
-Continue Stage 2 extraction with exact SOCKS5 TCP/UDP and HTTP CONNECT behavior from the v1.8.4 source. Then implement those parsers/front-end primitives in RushWay before moving to QUIC and pool details.
+Continue Stage 2 extraction of the exact GoWay SOCKS5/HTTP control flow and then move to exact QUIC listener/client/session/stream behavior. Do not mark proxy front-end complete until parser behavior and forwarding lifecycle are covered by actual Rust tests and later GoWay interop tests.
