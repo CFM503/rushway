@@ -43,7 +43,6 @@ struct StreamEntry { tx: mpsc::Sender<StreamCommand> }
 enum StreamCommand { Data(Vec<u8>), Fin, Reset }
 
 fn configured_cipher(key: &Option<String>) -> XorCipher { XorCipher::new(key.as_deref().unwrap_or("")) }
-
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) { cipher.apply(payload); }
 
 async fn dial_target(target: &TargetAddr, timeout_secs: u64) -> Result<TcpStream> {
@@ -96,9 +95,7 @@ async fn server_stream_task(id: u32, target: TcpStream, mut rx: mpsc::Receiver<S
     reader.abort();
 }
 
-async fn handle_mux_frames(stream: TcpStream, cfg: RuntimeConfig, request: Vec<u8>, first_payload: Vec<u8>) -> Result<()> {
-    let (mut rd, mut wr) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(wr));
+async fn handle_mux_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHalf<TcpStream>>>, cfg: RuntimeConfig, first_payload: Vec<u8>) -> Result<()> {
     let cipher = configured_cipher(&cfg.key);
     let mut hello = first_payload;
     transform_payload(&cipher, &mut hello);
@@ -106,7 +103,6 @@ async fn handle_mux_frames(stream: TcpStream, cfg: RuntimeConfig, request: Vec<u
     let mut ok = b"OK\n".to_vec();
     transform_payload(&cipher, &mut ok);
     { let mut w = writer.lock().await; write_frame(&mut *w, &ok, 2, false).await?; }
-    let _ = request;
     let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
@@ -159,9 +155,7 @@ fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn handle_server_udp(stream: TcpStream, cfg: RuntimeConfig, first_payload: Vec<u8>) -> Result<()> {
-    let (mut rd, mut wr) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(wr));
+async fn handle_server_udp_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHalf<TcpStream>>>, cfg: RuntimeConfig, first_payload: Vec<u8>) -> Result<()> {
     let cipher = configured_cipher(&cfg.key);
     let mut hello = first_payload;
     transform_payload(&cipher, &mut hello);
@@ -170,22 +164,21 @@ async fn handle_server_udp(stream: TcpStream, cfg: RuntimeConfig, first_payload:
     transform_payload(&cipher, &mut ok);
     { let mut w = writer.lock().await; write_frame(&mut *w, &ok, 2, false).await?; }
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
     let udp_send = udp.clone();
-    let cipher_send = configured_cipher(&cfg.key);
     let writer_send = writer.clone();
+    let cipher_send = configured_cipher(&cfg.key);
     let send_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let (n, _) = udp_send.recv_from(&mut buf).await?;
-            let src = match udp_send.local_addr() { Ok(_) => "0.0.0.0:0".parse::<SocketAddr>().unwrap(), Err(_) => break };
-            let mut packet = udp_envelope(src, &buf[..n]);
+            let (n, source) = udp_send.recv_from(&mut buf).await?;
+            let mut packet = udp_envelope(source, &buf[..n]);
             transform_payload(&cipher_send, &mut packet);
             let mut w = writer_send.lock().await;
             write_frame(&mut *w, &packet, 2, false).await?;
         }
         Result::<()>::Ok(())
     });
+    let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
         let Some((opcode, mut packet)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
         if opcode != 2 { continue; }
@@ -198,9 +191,18 @@ async fn handle_server_udp(stream: TcpStream, cfg: RuntimeConfig, first_payload:
     Ok(())
 }
 
-async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, TargetAddr)> {
+async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
     let first = stream.read_u8().await?;
-    if first != SOCKS5_VERSION { if first == b'C' { let mut buf = vec![first]; let mut tail = read_http_headers(stream).await?; buf.append(&mut tail); let target = parse_http_connect(&buf).map_err(|e| anyhow!(e.to_string()))?; return Ok((SocksCommand::Connect, target)); } bail!("unsupported proxy protocol"); }
+    if first != SOCKS5_VERSION {
+        if first == b'C' {
+            let mut buf = vec![first];
+            let mut tail = read_http_headers(stream).await?;
+            buf.append(&mut tail);
+            let target = parse_http_connect(&buf).map_err(|e| anyhow!(e.to_string()))?;
+            return Ok((SocksCommand::Connect, target, false));
+        }
+        bail!("unsupported proxy protocol");
+    }
     let n = stream.read_u8().await? as usize;
     let mut methods = vec![0u8; n];
     stream.read_exact(&mut methods).await?;
@@ -214,29 +216,16 @@ async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, Tar
     let mut req = head.to_vec(); req.extend_from_slice(&rest);
     if head[3] == 3 { let n = rest[0] as usize; let mut tail = vec![0u8; n + 2]; stream.read_exact(&mut tail).await?; req.extend_from_slice(&tail); }
     let parsed = parse_socks5_request(&req).map_err(|e| anyhow!(e.to_string()))?;
-    let command = parsed.command;
-    Ok((command, parsed.target))
-}
-
-async fn open_upstream(upstream: &str, actual_host: &str, cfg: &RuntimeConfig) -> Result<(tokio::io::ReadHalf<TcpStream>, tokio::io::WriteHalf<TcpStream>, Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>)> {
-    let (host, path) = parse_ws_url(upstream)?;
-    let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await??;
-    let (mut rd, mut wr) = tokio::io::split(socket);
-    let origin = Some(format!("https://{}", actual_host));
-    let (request, key) = build_client_handshake_request(actual_host, &path, origin.as_deref());
-    wr.write_all(&request).await?;
-    wr.flush().await?;
-    let response = read_http_headers(&mut rd).await?;
-    validate_client_handshake_response(&response, &key)?;
-    let writer = Arc::new(Mutex::new(wr));
-    Ok((rd, tokio::io::split(TcpStream::from_std(std::net::TcpStream::new_v4().unwrap()).unwrap()).0, writer))
+    Ok((parsed.command, parsed.target, true))
 }
 
 async fn handle_local_udp_proxy(mut control: TcpStream, cfg: RuntimeConfig, bind_hint: TargetAddr) -> Result<()> {
     let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host == "" { "0.0.0.0" } else { bind_hint.host.as_str() };
-    let udp = UdpSocket::bind(format!("{}:0", bind_ip)).await?;
+    let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
     let bound = udp.local_addr()?;
-    let mut resp = [0u8; 10]; resp[0]=5; resp[1]=0; resp[2]=0; resp[3]=1; resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
+    let mut resp = [0u8; 10]; resp[0]=5; resp[1]=0; resp[2]=0; resp[3]=1;
+    if let IpAddr::V4(ip) = bound.ip() { resp[4..8].copy_from_slice(&ip.octets()); }
+    resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
     control.write_all(&resp).await?;
     let upstream = cfg.upstream.clone().ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (host, path) = parse_ws_url(&upstream)?;
@@ -246,23 +235,35 @@ async fn handle_local_udp_proxy(mut control: TcpStream, cfg: RuntimeConfig, bind
     let origin = Some(format!("https://{}", actual_host));
     let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref());
     wr.write_all(&request).await?; wr.flush().await?;
-    let response = read_http_headers(&mut rd).await?; validate_client_handshake_response(&response, &key)?;
+    let response = read_http_headers(&mut rd).await?;
+    validate_client_handshake_response(&response, &key)?;
     let writer = Arc::new(Mutex::new(wr));
     let cipher = configured_cipher(&cfg.key);
     let mut hello = b"UDP\n".to_vec(); transform_payload(&cipher, &mut hello);
     { let mut w=writer.lock().await; write_frame(&mut *w, &hello, 2, true).await?; }
     let mut frame_buf=Vec::with_capacity(64*1024);
-    let Some((opcode, mut ok))=read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { bail!("upstream closed during UDP handshake") };
-    if opcode!=2 { bail!("invalid UDP handshake response opcode") } transform_payload(&cipher,&mut ok); if ok!=b"OK\n" { bail!("upstream rejected UDP handshake") }
-    let udp = Arc::new(udp);
-    let udp_send=udp.clone(); let writer_send=writer.clone(); let cipher_send=configured_cipher(&cfg.key);
-    let upload=tokio::spawn(async move { let mut buf=vec![0u8;64*1024]; loop { let (n,_)=udp_send.recv_from(&mut buf).await?; let mut data=buf[..n].to_vec(); transform_payload(&cipher_send,&mut data); let mut w=writer_send.lock().await; write_frame(&mut *w,&data,2,true).await?; } Result::<()>::Ok(()) });
-    loop { let Some((opcode,mut packet))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { break }; if opcode!=2 { continue } transform_payload(&cipher,&mut packet); let (_src,payload)=parse_socks5_udp_datagram(&packet).map_err(|e|anyhow!(e.to_string()))?; let _=udp.send_to(payload,"0.0.0.0:0").await; }
+    let Some((opcode,mut ok))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { bail!("upstream closed during UDP handshake") };
+    if opcode!=2 { bail!("invalid UDP handshake response opcode") }
+    transform_payload(&cipher,&mut ok); if ok!=b"OK\n" { bail!("upstream rejected UDP handshake") }
+    let latest_client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let udp_send=udp.clone(); let writer_send=writer.clone(); let cipher_send=configured_cipher(&cfg.key); let latest_send=latest_client.clone();
+    let upload=tokio::spawn(async move {
+        let mut buf=vec![0u8;64*1024];
+        loop { let (n,peer)=udp_send.recv_from(&mut buf).await?; *latest_send.lock().await=Some(peer); let mut data=buf[..n].to_vec(); transform_payload(&cipher_send,&mut data); let mut w=writer_send.lock().await; write_frame(&mut *w,&data,2,true).await?; }
+        Result::<()>::Ok(())
+    });
+    loop {
+        let Some((opcode,mut packet))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { break };
+        if opcode!=2 { continue; }
+        transform_payload(&cipher,&mut packet);
+        let (_src,payload)=parse_socks5_udp_datagram(&packet).map_err(|e|anyhow!(e.to_string()))?;
+        if let Some(peer)=*latest_client.lock().await { let _=udp.send_to(payload,peer).await; }
+    }
     upload.abort(); control.shutdown().await.ok(); Ok(())
 }
 
 async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u32) -> Result<()> {
-    let (command, target) = read_proxy_request(&mut local).await?;
+    let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
     if command == SocksCommand::UdpAssociate { return handle_local_udp_proxy(local, cfg, target).await; }
     let upstream = cfg.upstream.clone().ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (host, path) = parse_ws_url(&upstream)?;
@@ -274,9 +275,12 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
     wr.write_all(&request).await?; wr.flush().await?;
     let response = read_http_headers(&mut rd).await?; validate_client_handshake_response(&response, &key)?;
     let writer=Arc::new(Mutex::new(wr)); let cipher=configured_cipher(&cfg.key);
-    if command==SocksCommand::Connect { local.write_all(&socks5_success_response()).await?; } else { local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?; }
+    if is_socks5 { local.write_all(&socks5_success_response()).await?; } else { local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?; }
     let mut hello=b"MUX\n".to_vec(); transform_payload(&cipher,&mut hello); { let mut w=writer.lock().await; write_frame(&mut *w,&hello,2,true).await?; }
-    let mut frame_buf=Vec::with_capacity(64*1024); let Some((opcode,mut ok))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { bail!("upstream closed during MUX handshake") }; if opcode!=2 { bail!("invalid MUX handshake response opcode") } transform_payload(&cipher,&mut ok); if ok!=b"OK\n" { bail!("upstream rejected MUX handshake") }
+    let mut frame_buf=Vec::with_capacity(64*1024);
+    let Some((opcode,mut ok))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { bail!("upstream closed during MUX handshake") };
+    if opcode!=2 { bail!("invalid MUX handshake response opcode") }
+    transform_payload(&cipher,&mut ok); if ok!=b"OK\n" { bail!("upstream rejected MUX handshake") }
     let id=next_id.max(1); let target_text=format!("{}:{}",target.host,target.port); let syn=SynPayload{target:target_text.into_bytes(),initial_data:Vec::new()}; let syn_frame=MuxFrame::new(id,MuxCommand::Syn,syn.encode().map_err(|e|anyhow!(e.to_string()))?).map_err(|e|anyhow!(e.to_string()))?; send_frame(&writer,&syn_frame).await?;
     let (mut local_rd,mut local_wr)=tokio::io::split(local); let writer_up=writer.clone(); let upload=tokio::spawn(async move { let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)]; loop { let n=local_rd.read(&mut buf).await?; if n==0 { let _=send_frame(&writer_up,&MuxFrame::new(id,MuxCommand::Fin,Vec::new()).unwrap()).await; break } let mut off=0; while off<n { let end=(off+u16::MAX as usize).min(n); let f=MuxFrame::new(id,MuxCommand::Data,buf[off..end].to_vec()).unwrap(); send_frame(&writer_up,&f).await?; off=end; } } Result::<()>::Ok(()) });
     loop { let Some((opcode,payload))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { break }; if opcode!=2 { continue } let frame=MuxFrame::decode(&payload).map_err(|e|anyhow!(e.to_string()))?; if frame.stream_id!=id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(&frame.payload).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
@@ -303,24 +307,21 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     let listener=TcpListener::bind(format!("{}:{}",cfg.proxy_host,cfg.proxy_port)).await?;
     tracing::info!("RushWay server listening on {}:{}",cfg.proxy_host,cfg.proxy_port);
     loop {
-        let (mut stream,peer)=listener.accept().await?; let cfg2=cfg.clone();
+        let (stream,peer)=listener.accept().await?; let cfg2=cfg.clone();
         tokio::spawn(async move {
             let result=async {
-                let request=read_http_headers(&mut stream).await?;
-                let key=validate_server_handshake(&request)?;
-                stream.write_all(&build_server_handshake_response(&key)).await?;
-                stream.flush().await?;
                 let (mut rd,mut wr)=tokio::io::split(stream);
+                let request=read_http_headers(&mut rd).await?;
+                let key=validate_server_handshake(&request)?;
+                wr.write_all(&build_server_handshake_response(&key)).await?; wr.flush().await?;
+                let writer=Arc::new(Mutex::new(wr));
                 let mut buf=Vec::with_capacity(64*1024);
                 let Some((opcode,first))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut buf).await? else { bail!("missing transport handshake") };
                 if opcode!=2 { bail!("invalid transport handshake opcode") }
                 let mut plain=first.clone(); let cipher=configured_cipher(&cfg2.key); transform_payload(&cipher,&mut plain);
-                if plain==b"UDP\n" {
-                    let mut ok=b"OK\n".to_vec(); transform_payload(&cipher,&mut ok); { let mut w=wr; write_frame(&mut w,&ok,2,false).await?; }
-                    let mut fake=Vec::new(); fake.extend_from_slice(&first); let stream2=TcpStream::from_std(std::net::TcpStream::new_v4().unwrap()).unwrap(); let _=fake; bail!("UDP transport handoff requires direct socket ownership")
-                }
-                drop(wr);
-                let std_stream=rd.into_inner(); handle_mux_frames(std_stream,cfg2,request,first).await
+                if plain==b"UDP\n" { return handle_server_udp_parts(rd,writer,cfg2,first).await; }
+                if plain==b"MUX\n" { return handle_mux_parts(rd,writer,cfg2,first).await; }
+                bail!("unknown transport handshake")
             }.await;
             if let Err(e)=result { tracing::debug!(%peer,error=%e,"transport connection closed"); }
         });
