@@ -1,0 +1,31 @@
+name: RushWay CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.82.0
+      - name: Test
+        run: cargo test --all-targets --locked
+      - name: Release build
+        run: cargo build --release --locked
+
+  windows-x64:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.82.0
+          targets: x86_64-pc-windows-gnu
+      - name: Build Windows x64
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
