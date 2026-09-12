@@ -11,7 +11,7 @@
 
 **Stage 3 — Rust core implementation: `[~]`**
 
-MUX and WebSocket wire primitives exist. New SOCKS5/HTTP parser primitives now exist, but no runtime forwarding path is complete and no Rust test execution evidence exists yet.
+MUX and WebSocket wire primitives exist. New SOCKS5/HTTP parser primitives exist, but no runtime forwarding path is complete and no Rust test execution evidence exists yet.
 
 ## Completed project work
 
@@ -39,11 +39,13 @@ MUX and WebSocket wire primitives exist. New SOCKS5/HTTP parser primitives now e
 - [x] Add `SPEC.md` with verified intermediate migration contract.
 - [x] Extract functional WebSocket handshake behavior: GET/HTTP1.1, Host, Upgrade, Connection, Sec-WebSocket-Version 13, random Sec-WebSocket-Key, Origin/Sec-Fetch fields, 101 response and accept-key validation, common error statuses, 8192-byte header limit.
 - [~] Extract WebSocket framing behavior: complete non-fragmented data frames, 64 MiB limit, RFC6455 control-frame limits, masking/unmasking, Ping/Pong/Close handling. Browser-profile fingerprint parity and runtime transport integration remain pending.
-- [~] Extract SOCKS5/HTTP front-end wire shapes from v1.8.4 source/tests: no-auth greeting, CONNECT, UDP ASSOCIATE, RFC1928 address types, static success replies, HTTP CONNECT request framing and header limit. Exact GoWay error branches and UDP relay lifecycle still pending.
+- [~] Extract SOCKS5/HTTP front-end wire shapes from v1.8.4 source/tests: no-auth greeting, CONNECT, UDP ASSOCIATE, RFC1928 address types, static success replies, HTTP CONNECT request framing and header limit.
+- [~] Extract exact SOCKS5/HTTP control-flow details: UDP ASSOCIATE binds an ephemeral local UDP relay port; bind failure maps to SOCKS5 REP=0x01; UDP ASSOCIATE address reads use strict `io.ReadFull`; HTTP header acquisition loops until `\\r\\n\\r\\n`/`\\n\\n` and malformed/incomplete header reads map to HTTP 400. Full relay/error lifecycle is still pending.
+- [~] Extract initial exact QUIC behavior: `quic.ListenAddr`, `quic.DialAddr`, ALPN `goway-quic` + `h3`, idle timeout 60s, keepalive 15s, AcceptStream loop, normal CloseWithError(0), pool dialing outside mutex, single-flight barrier, and stream-open failure cleanup with error 0x01. Full QUIC config/TLS/bootstrap/retry behavior remains pending.
 - [ ] Read all remaining sections of `goway.go` without truncation.
-- [ ] Extract exact SOCKS5 TCP/UDP control-flow/error behavior.
-- [ ] Extract exact HTTP CONNECT control-flow/error behavior.
-- [ ] Extract exact QUIC listener/client/session/stream behavior.
+- [ ] Finish exact SOCKS5 TCP/UDP target dial, all REP mappings, UDP reply relay, FRAG behavior and close lifecycle.
+- [ ] Finish exact HTTP CONNECT target dial/error/close behavior.
+- [ ] Finish exact QUIC config/TLS/stream bootstrap/close behavior.
 - [ ] Extract exact connection-pool algorithms and retry/dead-IP behavior.
 - [ ] Extract exact JSON/config-file schema and behavior.
 - [ ] Extract all remaining tests and map them to Rust tests.
@@ -134,8 +136,12 @@ MUX and WebSocket wire primitives exist. New SOCKS5/HTTP parser primitives now e
 - GoWay client handshake uses functional upgrade headers plus browser-profile-dependent headers; non-fixed headers are shuffled.
 - GoWay client strictly expects HTTP 101 and reports distinct common upstream failure classes.
 - GoWay server checks for `Upgrade: websocket`, extracts `Sec-WebSocket-Key`, and returns a 101 response with `Sec-WebSocket-Accept`.
-- GoWay's integration tests use SOCKS5 no-auth (`05 01 00`), SOCKS5 CONNECT, HTTP CONNECT and UDP ASSOCIATE; static success replies include `05 00 00 01 00 00 00 00 00 00` and `HTTP/1.1 200 Connection Established\r\n\r\n`. citeturn432file0turn441file0
-- GoWay v1.8.4 hardens SOCKS5 UDP ASSOCIATE parsing against truncated reads. citeturn418file0
+- GoWay's integration tests use SOCKS5 no-auth (`05 01 00`), SOCKS5 CONNECT, HTTP CONNECT and UDP ASSOCIATE; static success replies include `05 00 00 01 00 00 00 00 00 00` and `HTTP/1.1 200 Connection Established\r\n\r\n`.
+- GoWay v1.8.4 hardens SOCKS5 UDP ASSOCIATE parsing against truncated reads.
+- SOCKS5 UDP ASSOCIATE binds a local UDP relay socket on an ephemeral port; a local bind failure returns REP=0x01.
+- HTTP CONNECT reads the complete request header across TCP segmentation and returns HTTP 400 for malformed/incomplete header reads.
+- QUIC server uses ALPN `goway-quic` and `h3`, `MaxIdleTimeout=60s`, `KeepAlivePeriod=15s`, `AcceptStream` loop and normal `CloseWithError(0, "connection closed")`.
+- QUIC client uses `quic.DialAddr`; pool DNS/dial/stream-open work is kept outside the mutex, with a single-flight dialing barrier. Failed `OpenStreamSync` causes `CloseWithError(0x01, "stream open failed")` and pool removal.
 - RushWay `src/proxy.rs` now contains isolated parsers for SOCKS5 greeting/request, SOCKS5 UDP datagrams and HTTP CONNECT, plus unit tests. These are not yet runtime forwarding.
 
 ## Verification policy
@@ -144,7 +150,7 @@ No cross-platform build, interoperability result, benchmark result, or Release i
 
 ## Current commit
 
-`15154b8aaadfc91aec0b00303e3e3073078b7bd8` — `SPEC.md` proxy findings update. The preceding code commits added `src/proxy.rs` and wired `mod proxy` into `main.rs`.
+`b4836a113af28ed15982c83e2390179b2167a750` — `SPEC.md` refined with exact proxy/QUIC extraction findings from GoWay v1.8.4. No runtime Rust implementation was added in this step.
 
 ## Exact verification commands actually run in this work session
 
@@ -165,14 +171,14 @@ cargo build --release
 ## Outstanding failures / limitations
 
 - Full `goway.go` extraction is not finished because the source is large and connector responses can be truncated.
-- Exact GoWay SOCKS5/HTTP control flow, UDP relay lifecycle, QUIC, pool/retry/dead-IP, config-file and remaining test details remain to be extracted.
+- Exact GoWay SOCKS5/HTTP target-forwarding lifecycle, UDP reply relay, FRAG semantics, full QUIC config/TLS/bootstrap, pool retry/dead-IP, config-file and remaining test details remain to be extracted.
 - RushWay core is still not a functional GoWay replacement.
 - The MUX, WebSocket and proxy parser tests have not yet been compiled or executed in this environment.
 - Browser-profile fingerprint parity is not yet implemented.
 
 ## Single recommended next step
 
-**Continue Stage 2 extraction:** finish exact SOCKS5/HTTP control flow and then inspect the exact QUIC listener/client/session/stream implementation. Only after that should the runtime forwarding architecture be expanded.
+**Continue Stage 2 extraction:** finish exact SOCKS5/HTTP forwarding/error lifecycle and then finish exact QUIC config/TLS/stream bootstrap/pool behavior. Only after those compatibility facts are captured should runtime transport implementation expand.
 
 ## Future target
 
