@@ -1,4 +1,5 @@
 mod protocol;
+mod ws;
 
 use anyhow::Result;
 use clap::Parser;
