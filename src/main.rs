@@ -1,4 +1,5 @@
 mod protocol;
+mod proxy;
 mod ws;
 
 use anyhow::Result;
