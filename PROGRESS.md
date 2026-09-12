@@ -5,7 +5,7 @@
 
 ## Current status
 
-**Overall engineering completion: ~38% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~42% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -20,19 +20,26 @@
 ### CI dependency/toolchain compatibility
 - [x] Rust 1.82 dependency compatibility fixed by pinning `clap = 4.5.20` and `tempfile = 3.13.0`.
 - [x] Linux test and release build passed in GitHub Actions run `34700901555`.
-- [x] Windows x64 GNU build passed in the same run after installing `gcc-mingw-w64-x86-64` in commit `95ac981973d0ae15f0717ccf1cdd9a7af8322d2b`.
-- [x] Corrected-XOR CI run `34701378943` completed successfully: test job `103573640597` and Windows job `103573877936` both `success`.
+- [x] Windows x64 GNU build passed in the same run.
+- [x] Corrected-XOR CI run `34701378943` completed successfully: Linux test/release and Windows x64 GNU all succeeded.
 
 ### XOR compatibility and runtime integration
-- [x] Previous Rust XOR implementation was audited against the exact GoWay v1.8.4 `Crypto.TransformInPlace` implementation.
-- [x] Corrected semantic mismatch in commit `0af63b233812d810ab06c0cf3b3ddee4fad61b58`: every transform call starts at offset zero.
-- [x] SHA-256(key) is expanded by repetition to 256 KiB; empty key remains a no-op.
-- [x] Added regression coverage for per-call offset reset.
-- [x] Runtime transport now uses the corrected XOR at the GoWay v1.8.4 authentication boundary in commit `1650c3e02de30b19e5bdc4d4915c0dbad58422a4`.
-- [x] Client sends one binary `MUX\n` WebSocket message, XOR-transformed when a key is configured, and waits for `OK\n` before the first SYN.
-- [x] Server validates/decrypts the standalone `MUX\n` message and returns transformed `OK\n` before accepting MUX frames.
-- [x] MUX stream frames themselves remain untransformed, matching the exact GoWay source evidence found during audit.
-- [ ] The new runtime integration still needs its own GitHub Actions build/test result before being called verified.
+- [x] Exact GoWay v1.8.4 `Crypto.TransformInPlace` semantics audited.
+- [x] Commit `0af63b233812d810ab06c0cf3b3ddee4fad61b58` corrected the per-call offset-reset behavior.
+- [x] SHA-256(key) repeated to 256 KiB; empty key is a no-op.
+- [x] Runtime uses XOR only at the standalone `MUX\n` / `OK\n` handshake boundary, matching GoWay v1.8.4 source evidence.
+- [x] Commit `1650c3e02de30b19e5bdc4d4915c0dbad58422a4` introduced the MUX hello/OK transport boundary.
+- [ ] The later UDP/runtime rewrite still needs GitHub Actions verification before it is marked verified.
+
+### SOCKS5 UDP compatibility work
+- [x] GoWay v1.8.4 UDP path was re-inspected: client uses a local ephemeral UDP relay socket; transport starts with standalone `UDP\n` / `OK\n`; UDP datagrams use RFC1928 framing; server relays to a UDP socket and returns source-address envelopes.
+- [x] RushWay runtime now recognizes SOCKS5 `UDP ASSOCIATE` instead of rejecting it.
+- [x] RushWay client allocates an ephemeral local UDP relay port and returns a SOCKS5 success response with the bound port.
+- [x] RushWay client sends `UDP\n`, waits for `OK\n`, forwards RFC1928 datagrams as binary WebSocket payloads, and maps returned source envelopes back to the latest local UDP peer.
+- [x] RushWay server recognizes `UDP\n`, returns `OK\n`, resolves IPv4/domain/IPv6 targets, relays payloads over UDP, and wraps replies with the actual UDP source address.
+- [x] UDP payloads are XOR-transformed per datagram when `-k` is configured, matching the existing GoWay crypto call semantics.
+- [ ] Actual GoWay↔RushWay UDP echo interoperability test is still pending.
+- [ ] FRAG behavior and exact UDP error/close lifecycle still need final regression coverage.
 
 ## Runtime slice currently present
 
@@ -50,10 +57,10 @@
 - [x] Local EOF -> MUX FIN.
 - [x] Remote MUX FIN -> local half-close.
 - [x] Remote MUX RST -> local connection termination.
+- [~] SOCKS5 UDP runtime relay implemented; CI + real interop still pending.
 - [ ] Runtime TLS/WSS.
 - [ ] Runtime QUIC.
 - [ ] Runtime connection pool/reuse/retry/dead-IP.
-- [ ] Runtime SOCKS5 UDP relay.
 - [ ] Runtime non-MUX mode.
 
 ## Stage 2 — GoWay v1.8.4 extraction `[~]`
@@ -61,9 +68,9 @@
 - [x] Main CLI options and client/server selection extracted.
 - [x] MUX wire format and lifecycle semantics extracted.
 - [x] WebSocket handshake/framing behavior substantially extracted.
-- [x] SOCKS5/HTTP front-end wire shapes and several exact error/control-flow branches extracted.
+- [x] SOCKS5/HTTP front-end wire shapes and exact UDP envelope structure extracted.
 - [x] QUIC listener/client/ALPN/timeout/pool observations extracted.
-- [x] Exact XOR handshake placement confirmed: standalone `MUX\n` client probe and standalone `OK\n` server response; XOR is applied to those payloads only.
+- [x] Exact XOR handshake placement confirmed.
 - [ ] Finish exact SOCKS5 TCP/UDP lifecycle, REP mappings, UDP reply relay and FRAG behavior.
 - [ ] Finish exact HTTP CONNECT target/error/close lifecycle.
 - [ ] Finish exact QUIC config/TLS/bootstrap/close semantics.
@@ -78,12 +85,11 @@
 - [x] `src/proxy.rs` SOCKS5/UDP/HTTP parser primitives.
 - [x] `src/runtime.rs` first WS+MUX+TCP forwarding slice.
 - [x] Fixed HTTP CONNECT runtime protocol detection.
-- [x] Rust unit tests and Linux/Windows CI builds verified by run `34700901555`.
 - [x] XOR primitive corrected to match GoWay call semantics.
 - [x] XOR MUX hello/OK runtime boundary implemented.
+- [x] UDP runtime relay path implemented in commit `7bb82a08049a4259e329c878ce74c49fd13df273`.
 - [ ] Full CLI/config parity.
 - [ ] WSS/TLS/SNI/FakeHost.
-- [ ] SOCKS5 UDP runtime relay.
 - [ ] MUX state/lifecycle hardening for high stream counts.
 - [ ] QUIC.
 - [ ] DNS resolver/cache.
@@ -91,8 +97,8 @@
 - [ ] Statistics/logging/TUI compatibility where required.
 
 ## Stage 4 — Compatibility/tests `[ ]`
-- [x] Rust unit tests executed in CI before latest runtime integration.
-- [ ] GitHub Actions verification of commit `1650c3e02de30b19e5bdc4d4915c0dbad58422a4`.
+- [x] Rust unit tests and Linux/Windows builds have passed for earlier runtime commits.
+- [ ] GitHub Actions verification of commit `7bb82a08049a4259e329c878ce74c49fd13df273`.
 - [ ] GoWay Client -> RushWay Server.
 - [ ] RushWay Client -> GoWay Server.
 - [ ] 1/100/500/1000 streams.
@@ -118,7 +124,8 @@
 - [x] Windows x64 GNU build job definition exists.
 - [x] Linux Rust test + release build completed successfully in run `34700901555`.
 - [x] Windows x64 GNU build completed successfully in run `34700901555`.
-- [x] Corrected-XOR run `34701378943` test + release + Windows jobs completed successfully.
+- [x] Corrected-XOR run `34701378943` completed successfully.
+- [ ] Current UDP/runtime commit CI run `34702137868` is still in progress at this documentation point.
 - [ ] Debian 12 build/package job.
 - [ ] KWRT/OpenWrt ARMv7 build/package job.
 - [ ] Release workflow.
@@ -141,8 +148,9 @@
 - HTTP header hard limit is 8192 bytes and header acquisition must handle TCP segmentation.
 - SOCKS5 uses no-auth greeting and supports IPv4/domain/IPv6 address forms; UDP uses the RFC1928 envelope.
 - UDP ASSOCIATE uses an ephemeral local relay port and local bind failure maps to REP `0x01`.
+- GoWay UDP transport is selected by standalone `UDP\n` WebSocket binary hello and acknowledged by standalone `OK\n`; the per-datagram XOR boundary is the UDP payload envelope, not the WebSocket framing bytes.
 - QUIC uses ALPN `goway-quic` and `h3`, idle timeout 60s and keepalive 15s; exact remaining config/bootstrap behavior is still pending.
-- XOR compatibility: SHA-256(key), repeated to 256 KiB, each TransformInPlace invocation starts at offset zero. In v1.8.4 runtime, the XOR boundary is the standalone binary `MUX\n` / `OK\n` handshake, not ordinary MUX stream frames.
+- XOR compatibility: SHA-256(key), repeated to 256 KiB, each transform call starts at offset zero.
 
 ## Verification policy
 
@@ -150,22 +158,22 @@ No build, test, interoperability, benchmark, platform artifact or Release is mar
 
 ## Exact verification status
 
-- Repository writes: confirmed.
-- Latest code commit: `1650c3e02de30b19e5bdc4d4915c0dbad58422a4`.
-- Corrected-XOR CI run `34701378943`: Linux test **success**, Linux release build **success**, Windows x64 GNU build **success**.
-- New runtime XOR integration commit `1650c3e02de30b19e5bdc4d4915c0dbad58422a4`: CI result pending at this progress update.
+- Latest main code commit: `7bb82a08049a4259e329c878ce74c49fd13df273`.
+- Current CI run: `34702137868`, status **in progress** at the time this document was written.
+- Previous runtime commit CI run `34701689043`: Linux test/release and Windows x64 GNU all **success**.
+- Corrected-XOR run `34701378943`: Linux test/release and Windows x64 GNU all **success**.
 - Local `cargo test`: not run; no local Rust toolchain execution used.
 - Local `cargo build --release`: not run.
 
 ## Next continuous sequence
 
-1. Verify the new runtime XOR integration commit in GitHub Actions; fix any compiler/test failure.
-2. Finish exact SOCKS5 UDP relay/error lifecycle and HTTP CONNECT lifecycle.
-3. Implement WSS/TLS/SNI/FakeHost.
-4. Implement QUIC and pool/retry/dead-IP behavior.
-5. Add non-MUX and remaining CLI/config/DNS behavior.
-6. Add bidirectional GoWay/RushWay interoperability and high-concurrency tests.
-7. Add Debian/KWRT builds, package standalone artifacts, and only then release v0.0.1.
+1. Verify CI run `34702137868`; fix any compiler/test failure immediately and update this file.
+2. If green, run/construct real GoWay v1.8.4 ↔ RushWay TCP and UDP echo interoperability tests; record exact evidence.
+3. Finish exact SOCKS5 UDP error/FRAG lifecycle and HTTP CONNECT lifecycle.
+4. Implement WSS/TLS/SNI/FakeHost.
+5. Implement QUIC and pool/retry/dead-IP behavior.
+6. Add non-MUX and remaining CLI/config/DNS behavior.
+7. Add high-concurrency tests, Debian/KWRT builds, standalone artifacts, and only then release v0.0.1.
 
 ## Handoff rule
 
