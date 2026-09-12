@@ -102,11 +102,41 @@ The v1.8.4 implementation derives a SHA-256 hash from the configured key and exp
 
 ## WebSocket behavior
 
-The client constructs a WebSocket HTTP upgrade request and uses browser-profile-dependent headers/TLS preferences. The server returns a standard `101 Switching Protocols` response with `Sec-WebSocket-Accept` derived from the RFC 6455 handshake key.
+### Client request
+
+The observed GoWay v1.8.4 client sends an HTTP/1.1 GET upgrade request with these functional fields:
+
+- `Host`
+- `Connection: Upgrade`
+- `Upgrade: websocket`
+- `Sec-WebSocket-Version: 13`
+- `Sec-WebSocket-Key: <16 random bytes, Base64>`
+- `Sec-Fetch-Dest: websocket`
+- `Sec-Fetch-Mode: websocket`
+- `Sec-Fetch-Site: cross-site` or `same-origin`
+- `Origin` based on the selected HTTP/HTTPS scheme and SNI hostname
+
+It also sends browser-profile-dependent User-Agent, Accept-Language and Chromium client-hint headers; the order of the non-fixed header group is randomized. RushWay currently implements the functional handshake fields, but browser-profile fingerprint parity is still pending.
+
+### Server response
+
+GoWay server requires an `Upgrade: websocket` header and extracts `Sec-WebSocket-Key`; the successful response is:
+
+`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: <computed>\r\n\r\n`
+
+The accept value is SHA-1(client key + RFC6455 GUID), Base64 encoded. GoWay emits HTTP 400 when the required upgrade is missing. RushWay's current validator additionally checks the Connection token and request line for a safe functional handshake; interoperability testing must confirm that this stricter parsing does not reject any real v1.8.4 peer behavior.
+
+### Handshake response validation
+
+The observed GoWay client strictly expects status `101`. It distinguishes common failures including `200`, `301/302/307/308`, `400`, `403`, `404`, `502`, `503`, and `504`. RushWay implements these status classes and also validates `Upgrade`, `Connection`, and `Sec-WebSocket-Accept` against the request key.
+
+### Framing
 
 Client-to-server WebSocket frames are masked. v1.8.4 uses a per-session/per-goroutine pooled xorshift-based mask PRNG seeded once with cryptographic randomness. Masking is an RFC 6455 framing requirement and is not the authentication primitive.
 
 Header parsing must enforce the 8192-byte hard limit. Oversized headers must return `header too large` behavior rather than being accepted indefinitely.
+
+RushWay's frame codec currently supports complete non-fragmented data frames, 64 MiB maximum frame size, RFC6455 control-frame size/fragmentation checks, masking/unmasking, Ping→Pong, Pong discard, and Close→EOF.
 
 ## Proxy front-end
 
@@ -176,8 +206,8 @@ GoWay v1.8.4 uses `quic-go` and exposes QUIC upstream schemes. RushWay must inve
 
 ## Specification status
 
-This file is an **intermediate verified baseline**, not a declaration that all of `goway.go` has been extracted. Remaining source sections must still be inspected before Stage 2 can be marked complete, especially exact QUIC behavior, WebSocket handshake headers/status handling, SOCKS5/HTTP parsing details, pool algorithms, and all JSON/config-file behavior.
+This file remains an **intermediate verified baseline**. The WebSocket handshake behavior is now substantially extracted and mirrored, but the full source inventory is not complete. Remaining sections include SOCKS5/HTTP parsing, QUIC, pools/retry/dead-IP, JSON/config behavior, remaining tests, and browser-profile parity.
 
 ## Next action
 
-Continue extracting the remaining v1.8.4 source and tests. Update this document with exact observed behavior. Only after the full inventory is complete should RushWay's protocol/transport implementation be expanded substantially.
+Continue Stage 2 extraction with exact SOCKS5 TCP/UDP and HTTP CONNECT behavior from the v1.8.4 source. Then implement those parsers/front-end primitives in RushWay before moving to QUIC and pool details.
