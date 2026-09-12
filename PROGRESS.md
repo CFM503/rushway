@@ -5,7 +5,7 @@
 
 ## Current status
 
-**Overall engineering completion: ~41% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~43% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -22,6 +22,7 @@
 - [x] Linux release build passed in the same run.
 - [x] Windows x64 GNU build passed in the same run.
 - [x] Corrected-XOR CI run `34701378943` previously passed test, release and Windows jobs.
+- [ ] New Rustls/WSS foundation commits have not yet received their own CI result.
 
 ### XOR compatibility and runtime integration
 - [x] Previous Rust XOR implementation was audited against exact GoWay v1.8.4 `Crypto.TransformInPlace` semantics.
@@ -41,6 +42,15 @@
 - [ ] Real GoWay v1.8.4 ↔ RushWay UDP echo interoperability test.
 - [ ] Exact GoWay FRAG/error/close behavior still needs final reconciliation.
 
+### WSS/TLS foundation
+- [x] Audited GoWay v1.8.4 WSS policy: TLS 1.2-1.3, `http/1.1` ALPN, `-verify-ssl` controls certificate verification and defaults to insecure verification. GoWay source evidence is in the pinned v1.8.4 tree.
+- [x] Added `rustls`, `tokio-rustls` and `webpki-roots` dependencies.
+- [x] Added `src/tls.rs` with TLS 1.2-1.3 client transport and both strict-WebPKI and GoWay-compatible insecure certificate modes.
+- [x] Registered TLS module in `main.rs`.
+- [ ] Integrate TLS stream into the actual WebSocket client path.
+- [ ] Implement/verify SNI + FakeHost separation: TCP destination, TLS server name and HTTP Host must follow GoWay semantics.
+- [ ] WSS runtime interoperability test.
+
 ## Runtime slice currently present
 
 - [x] Local SOCKS5 no-auth TCP CONNECT front-end.
@@ -58,7 +68,7 @@
 - [x] Remote MUX FIN -> local half-close.
 - [x] Remote MUX RST -> local connection termination.
 - [x] SOCKS5 UDP relay implementation slice.
-- [ ] Runtime TLS/WSS.
+- [~] TLS/WSS client transport foundation only; not runtime-integrated yet.
 - [ ] Runtime QUIC.
 - [ ] Runtime connection pool/reuse/retry/dead-IP.
 - [ ] Runtime non-MUX mode.
@@ -72,6 +82,7 @@
 - [x] QUIC listener/client/ALPN/timeout/pool observations extracted.
 - [x] Exact XOR handshake placement confirmed.
 - [x] UDP ASSOCIATE local relay and RFC1928 envelope behavior extracted to implementation level.
+- [x] WSS certificate policy and TLS version/ALPN policy extracted from v1.8.4 source/README evidence.
 - [ ] Finish exact SOCKS5 TCP/UDP lifecycle, REP mappings, UDP reply relay and FRAG behavior.
 - [ ] Finish exact HTTP CONNECT target/error/close lifecycle.
 - [ ] Finish exact QUIC config/TLS/bootstrap/close semantics.
@@ -89,8 +100,9 @@
 - [x] XOR primitive corrected to GoWay semantics.
 - [x] XOR MUX hello/OK runtime boundary implemented and CI-verified.
 - [x] SOCKS5 UDP relay implementation slice added and CI-verified for compilation/tests/builds.
+- [x] Rustls WSS client foundation added.
 - [ ] Full CLI/config parity.
-- [ ] WSS/TLS/SNI/FakeHost.
+- [ ] WSS/TLS/SNI/FakeHost runtime integration.
 - [ ] MUX state/lifecycle hardening for high stream counts.
 - [ ] QUIC.
 - [ ] DNS resolver/cache.
@@ -100,6 +112,7 @@
 ## Stage 4 — Compatibility/tests `[ ]`
 - [x] Rust unit tests executed in CI for current UDP transport commit.
 - [x] Current Linux release build and Windows x64 build verified by run `34702137868`.
+- [ ] CI verification of Rustls foundation commits `58474aa1692721e404874d74455c6f1e6090a793` / `57a22b5b242e00112ebf8fa4dbd0b771b54e69c8` / `851490dbe633fe633db6f3a377dca239a3d8f8fa`.
 - [ ] GoWay Client -> RushWay Server.
 - [ ] RushWay Client -> GoWay Server.
 - [ ] GoWay/RushWay SOCKS5 TCP echo.
@@ -148,6 +161,7 @@
 - HTTP header hard limit is 8192 bytes and header acquisition must handle TCP segmentation.
 - SOCKS5 uses no-auth greeting and supports IPv4/domain/IPv6 address forms; UDP uses the RFC1928 envelope.
 - UDP ASSOCIATE uses an ephemeral local relay port and local bind failure maps to REP `0x01`.
+- GoWay WSS uses TLS 1.2-1.3 and ALPN `http/1.1`; strict certificate verification is opt-in via `-verify-ssl`, default is insecure.
 - QUIC uses ALPN `goway-quic` and `h3`, idle timeout 60s and keepalive 15s; exact remaining config/bootstrap behavior is still pending.
 - XOR compatibility: SHA-256(key), repeated to 256 KiB, each transform invocation starts at offset zero. In v1.8.4 runtime, the XOR boundary is the standalone binary `MUX\\n` / `OK\\n` handshake, not ordinary MUX stream frames.
 
@@ -157,23 +171,24 @@ No build, test, interoperability, benchmark, platform artifact or Release is mar
 
 ## Exact verification status
 
-- Latest implementation commit: `7bb82a08049a4259e329c878ce74c49fd13df273`.
-- Latest documentation commit: this update.
-- Actions run `34702137868`: Linux test **success**, Linux release build **success**, Windows x64 GNU build **success**.
+- Latest UDP implementation verification: Actions run `34702137868` — Linux test **success**, Linux release build **success**, Windows x64 GNU build **success**.
+- Latest implementation sequence now includes Rustls foundation commits `58474aa1692721e404874d74455c6f1e6090a793`, `57a22b5b242e00112ebf8fa4dbd0b771b54e69c8`, `851490dbe633fe633db6f3a377dca239a3d8f8fa`.
+- New Rustls commits are awaiting their own Actions execution evidence.
 - Local `cargo test`: not run; no local Rust toolchain execution used.
 - Local `cargo build --release`: not run.
 - Actual GoWay ↔ RushWay interoperability: **not yet executed**, therefore not claimed.
 
 ## Next continuous sequence
 
-1. Reconcile the new UDP runtime against exact GoWay v1.8.4 FRAG/error/close behavior.
-2. Implement WSS/TLS transport without breaking the existing plain `ws://` path; preserve SNI/FakeHost semantics.
-3. Implement QUIC and exact pool/retry/dead-IP behavior.
-4. Add non-MUX and remaining CLI/config/DNS behavior.
-5. Build a real interop harness for GoWay v1.8.4 ↔ RushWay in both directions, including SOCKS5 TCP/UDP and HTTP CONNECT.
-6. Add 1/100/500/1000 stream and failure/reconnect tests.
-7. Add Debian/KWRT builds and standalone packaging.
-8. Only after all required evidence is green, create v0.0.1 release.
+1. Verify Rustls foundation with GitHub Actions; fix any Rust 1.82 compatibility issue.
+2. Integrate `tls::connect` into the actual WSS WebSocket client path using a generic async transport while preserving plain `ws://`.
+3. Implement exact SNI/FakeHost behavior and WSS interoperability.
+4. Reconcile UDP FRAG/error/close behavior against GoWay v1.8.4.
+5. Implement QUIC and exact pool/retry/dead-IP behavior.
+6. Add non-MUX and remaining CLI/config/DNS behavior.
+7. Build real bidirectional GoWay/RushWay interop and high-concurrency tests.
+8. Add Debian/KWRT builds and standalone packaging.
+9. Only after all required evidence is green, create v0.0.1 release.
 
 ## Handoff rule
 
