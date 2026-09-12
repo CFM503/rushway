@@ -5,7 +5,7 @@
 
 ## Current status
 
-**Overall engineering completion: ~32% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~33% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -22,15 +22,18 @@
 - [x] CI was changed to allow initial lockfile generation in commit `17b882ed9e79c7554a583caeca79af58dc3b063f`.
 - [x] Run `34700492768` reached dependency resolution on Rust 1.82.0, then failed because unconstrained `clap` selected `clap_lex 1.1.0`, requiring Cargo edition2024 support unavailable in Cargo 1.82.0.
 - [x] Pinned `clap` to `=4.5.20` in commit `a4f86afbd0d23eb67208438c57d9a01e7c4710d8`.
-- [x] The next run `34700616198` confirmed the clap issue was resolved: Cargo selected `clap_lex 0.7.7`, but then dependency resolution failed on `getrandom 0.4.3`, which was pulled by the unconstrained `tempfile` dev dependency and also requires edition2024 support.
-- [x] Pinned `tempfile` to `=3.13.0` in commit `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30` to keep the declared Rust 1.82 compatibility.
-- [ ] A new CI run for `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30` must complete before build/test status is marked successful.
+- [x] The next run `34700616198` confirmed the clap issue was resolved: Cargo selected `clap_lex 0.7.7`, but then dependency resolution failed on `getrandom 0.4.3`, pulled by unconstrained `tempfile` dev dependency.
+- [x] Pinned `tempfile` to `=3.13.0` in commit `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30`.
+- [x] Run `34700658993` on commit `a28c3beeda3c88b98ebf974334c0026009a01bea`: Linux test and release build both completed successfully.
+- [x] The same run exposed the next real release blocker: Windows GNU cross-build failed because `x86_64-w64-mingw32-dlltool` was missing on the Ubuntu runner.
+- [x] Fixed the CI Windows job in commit `95ac981973d0ae15f0717ccf1cdd9a7af8322d2b` by installing `gcc-mingw-w64-x86-64` before the Rust Windows target build.
+- [ ] The new CI run for `95ac981973d0ae15f0717ccf1cdd9a7af8322d2b` must complete before Windows build is marked successful.
 
 ### Runtime correctness fix
 - [x] Audited the current `src/runtime.rs` path before extending it.
 - [x] Found and fixed a concrete HTTP CONNECT dispatch bug: the runtime had checked for `G` even though an HTTP CONNECT request begins with `C`.
 - [x] Runtime now routes `C...` to the HTTP header reader/parser while preserving SOCKS5 `0x05` detection.
-- [ ] Runtime still needs actual compilation/test execution; this environment has no local Rust toolchain execution evidence.
+- [ ] Runtime still needs actual compilation/test execution beyond parser/unit evidence; full runtime interoperability has not been demonstrated.
 
 ## Runtime slice currently present
 
@@ -75,8 +78,7 @@
 - [x] `src/proxy.rs` SOCKS5/UDP/HTTP parser primitives.
 - [x] `src/runtime.rs` first WS+MUX+TCP forwarding slice.
 - [x] Fixed HTTP CONNECT runtime protocol detection.
-- [ ] Execute Rust unit tests.
-- [ ] Execute release build.
+- [x] Rust unit tests and Linux release build verified by GitHub Actions run `34700658993`.
 - [ ] Full CLI/config parity.
 - [ ] XOR compatibility implementation and transport integration.
 - [ ] WSS/TLS/SNI/FakeHost.
@@ -88,7 +90,7 @@
 - [ ] Statistics/logging/TUI compatibility where required.
 
 ## Stage 4 — Compatibility/tests `[ ]`
-- [ ] Rust unit/integration tests executed.
+- [x] Rust unit tests executed in CI.
 - [ ] GoWay Client -> RushWay Server.
 - [ ] RushWay Client -> GoWay Server.
 - [ ] 1/100/500/1000 streams.
@@ -112,7 +114,8 @@
 ## Stage 6 — GitHub Actions `[~]`
 - [x] CI workflow definition exists for Rust 1.82 tests/release build.
 - [x] Windows x64 GNU build job definition exists.
-- [ ] Completed CI run evidence.
+- [x] Linux Rust test + release build completed successfully in run `34700658993`.
+- [ ] Windows x64 build after MinGW fix.
 - [ ] Debian 12 build/package job.
 - [ ] KWRT/OpenWrt ARMv7 build/package job.
 - [ ] Release workflow.
@@ -145,12 +148,12 @@ No build, test, interoperability, benchmark, platform artifact or Release is mar
 ## Exact verification status
 
 - Repository writes: confirmed.
-- Current main tip: `63ba1b7ad1570c8513b579b1c6c0e0a7835e4a30` (tempfile/Rust 1.82 dependency compatibility fix).
-- GitHub Actions run `34700492768`: failed at dependency manifest parsing because `clap_lex 1.1.0` required Cargo edition2024 support.
-- GitHub Actions run `34700616198`: failed at dependency manifest parsing because `getrandom 0.4.3` required Cargo edition2024 support.
+- Current main tip: `95ac981973d0ae15f0717ccf1cdd9a7af8322d2b` (Windows CI MinGW toolchain fix).
+- GitHub Actions run `34700658993`: Linux Test **success**, Linux Release build **success**, Windows x64 GNU build **failure** due missing `x86_64-w64-mingw32-dlltool`.
+- Windows failure was diagnosed from the job log and addressed by installing `gcc-mingw-w64-x86-64` in commit `95ac981973d0ae15f0717ccf1cdd9a7af8322d2b`.
 - Local `cargo test`: not run; no local Rust toolchain execution used.
 - Local `cargo build --release`: not run.
-- New CI run after the tempfile pin: pending.
+- New CI run after the MinGW fix: pending.
 
 ## Git continuity note
 
@@ -158,7 +161,7 @@ During the latest audit, several pre-existing work branches/refs were found. No 
 
 ## Next continuous sequence
 
-1. Verify the new CI run after the tempfile pin; fix every compiler/test/build failure found.
+1. Verify CI run after the MinGW fix; fix every compiler/test/build failure found.
 2. Finish exact SOCKS5 UDP relay/error lifecycle and HTTP CONNECT lifecycle against GoWay v1.8.4.
 3. Implement XOR compatibility.
 4. Implement WSS/TLS/SNI/FakeHost.
