@@ -30,26 +30,24 @@ fn token_contains(value: &str, token: &str) -> bool {
     value.split(',').any(|v| v.trim().eq_ignore_ascii_case(token))
 }
 
-/// Read an HTTP header block with GoWay's hard 8192-byte limit.
+/// Read an HTTP header block with a hard 8192-byte limit.
+/// GoWay's HTTP proxy parser tolerates both CRLFCRLF and LF LF framing.
 pub async fn read_http_headers<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
     let mut b = [0u8; 1];
     while out.len() < MAX_HTTP_HEADER_SIZE {
         r.read_exact(&mut b).await?;
         out.push(b[0]);
-        if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
-            return Ok(out);
-        }
+        if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" { return Ok(out); }
+        if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" { return Ok(out); }
     }
     bail!("header too large")
 }
 
-/// Validate the HTTP request used by the GoWay v1.8.4 WebSocket server.
-/// GoWay explicitly requires an Upgrade: websocket header and a WebSocket key.
 pub fn validate_server_handshake(request: &[u8]) -> Result<String> {
     if request.len() > MAX_HTTP_HEADER_SIZE { bail!("header too large"); }
     let text = std::str::from_utf8(request).map_err(|_| anyhow!("invalid HTTP header"))?;
-    if !text.ends_with("\r\n\r\n") { bail!("incomplete websocket handshake"); }
+    if !(text.ends_with("\r\n\r\n") || text.ends_with("\n\n")) { bail!("incomplete websocket handshake"); }
     let first = text.lines().next().ok_or_else(|| anyhow!("empty HTTP request"))?;
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -65,36 +63,21 @@ pub fn validate_server_handshake(request: &[u8]) -> Result<String> {
     Ok(key.to_string())
 }
 
-/// Build the exact functional HTTP 101 response used by GoWay.
 pub fn build_server_handshake_response(key: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-        compute_accept_key(key)
-    ).into_bytes()
+    format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", compute_accept_key(key)).into_bytes()
 }
 
-/// Build a GoWay-compatible client upgrade request. Browser-fingerprint header
-/// randomization is intentionally not implemented yet; these are the required
-/// functional headers observed in v1.8.4.
 pub fn build_client_handshake_request(host: &str, path: &str, origin: Option<&str>) -> (Vec<u8>, String) {
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
     let key = STANDARD.encode(key_bytes);
     let path = if path.is_empty() { "/" } else { path };
-    let mut req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
-    );
-    if let Some(origin) = origin {
-        req.push_str(&format!("Origin: {origin}\r\n"));
-    }
-    req.push_str(&format!(
-        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: cross-site\r\n\r\n"
-    ));
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n");
+    if let Some(origin) = origin { req.push_str(&format!("Origin: {origin}\r\n")); }
+    req.push_str(&format!("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: cross-site\r\n\r\n"));
     (req.into_bytes(), key)
 }
 
-/// Strictly validate a WebSocket response. GoWay requires HTTP 101 and treats
-/// redirects and common upstream errors as handshake failures.
 pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<()> {
     if response.len() > MAX_HTTP_HEADER_SIZE { bail!("header too large"); }
     let text = std::str::from_utf8(response).map_err(|_| anyhow!("invalid HTTP response"))?;
@@ -106,10 +89,10 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
     if !proto.starts_with("HTTP/") { bail!("malformed websocket handshake response: {first}"); }
     if status != "101" {
         match status {
-            "200" => bail!("handshake failed: server returned 200 OK instead of 101 Switching Protocols (upstream may not support WebSocket)"),
+            "200" => bail!("handshake failed: server returned 200 OK instead of 101 Switching Protocols"),
             "301" | "302" | "307" | "308" => bail!("handshake failed: HTTP {status} redirect"),
             "400" => bail!("handshake failed: HTTP 400 Bad Request"),
-            "403" => bail!("handshake failed: HTTP 403 Forbidden (check CDN / firewall rules)"),
+            "403" => bail!("handshake failed: HTTP 403 Forbidden"),
             "404" => bail!("handshake failed: HTTP 404 Not Found"),
             "502" => bail!("handshake failed: HTTP 502 Bad Gateway"),
             "503" => bail!("handshake failed: HTTP 503 Service Unavailable"),
@@ -117,12 +100,8 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
             _ => bail!("handshake failed: unexpected HTTP status {status} ({reason})"),
         }
     }
-    if !token_contains(header_value(text, "Upgrade").ok_or_else(|| anyhow!("missing Upgrade header"))?, "websocket") {
-        bail!("handshake failed: missing Upgrade: websocket");
-    }
-    if !token_contains(header_value(text, "Connection").ok_or_else(|| anyhow!("missing Connection header"))?, "Upgrade") {
-        bail!("handshake failed: missing Connection: Upgrade");
-    }
+    if !token_contains(header_value(text, "Upgrade").ok_or_else(|| anyhow!("missing Upgrade header"))?, "websocket") { bail!("handshake failed: missing Upgrade: websocket"); }
+    if !token_contains(header_value(text, "Connection").ok_or_else(|| anyhow!("missing Connection header"))?, "Upgrade") { bail!("handshake failed: missing Connection: Upgrade"); }
     let accept = header_value(text, "Sec-WebSocket-Accept").ok_or_else(|| anyhow!("handshake failed: missing Sec-WebSocket-Accept"))?;
     if accept != compute_accept_key(key) { bail!("handshake failed: invalid Sec-WebSocket-Accept"); }
     Ok(())
@@ -152,8 +131,6 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8], opcod
     Ok(())
 }
 
-/// Read one complete, non-fragmented data/control frame. Ping is answered
-/// automatically and Pong is discarded, matching GoWay's relay behavior.
 pub async fn read_frame<R, W>(r: &mut R, mut reply: Option<&mut W>, buf: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>>
 where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
     loop {
@@ -163,21 +140,14 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
         let opcode = b0 & 0x0f;
         let masked = b1 & 0x80 != 0;
         let mut len = (b1 & 0x7f) as u64;
-        if len == 126 { len = r.read_u16().await? as u64; }
-        else if len == 127 { len = r.read_u64().await?; }
+        if len == 126 { len = r.read_u16().await? as u64; } else if len == 127 { len = r.read_u64().await?; }
         if len > MAX_WS_FRAME_SIZE as u64 { return Err(anyhow!("frame too large")); }
         if opcode >= 0x8 {
-            if !fin { return Err(anyhow!("control frame must not be fragmented")); }
-            if len > 125 { return Err(anyhow!("control frame payload exceeds 125 bytes")); }
-        } else {
-            if opcode == 0 || !fin { return Err(anyhow!("fragmented websocket frames not supported")); }
-            if opcode != 1 && opcode != 2 { return Err(anyhow!("unsupported websocket opcode: 0x{opcode:x}")); }
-        }
+            if !fin || len > 125 { return Err(anyhow!("invalid websocket control frame")); }
+        } else if opcode == 0 || !fin || (opcode != 1 && opcode != 2) { return Err(anyhow!("unsupported or fragmented websocket frame")); }
         let mut key = [0u8; 4];
         if masked { r.read_exact(&mut key).await?; }
-        buf.clear();
-        buf.resize(len as usize, 0);
-        r.read_exact(buf).await?;
+        buf.clear(); buf.resize(len as usize, 0); r.read_exact(buf).await?;
         if masked { for (i, b) in buf.iter_mut().enumerate() { *b ^= key[i & 3]; } }
         match opcode {
             1 | 2 => return Ok(Some((opcode, buf.clone()))),
@@ -193,47 +163,30 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
 mod tests {
     use super::*;
     use tokio::io::duplex;
-
     #[test]
-    fn rfc6455_accept_key_vector() {
-        assert_eq!(compute_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-    }
-
+    fn rfc6455_accept_key_vector() { assert_eq!(compute_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="); }
     #[test]
     fn handshake_request_and_response_validate() {
         let (request, key) = build_client_handshake_request("example.com", "/ws", Some("https://example.com"));
-        let parsed = validate_server_handshake(&request).unwrap();
-        assert_eq!(parsed, key);
-        let response = build_server_handshake_response(&key);
-        validate_client_handshake_response(&response, &key).unwrap();
+        assert_eq!(validate_server_handshake(&request).unwrap(), key);
+        validate_client_handshake_response(&build_server_handshake_response(&key), &key).unwrap();
     }
-
     #[test]
-    fn header_limit_is_hard() {
-        let oversized = vec![b'x'; MAX_HTTP_HEADER_SIZE + 1];
-        assert!(validate_server_handshake(&oversized).is_err());
-    }
-
+    fn header_limit_is_hard() { assert!(validate_server_handshake(&vec![b'x'; MAX_HTTP_HEADER_SIZE + 1]).is_err()); }
     #[tokio::test]
     async fn round_trip_unmasked_binary() {
         let (mut a, mut b) = duplex(1024 * 1024);
-        let data = vec![7u8; 70000];
-        let expected = data.clone();
+        let data = vec![7u8; 70000]; let expected = data.clone();
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, false).await });
         let mut buf = Vec::new();
         let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
-        writer.await.unwrap().unwrap();
-        assert_eq!(got.0, 2);
-        assert_eq!(got.1, expected);
+        writer.await.unwrap().unwrap(); assert_eq!(got.0, 2); assert_eq!(got.1, expected);
     }
-
     #[tokio::test]
     async fn close_frame_returns_eof_marker() {
         let (mut a, mut b) = duplex(1024);
         let writer = tokio::spawn(async move { write_frame(&mut a, b"", 8, false).await });
-        let mut buf = Vec::new();
-        let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap();
-        writer.await.unwrap().unwrap();
-        assert!(got.is_none());
+        let mut buf = Vec::new(); let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap();
+        writer.await.unwrap().unwrap(); assert!(got.is_none());
     }
 }
