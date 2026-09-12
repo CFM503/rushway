@@ -1,132 +1,145 @@
 # RushWay v0.0.1 — Continuous Handoff Progress
 
 > Purpose: allow any AI/developer to resume work without repeating completed stages.
->
 > Compatibility baseline: GoWay v1.8.4, stable source commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc` from `CFM503/way/goway`.
->
-> Release target: **v0.0.1**
->
-> Release artifact requirement: each target platform must produce a standalone executable. Source may be modular; the published runtime artifact must be a single executable file.
-
-## Status legend
-
-- `[ ]` Not started
-- `[~]` In progress
-- `[x]` Completed and committed
-- `[!]` Completed but not independently verified
+> Release target: **v0.0.1**.
+> Final runtime artifact: one standalone executable per target platform.
 
 ## Current overall status
 
-**Stage 1 — Project bootstrap: `[~]`**
+**Stage 2 — GoWay v1.8.4 specification extraction: `[~]`**
 
-Last known commits in `CFM503/rushway`:
-- `beeb5af64a16a4af806d476b37b7c25716196c0d`
-- `9645a5be092a1889a563bef39f36defca9aa8a12`
+A verified intermediate specification has been added as `SPEC.md`.
 
-The repository currently contains the initial Rust project skeleton. Do **not** claim v0.0.1 is releasable yet.
+## Completed project work
 
-## Stages
-
-### Stage 1 — Repository/bootstrap
+### Stage 1 — Repository/bootstrap `[~]`
 - [x] Confirm `CFM503/rushway` exists and is writable.
 - [x] Initialize Rust/Cargo project.
 - [x] Set package version to `0.0.1`.
 - [x] Add initial CLI/config skeleton.
-- [x] Add this progress/handoff document.
-- [ ] Add final README and compatibility documentation.
-- [ ] Add LICENSE if required.
+- [x] Add progress/handoff document.
+- [ ] Final README and compatibility documentation.
+- [ ] LICENSE if required.
 
-### Stage 2 — GoWay v1.8.4 specification extraction
-- [ ] Read the complete GoWay v1.8.4 `goway.go`.
-- [ ] Extract every CLI option and preserve compatible invocation syntax.
-- [ ] Extract JSON/config schema and defaults.
-- [ ] Inventory client/server modes.
-- [ ] Inventory transport implementations.
-- [ ] Inventory MUX/frame/session semantics.
-- [ ] Inventory forwarding and lifecycle behavior.
-- [ ] Inventory TLS/QUIC behavior.
-- [ ] Inventory connection pool/buffer behavior.
-- [ ] Map all relevant v1.8.4 tests.
+### Stage 2 — GoWay v1.8.4 specification extraction `[~]`
+- [x] Identify stable compatibility commit: `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.
+- [x] Extract complete CLI option list visible in v1.8.4 main path.
+- [x] Extract core Config fields and derived runtime resources.
+- [x] Confirm client/server selection: `-up` present = Client; omitted = Server.
+- [x] Confirm upstream schemes: `ws`, `wss`, `quic`, `quic+tls`.
+- [x] Confirm MUX command values and 7-byte frame header layout.
+- [x] Confirm MUX SYN/DATA/FIN/RST semantics at the frame level.
+- [x] Confirm 8192-byte HTTP header limit and 64 MiB WebSocket frame limit.
+- [x] Confirm XOR compatibility primitive: SHA-256-derived repeating expanded key.
+- [x] Confirm pooled buffering/backpressure/lifecycle design at a high level.
+- [x] Map v1.8.4 regression tests for header limit, PRNG lifecycle, target lifecycle, slow/fast/RST, 1000 streams and log-ring concurrency.
+- [x] Add `SPEC.md` with verified intermediate migration contract.
+- [ ] Read all remaining sections of `goway.go` without truncation.
+- [ ] Extract exact WebSocket handshake/header validation behavior.
+- [ ] Extract exact SOCKS5 TCP/UDP behavior.
+- [ ] Extract exact HTTP CONNECT behavior.
+- [ ] Extract exact QUIC listener/client/session/stream behavior.
+- [ ] Extract exact connection-pool algorithms and retry/dead-IP behavior.
+- [ ] Extract exact JSON/config-file schema and behavior.
+- [ ] Extract all remaining tests and map them to Rust tests.
+- [ ] Reconcile every extracted behavior against `SPEC.md`.
 
-### Stage 3 — Rust core implementation
-- [ ] Implement CLI/config compatibility.
-- [ ] Implement protocol constants/frame encoding/decoding.
-- [ ] Implement MUX stream/session management.
-- [ ] Implement WebSocket transport.
-- [ ] Implement TCP forwarding/listeners.
-- [ ] Implement TLS support.
-- [ ] Implement QUIC support where present in the v1.8.4 baseline.
-- [ ] Implement connection pooling/reuse.
-- [ ] Implement buffering/backpressure without changing wire semantics.
-- [ ] Implement cancellation/EOF/RST/error handling.
-- [ ] Implement reconnect/lifecycle behavior.
+### Stage 3 — Rust core implementation `[ ]`
+- [ ] CLI/config compatibility.
+- [ ] Protocol frame encoding/decoding.
+- [ ] Crypto compatibility.
+- [ ] WebSocket transport.
+- [ ] SOCKS5 + HTTP CONNECT front-end.
+- [ ] TCP forwarding.
+- [ ] MUX sessions/streams/backpressure.
+- [ ] TLS/SNI/fakehost behavior.
+- [ ] QUIC.
+- [ ] DNS resolver/cache.
+- [ ] Connection pooling/reuse/reconnect.
+- [ ] Cancellation/EOF/FIN/RST/error handling.
+- [ ] Statistics/logging/TUI where appropriate.
 
-### Stage 4 — Compatibility and tests
-- [ ] Rust unit tests pass.
-- [ ] Rust integration tests pass.
-- [ ] GoWay client ↔ RushWay server interoperability.
-- [ ] RushWay client ↔ GoWay server interoperability.
-- [ ] Single stream test.
-- [ ] Multi-stream test.
-- [ ] 100-stream test.
-- [ ] 500-stream test.
-- [ ] 1000-stream test.
-- [ ] Large payload/file test.
-- [ ] Slow/fast concurrent stream test.
-- [ ] EOF/RST test.
-- [ ] Disconnect/reconnect test.
-- [ ] TLS test.
-- [ ] QUIC test.
-- [ ] Invalid configuration/argument tests.
+### Stage 4 — Compatibility and tests `[ ]`
+- [ ] Rust unit tests.
+- [ ] Rust integration tests.
+- [ ] GoWay Client ↔ RushWay Server.
+- [ ] RushWay Client ↔ GoWay Server.
+- [ ] 1/100/500/1000 streams.
+- [ ] Large payload/file.
+- [ ] Slow/fast streams.
+- [ ] EOF/FIN/RST.
+- [ ] Disconnect/reconnect.
+- [ ] TLS/WSS.
+- [ ] QUIC.
+- [ ] SOCKS5 TCP/UDP.
+- [ ] HTTP CONNECT.
+- [ ] Invalid arguments/config.
 
-### Stage 5 — Single-file release builds
-- [ ] Windows x86_64 executable builds successfully.
-- [ ] Debian 12 x86_64 executable builds successfully.
-- [ ] KWRT/OpenWrt ARMv7 executable builds successfully.
-- [ ] Verify release artifacts are standalone executables.
-- [ ] Verify no unnecessary runtime dependency is bundled.
-- [ ] Verify `rushway --version` reports `0.0.1`.
-- [ ] Verify `rushway --help` is usable.
+### Stage 5 — Single-file release builds `[ ]`
+- [ ] Windows x86_64.
+- [ ] Debian 12 x86_64.
+- [ ] KWRT/OpenWrt ARMv7.
+- [ ] Standalone executable verification.
+- [ ] `--version` / `--help` verification.
 
-### Stage 6 — GitHub Actions
-- [ ] Add CI checks.
-- [ ] Add release workflow.
-- [ ] Build Windows x86_64.
-- [ ] Build Debian 12 x86_64.
-- [ ] Build KWRT/OpenWrt ARMv7.
-- [ ] Package artifacts with stable names.
-- [ ] Run tests before publishing.
-- [ ] Publish only after all required builds/tests pass.
+### Stage 6 — GitHub Actions `[ ]`
+- [ ] CI workflow.
+- [ ] Three target builds.
+- [ ] Release workflow.
+- [ ] Artifact packaging and naming.
+- [ ] Tests before publish.
 
-### Stage 7 — v0.0.1 release
-- [ ] Create git tag `v0.0.1`.
-- [ ] GitHub Actions release workflow succeeds.
-- [ ] Release exists and is not draft.
-- [ ] Windows artifact downloadable.
-- [ ] Debian 12 artifact downloadable.
-- [ ] KWRT ARMv7 artifact downloadable.
-- [ ] Final release notes document compatibility and known limitations.
-- [ ] Final end-to-end verification completed.
+### Stage 7 — v0.0.1 release `[ ]`
+- [ ] Tag `v0.0.1`.
+- [ ] Successful required Actions runs.
+- [ ] Verified downloadable artifacts.
+- [ ] Release notes.
+- [ ] Final end-to-end verification.
 
-## Handoff rules
+## Important compatibility findings
 
-1. **Never mark a stage `[x]` merely because code was written.** Compilation/test evidence is required for implementation and release stages.
-2. **Never create a fake/placeholder release.** `v0.0.1` is only releasable after required builds and tests succeed.
-3. **Do not change the GoWay v1.8.4 wire protocol for optimization unless interoperability tests prove compatibility.**
-4. **Do not assume Rust is faster.** Performance changes must be benchmarked against GoWay v1.8.4.
-5. **Preserve CLI/config compatibility wherever technically possible.**
-6. **Source may use multiple Rust modules, but each release target must produce a single executable runtime artifact.**
-7. At the end of every work session, update this file with:
-   - completed checklist items;
-   - current commit SHA;
-   - exact test/build commands actually run;
-   - exact failures still outstanding;
-   - the single recommended next stage.
+- MUX header is 7 bytes: 4-byte big-endian stream ID + 1-byte command + 2-byte big-endian payload length.
+- SYN payload starts with a 2-byte target-address length, followed by target address and optional initial data.
+- DATA is chunked because payload length is uint16.
+- FIN is the stream half-close/EOF signal; RST is abrupt reset/error.
+- Client MUX buffering is bounded; server stream delivery also uses bounded queues/backpressure.
+- A slow stream must not stall unrelated streams.
+- Close/RST must release resources and unblock pending operations.
+- Server mode without key requires explicit open-proxy permission.
+- `-max-conn` default is 1000 and validated to 1..1,000,000.
+- `-W` default is 128 KiB; runtime buffer has a lower bound around 64 KiB and an upper bound around 12 MiB plus framing overhead.
+- Remote DNS falls back to system DNS on failure and caches successful results.
+- `-fakehost` affects CDN/reverse-proxy Host/SNI behavior and requires exact source-level treatment.
 
-## Resume instruction
+## Verification policy
 
-When another AI takes over this repository, **read this file first**, inspect the current tree/commits, then continue from the first unchecked item. Do not restart completed stages and do not infer completion without evidence.
+No cross-platform build, interoperability result, benchmark result, or Release is marked complete unless there is actual execution evidence. The current connector can write/read repository files but does not itself constitute evidence that Rust binaries compile or interoperate.
 
-## Next recommended action
+## Current commit
 
-**Stage 2:** systematically extract the complete GoWay v1.8.4 CLI, configuration, protocol, transport, MUX, forwarding, TLS/QUIC, lifecycle, and test specification before expanding the Rust implementation.
+Latest RushWay commit after this documentation step: `600829f0e6f12b16b8fd84e99c799635330238d6` (`SPEC.md`).
+
+Previous project commits remain in history, including the initial Cargo/CLI skeleton and progress tracker.
+
+## Exact commands actually run in this work session
+
+No local Rust/Cargo build was executed in this session. No GitHub Actions build was executed in this session. Repository changes were written through GitHub's repository API.
+
+## Outstanding failures / limitations
+
+- Full `goway.go` extraction is not finished because the source is large and tool responses can be truncated.
+- Exact QUIC, pool, proxy parser, config-file and handshake details remain to be extracted.
+- RushWay core is still only the initial skeleton; it is not a functional GoWay replacement yet.
+
+## Single recommended next step
+
+**Continue Stage 2:** extract the remaining GoWay v1.8.4 source in smaller verified sections, especially QUIC, WebSocket handshake, SOCKS5/HTTP, pools, config-file parsing and lifecycle, then reconcile the complete specification before substantial Rust implementation.
+
+## Future target
+
+The eventual target is a tested, protocol-compatible **RushWay v0.0.1** that can replace GoWay v1.8.4 in real deployments, interoperate in both directions, handle high stream counts reliably, and publish standalone Windows x64, Debian 12 x64 and KWRT/OpenWrt ARMv7 executables through GitHub Actions.
+
+## Handoff instruction
+
+Any future AI must read `PROGRESS.md` and `SPEC.md` first, inspect the current repository, continue from the first unchecked item, update this document after each meaningful step, record exact evidence, and never claim completion without verification.
