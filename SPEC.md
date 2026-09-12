@@ -140,21 +140,25 @@ RushWay's frame codec currently supports complete non-fragmented data frames, 64
 
 ## Proxy front-end
 
-The v1.8.4 integration tests exercise SOCKS5 TCP CONNECT, HTTP CONNECT, SOCKS5 UDP ASSOCIATE and TCP echo forwarding. The GoWay source also contains a static successful SOCKS5 response:
+The v1.8.4 integration tests exercise SOCKS5 TCP CONNECT, HTTP CONNECT, SOCKS5 UDP ASSOCIATE and TCP echo forwarding. The GoWay source contains preallocated responses:
 
-`05 00 00 01 00 00 00 00 00 00`
+- SOCKS5 success: `05 00 00 01 00 00 00 00 00 00`
+- SOCKS5 general failure used by the UDP-associate local bind failure path: `05 01 00 01 00 00 00 00 00 00`
+- HTTP CONNECT success: `HTTP/1.1 200 Connection Established\r\n\r\n`
+- HTTP malformed/header-read failure: `HTTP/1.1 400 Bad Request\r\n\r\n`
 
-and a static HTTP CONNECT success response:
+The v1.8.4 test suite explicitly starts SOCKS5 with `[VER=5, NMETHODS=1, METHOD=0=no-auth]` and then tests CONNECT. UDP ASSOCIATE is separately exercised end-to-end against a UDP echo server. Truncated UDP-associate reads were hardened with strict `io.ReadFull` error/EOF checks in the v1.8.4 source.
 
-`HTTP/1.1 200 Connection Established\r\n\r\n`.
+### Exact control-flow findings extracted so far
 
-The v1.8.4 test suite explicitly starts SOCKS5 with `[VER=5, NMETHODS=1, METHOD=0=no-auth]` and then tests CONNECT. UDP ASSOCIATE is separately exercised end-to-end against a UDP echo server. Truncated UDP-associate reads were hardened with strict `io.ReadFull` error/EOF checks in the v1.8.4 source. citeturn432file0turn418file0
+- SOCKS5 UDP ASSOCIATE creates a local UDP listener with `net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})`, i.e. an ephemeral local UDP port. If this bind fails, GoWay sends the SOCKS5 general-failure reply (`REP=0x01`) and terminates the local connection.
+- The UDP-associate response therefore advertises the dynamically bound relay endpoint rather than a fixed port. RushWay's parser currently understands the response/request envelope, but the runtime relay is not implemented yet.
+- The source explicitly checks errors/EOF for the fixed-size `io.ReadFull` reads used while parsing UDP ASSOCIATE address fields; truncated IPv4/domain/IPv6 inputs must not proceed with partially initialized addresses.
+- SOCKS5 UDP relay frames are parsed as `[RSV(2), FRAG(1), ATYP(1), ADDR..., PORT(2), PAYLOAD...]`. The current source path inspects `ATYP` and computes the payload offset before dialing/relaying the destination.
+- The static SOCKS5/HTTP responses are preallocated in v1.8.4 to avoid per-connection allocations.
+- HTTP CONNECT header acquisition is a looped read until `\r\n\r\n` or `\n\n`, with the 8192-byte hard limit; malformed/incomplete header reads map to HTTP 400 rather than being silently accepted.
 
-The GoWay/PyWay lineage confirms the SOCKS5 no-auth greeting response is `05 00`; address types include IPv4, domain and IPv6, and the UDP datagram envelope is RFC1928-style reserved bytes + FRAG + ATYP + address + port + payload. RushWay now has isolated parsers for the SOCKS5 greeting, CONNECT/UDP ASSOCIATE request, UDP datagram envelope and HTTP CONNECT authority. These are **parser primitives, not the forwarding implementation**. citeturn434file0turn431file3
-
-HTTP CONNECT requests are expected to be read until a complete header terminator rather than assuming one TCP read contains the complete request. The v1.8.4 changelog specifically records support for `\r\n\r\n` / `\n\n` framing with the 8192-byte header limit. The integration test uses the form `CONNECT 127.0.0.1:<port> HTTP/1.1` with a Host header. citeturn418file0turn420file4
-
-**Important extraction status:** exact GoWay `goway.go` parser/control-flow code for every SOCKS5 error reply, UDP relay lifecycle, HTTP method/error mapping and target-resolution path is still being extracted. Do not mark this section fully complete until those exact branches are reconciled.
+These findings are still not the complete forwarding lifecycle: exact target dial, UDP reply path, FRAG handling, connection-close ordering and every SOCKS5 REP/error branch must still be reconciled against the full source before marking the proxy subsystem complete.
 
 ## DNS
 
@@ -188,7 +192,18 @@ RushWay compatibility implementation must first reproduce functional TLS/SNI beh
 
 ## QUIC
 
-GoWay v1.8.4 uses `quic-go` and exposes QUIC upstream schemes. RushWay must inventory the exact QUIC listener/client/session/stream behavior from the remaining source before implementing this subsystem. QUIC is **not** considered specified merely because the CLI accepts `quic://`.
+GoWay v1.8.4 uses `quic-go`. Exact source extraction has now established these concrete wire/runtime facts:
+
+- Server listener is created with `quic.ListenAddr(listenAddr, tlsConf, defaultQUICConfig())`.
+- Server TLS configuration advertises ALPN protocols `goway-quic` and `h3`.
+- `defaultQUICConfig()` sets `MaxIdleTimeout` to 60 seconds and `KeepAlivePeriod` to 15 seconds. Remaining QUIC config fields still need exact extraction.
+- Server accepts streams in a loop with `AcceptStream(context.Background())`. If stream acceptance fails, the connection handler returns.
+- The connection handler defers `CloseWithError(0, "connection closed")` for normal handler teardown.
+- Client dialing uses `quic.DialAddr(ctx, actualAddr, tlsConf, defaultQUICConfig())`.
+- The QUIC client pool deliberately performs DNS resolution, `quic.DialAddr`, and `OpenStreamSync` outside the pool mutex. A single-flight `dialing` barrier prevents a burst of concurrent stream requests from creating a connection storm.
+- If `OpenStreamSync` fails on an existing pooled connection, v1.8.4 closes that QUIC connection with application error `0x01` (`"stream open failed"`) and removes the failed connection from the pool.
+
+This is enough to constrain the RushWay QUIC architecture, but **not enough to implement it as complete compatibility yet**. Remaining extraction items are: full `defaultQUICConfig`, TLS certificate/client verification behavior, exact `quic+tls` vs `quic` handling, server stream target/bootstrap framing, connection close/reset mapping, pool capacity/selection, retry/dead-IP behavior, and how QUIC streams attach to the MUX/non-MUX forwarding paths.
 
 ## Required interoperability matrix
 
@@ -213,8 +228,15 @@ GoWay v1.8.4 uses `quic-go` and exposes QUIC upstream schemes. RushWay must inve
 
 ## Specification status
 
-This file remains an **intermediate verified baseline**. WebSocket functional behavior is substantially extracted. SOCKS5/HTTP front-end wire shapes and test coverage are now documented and isolated Rust parser primitives exist, but exact GoWay control-flow/error branches and UDP relay lifecycle remain to be reconciled.
+This file remains an **intermediate verified baseline**. WebSocket functional behavior is substantially extracted. SOCKS5/HTTP front-end wire shapes plus several exact control-flow branches are now documented, and isolated Rust parser primitives exist, but full proxy forwarding/error lifecycle remains pending. QUIC listener/client/session facts are partially extracted; QUIC is not yet implementation-complete.
 
 ## Next action
 
-Continue Stage 2 extraction of the exact GoWay SOCKS5/HTTP control flow and then move to exact QUIC listener/client/session/stream behavior. Do not mark proxy front-end complete until parser behavior and forwarding lifecycle are covered by actual Rust tests and later GoWay interop tests.
+Continue Stage 2 extraction in this order:
+
+1. finish exact SOCKS5 TCP/UDP control flow, including all REP mappings, UDP relay reply path, FRAG behavior, target dial and close lifecycle;
+2. finish exact HTTP CONNECT dial/error/close behavior;
+3. finish exact QUIC config/TLS/stream bootstrap/close semantics and pool retry/dead-IP behavior;
+4. then implement the runtime transport layers in Rust and add executable interoperability tests.
+
+Do not mark a subsystem complete merely because its parser or constructor compiles.
