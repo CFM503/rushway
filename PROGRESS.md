@@ -11,7 +11,7 @@
 
 **Stage 3 — Rust core implementation: `[~]`**
 
-The verified MUX primitive and RFC6455 WebSocket framing/handshake primitives are now in the repository. Neither is marked fully complete until compilation/tests and interoperability evidence exist.
+MUX and WebSocket wire primitives exist. New SOCKS5/HTTP parser primitives now exist, but no runtime forwarding path is complete and no Rust test execution evidence exists yet.
 
 ## Completed project work
 
@@ -38,10 +38,11 @@ The verified MUX primitive and RFC6455 WebSocket framing/handshake primitives ar
 - [x] Map v1.8.4 regression tests for header limit, PRNG lifecycle, target lifecycle, slow/fast/RST, 1000 streams and log-ring concurrency.
 - [x] Add `SPEC.md` with verified intermediate migration contract.
 - [x] Extract functional WebSocket handshake behavior: GET/HTTP1.1, Host, Upgrade, Connection, Sec-WebSocket-Version 13, random Sec-WebSocket-Key, Origin/Sec-Fetch fields, 101 response and accept-key validation, common error statuses, 8192-byte header limit.
-- [~] Extract WebSocket framing behavior: complete non-fragmented data frames, 64 MiB limit, RFC6455 control-frame limits, masking/unmasking, Ping/Pong/Close handling, RFC6455 accept-key vector. **Browser-profile fingerprint parity and runtime transport integration remain pending.**
+- [~] Extract WebSocket framing behavior: complete non-fragmented data frames, 64 MiB limit, RFC6455 control-frame limits, masking/unmasking, Ping/Pong/Close handling. Browser-profile fingerprint parity and runtime transport integration remain pending.
+- [~] Extract SOCKS5/HTTP front-end wire shapes from v1.8.4 source/tests: no-auth greeting, CONNECT, UDP ASSOCIATE, RFC1928 address types, static success replies, HTTP CONNECT request framing and header limit. Exact GoWay error branches and UDP relay lifecycle still pending.
 - [ ] Read all remaining sections of `goway.go` without truncation.
-- [ ] Extract exact SOCKS5 TCP/UDP behavior.
-- [ ] Extract exact HTTP CONNECT behavior.
+- [ ] Extract exact SOCKS5 TCP/UDP control-flow/error behavior.
+- [ ] Extract exact HTTP CONNECT control-flow/error behavior.
 - [ ] Extract exact QUIC listener/client/session/stream behavior.
 - [ ] Extract exact connection-pool algorithms and retry/dead-IP behavior.
 - [ ] Extract exact JSON/config-file schema and behavior.
@@ -59,13 +60,16 @@ The verified MUX primitive and RFC6455 WebSocket framing/handshake primitives ar
 - [~] Add masking/unmasking and control-frame validation.
 - [~] Add Ping/Pong/Close handling to the frame reader.
 - [~] Add HTTP header reader with hard 8192-byte limit.
-- [~] Add server-side WebSocket handshake request validation and 101 response builder.
-- [~] Add client-side WebSocket handshake request builder and strict response validation.
-- [ ] Execute and pass Rust unit tests before marking these codecs complete.
+- [~] Add server/client WebSocket handshake primitives.
+- [~] Add isolated SOCKS5 greeting/request parser in `src/proxy.rs`.
+- [~] Add SOCKS5 UDP datagram parser in `src/proxy.rs`.
+- [~] Add HTTP CONNECT authority/request-line parser with 8192-byte limit in `src/proxy.rs`.
+- [~] Wire `proxy` module into `main.rs`.
+- [ ] Execute and pass Rust unit tests before marking these primitives complete.
 - [ ] CLI/config compatibility.
 - [ ] Crypto compatibility implementation.
 - [ ] WebSocket runtime client/server transport integration.
-- [ ] SOCKS5 + HTTP CONNECT front-end.
+- [ ] SOCKS5 + HTTP CONNECT runtime front-end.
 - [ ] TCP forwarding.
 - [ ] MUX session/stream state machine, backpressure and cancellation.
 - [ ] TLS/SNI/fakehost behavior.
@@ -130,7 +134,9 @@ The verified MUX primitive and RFC6455 WebSocket framing/handshake primitives ar
 - GoWay client handshake uses functional upgrade headers plus browser-profile-dependent headers; non-fixed headers are shuffled.
 - GoWay client strictly expects HTTP 101 and reports distinct common upstream failure classes.
 - GoWay server checks for `Upgrade: websocket`, extracts `Sec-WebSocket-Key`, and returns a 101 response with `Sec-WebSocket-Accept`.
-- RushWay now has pure handshake parsing/building primitives matching these functional rules; runtime network integration is not implemented yet.
+- GoWay's integration tests use SOCKS5 no-auth (`05 01 00`), SOCKS5 CONNECT, HTTP CONNECT and UDP ASSOCIATE; static success replies include `05 00 00 01 00 00 00 00 00 00` and `HTTP/1.1 200 Connection Established\r\n\r\n`. citeturn432file0turn441file0
+- GoWay v1.8.4 hardens SOCKS5 UDP ASSOCIATE parsing against truncated reads. citeturn418file0
+- RushWay `src/proxy.rs` now contains isolated parsers for SOCKS5 greeting/request, SOCKS5 UDP datagrams and HTTP CONNECT, plus unit tests. These are not yet runtime forwarding.
 
 ## Verification policy
 
@@ -138,7 +144,7 @@ No cross-platform build, interoperability result, benchmark result, or Release i
 
 ## Current commit
 
-`b8f02039c5fd337a25afb0d53eb8a68b623ca532` — `SPEC.md` updated with exact WebSocket handshake findings. The preceding code commit is `7ad32df5bd78d04b183320737c0c3da66f790921`.
+`15154b8aaadfc91aec0b00303e3e3073078b7bd8` — `SPEC.md` proxy findings update. The preceding code commits added `src/proxy.rs` and wired `mod proxy` into `main.rs`.
 
 ## Exact verification commands actually run in this work session
 
@@ -159,14 +165,14 @@ cargo build --release
 ## Outstanding failures / limitations
 
 - Full `goway.go` extraction is not finished because the source is large and connector responses can be truncated.
-- Exact QUIC, pool, proxy parser, config-file and remaining test details remain to be extracted.
+- Exact GoWay SOCKS5/HTTP control flow, UDP relay lifecycle, QUIC, pool/retry/dead-IP, config-file and remaining test details remain to be extracted.
 - RushWay core is still not a functional GoWay replacement.
-- The new MUX and WebSocket codecs/handshake primitives have not yet been compiled or tested in this environment.
+- The MUX, WebSocket and proxy parser tests have not yet been compiled or executed in this environment.
 - Browser-profile fingerprint parity is not yet implemented.
 
 ## Single recommended next step
 
-**Continue Stage 2 extraction:** inspect the exact GoWay v1.8.4 SOCKS5 TCP/UDP and HTTP CONNECT parsers/handshake behavior, document them in `SPEC.md`, then add isolated Rust parser tests/primitives. Do not build the full proxy front-end until these wire-level details are verified.
+**Continue Stage 2 extraction:** finish exact SOCKS5/HTTP control flow and then inspect the exact QUIC listener/client/session/stream implementation. Only after that should the runtime forwarding architecture be expanded.
 
 ## Future target
 
