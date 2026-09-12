@@ -18,25 +18,15 @@ pub fn compute_accept_key(challenge: &str) -> String {
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8], opcode: u8, mask: bool) -> Result<()> {
-    if payload.len() > MAX_WS_FRAME_SIZE {
-        return Err(anyhow!("websocket frame too large"));
-    }
-    if opcode >= 0x8 && payload.len() > 125 {
-        return Err(anyhow!("control frame payload exceeds 125 bytes"));
-    }
+    if payload.len() > MAX_WS_FRAME_SIZE { return Err(anyhow!("websocket frame too large")); }
+    if opcode >= 0x8 && payload.len() > 125 { return Err(anyhow!("control frame payload exceeds 125 bytes")); }
     let mut h = Vec::with_capacity(14);
     h.push(0x80 | (opcode & 0x0f));
     let mask_bit = if mask { 0x80 } else { 0 };
     match payload.len() {
         0..=125 => h.push(mask_bit | payload.len() as u8),
-        126..=65535 => {
-            h.push(mask_bit | 126);
-            h.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        }
-        n => {
-            h.push(mask_bit | 127);
-            h.extend_from_slice(&(n as u64).to_be_bytes());
-        }
+        126..=65535 => { h.push(mask_bit | 126); h.extend_from_slice(&(payload.len() as u16).to_be_bytes()); }
+        n => { h.push(mask_bit | 127); h.extend_from_slice(&(n as u64).to_be_bytes()); }
     }
     let mut data = payload.to_vec();
     if mask {
@@ -81,9 +71,7 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
         match opcode {
             1 | 2 => return Ok(Some((opcode, buf.clone()))),
             8 => return Ok(None),
-            9 => {
-                if let Some(w) = reply.as_deref_mut() { write_frame(w, buf, 0xA, false).await?; }
-            }
+            9 => { if let Some(w) = reply.as_deref_mut() { write_frame(w, buf, 0xA, false).await?; } }
             10 => {}
             _ => unreachable!(),
         }
@@ -114,12 +102,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ping_is_automatically_ponged() {
-        let (mut a, mut b) = duplex(4096);
-        let writer = tokio::spawn(async move { write_frame(&mut a, b"ping", 9, false).await });
+    async fn close_frame_returns_eof_marker() {
+        let (mut a, mut b) = duplex(1024);
+        let writer = tokio::spawn(async move { write_frame(&mut a, b"", 8, false).await });
         let mut buf = Vec::new();
-        let result = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await;
-        assert!(result.is_err() || result.unwrap().is_none());
+        let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap();
         writer.await.unwrap().unwrap();
+        assert!(got.is_none());
     }
 }
