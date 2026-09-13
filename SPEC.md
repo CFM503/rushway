@@ -22,8 +22,8 @@ Current high-level status:
 | Plain WS MUX TCP | Implemented |
 | Plain WS physical MUX pooling | Implemented |
 | Plain WS SOCKS5 UDP slice | Implemented, interop evidence pending |
-| WSS TCP client path | Implemented, pooling incomplete |
-| WSS physical pooling | Not implemented |
+| WSS TCP client path | Implemented, physical pooling now present; execution evidence pending |
+| WSS physical pooling | Implemented in current head; execution evidence pending |
 | WSS UDP | Not implemented/validated |
 | Non-MUX parity | Not implemented |
 | QUIC / QUIC+TLS runtime | Not implemented |
@@ -198,9 +198,9 @@ RushWay still needs to reconcile this behavior against the exact GoWay v1.8.4 so
 
 ## Connection pool / MUX pool
 
-Client mode has pooling/reuse infrastructure. MUX mode maintains multiple physical MUX sessions and assigns logical streams over those sessions. Plain `ws://` physical MUX pooling is implemented in the current RushWay head.
+Client mode has pooling/reuse infrastructure. MUX mode maintains multiple physical MUX sessions and assigns logical streams over those sessions. Plain `ws://` physical MUX pooling and WSS physical TLS+WebSocket+MUX pooling are implemented in the current RushWay head.
 
-The current pool exposes configurable physical session count, least-active selection, 256 logical streams per session and session retirement when the physical reader terminates. Heavy concurrent acquire/stream reservation still needs stress validation.
+The current pools expose configurable physical session count, least-active selection, 256 logical streams per session and session retirement when the physical reader terminates. Heavy concurrent acquire/stream reservation still needs stress validation.
 
 Non-MUX mode is intended to fall back to a 1:1 pooled connection model, but RushWay's runtime implementation is not complete. Do not mark non-MUX parity complete until executable tests prove it.
 
@@ -226,7 +226,7 @@ RushWay has implemented important pieces of this behavior, but current-head exec
 
 The v1.8.4 source contains multiple browser profiles bundling User-Agent, Accept-Language, Chromium Client Hints where applicable, TLS cipher preferences, and curve preferences. WSS initialization pre-builds TLS configurations for profiles. `-fakehost` is used for Host/SNI/CDN/reverse-proxy scenarios.
 
-RushWay currently preserves functional TLS verification/ALPN behavior and caches verified/insecure rustls client configurations with `OnceLock`. WSS TCP forwarding is implemented, but WSS physical-session pooling is not yet implemented. Browser fingerprint parity remains a separate compatibility item.
+RushWay currently preserves functional TLS verification/ALPN behavior and caches verified/insecure rustls client configurations with `OnceLock`. WSS TCP forwarding and WSS physical-session pooling are implemented in code. Browser fingerprint parity remains a separate compatibility item, and WSS pooled execution/interop evidence is still required.
 
 ## QUIC
 
@@ -272,11 +272,11 @@ This file remains an **intermediate, source-derived compatibility contract**. It
 
 Use the following order unless newer execution evidence identifies a stronger blocker:
 
-1. Finish executable CI/current-head build evidence.
-2. Finish exact SOCKS5 TCP/UDP control flow, including all REP mappings, UDP relay reply path, FRAG behavior, target dial and close lifecycle.
-3. Finish exact HTTP CONNECT dial/error/close behavior.
-4. Finish exact QUIC config/TLS/stream bootstrap/close semantics and pool retry/dead-IP behavior.
-5. Implement WSS physical-session pooling.
+1. Finish executable CI/current-head build evidence for the WSS pooling head.
+2. Run current-head WSS pooled TCP and plain MUX benchmarks.
+3. Finish exact SOCKS5 TCP/UDP control flow, including all REP mappings, UDP relay reply path, FRAG behavior, target dial and close lifecycle.
+4. Finish exact HTTP CONNECT dial/error/close behavior.
+5. Finish exact QUIC config/TLS/stream bootstrap/close semantics and pool retry/dead-IP behavior.
 6. Implement/validate WSS UDP.
 7. Complete runtime non-MUX 1:1 behavior.
 8. Add executable GoWay <-> RushWay interoperability tests.
