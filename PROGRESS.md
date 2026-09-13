@@ -5,218 +5,166 @@
 
 ## Current checkpoint — 2026-09-13
 
-**Overall engineering completion: ~65% estimate.** This is migration progress, not production-readiness evidence.
+**Overall project/release completion: ~70% estimate.**
+
+This is an engineering estimate, not a test score. Implementation coverage is roughly 80%; executable verification of the newest transport expansion is still pending.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
 - Stage 3 Rust implementation: `[~]`
 - Stage 4 executable compatibility tests: `[ ]`
 - Stage 5 release builds: `[~]`
-- Stage 6 GitHub Actions: `[~]` — latest known jobs fail before executable workflow steps start
+- Stage 6 GitHub Actions: `[~]` — old known runs failed at job/infrastructure level before executable steps
 - Stage 7 v0.0.1 release: `[ ]`
 
-## Current head and completed implementation
+## Current head
 
-Latest code head for the WSS pooling milestone: `3de81c63fb06062183004c75e5928f0cfb851319`.
+Latest recorded head: `b6b3ab6c8b7d3bf1d4a1179433c0305a9e7475ab`.
 
-### Client front-end
+Recent implementation commits include:
+- `8096a7a410c5c5f0cf9a8b3d947114059111e68d` — WSS UDP ASSOCIATE raw transport.
+- `a03e0e40fc336ad18ec877223b913b1be26545df` — SOCKS5 UDP ASSOCIATE zero-port bind hint.
+- `7f45e8f04c4422fa190d2ebe28ab9a1c5cef2198` — plain non-MUX module.
+- `74d32a802ccddaba25b2d7147e64afdbb9995e53` — WSS non-MUX entry path.
+- `31a1a552f96386eef8d2e25d500b990355a597ec` through `29c0b7c0b1c47bd510c619954527fb8cb8535313` — QUIC TCP/UDP implementation sequence.
+- `4cbeef7a1035cac0a545e2b20bb9cbc8f520078f` through `7b690ed23a0a387fa6f954a6d0688ce946781f33` — MUX/WSS XOR framing corrections.
+- `c67bd7379d99d6f628befd820a8ff893ce5c5772` — runtime compatibility option groundwork.
+- `b6b3ab6c8b7d3bf1d4a1179433c0305a9e7475ab` — this relay checkpoint.
 
-- [x] SOCKS5 no-auth TCP CONNECT front-end.
-- [x] HTTP CONNECT front-end.
-- [x] TCP target dialing with timeout and TCP_NODELAY on the current runtime path.
-- [x] `--mux` / `--no-mux` CLI switches parsed.
-- [x] `--mux-sessions` CLI option, mapped to `RUSHWAY_MUX_SESSIONS`, clamped 1..64, default 4.
-- [ ] Full non-MUX runtime parity with GoWay.
+## Transport implementation status
+
+### Client/proxy front-end
+
+- [x] SOCKS5 no-auth TCP CONNECT.
+- [x] HTTP CONNECT.
+- [x] TCP target timeout handling.
+- [x] `--mux` / `--no-mux`.
+- [x] `--mux-sessions` 1..64, default 4.
+- [x] Non-MUX client/server code path exists.
+- [ ] Exact non-MUX pooling and lifecycle parity.
 
 ### Plain WebSocket / MUX
 
-- [x] Functional plain `ws://` client/server handshake.
-- [x] GoWay-compatible XOR MUX hello/OK boundary.
-- [x] MUX SYN/DATA/FIN/RST flow.
+- [x] Functional `ws://` handshake.
+- [x] XOR MUX hello/OK boundary.
+- [x] SYN/DATA/FIN/RST.
 - [x] uint16 DATA chunking.
-- [x] Bounded per-stream queue/backpressure.
-- [x] Target EOF -> FIN.
-- [x] Target read error -> RST.
-- [x] Local EOF -> FIN.
-- [x] Remote FIN -> local half-close.
-- [x] Remote RST -> local termination.
-
-### Physical MUX pooling
-
-- [x] Plain `ws://` physical MUX session reuse.
-- [x] Least-active physical-session selection.
-- [x] Logical stream multiplexing over shared sessions.
-- [x] Physical session retirement on reader termination.
-- [x] Configurable physical session count.
+- [x] Bounded stream queues.
+- [x] EOF/FIN/RST mapping.
+- [x] Physical MUX pooling and least-active selection.
 - [x] 256 logical streams/session.
-- [x] Active-count lifecycle hardening.
-- [x] TCP MUX serialization buffer reuse.
-- [ ] Atomic acquire/stream-count reservation under heavy concurrent bursts.
-- [ ] Current-head pooled throughput benchmark.
+- [x] Session retirement.
+- [x] MUX serialization buffer reuse.
+- [ ] Heavy concurrent reservation stress proof.
+- [ ] Current-head throughput benchmark.
+- [ ] Authenticated GoWay interop.
 
 ### UDP
 
-- [x] Plain `ws://` SOCKS5 UDP relay slice.
-- [x] Separate raw `UDP\n` WebSocket handshake/session.
-- [x] UDP payloads are raw WebSocket binary frames, not TCP MUX DATA.
-- [ ] WSS UDP end-to-end implementation/validation.
-- [ ] Full GoWay UDP error/FRAG/reply lifecycle parity evidence.
+- [x] Plain WS SOCKS5 UDP slice.
+- [x] Separate raw `UDP\n` WS session.
+- [x] No TCP MUX framing for UDP.
+- [x] WSS UDP ASSOCIATE code path exists.
+- [x] QUIC UDP length-prefixed stream framing code exists.
+- [ ] Plain WS UDP executable round-trip.
+- [ ] WSS UDP executable round-trip.
+- [ ] QUIC UDP executable round-trip.
+- [ ] Full FRAG/error/reply lifecycle parity.
 
 ### WSS / TLS
 
-- [x] WSS client TCP forwarding path.
-- [x] Verified rustls `ClientConfig` cached with `OnceLock`.
-- [x] Insecure rustls `ClientConfig` cached separately with `OnceLock`.
-- [x] TLS verification behavior and HTTP/1.1 ALPN preserved.
-- [x] Unit pointer-reuse check for cached TLS configs.
-- [x] WSS physical-session pooling implementation.
-- [ ] WSS pooled TCP executable/functional validation.
-- [ ] WSS pooled throughput benchmark.
-- [ ] WSS UDP.
+- [x] WSS TCP forwarding.
+- [x] Cached verified/insecure rustls configurations.
+- [x] HTTP/1.1 ALPN.
+- [x] WSS physical-session pooling.
+- [x] WSS non-MUX client path.
+- [x] WSS UDP ASSOCIATE client path.
+- [ ] WSS pooled TCP executable validation.
+- [ ] WSS non-MUX executable validation.
+- [ ] WSS UDP executable validation.
 - [ ] Server-side WSS runtime.
 
-## WebSocket codec status
+### QUIC / QUIC+TLS
 
-- [x] RFC6455 data/control frame support for current non-fragmented path.
-- [x] 64 MiB maximum frame size.
-- [x] 8192-byte HTTP header hard limit.
-- [x] Client masking / server unmasked frames.
-- [x] Ping -> Pong, Pong discard, Close -> EOF.
-- [x] Thread-local xorshift-style mask generation.
-- [ ] Reuse outbound large-frame masking buffer.
-- [ ] Reuse receive-buffer capacity.
-- [ ] Reduce shared writer-lock contention.
+- [x] `quic://` / `quic+tls://` main-entry recognition.
+- [x] QUIC TLS with GoWay ALPN `goway-quic` / `h3`.
+- [x] 60s idle timeout and 15s keepalive configuration.
+- [x] GoWay-derived stream/connection receive windows.
+- [x] TCP stream bootstrap and `OK\n` / `ERR: DIAL_FAILED\n` semantics.
+- [x] UDP `UDP` control path and 2-byte big-endian packet framing.
+- [ ] QUIC physical connection pooling parity.
+- [ ] QUIC retry/dead-IP semantics.
+- [ ] QUIC TCP executable validation.
+- [ ] QUIC UDP executable validation.
+- [ ] GoWay QUIC interop.
 
-A proposed large-frame masking-reuse rewrite was deliberately not committed because it could not be safely validated. Preserve the current `src/ws.rs` implementation until a clean, testable patch exists.
+## Compatibility option status
 
-## Functional runtime boundary
+- [x] `max-conn` runtime groundwork.
+- [x] block-local policy groundwork.
+- [x] TCP_NODELAY policy groundwork.
+- [ ] Exact socket-buffer semantics.
+- [ ] Exact TCP keepalive semantics.
+- [ ] Exact DNS/cache/fallback behavior.
+- [ ] Every SOCKS5 REP/error branch.
+- [ ] HTTP CONNECT error/close parity.
+- [ ] Browser profile/TLS fingerprint parity.
 
-- [x] Plain `ws://` MUX TCP forwarding.
-- [x] Plain `ws://` SOCKS5 UDP slice.
-- [x] WSS TCP forwarding.
-- [x] WSS physical-session pooling implementation.
-- [ ] WSS pooled TCP executable validation.
-- [ ] WSS UDP.
-- [ ] Runtime QUIC (`quic://`, `quic+tls://`).
-- [ ] Full retry/dead-IP/connection-pool parity.
-- [ ] Runtime non-MUX 1:1 pooling parity.
-- [ ] Exact DNS/runtime compatibility.
-- [ ] Full GoWay <-> RushWay executable interoperability.
+## WebSocket codec
 
-## Compatibility extraction remaining
+- [x] RFC6455 non-fragmented data/control path.
+- [x] 64 MiB frame limit.
+- [x] 8192-byte HTTP header limit.
+- [x] Client masking/server unmasked.
+- [x] Ping/Pong/Close.
+- [x] Thread-local xorshift-style masking PRNG.
+- [ ] Large outbound masking buffer reuse.
+- [ ] Receive-buffer reuse.
+- [ ] Writer contention reduction.
 
-`SPEC.md` is the authority for observed GoWay behavior. Still to reconcile before marking compatibility complete:
+## Verification status
 
-- [ ] Every SOCKS5 TCP/UDP REP/error branch.
-- [ ] UDP FRAG behavior and relay reply/close lifecycle.
-- [ ] HTTP CONNECT dial/error/close behavior.
-- [ ] DNS timeout/cache/fallback behavior.
-- [ ] socket-buffer and keepalive flag semantics.
-- [ ] block-local behavior.
-- [ ] max-conn behavior.
-- [ ] browser-profile HTTP/TLS fingerprint parity where required.
-- [ ] Full QUIC config/TLS/stream bootstrap/close/retry behavior.
-- [ ] Non-MUX 1:1 connection pool semantics.
+### Verified by source/static inspection in this relay
 
-## Required interoperability evidence
+- GoWay v1.8.4 non-MUX wire shape.
+- GoWay v1.8.4 QUIC ALPN/timing/window values.
+- GoWay v1.8.4 QUIC TCP bootstrap and UDP 2-byte framing.
+- GoWay v1.8.4 MUX full-frame XOR requirement.
+- Main routing of WS/WSS/QUIC/non-MUX paths.
 
-The final compatibility pass must execute, not merely compile, at least:
+### Not executable-verified yet
 
-1. GoWay client -> RushWay server.
-2. RushWay client -> GoWay server.
-3. WS authenticated.
-4. WS open mode where supported.
-5. MUX enabled.
-6. MUX disabled / 1:1.
-7. WSS.
-8. QUIC / QUIC+TLS.
-9. SOCKS5 TCP.
-10. HTTP CONNECT.
-11. SOCKS5 UDP.
-12. EOF / FIN.
-13. RST.
-14. disconnect/reconnect.
-15. 1 / 100 / 500 / 1000 logical streams.
-16. large sustained payloads.
-17. mixed slow and fast streams.
-18. invalid configuration and argument handling.
+- `cargo check` / `cargo build` / `cargo test` on current head.
+- Authenticated GoWay ↔ RushWay TCP interop.
+- WS/WSS/QUIC UDP round-trip.
+- 1/100/500/1000 stream stress.
+- Current-head c1/c8/c32 throughput.
+- Windows x64 / Debian 12 / ARMv7 current-head release builds.
+- v0.0.1 release smoke tests.
 
-## Performance evidence
+The relay environment currently lacks a usable Rust/Cargo toolchain and cannot resolve GitHub for dependency retrieval. Do not convert code inspection into a false “passed” claim.
 
-The last fully verified RushWay-only benchmark is Run 95 (`34755206730`). Historical results:
+## Final verification sequence
 
-| Workload | c1 | c8 | c32 |
-|---|---:|---:|---:|
-| Setup-inclusive median, 5 samples | 43.31 | 170.17 | 345.55 MiB/s |
-| Steady-state median, 5 samples | 43.06 | 205.04 | 349.28 MiB/s |
-
-Historical formal e2e from that run:
-`rushway_e2e payload_mib=4 roundtrip_echo=1 c1_mib_s=43.06 c8_mib_s=166.93 c32_mib_s=383.52`
-
-Historical MUX ownership microbenchmark:
-- copied decode: `11456.35 ns/op`
-- owned/reused decode: `1.54 ns/op`
-- reported directional speedup: `7431.47x`
-
-These are historical only. Do not use them as current-head speed or GoWay comparison claims.
-
-### Performance backlog
-
-1. Current-head pooled MUX c1/c8/c32 setup-inclusive and steady-state medians.
-2. Current-head WSS pooled TCP c1/c8/c32 setup-inclusive and steady-state medians.
-3. Large outbound WebSocket masking allocation reuse.
-4. Receive buffer capacity reuse.
-5. Shared writer-lock contention.
-6. Stream/session lifecycle stress.
-7. Re-benchmark every transport optimization after correctness evidence.
-
-## CI / build evidence
-
-Latest known evidence before the WSS pooling commits:
-
-- RushWay CI run #136, id `34761469476`, triggered from docs commit `a3e8f36836793635a967c17b1319d860e186ac16`: failed at the job level before executable workflow steps; `test` and `goway-comparison` failed, platform jobs were skipped.
-- RushWay Build Smoke run #17, id `34761469458`, same trigger: failed at the job level before executable workflow steps.
-- No compiler/test logs were produced, so these are runner/infrastructure failures rather than compile failures.
-- Relay environment could not resolve `github.com`; current-head local clone/build was therefore unavailable.
-
-The WSS pooling commits `5f171ec` and `3de81c6` therefore still require fresh executable build/test evidence. Do not claim current-head compile/test success until a new workflow or local execution produces logs.
-
-## Platform / release
-
-- [x] Prior Windows x64 build evidence exists.
-- [x] Prior Debian 12 x64 release build evidence exists.
-- [ ] Re-run Windows x64 build on actual release head.
-- [ ] Re-run Debian 12 x64 build on actual release head.
-- [ ] Verify ARMv7 with intended Rust toolchain.
-- [ ] Package KWRT/OpenWrt ARMv7 artifact.
-- [ ] Final artifact smoke test.
-- [ ] v0.0.1 release/tag.
-
-## Accelerated implementation sequence
-
-1. Obtain executable CI/build evidence for the current WSS pooling head.
-2. Fix compile/test failures, if any.
-3. Run current-head plain MUX and WSS pooled TCP benchmarks at c1/c8/c32 and compare with the historical Run 95 baseline.
-4. Implement WSS UDP with raw WebSocket UDP framing.
-5. Complete GoWay compatibility extraction for SOCKS5/HTTP/DNS/options/limits.
-6. Implement runtime non-MUX behavior.
-7. Implement QUIC and `quic+tls` from the source-derived contract.
-8. Execute the full GoWay <-> RushWay interop matrix.
-9. Stress 1/100/500/1000 streams, large payloads, slow/fast concurrency, EOF/RST and reconnect.
-10. Validate release artifacts on Windows x64, Debian 12 x64 and ARMv7/OpenWrt.
-11. Cut v0.0.1 only after execution evidence and smoke tests are green.
+1. Compile/test current head and fix every compiler/test failure.
+2. Plain WS authenticated MUX TCP.
+3. Plain WS authenticated non-MUX TCP.
+4. WSS MUX/non-MUX TCP.
+5. Plain WS UDP.
+6. WSS UDP.
+7. QUIC TCP/UDP.
+8. Bidirectional GoWay v1.8.4 interop.
+9. 1/100/500/1000 stream stress + large payloads + mixed slow/fast.
+10. Current-head c1/c8/c32 benchmarks.
+11. Windows/Debian/ARMv7 release artifacts.
+12. v0.0.1 smoke test and tag.
 
 ## AI relay rules
 
-Every future AI must:
-
-1. Read `AI_HANDOFF.md`, `PROGRESS.md` and `SPEC.md` before changing code.
-2. Start from the latest repository head, not from chat assumptions.
-3. Check the latest Actions runs before trusting old build/test statements.
-4. Make one logical change at a time and record the exact commit.
-5. Record actual verification evidence: commands, test output, benchmark IDs or Actions run IDs.
-6. Never mark interop, WSS UDP, QUIC, non-MUX, production readiness or release readiness complete without execution evidence.
-7. Never route UDP payloads through TCP MUX DATA framing.
-8. Do not weaken TLS verification or compatibility behavior to obtain a benchmark result.
-9. Preserve both `AI_HANDOFF.md` and `PROGRESS.md` after every verified milestone.
-10. Treat `SPEC.md` as protocol authority when implementation and assumptions conflict.
+- Read `AI_HANDOFF.md`, `PROGRESS.md`, `SPEC.md` first.
+- Start from latest `main`.
+- One logical change per commit.
+- Record exact verification evidence.
+- Never claim runtime interoperability or release readiness without actual execution.
+- Never route UDP packets through TCP MUX DATA.
+- Preserve TLS verification and protocol semantics while optimizing.
