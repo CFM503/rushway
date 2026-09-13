@@ -23,6 +23,7 @@ struct Args {
     #[arg(long = "fakehost")] fakehost: Option<String>,
     #[arg(long = "mux", default_value_t = true)] mux: bool,
     #[arg(long = "no-mux", default_value_t = false)] no_mux: bool,
+    #[arg(long = "mux-sessions", default_value_t = 4, value_parser = clap::value_parser!(usize).range(1..=64))] mux_sessions: usize,
     #[arg(long = "allow-open", default_value_t = false)] allow_open: bool,
     #[arg(long = "verify-ssl", default_value_t = false)] verify_ssl: bool,
     #[arg(short = 'W')] buffer_size: Option<usize>,
@@ -39,6 +40,7 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
     if let Some(x) = v.get("key").and_then(|x| x.as_str()) { cfg.key = Some(x.into()); }
     if let Some(x) = v.get("fakehost").or_else(|| v.get("fakeHost")).and_then(|x| x.as_str()) { cfg.fakehost = Some(x.into()); }
     if let Some(x) = v.get("mux").and_then(|x| x.as_bool()) { cfg.mux = x; }
+    if let Some(x) = v.get("mux_sessions").or_else(|| v.get("muxSessions")).and_then(|x| x.as_u64()) { cfg.mux_sessions = usize::try_from(x).map_err(|_| anyhow!("mux_sessions out of range"))?.clamp(1, 64); }
     if let Some(x) = v.get("buffer_size").or_else(|| v.get("bufferSize")).and_then(|x| x.as_u64()) { cfg.buffer_size = usize::try_from(x).map_err(|_| anyhow!("buffer_size out of range"))?; }
     if let Some(x) = v.get("connection_timeout").or_else(|| v.get("connectionTimeout")).and_then(|x| x.as_u64()) { cfg.connection_timeout = x; }
     if let Some(x) = v.get("allow_open").or_else(|| v.get("allowOpen")).and_then(|x| x.as_bool()) { cfg.allow_open = x; }
@@ -57,6 +59,7 @@ async fn main() -> Result<()> {
     if let Some(v) = args.fakehost { cfg.fakehost = Some(v); }
     if let Some(v) = args.buffer_size { cfg.buffer_size = v; }
     if let Some(v) = args.connection_timeout { cfg.connection_timeout = v; }
+    cfg.mux_sessions = args.mux_sessions;
     if args.no_mux { cfg.mux = false; } else { cfg.mux = args.mux; }
     if args.allow_open { cfg.allow_open = true; }
     if let Some(upstream) = cfg.upstream.as_deref() {
@@ -78,6 +81,12 @@ mod tests {
         let a = Args::parse_from(["rushway", "-p", "9192", "--up", "ws://127.0.0.1:8080/ws"]);
         assert_eq!(a.port, Some(9192));
         assert_eq!(a.upstream.as_deref(), Some("ws://127.0.0.1:8080/ws"));
+        assert_eq!(a.mux_sessions, 4);
+    }
+    #[test]
+    fn parses_mux_sessions() {
+        let a = Args::parse_from(["rushway", "--up", "ws://example.com/ws", "--mux-sessions", "12"]);
+        assert_eq!(a.mux_sessions, 12);
     }
     #[test]
     fn parses_verify_ssl() {
