@@ -20,7 +20,7 @@
 - `8c54f465e0fc11f005596138be21336fadf89510` — server runtime target DNS integration.
 - `dd54bd4f02a89129e8c88c59fb19211b4e130991` — non-MUX DNS and socket-policy integration.
 - `da7c6bf6e4f39e19441976d7b465667cbf6f278c` — accepted GoWay logging/profiling CLI names.
-- `3cd5d6af6b28885cc6e4922d8296a2567ff2ea18` — fixed the invalid Clap `args.version` reference from the prior CLI expansion.
+- `3cd5d6af6b28885cc6e4922d8296a2567ff2ea18` — fixed invalid Clap `args.version` reference.
 - `cb24a792a072bd3f16f598e27cd80bdbe5de9f61` — normalized GoWay boolean forms such as `-mux=true`, `-mux=false`, `-block-local=false`, and `-no-tcp-keepalive=false` into valid Clap semantics.
 
 ### Important CLI compatibility result
@@ -45,7 +45,7 @@ Currently integrated into server-side target dialing and the plain non-MUX clien
 
 ### CI reality check
 
-A same-day earlier run `34756277983` on commit `994a52c7797f408654057d881effebb9e4af07f2` completed successfully. Every continuation push since then has produced GitHub Actions runs that terminate in about four seconds with `failure`, while the connector cannot expose job steps/logs. This pattern is treated as an **inconclusive Actions infrastructure/setup failure**, not as a proven Rust compile failure. Do not mark any compile/test/build gate passed from these red checks.
+A same-day earlier run `34756277983` on commit `994a52c7797f408654057d881effebb9e4af07f2` completed successfully. Continuation runs since then, including the latest `34763815521`, terminate in about four seconds with `failure`; `test` and `goway-comparison` are marked failed, downstream artifact jobs are skipped, and job logs/steps are unavailable through the connector. This pattern is treated as an **inconclusive Actions infrastructure/setup failure**, not as a proven Rust compile failure. Do not mark any compile/test/build gate passed from these red checks.
 
 ### Remaining implementation priority
 
