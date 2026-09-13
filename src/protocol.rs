@@ -122,6 +122,13 @@ impl MuxFrame {
             payload: header.payload(buf).to_vec(),
         })
     }
+
+    pub fn decode_owned(mut buf: Vec<u8>) -> Result<Self, ProtocolError> {
+        let header = MuxHeader::parse(&buf)?;
+        let payload = buf.split_off(MUX_HEADER_LEN);
+        debug_assert_eq!(payload.len(), header.payload_len);
+        Ok(Self { stream_id: header.stream_id, command: header.command, payload })
+    }
 }
 
 /// SYN payload: uint16 target length, target bytes, optional initial data.
@@ -208,6 +215,16 @@ mod tests {
         assert_eq!(header.command, MuxCommand::Data);
         assert_eq!(header.payload_len, 4);
         assert_eq!(header.payload(&encoded), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn owned_decode_transfers_payload_storage() {
+        let mut encoded = Vec::with_capacity(MUX_HEADER_LEN + 4);
+        write_frame_parts(&mut encoded, 7, MuxCommand::Data, &[1, 2, 3, 4]).unwrap();
+        let ptr = encoded.as_ptr();
+        let frame = MuxFrame::decode_owned(encoded).unwrap();
+        assert_eq!(frame.payload, vec![1, 2, 3, 4]);
+        assert_eq!(frame.payload.as_ptr(), unsafe { ptr.add(MUX_HEADER_LEN) });
     }
 
     #[test]
