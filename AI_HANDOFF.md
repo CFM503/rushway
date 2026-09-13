@@ -3,30 +3,35 @@
 ## 2026-09-13 verified checkpoint
 
 Current code baseline:
-- `24d36bc2fed4c85518ccdd104da23a56e5d86138` — corrected MUX benchmark to prevent compiler elimination of the copied decode input.
+- `74bd9bbbd8fb607230e4199f49d411393c6a07b5` — fixed moved `OwnedMuxFrame` use in the server MUX DATA dispatch after CI caught the ownership error.
+- `b24a182c6eea268dff081fb17749ab093ec6ba7f` — introduced runtime owned MUX DATA integration for the server path and WSS downstream path.
 - Prior stable runtime baseline: `f36b75767531c05e83d0cdd9a336b4d1ebc50a64`.
 
-Latest verified CI before benchmark correction:
-- Run 59 / workflow `34747270574`: Linux tests passed, Linux release build passed, Windows x64 GNU passed.
-- Rust toolchain: 1.82.0.
+CI evidence:
+- Run 60 / workflow `34747612337`: Linux tests passed, Linux release build passed, MUX benchmark passed, Windows x64 GNU build passed.
+- Run 65 / workflow `34748092662`: failed at compile with `E0382` because `OwnedMuxFrame` was moved into `StreamCommand::Data` and then its stream ID was referenced. This is fixed in `74bd9bb` by saving `stream_id` before the move.
+- Run 66 / workflow `34748327454` is currently running against `74bd9bb`.
+- Rust toolchain remains 1.82.0.
 
-Important benchmark finding:
-- Run 59 originally reported `decode_copy = 0.62 ns/op` and `decode_owned_reused = 1.65 ns/op` for 32 KiB payloads.
-- That result is NOT trusted because the copied decode input was not passed through `black_box`; compiler elimination may have made the copy path unrealistically cheap.
-- Benchmark has now been corrected in `24d36bc` by changing the copied path to `MuxFrame::decode(black_box(encoded.as_slice()))`.
-- Do not use the old 0.62 ns/op result for performance decisions.
+Benchmark finding:
+- The corrected benchmark in `24d36bc` applies `black_box` to the copied decode input.
+- The corrected 32 KiB comparison showed the copied path around 12.5 microseconds/op versus owned around 1.7 nanoseconds/op in the benchmark run, demonstrating that the previous 0.62 ns/op copied result was invalid and that the corrected benchmark exposes the clone cost.
+- Treat microbenchmarks as directional evidence only; end-to-end proxy throughput still needs measurement.
 
 Runtime performance status:
-- `ws.rs` now has an owned frame receive helper, but the main runtime still uses the established `read_frame`/`MuxFrame::decode` path.
-- `OwnedMuxFrame` exists and has tests proving the original payload storage is retained without copying.
-- Do not wire OwnedMuxFrame into runtime until a fair benchmark demonstrates an actual benefit and CI validates ownership/lifetime correctness.
+- `OwnedMuxFrame` is now used by the server MUX DATA receive path and WSS downstream receive path.
+- DATA payload is written from owned storage without cloning the MUX payload.
+- SYN parsing remains unchanged.
+- The client plain-WS downstream path already uses `read_frame_owned`.
+- WSS import cleanup may still be needed if CI leaves only an unused `OwnedMuxFrame` import warning.
 
 Immediate next steps:
-1. Wait for CI on `24d36bc` and record the corrected copy-vs-owned benchmark result.
-2. Only if owned decode is measurably beneficial, implement the smallest runtime integration: server MUX DATA first, then client reverse DATA path.
-3. Preserve SYN parsing as-is; optimize DATA fast paths first.
-4. Record every meaningful commit and exact Actions run evidence in `PROGRESS.md`.
-5. Keep Rust 1.82.0 compatibility.
+1. Wait for Run 66 and inspect exact test/release/benchmark/Windows results.
+2. If Run 66 passes, clean only the now-redundant WSS `OwnedMuxFrame` import/warnings, then CI again.
+3. Add a real end-to-end local proxy throughput benchmark before further speculative allocation changes.
+4. Inspect shared WebSocket writer lock contention and queue/backpressure behavior against GoWay's documented limits.
+5. Only after evidence, consider buffer pooling, session pooling, retry/dead-IP handling, WSS/QUIC expansion, and release packaging.
+6. Keep Rust 1.82.0 compatibility.
 
 Do not claim:
 - GoWay/RushWay interoperability
