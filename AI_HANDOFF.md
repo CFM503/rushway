@@ -9,7 +9,7 @@
 - Repository: `CFM503/rushway`
 - Compatibility target: GoWay v1.8.4
 - GoWay compatibility baseline commit: `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
-- Current RushWay code head: `f20c19924e70b843338da2c245bb8668f7125bb3`
+- Current RushWay code head at checkpoint: `f20c19924e70b843338da2c245bb8668f7125bb3`
 - Intended release: `v0.0.1`
 - Target artifacts: Windows x64, Debian 12 x64, KWRT/OpenWrt ARMv7
 - This checkpoint is engineering progress, not a release-readiness claim.
@@ -61,13 +61,14 @@
 #### WSS / TLS
 
 - WSS client TCP forwarding path exists.
-- WSS client establishes TCP + TLS + WebSocket + MUX for local proxy connections.
+- WSS client establishes TLS + WebSocket + MUX and now reuses physical WSS MUX sessions for multiple logical TCP connections.
+- WSS physical session pool uses the same 1..64 configurable session count and 256 logical streams per session model as plain MUX.
+- Physical WSS sessions use least-active selection and atomic active-stream reservation.
+- Each physical WSS session owns a stream dispatch map and a dedicated reader loop; FIN/RST or reader termination retires logical/physical state.
 - Verified TLS `rustls::ClientConfig` is cached with `OnceLock`.
 - Insecure TLS `rustls::ClientConfig` is cached separately with `OnceLock`.
 - TLS verification policy and HTTP/1.1 ALPN behavior were preserved.
 - A unit-level pointer-reuse test exists for cached TLS configurations.
-- Current WSS client still creates a separate physical upstream TLS+WebSocket+MUX connection for each local proxy connection.
-- WSS physical-session pooling is not implemented yet.
 - WSS UDP is not implemented/validated end-to-end.
 - Server-side WSS integration is not currently claimed complete.
 
@@ -83,15 +84,36 @@
 - Receive-path buffer capacity reuse is still an optimization opportunity.
 - A large-frame masking-reuse rewrite was reviewed but deliberately not committed because it could not be safely validated. Preserve `src/ws.rs` until a clean, testable change is available.
 
-#### Code quality / architecture status
+### 2026-09-13 — WSS physical pooling implementation milestone
 
-- Rust implementation is structured into crypto, MUX pool, protocol, proxy, runtime, TLS, WebSocket and WSS client modules.
-- Release profile is configured with thin LTO, one codegen unit, stripped binary and abort-on-panic.
-- Current code is a migration implementation, not yet a protocol-complete GoWay replacement.
+#### Code changes
+
+- `5f171ec20c70c0bc1e416390ffa19fa5b729a24b` initially introduced WSS physical MUX session pooling.
+- `3de81c63fb06062183004c75e5928f0cfb851319` is the corrected follow-up and current final code commit for this milestone.
+- Changed file: `src/wss_client.rs`.
+
+#### Implemented
+
+- Added `WssSessionState` for one reusable TLS + WebSocket + MUX physical connection.
+- Added per-session logical stream map and reader dispatch loop.
+- Added atomic active-stream reservation capped at 256 streams/session.
+- Added least-active WSS physical-session selection.
+- Added configurable/prewarmed WSS physical session pool using `RUSHWAY_MUX_SESSIONS` with the existing 1..64 clamp and default 4.
+- Local WSS TCP proxy connections now acquire a logical stream from an existing physical session instead of opening a new TLS/WS/MUX chain every time.
+- Preserved existing WSS Host/SNI/fakehost/origin/ALPN/TLS verification behavior.
+- Kept MUX DATA chunking at the uint16 payload boundary and reused the existing MUX command framing rules.
+- UDP remains completely separate and is not routed through TCP MUX framing.
+
+#### Verification status
+
+- Static code review was performed after the initial pooling commit; an unnecessary `blocking_lock()` lookup was removed in `3de81c6` so the accepted session is held directly by each logical connection.
+- Current relay environment still cannot clone/build the repository because `github.com` DNS is unavailable.
+- The latest available GitHub Actions evidence before this milestone was still infrastructure-level failure before executable steps; therefore this milestone is **implemented but not execution-verified** in the current environment.
+- Do not claim WSS pooled TCP build/test/benchmark success until a runnable CI or local environment provides output.
 
 ### What is NOT complete yet
 
-- WSS physical-session pooling.
+- WSS pooled TCP execution/interop validation and current-head benchmark.
 - WSS UDP relay and end-to-end packet framing validation.
 - Full non-MUX runtime parity / 1:1 pool behavior.
 - QUIC runtime (`quic://` and `quic+tls://`).
@@ -125,13 +147,12 @@ These are historical measurements only. They must not be presented as current-he
 
 ### CI and environment evidence
 
-- RushWay CI run #131, id `34761172740`, was triggered from documentation commit `c90d8ca70bd7c9c33c472e1b46d2e60af1c43bc4` and failed before executable workflow steps.
-- RushWay Build Smoke run #12, id `34761172747`, triggered by the same documentation commit, also failed before executable workflow steps.
+- RushWay CI run #136, id `34761469476`, was triggered from docs commit `a3e8f36836793635a967c17b1319d860e186ac16` and failed at the job level before executable steps; jobs `test` and `goway-comparison` failed and platform jobs were skipped.
+- RushWay Build Smoke run #17, id `34761469458`, also failed at the job level before executable steps.
 - No compiler/test logs were produced by those failures.
-- Earlier retries showed the same infrastructure-level behavior.
 - The relay environment could not resolve `github.com`, preventing local clone/build execution.
-- Therefore there is currently no evidence that the latest `f20c199` head compiles/tests successfully in the present relay environment.
-- Future AIs must check the latest Actions status before claiming executable evidence.
+- Therefore there is no executable evidence that the new WSS pooling commits compile or pass tests yet.
+- Future AIs must check the newest Actions runs after the WSS pooling push before trusting it as build/test evidence.
 
 ### Chronological engineering history
 
@@ -141,28 +162,28 @@ These are historical measurements only. They must not be presented as current-he
 4. **Hot-path reuse** — reused TCP MUX serialization buffers and hardened active stream counting.
 5. **UDP regression repair** — restored the intended raw `UDP\n` WebSocket UDP framing after a performance refactor accidentally routed UDP through TCP MUX DATA.
 6. **TLS reuse** — `f20c199` cached verified/insecure rustls client configs with `OnceLock` without changing verification or ALPN semantics.
-7. **Current boundary** — plain `ws://` MUX is the strongest candidate path; WSS works for TCP forwarding but lacks physical pooling; WSS UDP, QUIC, non-MUX and true GoWay interop remain.
+7. **WSS physical pooling** — `5f171ec` introduced the reusable WSS session pool and `3de81c6` corrected stream/session ownership so each logical connection keeps the already-acquired physical session directly.
+8. **Current boundary** — plain `ws://` MUX and WSS TCP physical pooling are implemented in code, but WSS pooled execution evidence is still pending; WSS UDP, QUIC, non-MUX and true GoWay interop remain.
 
 ### Immediate implementation order
 
 Do these in order unless new execution evidence proves a better blocker:
 
-1. Get executable CI/build evidence on a current-head commit containing the TLS optimization.
-2. Run current-head pooled MUX throughput benchmarks at c1/c8/c32, with setup-inclusive and steady-state medians, and compare to Run 95.
-3. Fix compile/test failures before doing further optimization.
-4. Implement WSS physical-session pooling, preserving TLS verification, ALPN and stream lifecycle semantics.
-5. Validate WSS pooled TCP with functional tests and current-head benchmarks.
-6. Implement WSS UDP using the same raw-UDP framing rule as plain `ws://`; do not reuse TCP MUX DATA framing.
-7. Extract/implement remaining exact GoWay compatibility behavior: SOCKS5/HTTP error branches, DNS, connection limits, keepalive/socket-buffer flags and non-MUX 1:1 pooling.
-8. Implement QUIC and its TLS/pool/close/retry semantics from `SPEC.md` rather than assumptions.
-9. Execute the full GoWay <-> RushWay interop matrix for TCP/UDP/WSS/QUIC/non-MUX/MUX.
-10. Validate 1/100/500/1000 stream counts, large sustained transfers, slow/fast mixed streams, EOF/FIN, RST and reconnects.
-11. Produce current-head Windows x64, Debian 12 x64 and ARMv7/OpenWrt artifacts.
-12. Cut `v0.0.1` only after execution evidence and smoke tests are green.
+1. Get executable CI/build evidence on the current WSS pooling head.
+2. Run current-head WSS pooled TCP and plain MUX throughput benchmarks at c1/c8/c32, with setup-inclusive and steady-state medians.
+3. Fix any compile/test/lifecycle failures before further optimization.
+4. Implement WSS UDP using the same raw-UDP framing rule as plain `ws://`; never use TCP MUX DATA framing for UDP.
+5. Extract/implement remaining exact GoWay compatibility behavior: SOCKS5/HTTP error branches, DNS, connection limits, keepalive/socket-buffer flags and non-MUX 1:1 pooling.
+6. Implement QUIC and its TLS/pool/close/retry semantics from `SPEC.md` rather than assumptions.
+7. Execute the full GoWay <-> RushWay interop matrix for TCP/UDP/WSS/QUIC/non-MUX/MUX.
+8. Validate 1/100/500/1000 stream counts, large sustained transfers, slow/fast mixed streams, EOF/FIN, RST and reconnects.
+9. Produce current-head Windows x64, Debian 12 x64 and ARMv7/OpenWrt artifacts.
+10. Cut `v0.0.1` only after execution evidence and smoke tests are green.
 
 ### Performance backlog, in priority order
 
 - [ ] Current-head pooled MUX benchmark.
+- [ ] Current-head WSS pooled benchmark.
 - [ ] Large masked WebSocket DATA buffer reuse.
 - [ ] Receive buffer capacity reuse.
 - [ ] Shared writer-lock contention reduction.
