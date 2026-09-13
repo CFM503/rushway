@@ -15,7 +15,7 @@ fn main() {
     let start = Instant::now();
     let mut copied = 0usize;
     for _ in 0..ITERS {
-        let frame = MuxFrame::decode(&encoded).unwrap();
+        let frame = MuxFrame::decode(black_box(encoded.as_slice())).unwrap();
         copied = copied.wrapping_add(frame.payload.len());
         black_box(frame.payload.len());
     }
