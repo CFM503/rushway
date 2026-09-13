@@ -23,6 +23,8 @@ jobs:
         run: cargo run --release --bin e2e_bench
       - name: Cross-proxy benchmark runner self-check
         run: cargo run --release --bin proxy_bench -- --implementation rushway --bin target/release/rushway
+      - name: Repeated cross-proxy benchmark median
+        run: bash scripts/repeat_proxy_bench.sh rushway target/release/rushway 5
 
   windows-x64:
     runs-on: ubuntu-latest
