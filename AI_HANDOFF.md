@@ -11,7 +11,7 @@
 - Formal release target: `v0.0.2`
 - Targets: Windows x64, Debian 12 x64, KWRT/OpenWrt ARMv7
 - Branch: `main`
-- Current main HEAD after this docs correction: `34a8b6e3b7d3b0f4f0be7e6b9b0d8c5b1a2f5f21` (resulting commit will supersede this line if amended by GitHub)
+- Last verified runtime source HEAD before docs-only relay commits: `ad88a9d218af7f841f74d0231864e56723fff840`
 
 ### Newly completed in this continuation
 
@@ -23,7 +23,6 @@
 - `75610b2123433a2b034eba577b61ddc161ac159f` — QUIC target-dial failure maps to local SOCKS5/HTTP failure and server target TCP sockets receive the shared socket policy; existing client pool retries once after failed `open_bi`.
 - `ce9e0cf4013c615c22f89b21e01389c741e09a39` — release dashboard updated for the hardened source state.
 - `ad88a9d218af7f841f74d0231864e56723fff840` — compatibility contract refreshed to reflect the hardened transport/error/socket-policy source state.
-- `7a019d45515899abc19bf45311dd94a5c4ae7d77` — handoff refreshed after the repository became public and after another CI runner investigation; no runtime source code was changed by that docs-only commit.
 
 ### Public-repository CI finding
 
