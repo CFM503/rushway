@@ -36,7 +36,7 @@ struct Args {
     #[arg(long = "no-tcp-nodelay", default_value_t = false)] no_tcp_nodelay: bool,
     #[arg(long = "no-tcp-keepalive", default_value_t = false)] no_tcp_keepalive: bool,
     #[arg(long = "dns")] dns: Option<String>,
-    #[arg(long = "block-local")] block_local: bool,
+    #[arg(long = "block-local", default_value_t = false)] block_local: bool,
     #[arg(long = "no-block-local", default_value_t = false)] no_block_local: bool,
     #[arg(long = "max-conn", value_parser = clap::value_parser!(usize).range(1..=1_000_000))]
     max_conn: Option<usize>,
@@ -64,10 +64,33 @@ where
         for name in LEGACY_LONG_FLAGS {
             let exact = format!("-{name}");
             if arg == exact { return format!("--{name}"); }
-            if let Some(value) = arg.strip_prefix(&format!("{exact}=")) { return format!("--{name}={value}"); }
+            if let Some(value) = arg.strip_prefix(&format!("{exact}=")) {
+                let bool_value = match value.to_ascii_lowercase().as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+                if let Some(value) = bool_value {
+                    match *name {
+                        "mux" | "block-local" | "allow-open" | "verify-ssl" | "tui" => {
+                            return if value { format!("--{name}") } else { format!("--no-{name}") };
+                        }
+                        "no-mux" | "no-block-local" | "no-tcp-nodelay" | "no-tcp-keepalive" => {
+                            if value { return format!("--{name}"); }
+                            return match *name {
+                                "no-mux" => "--mux".to_string(),
+                                "no-block-local" => "--block-local".to_string(),
+                                _ => String::new(),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                return format!("--{name}={value}");
+            }
         }
         arg
-    }).collect()
+    }).filter(|arg| !arg.is_empty()).collect()
 }
 
 fn apply_listen_arg(cfg: &mut RuntimeConfig, value: &str) -> Result<()> {
@@ -166,9 +189,9 @@ mod tests {
     use super::*;
     use clap::Parser;
     #[test]
-    fn normalizes_goway_single_dash_long_flags() {
-        let got = normalize_legacy_args(["rushway", "-up=ws://127.0.0.1:8080/ws", "-fakehost", "edge.example.com", "-mux-sessions", "4", "-socket-buffer", "128", "-no-tcp-keepalive", "-log", "ERROR", "-version"]);
-        assert_eq!(got, vec!["rushway", "--up=ws://127.0.0.1:8080/ws", "--fakehost", "edge.example.com", "--mux-sessions", "4", "--socket-buffer", "128", "--no-tcp-keepalive", "--log", "ERROR", "--version"]);
+    fn normalizes_goway_single_dash_long_flags_and_bool_values() {
+        let got = normalize_legacy_args(["rushway", "-up=ws://127.0.0.1:8080/ws", "-fakehost", "edge.example.com", "-mux=true", "-block-local=false", "-socket-buffer", "128", "-no-tcp-keepalive=false", "-log", "ERROR", "-version"]);
+        assert_eq!(got, vec!["rushway", "--up=ws://127.0.0.1:8080/ws", "--fakehost", "edge.example.com", "--mux", "--no-block-local", "--socket-buffer", "128", "--log", "ERROR", "--version"]);
     }
     #[test]
     fn preserves_short_flags_and_values() {
