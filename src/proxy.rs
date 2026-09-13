@@ -70,6 +70,7 @@ pub fn parse_socks5_greeting(buf: &[u8]) -> Result<(), ProxyParseError> {
 }
 
 /// Parse a complete RFC1928 request (CONNECT or UDP ASSOCIATE).
+/// UDP ASSOCIATE permits the conventional 0.0.0.0:0 placeholder.
 pub fn parse_socks5_request(buf: &[u8]) -> Result<SocksRequest, ProxyParseError> {
     if buf.len() < 4 { return Err(ProxyParseError::Truncated); }
     if buf[0] != SOCKS5_VERSION { return Err(ProxyParseError::InvalidVersion(buf[0])); }
@@ -102,7 +103,7 @@ pub fn parse_socks5_request(buf: &[u8]) -> Result<SocksRequest, ProxyParseError>
     };
     if buf.len() < consumed + 2 { return Err(ProxyParseError::Truncated); }
     let port = u16::from_be_bytes([buf[consumed], buf[consumed + 1]]);
-    if port == 0 { return Err(ProxyParseError::InvalidPort); }
+    if port == 0 && matches!(command, SocksCommand::Connect) { return Err(ProxyParseError::InvalidPort); }
     Ok(SocksRequest { command, target: TargetAddr { host, port } })
 }
 
@@ -184,6 +185,14 @@ mod tests {
     fn socks_connect_ipv4() {
         let req = [5, 1, 0, 1, 127, 0, 0, 1, 0x01, 0xbb];
         assert_eq!(parse_socks5_request(&req).unwrap().target, TargetAddr { host: "127.0.0.1".into(), port: 443 });
+    }
+
+    #[test]
+    fn socks_udp_associate_allows_zero_port() {
+        let req = [5, 3, 0, 1, 0, 0, 0, 0, 0, 0];
+        let parsed = parse_socks5_request(&req).unwrap();
+        assert_eq!(parsed.command, SocksCommand::UdpAssociate);
+        assert_eq!(parsed.target.port, 0);
     }
 
     #[test]
