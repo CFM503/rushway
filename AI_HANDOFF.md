@@ -2,13 +2,15 @@
 
 ## 2026-09-13 accelerated implementation checkpoint
 
-Latest implementation commit: `d3432d5371f8a16cee11a75cedf63d8d7b8daa5a`.
+Latest implementation commit: `f20c19924e70b843338da2c245bb8668f7125bb3`.
 
 ### Just completed
 
 - Re-audited `src/mux_pool.rs` before release work.
 - Fixed the UDP regression: after the raw `UDP\n` WebSocket handshake, UDP payloads are sent as raw WebSocket binary frames again; they are no longer incorrectly wrapped in TCP MUX `DATA` frames.
 - Preserved TCP MUX pooling and the reused MUX serialization buffer on the TCP hot path.
+- Optimized WSS TLS setup by caching the verified and insecure `rustls::ClientConfig` instances with `OnceLock`; TLS verification policy and ALPN behavior are unchanged.
+- Added a unit-level pointer-reuse check for both cached TLS configurations.
 
 ### Current implementation
 
@@ -17,11 +19,14 @@ Latest implementation commit: `d3432d5371f8a16cee11a75cedf63d8d7b8daa5a`.
 - Per-session logical stream capacity is 256.
 - SOCKS5 TCP/UDP and HTTP CONNECT client handling are present.
 - Server-side MUX forwarding, plain WebSocket and WSS foundations remain present.
+- WSS client currently establishes one upstream physical connection per local proxy connection; WSS physical-session pooling is still unfinished.
 - Release profile is optimized for deployment.
 
 ### CI / delivery reality
 
-Commit `d3432d5` immediately triggered RushWay CI run #127 and Build Smoke run #8. At the current check both are still queued, with jobs showing no assigned runner yet. Therefore there is still no new compile/test evidence; do not call the build green until the jobs actually execute.
+RushWay CI run #128 and Build Smoke run #9 for documentation commit `9668fad1...` both failed before running workflow steps; the jobs report no runner execution and no usable job logs. A retry was attempted and again did not produce executable steps. This is not compile/test evidence.
+
+The current `f20c199` commit has not yet obtained workflow execution evidence. Local container execution was also blocked because the environment could not resolve `github.com`, so do not claim a local build/test pass.
 
 ### Verified historical performance baseline
 
@@ -33,7 +38,7 @@ These numbers are historical baseline measurements, not a claim that the current
 
 ### Fast-track release order
 
-1. Get current CI/build evidence.
+1. Obtain executable CI/build evidence on a commit containing the current WSS TLS optimization.
 2. Run/verify TCP MUX benchmark against the historical baseline.
 3. Fix any compile/test failures immediately.
 4. Audit and optimize remaining WebSocket masking allocation without changing protocol behavior.
@@ -45,13 +50,13 @@ These numbers are historical baseline measurements, not a claim that the current
 
 ### Explicit unfinished items
 
+- current-commit compile/test/benchmark evidence
 - WSS pooled transport
 - WSS UDP
 - non-MUX runtime
 - full GoWay interoperability validation
 - QUIC runtime
 - release packaging and v0.0.1
-- current-commit benchmark evidence
 
 ### Operational rules
 
