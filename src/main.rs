@@ -1,4 +1,5 @@
 mod crypto;
+mod mux_pool;
 mod protocol;
 mod proxy;
 mod runtime;
@@ -62,7 +63,7 @@ async fn main() -> Result<()> {
         if upstream.starts_with("wss://") {
             return wss_client::run_client_from_config(cfg, args.verify_ssl).await;
         }
-        runtime::run_client(cfg).await
+        mux_pool::run_client(cfg).await
     } else {
         runtime::run_server(cfg).await
     }
