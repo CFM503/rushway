@@ -16,7 +16,7 @@ fn main() {
     let mut bytes = 0usize;
     for _ in 0..ITERS {
         let frame = MuxFrame::decode_owned(encoded.clone()).unwrap();
-        bytes = bytes.wrapping_add(frame.payload.len());
+        bytes = bytes.wrapping_add(frame.payload().len());
         black_box(frame);
     }
     let elapsed = start.elapsed();
