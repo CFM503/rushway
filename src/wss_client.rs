@@ -284,10 +284,7 @@ impl WssSessionState {
             bail!("WSS physical session is full or closed");
         }
 
-        let id = self
-            .next_id
-            .fetch_add(1, Ordering::Relaxed)
-            .max(1);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
         let (tx, rx) = mpsc::channel(64);
         {
             let mut streams = self.streams.lock().await;
@@ -318,10 +315,7 @@ impl WssSessionState {
     }
 }
 
-async fn wss_reader_loop(
-    rd: &mut BoxReader,
-    session: Arc<WssSessionState>,
-) -> Result<()> {
+async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
         let Some((opcode, payload)) =
@@ -376,55 +370,48 @@ impl WssSessionPool {
         self: &Arc<Self>,
         target: &TargetAddr,
     ) -> Result<(Arc<WssSessionState>, u32, mpsc::Receiver<OwnedMuxFrame>)> {
-        loop {
-            let snapshot = {
-                let mut sessions = self.sessions.lock().await;
-                sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-                sessions.clone()
-            };
+        let snapshot = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
+            sessions.clone()
+        };
 
-            let mut ordered = snapshot;
-            ordered.sort_by_key(|s| s.active.load(Ordering::Acquire));
-            for session in ordered {
-                if !session.available() {
-                    continue;
-                }
-                if let Ok((id, rx)) = session.open_stream(target).await {
-                    return Ok((session, id, rx));
-                }
+        let mut ordered = snapshot;
+        ordered.sort_by_key(|s| s.active.load(Ordering::Acquire));
+        for session in ordered {
+            if !session.available() {
+                continue;
             }
-
-            let limit = configured_session_count();
-            {
-                let sessions = self.sessions.lock().await;
-                if sessions.len() < limit {
-                    drop(sessions);
-                    match WssSessionState::connect(&self.cfg).await {
-                        Ok(session) => {
-                            let opened = session.open_stream(target).await?;
-                            self.sessions.lock().await.push(session.clone());
-                            return Ok((session, opened.0, opened.1));
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+            if let Ok((id, rx)) = session.open_stream(target).await {
+                return Ok((session, id, rx));
             }
-
-            bail!("all WSS physical MUX sessions are full or unavailable")
         }
+
+        let limit = configured_session_count();
+        let can_create = {
+            let sessions = self.sessions.lock().await;
+            sessions.len() < limit
+        };
+        if can_create {
+            let session = WssSessionState::connect(&self.cfg).await?;
+            let opened = session.open_stream(target).await?;
+            self.sessions.lock().await.push(session.clone());
+            return Ok((session, opened.0, opened.1));
+        }
+
+        bail!("all WSS physical MUX sessions are full or unavailable")
     }
 }
 
-async fn handle_connection(
-    mut local: TcpStream,
-    pool: Arc<WssSessionPool>,
-) -> Result<()> {
+async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> Result<()> {
     let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
     if command != SocksCommand::Connect {
         bail!("WSS path only supports CONNECT");
     }
 
-    let (_session, stream_id, mut rx) = pool.acquire(&target).await?;
+    let (session, stream_id, mut rx) = pool.acquire(&target).await?;
+    let writer = session.writer.clone();
+
     if is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else {
@@ -434,18 +421,6 @@ async fn handle_connection(
     }
 
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    let writer = {
-        let sessions = pool.sessions.lock().await;
-        let session = sessions
-            .iter()
-            .find(|session| session.streams.blocking_lock().contains_key(&stream_id))
-            .cloned();
-        session.map(|session| session.writer.clone())
-    };
-    let Some(writer) = writer else {
-        bail!("WSS session disappeared after stream allocation");
-    };
-
     let buffer_size = pool.cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size];
