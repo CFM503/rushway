@@ -4,15 +4,15 @@
 
 ## Current checkpoint — 2026-09-13
 
-**Implementation coverage: ~90% estimate. Overall project/release completion: ~70% estimate.**
+**Implementation coverage: ~92% estimate. Overall project/release completion: ~72% estimate.**
 
-The implementation surface is substantially present across WS, WSS, non-MUX and QUIC. The next gate is exact CLI/config compatibility, then executable compile/test/interop evidence, stress, benchmarks and release artifacts.
+This is an engineering estimate, not a test score. The transport surface is substantially present across WS, WSS, non-MUX and QUIC. The active implementation gate is now CLI/config parity followed by the real compiler/test/interop gate.
 
 ### Latest handoff checkpoint
 
-- `d8b37416b66e0778fad0baee1afbd7277b0c48da` — interruption-safe AI handoff checkpoint.
-- Code baseline to resume from: `97718e3bd6f3433714fb8d16ea3e8e639d2913fe`.
-- No current-head runtime test result has been claimed.
+- `133d6fad53053b889c96233c122cfdfc68191290` — normalized GoWay single-dash CLI forms and propagated socket policy values.
+- `1cf7e24e00896fefb7f41491ed9b2309de04bfea` — updated interruption-safe AI handoff with the new implementation boundary.
+- No current-head compiler, unit-test, interoperability or release result has been claimed.
 
 ## Transport status
 
@@ -24,14 +24,14 @@ The implementation surface is substantially present across WS, WSS, non-MUX and 
 - [x] uint16 DATA chunking.
 - [x] Per-stream backpressure.
 - [x] Physical MUX pooling, least-active selection and session retirement.
-- [x] SOCKS5 UDP separate `UDP\\n` WebSocket transport.
+- [x] SOCKS5 UDP separate `UDP\n` WebSocket transport.
 - [ ] Current-head executable interop/benchmark evidence.
 
 ### Non-MUX
 
 - [x] Plain WS 1:1 TCP client/server path.
 - [x] HTTP CONNECT and SOCKS5 CONNECT front-end.
-- [x] GoWay-style `host:port\\n` bootstrap and XOR handling.
+- [x] GoWay-style `host:port\n` bootstrap and XOR handling.
 - [ ] Exact 1:1 pooling/lifecycle parity evidence.
 - [ ] Executable GoWay interoperability evidence.
 
@@ -53,7 +53,7 @@ The implementation surface is substantially present across WS, WSS, non-MUX and 
 - [x] GoWay ALPN `goway-quic` / `h3`.
 - [x] 60s idle / 15s keepalive.
 - [x] GoWay-derived receive-window configuration.
-- [x] TCP stream bootstrap and `OK\\n` / `ERR: DIAL_FAILED\\n` semantics.
+- [x] TCP stream bootstrap and `OK\n` / `ERR: DIAL_FAILED\n` semantics.
 - [x] QUIC physical connection reuse with single-flight dialing.
 - [x] QUIC UDP 2-byte big-endian datagram framing.
 - [x] QUIC UDP keyed authentication and XOR payload handling.
@@ -65,18 +65,24 @@ The implementation surface is substantially present across WS, WSS, non-MUX and 
 - [x] `max-conn` runtime limit groundwork.
 - [x] block-local target policy groundwork.
 - [x] TCP_NODELAY runtime policy.
-- [x] socket send/receive buffer implementation groundwork.
-- [x] TCP keepalive implementation groundwork.
-- [ ] Exact GoWay single-hyphen multi-character CLI forms (`-up`, `-fakehost`, `-mux-sessions`, etc.).
-- [ ] Full propagation of `socket-buffer`, `dns`, `no-tcp-keepalive` from CLI/JSON into runtime behavior.
-- [ ] Exact remote DNS server/cache/fallback behavior.
+- [x] socket send/receive buffer configuration propagation.
+- [x] TCP keepalive configuration propagation.
+- [x] GoWay single-hyphen multi-character CLI normalization (`-up`, `-fakehost`, `-mux-sessions`, etc.).
+- [x] Parser tests for legacy aliases and ordinary short flags.
+- [ ] Remote DNS runtime implementation: 5s remote lookup, system fallback and 5-minute positive cache.
+- [ ] Remote DNS integration into both target dialing and upstream host dialing.
+- [ ] Exact socket-option propagation audit across non-MUX/WSS upstream connections.
 - [ ] Every SOCKS5 REP/error/FRAG branch verified against GoWay.
 - [ ] HTTP CONNECT error/close parity verified.
 - [ ] Full browser/TLS profile parity.
 
+## Source-derived DNS contract
+
+GoWay v1.8.4 uses a custom resolver with a 5-second timeout, remote DNS first, system-DNS fallback on failure and a 5-minute positive cache. The configured DNS resolver is used for server-side target resolution and client-side upstream host resolution; TLS/SNI keeps the original hostname while transport dialing may use the resolved address.
+
 ## Verification gate — not yet executed on current head
 
-The current execution cloud has no usable `cargo` or `rustc`, and GitHub dependency retrieval is unavailable. Therefore these remain **not verified**:
+The current execution environment has no usable `cargo` or `rustc`; the GitHub Actions connector also reports no workflow run associated with commit `133d6fad53053b889c96233c122cfdfc68191290`. Therefore these remain **not verified**:
 
 - `cargo fmt -- --check`
 - `cargo check --all-targets`
@@ -89,16 +95,18 @@ The current execution cloud has no usable `cargo` or `rustc`, and GitHub depende
 - Windows x64 / Debian 12 x64 / ARMv7 current-head binaries
 - v0.0.1 smoke test and release
 
-## Mandatory resume order for the next AI
+## Mandatory resume order
 
-1. Implement exact GoWay single-hyphen multi-character CLI normalization without changing ordinary `-p`, `-k`, `-W` behavior.
-2. Wire parsed socket-buffer, keepalive and DNS values into `RuntimeConfig`; remove throwaway locals.
-3. Add/adjust parser unit tests for GoWay-style and GNU-style aliases.
-4. Run `cargo fmt -- --check`.
-5. Run `cargo check --all-targets` and fix every compiler error.
-6. Run `cargo test --all-targets --all-features` and fix every failing test.
-7. Build release and start the WS/WSS/QUIC interop matrix.
-8. Stress 1/100/500/1000 streams, benchmark c1/c8/c32, build target platforms, smoke-test and tag v0.0.1.
+1. Implement the exact GoWay remote-DNS resolver contract.
+2. Audit non-MUX/WSS upstream socket policy propagation.
+3. Compile current head in a real Rust environment and fix every compiler failure.
+4. Run all unit tests and fix every failure.
+5. Execute WS MUX/non-MUX TCP + UDP.
+6. Execute WSS MUX/non-MUX TCP + UDP.
+7. Execute QUIC TCP + UDP.
+8. Run GoWay -> RushWay and RushWay -> GoWay interoperability.
+9. Stress 1/100/500/1000 streams, sustained large payloads and mixed slow/fast streams.
+10. Benchmark c1/c8/c32, build Windows/Debian/ARMv7 artifacts, smoke-test and tag v0.0.1.
 
 Never turn source inspection into a false runtime-pass claim.
 
@@ -106,6 +114,6 @@ Never turn source inspection into a false runtime-pass claim.
 
 Only these files are canonical handoff state:
 
-1. `AI_HANDOFF.md` — chronological decisions/commits/blockers/next step.
+1. `AI_HANDOFF.md` — chronological decisions/blockers/next step.
 2. `PROGRESS.md` — compact project dashboard.
 3. `SPEC.md` — source-derived GoWay compatibility contract.
