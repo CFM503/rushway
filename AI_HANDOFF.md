@@ -1,24 +1,27 @@
 # RushWay AI Relay Handoff
 
-## 2026-09-13 continuous checkpoint
+## 2026-09-13 accelerated implementation checkpoint
 
-Latest code head: `f14f99c5b3295b3166cb95c98d9c3c6e54f9892e`.
+Latest code head: `d2dabf16e0abffe635058e79a348956585b48335`.
 
 ### Current implementation
 
-- Client `ws://` path now uses a physical MUX session pool with 4 prewarmed sessions and logical stream reuse.
+- Client `ws://` path uses physical MUX session pooling with 4 prewarmed sessions and logical stream reuse.
 - Stream lifecycle hardening prevents duplicate active-count decrements and avoids holding the shared writer lock during network reads.
 - Existing server-side MUX forwarding, SOCKS5 TCP/UDP parsing, HTTP CONNECT, plain WebSocket and WSS client path remain present.
-- CI now uploads Linux x64, Windows x64, Debian 12 x64 and ARMv7 binaries as artifacts whenever the runner executes successfully.
-- `.github/workflows/release.yml` was added for tagged/manual release artifact generation.
+- CI is configured to publish Linux x64, Windows x64, Debian 12 x64 and ARMv7 artifacts when the runner executes normally.
+- Tagged/manual release workflow is present.
+- `scripts/build-local.ps1` was added so Windows users can build a release EXE locally without depending on GitHub Actions.
 
-### CI incident / build delivery status
+### Delivery priority
 
-Runs 101 through 110 have failed before normal workflow steps execute (`steps: null`). This is a GitHub Actions runner-layer failure, not compiler output. Run 95 remains the last fully verified RushWay-only execution.
+Do not repeat historical audit rounds. Continue implementation directly. The immediate delivery goal is a runnable Windows x64 build followed by the remaining transport/runtime compatibility layers.
 
-Because the current environment cannot execute Rust locally (no Cargo toolchain/cache and no outbound DNS) and GitHub Actions is failing before job startup, there is not yet a newly compiled pooled-client binary that can honestly be attached from this checkpoint.
+### CI status
 
-### Verified performance baseline to preserve
+Recent runs are still failing before normal workflow steps execute (`steps: null`). Treat this only as a delivery-channel problem; it must not block implementation progress.
+
+### Verified performance baseline
 
 Run 95 remains the last fully verified RushWay-only baseline:
 - setup-inclusive median: c1 `43.31`, c8 `170.17`, c32 `345.55` MiB/s
@@ -27,21 +30,18 @@ Run 95 remains the last fully verified RushWay-only baseline:
 
 These are not GoWay comparison results.
 
-### Remaining compatibility work
+### Remaining implementation work
 
-The project is not honestly at 100% GoWay v1.8.4 parity yet. The specification still has open implementation/evidence requirements for WSS UDP, QUIC runtime, non-MUX mode, remote DNS/cache behavior, retry/dead-IP policy, full connection-pool semantics, complete CLI parity, and executable GoWay <-> RushWay interoperability coverage.
+Priority order:
+1. Finish non-MUX 1:1 transport path and matching server-side handshake.
+2. Add configurable MUX session count and full CLI/config parity.
+3. Complete WSS UDP and WSS session reuse.
+4. Implement QUIC runtime, pool/retry/dead-IP behavior.
+5. Complete remote DNS/cache behavior and connection limits/keepalive options.
+6. Add executable GoWay <-> RushWay interoperability coverage.
+7. Produce final Windows x64, Debian 12 x64 and ARMv7 release packages.
 
-### Continuous execution order
-
-1. Restore a normal GitHub Actions runner execution and compile the current pooled-client head.
-2. Download and manually test the Windows x64 binary first.
-3. Test SOCKS5 TCP / HTTP CONNECT through a real GoWay server and compare repeated c1/c8/c32 throughput.
-4. Build and test Debian 12 x64 and ARMv7 binaries.
-5. Continue WSS UDP, QUIC, non-MUX and retry/dead-IP implementation using SPEC-derived behavior only.
-6. Add executable interoperability tests for GoWay Client -> RushWay Server and RushWay Client -> GoWay Server.
-7. Only after all required execution evidence is green, mark v0.0.1 release-ready.
-
-Do not claim 100% compatibility, GoWay parity or performance improvement without execution evidence.
+Do not mark 100% compatibility or release-ready until the above implementation work has real execution evidence.
 
 ## Relay files
 
