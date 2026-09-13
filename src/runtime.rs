@@ -138,8 +138,13 @@ async fn handle_mux_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHa
                 }
             }
             MuxCommand::Data => {
-                let tx = streams.lock().await.get(&frame.stream_id).map(|s| s.tx.clone());
-                if let Some(tx) = tx { if tx.send(StreamCommand::Data(frame)).await.is_err() { streams.lock().await.remove(&frame.stream_id); } }
+                let stream_id = frame.stream_id;
+                let tx = streams.lock().await.get(&stream_id).map(|s| s.tx.clone());
+                if let Some(tx) = tx {
+                    if tx.send(StreamCommand::Data(frame)).await.is_err() {
+                        streams.lock().await.remove(&stream_id);
+                    }
+                }
             }
             MuxCommand::Fin => {
                 let tx = streams.lock().await.get(&frame.stream_id).map(|s| s.tx.clone());
