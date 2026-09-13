@@ -15,72 +15,67 @@
 - Stage 6 GitHub Actions: `[x]`
 - Stage 7 v0.0.1 release: `[ ]`
 
-### Current main / optimization infrastructure
-- Formal RushWay benchmark baseline: `7a5d4f2f72c021e6a9cb9aab5e7236e61718d5a2`.
-- Cross-proxy runner introduced: `e10020e7437bf575b6f674591b2ca5c146233fe1`.
-- Current repeated-sample wrapper: `872ca45b800ab06c8594e4317b91d2ed1128030b`.
-- Current CI median stage: `1b1a5cc01d6b2e0d5dfb3b707e0d6733ad12725c`.
+### Current verified head / optimization infrastructure
+- Latest verified head: `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`.
+- Cross-proxy runner: `e10020e7437bf575b6f674591b2ca5c146233fe1`.
+- Repeated-sample wrapper: `872ca45b800ab06c8594e4317b91d2ed1128030b`.
+- CI median stage: `1b1a5cc01d6b2e0d5dfb3b707e0d6733ad12725c`.
 - GoWay address-format compatibility fix: `9d3bc56358218aec673af589334027d823a900a0`.
 - Optional pinned GoWay comparison CI: `a0e787a6642401003f34e941d09d31501dbb1422`.
+- Steady-state benchmark support: current head `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`.
 - Rust toolchain: `1.82.0`.
 
 ## Latest CI evidence
 
-### Run 89 — workflow `34754682561`
-Head: `a0e787a6642401003f34e941d09d31501dbb1422`
-- `goway-comparison`: **success**, but all comparison steps were skipped because the optional `WAY_READ_TOKEN` secret is not configured for the private sibling repository `CFM503/way`.
-- `test`: **in progress** at the latest check; do not count it as verified until completion.
+### Run 95 — workflow `34755206730` — **fully green**
+Head: `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`
 
-This means the comparison plumbing is present, but there is still **no GoWay throughput measurement**.
+- `test`: **success** — Rust 1.82 tests, release build, MUX benchmark, formal e2e, common proxy runner, repeated setup-inclusive median and repeated steady-state median all passed.
+- `windows-x64`: **success**.
+- `goway-comparison`: **success**, but comparison steps were skipped because `WAY_READ_TOKEN` is not configured for the private sibling repository `CFM503/way`.
 
-### Run 83 — workflow `34753910015`
-Head: `f40cf667360adfad4ad824d0dbac6f079026cff7`
-- Linux tests/release/MUX/e2e/cross-proxy self-check: **success**.
-- Windows x64 GNU build: **success**.
+The current RushWay-only benchmark evidence from this verified run is:
 
-Observed same-run benchmark outputs:
-- formal `e2e_bench`: `c1=76.42 c8=161.85 c32=314.20 MiB/s`
-- common `proxy_bench`: `c1=76.48 c8=274.57 c32=329.86 MiB/s`
+| Workload | c1 | c8 | c32 |
+|---|---:|---:|---:|
+| Setup-inclusive median, 5 samples | 43.31 | 170.17 | 345.55 MiB/s |
+| Steady-state median, 5 samples | 43.06 | 205.04 | 349.28 MiB/s |
 
-The large 8-flow variation demonstrates that a single connection-establishment-inclusive run is noisy enough that it should not be used for performance conclusions. The repeated-sample median wrapper was added for this reason.
+Both are local end-to-end proxy benchmarks using the same runner conditions; neither is a one-way Internet throughput claim.
 
-### Run 76 — workflow `34752632479`
-Head: `7a5d4f2f72c021e6a9cb9aab5e7236e61718d5a2`
-- Linux tests: **success**
-- Linux release build: **success**
-- MUX benchmark: **success**
-- End-to-end proxy benchmark: **success**
-- Windows x64 GNU build: **success**
+### Run 95 MUX microbenchmark
+- copied decode: `11456.35 ns/op`
+- owned/reused decode: `1.54 ns/op`
+- reported owned-vs-copy speedup: `7431.47x`
 
-Formal RushWay baseline:
+This is directional microbenchmark evidence only and is not an end-to-end speed claim.
+
+### Run 95 formal e2e benchmark
+`rushway_e2e payload_mib=4 roundtrip_echo=1 c1_mib_s=43.06 c8_mib_s=166.93 c32_mib_s=383.52`
+
+The common cross-proxy runner remains the preferred comparison metric because it uses the same launch and protocol workload shape for both implementations.
+
+### Earlier evidence
+Run 83 / workflow `34753910015` showed large same-run c8 variance between the formal and common runners. This is why five-sample medians are now used instead of single-run performance conclusions.
+
+Run 76 / workflow `34752632479` formal baseline:
 `rushway_e2e payload_mib=4 roundtrip_echo=1 c1_mib_s=43.69 c8_mib_s=219.81 c32_mib_s=340.16`
-
-Interpretation:
-- local SOCKS5 -> WebSocket/MUX -> RushWay server -> local TCP echo;
-- not one-way Internet throughput;
-- timer includes SOCKS5 and upstream WebSocket establishment;
-- immutable payload storage uses `Arc<[u8]>`.
 
 ## Cross-proxy benchmark infrastructure
 
-`src/bin/proxy_bench.rs` now supports both implementation shapes:
+`src/bin/proxy_bench.rs` supports both implementation shapes:
 - RushWay gets `-p <port>`;
 - GoWay gets `-p :<port>` to match its listen-address CLI contract;
 - both use `--up ws://127.0.0.1:<server>/` on the client side;
 - same 4 MiB deterministic payload, 1/8/32 concurrency, SOCKS5 no-auth and local TCP echo.
 
-`scripts/repeat_proxy_bench.sh` executes repeated samples and reports the median for c1/c8/c32. CI runs five RushWay samples.
+`scripts/repeat_proxy_bench.sh` executes repeated samples and reports the median for c1/c8/c32. CI runs five samples.
+
+The benchmark now has two modes:
+- `setup_inclusive`: timer includes local SOCKS5 negotiation, upstream WebSocket setup, transfer and echo;
+- `steady_state`: a warm-up flow establishes the physical upstream WebSocket before the timed flows, so the timed interval focuses on new proxy streams plus data transfer.
 
 The optional `goway-comparison` job pins GoWay to `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc` and Go 1.25.0. Because `CFM503/way` is private, the job requires a repository-read token in `WAY_READ_TOKEN`; without it, the job safely skips rather than failing the main CI.
-
-## MUX microbenchmark evidence
-
-Run 76:
-- copied decode: `12488.78 ns/op`
-- owned/reused decode: `1.74 ns/op`
-- reported owned-vs-copy speedup: `7169.12x`
-
-This is directional microbenchmark evidence only and is not an end-to-end speed claim.
 
 ## Current runtime performance state
 
@@ -127,7 +122,7 @@ Do not optimize these blindly. First obtain controlled RushWay vs GoWay evidence
 
 ## Known cleanup backlog
 
-Compiler warnings remain in the verified baseline. Examples include unused protocol helpers, dead-code benchmark fields and unreachable expressions after intentional infinite UDP loops. These are cleanup items, not current correctness failures.
+Compiler warnings remain in the verified baseline. Run 95 still reports unused protocol helpers, dead-code fields/methods and unreachable expressions after intentional infinite UDP loops. These are cleanup items, not current correctness failures.
 
 ## GoWay comparison baseline
 
@@ -136,16 +131,17 @@ Reference commit: `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
 
 Documented GoWay performance mechanisms include pooled WebSocket buffers, owned MUX DATA, physical MUX session pooling, active-stream-aware scheduling, byte-level backpressure, connection-pool prewarming/refill and optimized WebSocket masking. These are comparison targets, not claims of RushWay parity.
 
+There is still **no measured GoWay throughput number** because `WAY_READ_TOKEN` is unavailable to the optional CI comparison job.
+
 ## Immediate continuous sequence
 
-1. Finish Run 89 and record the actual repeated RushWay median output.
-2. Enable the optional private-GoWay CI comparison with `WAY_READ_TOKEN`, then capture GoWay 1/8/32 medians using the same runner.
-3. Put both implementations into one comparison table before changing runtime code for speed.
-4. Add a separate steady-state transfer benchmark that excludes connection setup.
-5. Profile the slower path and only then optimize outbound MUX allocation, WS buffer reuse, writer contention or physical session pooling.
-6. Continue WSS, QUIC, non-MUX, retry/dead-IP/pool and release work after the core benchmark/compatibility slice is stable.
-7. Add Debian 12 x64 and KWRT/OpenWrt ARMv7 build jobs and artifact packaging.
-8. Only after required evidence is green, create v0.0.1 release.
+1. Enable the optional private-GoWay CI comparison with `WAY_READ_TOKEN`, then capture GoWay setup-inclusive and steady-state c1/c8/c32 medians using the identical runner.
+2. Put RushWay and GoWay results into one comparison table before changing runtime code for speed.
+3. Profile the slower/hotter path and only then optimize outbound MUX allocation, WS buffer reuse, writer contention or physical session pooling.
+4. After the core benchmark comparison is stable, continue WSS UDP, QUIC, non-MUX, retry/dead-IP/pool and broader compatibility work.
+5. Add Debian 12 x64 and KWRT/OpenWrt ARMv7 build jobs plus artifact packaging.
+6. Add true GoWay <-> RushWay interoperability tests.
+7. Only after required evidence is green, create v0.0.1 release.
 
 ## AI relay rule
 
