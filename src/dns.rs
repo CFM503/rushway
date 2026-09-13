@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
@@ -16,12 +16,30 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
+
 type Cache = Arc<Mutex<HashMap<String, (IpAddr, Instant)>>>;
+struct State { server: Option<IpAddr>, cache: Cache }
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
-pub(crate) fn new_cache() -> Cache { Arc::new(Mutex::new(HashMap::new())) }
+fn state() -> &'static Mutex<State> {
+    STATE.get_or_init(|| Mutex::new(State { server: None, cache: Arc::new(Mutex::new(HashMap::new())) }))
+}
 
-pub(crate) async fn resolve_host(host: &str, server: Option<&str>, cache: &Cache) -> Result<IpAddr> {
+pub(crate) async fn configure(server: Option<String>) -> Result<()> {
+    let parsed = match server.as_deref() {
+        Some(value) => Some(value.parse::<IpAddr>().map_err(|_| anyhow!("-dns requires a valid IP address, got '{value}'"))?),
+        None => None,
+    };
+    state().lock().await.server = parsed;
+    Ok(())
+}
+
+pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() { return Ok(ip); }
+    let (server, cache) = {
+        let guard = state().lock().await;
+        (guard.server, guard.cache.clone())
+    };
     let key = host.trim_end_matches('.').to_ascii_lowercase();
     {
         let mut guard = cache.lock().await;
@@ -30,7 +48,7 @@ pub(crate) async fn resolve_host(host: &str, server: Option<&str>, cache: &Cache
             guard.remove(&key);
         }
     }
-    let remote_result = match server.and_then(|s| s.parse::<IpAddr>().ok()) {
+    let remote_result = match server {
         Some(server_ip) => resolve_remote(&key, server_ip).await,
         None => Err(anyhow!("remote DNS not configured")),
     };
@@ -44,6 +62,10 @@ pub(crate) async fn resolve_host(host: &str, server: Option<&str>, cache: &Cache
     };
     cache.lock().await.insert(key, (resolved, Instant::now() + CACHE_TTL));
     Ok(resolved)
+}
+
+pub(crate) async fn resolve_socket(host: &str, port: u16) -> Result<SocketAddr> {
+    Ok(SocketAddr::new(resolve_host(host).await?, port))
 }
 
 async fn resolve_remote(host: &str, server: IpAddr) -> Result<IpAddr> {
