@@ -33,11 +33,26 @@ fn configured_session_count() -> usize {
 fn configured_cipher(key: &Option<String>) -> XorCipher { XorCipher::new(key.as_deref().unwrap_or("")) }
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) { cipher.apply(payload); }
 
+// Keep the MUX serialization buffer owned by the caller. The hot TCP->MUX path
+// can therefore reuse one allocation for every DATA frame instead of allocating
+// a fresh Vec for each chunk.
+async fn send_mux_parts_reuse(
+    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    stream_id: u32,
+    command: MuxCommand,
+    payload: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    scratch.clear();
+    scratch.reserve(7 + payload.len().saturating_sub(scratch.capacity().saturating_sub(7)));
+    write_frame_parts(scratch, stream_id, command, payload).map_err(|e| anyhow!(e.to_string()))?;
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, scratch, 2, true).await
+}
+
 async fn send_mux_parts(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + payload.len());
-    write_frame_parts(&mut bytes, stream_id, command, payload).map_err(|e| anyhow!(e.to_string()))?;
-    let mut w = writer.lock().await;
-    write_frame(&mut *w, &bytes, 2, true).await
+    send_mux_parts_reuse(writer, stream_id, command, payload, &mut bytes).await
 }
 
 fn parse_upstream(input: &str) -> Result<(String, String)> {
@@ -258,11 +273,12 @@ async fn handle_udp_proxy(mut control: TcpStream, cfg: RuntimeConfig, bind_hint:
     let udp_send = udp.clone(); let writer_send = writer.clone(); let cipher_send = configured_cipher(&cfg.key); let latest_send = latest_client.clone();
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
+        let mut frame_scratch = Vec::with_capacity(64 * 1024 + 7);
         loop {
             let (n, peer) = udp_send.recv_from(&mut buf).await?;
             *latest_send.lock().await = Some(peer);
             let mut data = buf[..n].to_vec(); transform_payload(&cipher_send, &mut data);
-            let mut w = writer_send.lock().await; write_frame(&mut *w, &data, 2, true).await?;
+            send_mux_parts_reuse(&writer_send, 0, MuxCommand::Data, &data, &mut frame_scratch).await?;
         }
         Result::<()>::Ok(())
     });
@@ -287,13 +303,14 @@ async fn handle_tcp_proxy(mut local: TcpStream, cfg: RuntimeConfig, pool: Arc<Mu
     let writer = session.writer.clone();
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut frame_scratch = Vec::with_capacity(buf.len().min(u16::MAX as usize) + 7);
         loop {
             let n = local_rd.read(&mut buf).await?;
-            if n == 0 { let _ = send_mux_parts(&writer, id, MuxCommand::Fin, &[]).await; break; }
-            let mut off = 0usize;
+            if n == 0 { let _ = send_mux_parts_reuse(&writer, id, MuxCommand::Fin, &[], &mut frame_scratch).await; break; }
+            let mut off = 0;
             while off < n {
                 let end = (off + u16::MAX as usize).min(n);
-                send_mux_parts(&writer, id, MuxCommand::Data, &buf[off..end]).await?;
+                send_mux_parts_reuse(&writer, id, MuxCommand::Data, &buf[off..end], &mut frame_scratch).await?;
                 off = end;
             }
         }
