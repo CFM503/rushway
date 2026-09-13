@@ -89,9 +89,9 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> io::Result<TcpStre
     Ok(stream)
 }
 
-async fn one_flow(proxy_port: u16, target_port: u16, payload: &[u8]) -> io::Result<usize> {
+async fn one_flow(proxy_port: u16, target_port: u16, payload: Vec<u8>) -> io::Result<usize> {
     let mut stream = socks5_connect(proxy_port, target_port).await?;
-    stream.write_all(payload).await?;
+    stream.write_all(&payload).await?;
     let mut echoed = vec![0u8; payload.len()];
     stream.read_exact(&mut echoed).await?;
     if echoed != payload {
@@ -104,7 +104,7 @@ async fn run_case(proxy_port: u16, target_port: u16, concurrency: usize, payload
     let start = Instant::now();
     let mut tasks = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
-        tasks.push(tokio::spawn(one_flow(proxy_port, target_port, payload)));
+        tasks.push(tokio::spawn(one_flow(proxy_port, target_port, payload.to_vec())));
     }
     let mut total = 0usize;
     for task in tasks {
