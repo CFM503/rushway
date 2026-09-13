@@ -1,102 +1,74 @@
 # RushWay AI Relay Handoff
 
-## 2026-09-13 verified checkpoint
+## 2026-09-13 continuous engineering checkpoint
 
-Latest verified head: `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`
+Latest code head: `590a818c843af81043277f107eaae2fc8bd375c8`.
 
-Workflow `34755206730` (Run 95) is fully green:
-- Rust 1.82 tests: success
-- release build: success
-- MUX benchmark: success
-- formal e2e benchmark: success
-- common proxy benchmark self-check: success
-- repeated setup-inclusive median: success
-- repeated steady-state median: success
-- Windows x64 GNU build: success
+### CI / platform status
 
-The optional GoWay comparison job completed successfully but did not execute its comparison steps, so there is still no measured GoWay throughput result.
+- Run 100 (`34756739632`) proved the Rust 1.82 main test/release path and Windows/Debian paths; its real ARM failure was a transitive Edition 2024 dependency requiring a newer Cargo.
+- ARMv7 CI was then pinned to Rust 1.86.0 in `.github/workflows/ci.yml` while the main compatibility/test job remains Rust 1.82.0.
+- Runs 101-105 repeatedly failed at the GitHub Actions run/job layer with jobs reported as completed + failure but `steps: null`; no compile or test logs were produced. Treat these as CI infrastructure failures, not code evidence.
 
-## Run 95 benchmark evidence
+### New runtime optimization work
 
-MUX microbenchmark:
+Commits:
+- `f23ab32d8b5ef8343a81b9bfa4665da945d06e5b` — add `src/mux_pool.rs` with client-side physical MUX session pooling.
+- `590a818c843af81043277f107eaae2fc8bd375c8` — route normal `ws://` client mode through the pooled MUX client.
+
+The new client path changes the connection model:
+- prewarm up to 4 physical WebSocket/MUX sessions;
+- local TCP proxy connections become logical MUX streams;
+- choose the least-active reusable physical session;
+- maintain a per-session stream dispatch map and one reader task;
+- reuse the same physical WebSocket across repeated local TCP connections;
+- retain the existing WSS client path separately;
+- retain SOCKS5 UDP handling in the pooled client module.
+
+This directly targets the largest currently visible client-side setup overhead: every local TCP connection previously created a fresh upstream WebSocket + MUX physical connection.
+
+### Current performance interpretation
+
+This pooling change is an architectural optimization, not yet a measured speed claim. Existing RushWay-only benchmark evidence remains:
+
+| Mode | c1 | c8 | c32 |
+|---|---:|---:|---:|
+| Setup-inclusive median, Run 95 | 43.31 | 170.17 | 345.55 MiB/s |
+| Steady-state median, Run 95 | 43.06 | 205.04 | 349.28 MiB/s |
+
+Existing MUX ownership microbenchmark evidence remains directional only:
 - copied decode: `11456.35 ns/op`
 - owned/reused decode: `1.54 ns/op`
 - reported owned-vs-copy speedup: `7431.47x`
 
-Formal e2e:
-`rushway_e2e payload_mib=4 roundtrip_echo=1 c1_mib_s=43.06 c8_mib_s=166.93 c32_mib_s=383.52`
+No RushWay-vs-GoWay speed conclusion is permitted until the optional private GoWay comparison executes successfully.
 
-Common cross-proxy five-sample medians:
+### Static audit items before trusting the pooled client
 
-| Mode | c1 | c8 | c32 |
-|---|---:|---:|---:|
-| Setup-inclusive | 43.31 | 170.17 | 345.55 MiB/s |
-| Steady-state | 43.06 | 205.04 | 349.28 MiB/s |
+The new pool should be compiled and exercised before further optimization. Pay particular attention to:
+- stream active-counter lifecycle on terminal FIN/RST;
+- reader-loop WebSocket ping/pong handling without holding the shared writer lock across a network read;
+- session replacement after physical connection failure;
+- prewarm behavior when the upstream is unavailable;
+- repeated c1/c8/c32 setup-inclusive and steady-state medians versus the pre-pool baseline.
 
-Both modes use a 4 MiB deterministic payload, concurrency 1/8/32, local TCP echo, local SOCKS5 no-auth and WebSocket upstream. Setup-inclusive includes initial upstream setup; steady-state performs one warm-up flow before timed cases.
-
-These are RushWay-only measurements. They are not evidence that RushWay is faster than GoWay.
-
-## Benchmark infrastructure history
-
-- `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47` — current verified head; steady-state runner formatting fixed.
-- `c985438d7412c71521abbca235da41c27a080354` — steady-state benchmark CI introduced before the formatting fix.
-- `a0e787a6642401003f34e941d09d31501dbb1422` — optional pinned GoWay comparison job.
-- `1b1a5cc01d6b2e0d5dfb3b707e0d6733ad12725c` — repeated five-sample median stage.
-- `872ca45b800ab06c8594e4317b91d2ed1128030b` — repeated benchmark wrapper.
-- `e10020e7437bf575b6f674591b2ca5c146233fe1` — common proxy benchmark runner.
-- `7a5d4f2f72c021e6a9cb9aab5e7236e61718d5a2` — formal RushWay e2e baseline.
-
-## Current runtime performance status
-
-Completed ownership work:
-- `OwnedMuxFrame` retains original frame storage.
-- Server MUX DATA receive and WSS downstream use owned frames.
-- Plain WebSocket downstream uses the owned frame path.
-- DATA payload is forwarded without cloning.
-- WebSocket binary ownership transfer is covered by tests.
-
-Potential hotspots still requiring evidence:
-- outbound MUX frame allocation
-- WebSocket receive-buffer capacity reuse
-- shared WebSocket writer-lock contention
-- physical MUX session pooling / scheduling
-
-Do not optimize those areas blindly. First compare GoWay under the identical runner or collect allocation/CPU profile evidence.
-
-## Functional gaps still open
+### Functional gaps still open
 
 - WSS UDP
 - runtime QUIC
-- runtime connection pool/reuse/retry/dead-IP
+- runtime connection pool/reuse/retry/dead-IP beyond the new TCP MUX physical-session reuse
 - runtime non-MUX mode
 - true GoWay <-> RushWay interoperability evidence
-- Debian 12 x64 build/artifact packaging
-- KWRT/OpenWrt ARMv7 build/artifact packaging
+- Debian 12 x64 artifact packaging
+- KWRT/OpenWrt ARMv7 artifact packaging
 - v0.0.1 release
 
-Compiler warnings remain but are not current CI failures.
+Compiler warnings remain but are not current correctness evidence.
 
-## Immediate relay sequence
+## Relay operating rule
 
-1. Obtain the required access for the private GoWay benchmark and run the pinned GoWay v1.8.4 through both benchmark modes.
-2. Produce one RushWay vs GoWay c1/c8/c32 comparison table.
-3. Profile the slower/hotter path and optimize only evidenced hotspots.
-4. Continue WSS UDP, QUIC, non-MUX, pool/retry/dead-IP, interoperability and platform build work.
-5. Synchronize `PROGRESS.md` and `AI_HANDOFF.md` after each verified milestone.
-
-## Do not claim without execution evidence
-
-- GoWay/RushWay interoperability
-- RushWay faster than GoWay
-- WSS UDP complete
-- QUIC runtime complete
-- non-MUX parity
-- production readiness
-- v0.0.1 release readiness
-
-## Canonical relay files
-
-- `PROGRESS.md` — roadmap, stage status, verified evidence and next sequence.
-- `AI_HANDOFF.md` — detailed chronological handoff, incidents and benchmark caveats.
-- `SPEC.md` — implementation/compatibility specification.
+1. Read `PROGRESS.md`, `AI_HANDOFF.md` and `SPEC.md` before changing code.
+2. Treat the latest repository head and latest Actions run as authoritative; old benchmark notes are historical.
+3. Make one logical runtime change at a time, validate it, then record exact commit/run/evidence.
+4. Never convert a microbenchmark, RushWay-only benchmark or documentation claim into a GoWay comparison claim.
+5. Keep `PROGRESS.md` as the canonical status table and this file as the chronological handoff log.
