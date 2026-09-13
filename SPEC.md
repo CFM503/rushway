@@ -6,6 +6,30 @@ This document is the migration contract for RushWay. The compatibility baseline 
 
 **Rule:** implementation must follow observed v1.8.4 behavior, not assumptions about how a proxy of this type normally works.
 
+## Compatibility status at 2026-09-13
+
+This is a living specification, not a statement that all listed features are implemented. Use the following status vocabulary:
+
+- **Implemented** — current RushWay code contains the path, but it still needs current-head executable evidence before being called production-ready or interop-complete.
+- **Partially implemented** — an important slice exists, but parity or lifecycle behavior is incomplete.
+- **Not implemented** — no validated runtime implementation exists yet.
+
+Current high-level status:
+
+| Area | Status |
+|---|---|
+| Plain WS handshake | Implemented |
+| Plain WS MUX TCP | Implemented |
+| Plain WS physical MUX pooling | Implemented |
+| Plain WS SOCKS5 UDP slice | Implemented, interop evidence pending |
+| WSS TCP client path | Implemented, pooling incomplete |
+| WSS physical pooling | Not implemented |
+| WSS UDP | Not implemented/validated |
+| Non-MUX parity | Not implemented |
+| QUIC / QUIC+TLS runtime | Not implemented |
+| Full GoWay interoperability | Not validated |
+| Release artifacts on current head | Not validated |
+
 ## Confirmed protocol constants
 
 - Version: `1.8.4`
@@ -152,21 +176,33 @@ The v1.8.4 test suite explicitly starts SOCKS5 with `[VER=5, NMETHODS=1, METHOD=
 ### Exact control-flow findings extracted so far
 
 - SOCKS5 UDP ASSOCIATE creates a local UDP listener with `net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})`, i.e. an ephemeral local UDP port. If this bind fails, GoWay sends the SOCKS5 general-failure reply (`REP=0x01`) and terminates the local connection.
-- The UDP-associate response therefore advertises the dynamically bound relay endpoint rather than a fixed port. RushWay's parser currently understands the response/request envelope, but the runtime relay is not implemented yet.
+- The UDP-associate response therefore advertises the dynamically bound relay endpoint rather than a fixed port.
 - The source explicitly checks errors/EOF for the fixed-size `io.ReadFull` reads used while parsing UDP ASSOCIATE address fields; truncated IPv4/domain/IPv6 inputs must not proceed with partially initialized addresses.
-- SOCKS5 UDP relay frames are parsed as `[RSV(2), FRAG(1), ATYP(1), ADDR..., PORT(2), PAYLOAD...]`. The current source path inspects `ATYP` and computes the payload offset before dialing/relaying the destination.
+- SOCKS5 UDP relay frames are parsed as `[RSV(2), FRAG(1), ATYP(1), ADDR..., PORT(2), PAYLOAD...]`. The source path inspects `ATYP` and computes the payload offset before dialing/relaying the destination.
 - The static SOCKS5/HTTP responses are preallocated in v1.8.4 to avoid per-connection allocations.
 - HTTP CONNECT header acquisition is a looped read until `\r\n\r\n` or `\n\n`, with the 8192-byte hard limit; malformed/incomplete header reads map to HTTP 400 rather than being silently accepted.
 
-These findings are still not the complete forwarding lifecycle: exact target dial, UDP reply path, FRAG handling, connection-close ordering and every SOCKS5 REP/error branch must still be reconciled against the full source before marking the proxy subsystem complete.
+### RushWay implementation status for the proxy front-end
+
+- Plain WS SOCKS5 TCP and HTTP CONNECT forwarding are implemented.
+- Plain WS SOCKS5 UDP forwarding has an implementation slice: the control path uses a dedicated raw `UDP\n` WebSocket session and UDP payloads are carried as raw WebSocket binary frames.
+- That UDP implementation must not be described as full GoWay parity until FRAG/error/reply/close behavior is exercised in an executable compatibility test matrix.
+- WSS UDP is not implemented/validated yet.
+- Exact SOCKS5/HTTP REP/error lifecycle parity is still a Stage 2/4 compatibility item.
 
 ## DNS
 
 Remote DNS uses a configured server and caches resolved addresses. Failed remote resolution falls back to the system resolver. The resolver has a timeout and caches successful results. Upstream dialing can use resolved IPs while preserving the configured hostname for TLS/SNI where required.
 
+RushWay still needs to reconcile this behavior against the exact GoWay v1.8.4 source and wire it into the complete runtime before marking DNS compatibility complete.
+
 ## Connection pool / MUX pool
 
-Client mode has pooling/reuse infrastructure. MUX mode maintains multiple physical MUX sessions and assigns logical streams over those sessions. Non-MUX mode falls back to a 1:1 pooled connection model.
+Client mode has pooling/reuse infrastructure. MUX mode maintains multiple physical MUX sessions and assigns logical streams over those sessions. Plain `ws://` physical MUX pooling is implemented in the current RushWay head.
+
+The current pool exposes configurable physical session count, least-active selection, 256 logical streams per session and session retirement when the physical reader terminates. Heavy concurrent acquire/stream reservation still needs stress validation.
+
+Non-MUX mode is intended to fall back to a 1:1 pooled connection model, but RushWay's runtime implementation is not complete. Do not mark non-MUX parity complete until executable tests prove it.
 
 Do not change pool/session selection semantics merely for performance until interoperability tests prove equivalence.
 
@@ -184,15 +220,17 @@ Observed v1.8.4 regression tests specifically cover:
 - concurrent log-ring save
 - hard HTTP header limit
 
+RushWay has implemented important pieces of this behavior, but current-head execution evidence is still required before declaring lifecycle compatibility complete.
+
 ## TLS / browser profile behavior
 
 The v1.8.4 source contains multiple browser profiles bundling User-Agent, Accept-Language, Chromium Client Hints where applicable, TLS cipher preferences, and curve preferences. WSS initialization pre-builds TLS configurations for profiles. `-fakehost` is used for Host/SNI/CDN/reverse-proxy scenarios.
 
-RushWay compatibility implementation must first reproduce functional TLS/SNI behavior. Browser fingerprint parity is a separate compatibility item and must be implemented from observed source behavior, not invented values.
+RushWay currently preserves functional TLS verification/ALPN behavior and caches verified/insecure rustls client configurations with `OnceLock`. WSS TCP forwarding is implemented, but WSS physical-session pooling is not yet implemented. Browser fingerprint parity remains a separate compatibility item.
 
 ## QUIC
 
-GoWay v1.8.4 uses `quic-go`. Exact source extraction has now established these concrete wire/runtime facts:
+GoWay v1.8.4 uses `quic-go`. Exact source extraction has established these concrete wire/runtime facts:
 
 - Server listener is created with `quic.ListenAddr(listenAddr, tlsConf, defaultQUICConfig())`.
 - Server TLS configuration advertises ALPN protocols `goway-quic` and `h3`.
@@ -203,7 +241,7 @@ GoWay v1.8.4 uses `quic-go`. Exact source extraction has now established these c
 - The QUIC client pool deliberately performs DNS resolution, `quic.DialAddr`, and `OpenStreamSync` outside the pool mutex. A single-flight `dialing` barrier prevents a burst of concurrent stream requests from creating a connection storm.
 - If `OpenStreamSync` fails on an existing pooled connection, v1.8.4 closes that QUIC connection with application error `0x01` (`"stream open failed"`) and removes the failed connection from the pool.
 
-This is enough to constrain the RushWay QUIC architecture, but **not enough to implement it as complete compatibility yet**. Remaining extraction items are: full `defaultQUICConfig`, TLS certificate/client verification behavior, exact `quic+tls` vs `quic` handling, server stream target/bootstrap framing, connection close/reset mapping, pool capacity/selection, retry/dead-IP behavior, and how QUIC streams attach to the MUX/non-MUX forwarding paths.
+This constrains the RushWay QUIC architecture, but **does not constitute a complete QUIC implementation**. Remaining extraction items are: full `defaultQUICConfig`, TLS certificate/client verification behavior, exact `quic+tls` vs `quic` handling, server stream target/bootstrap framing, connection close/reset mapping, pool capacity/selection, retry/dead-IP behavior, and how QUIC streams attach to the MUX/non-MUX forwarding paths.
 
 ## Required interoperability matrix
 
@@ -228,15 +266,20 @@ This is enough to constrain the RushWay QUIC architecture, but **not enough to i
 
 ## Specification status
 
-This file remains an **intermediate verified baseline**. WebSocket functional behavior is substantially extracted. SOCKS5/HTTP front-end wire shapes plus several exact control-flow branches are now documented, and isolated Rust parser primitives exist, but full proxy forwarding/error lifecycle remains pending. QUIC listener/client/session facts are partially extracted; QUIC is not yet implementation-complete.
+This file remains an **intermediate, source-derived compatibility contract**. It intentionally distinguishes extracted GoWay behavior from RushWay implementation status. A constructor compiling, a unit test passing or a parser existing is not sufficient to mark a transport or protocol feature complete.
 
 ## Next action
 
-Continue Stage 2 extraction in this order:
+Use the following order unless newer execution evidence identifies a stronger blocker:
 
-1. finish exact SOCKS5 TCP/UDP control flow, including all REP mappings, UDP relay reply path, FRAG behavior, target dial and close lifecycle;
-2. finish exact HTTP CONNECT dial/error/close behavior;
-3. finish exact QUIC config/TLS/stream bootstrap/close semantics and pool retry/dead-IP behavior;
-4. then implement the runtime transport layers in Rust and add executable interoperability tests.
+1. Finish executable CI/current-head build evidence.
+2. Finish exact SOCKS5 TCP/UDP control flow, including all REP mappings, UDP relay reply path, FRAG behavior, target dial and close lifecycle.
+3. Finish exact HTTP CONNECT dial/error/close behavior.
+4. Finish exact QUIC config/TLS/stream bootstrap/close semantics and pool retry/dead-IP behavior.
+5. Implement WSS physical-session pooling.
+6. Implement/validate WSS UDP.
+7. Complete runtime non-MUX 1:1 behavior.
+8. Add executable GoWay <-> RushWay interoperability tests.
+9. Validate release builds/artifacts and only then cut v0.0.1.
 
 Do not mark a subsystem complete merely because its parser or constructor compiles.
