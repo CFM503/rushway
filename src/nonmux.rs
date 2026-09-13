@@ -1,19 +1,19 @@
 //! Plain WebSocket 1:1 relay compatibility path.
 //!
 //! GoWay v1.8.4 non-MUX mode dedicates one physical WebSocket to one target.
-//! The first binary payload is `host:port\n` (XOR-transformed when a key is set),
-//! the server answers `OK\n`, and subsequent binary frames carry raw TCP data.
+//! The first binary payload is `host:port\n` after XOR transformation, the
+//! server answers `OK\n`, and subsequent binary frames carry raw TCP data.
 
 use crate::crypto::XorCipher;
 use crate::proxy::{parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION};
 use crate::runtime::RuntimeConfig;
 use crate::ws::{build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers, validate_client_handshake_response, validate_server_handshake, write_frame};
 use anyhow::{anyhow, bail, Context, Result};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
-use std::sync::Arc;
 
 fn cipher(key: &Option<String>) -> XorCipher {
     XorCipher::new(key.as_deref().unwrap_or(""))
@@ -72,7 +72,7 @@ async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, Tar
     bail!("unsupported local proxy protocol")
 }
 
-async fn open_upstream(cfg: &RuntimeConfig) -> Result<(tokio::io::ReadHalf<TcpStream>, Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>, String)> {
+async fn open_upstream(cfg: &RuntimeConfig) -> Result<(tokio::io::ReadHalf<TcpStream>, Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>)> {
     let upstream = cfg.upstream.as_deref().ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (addr, path) = parse_ws_url(upstream)?;
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr.as_str()).to_string();
@@ -89,11 +89,11 @@ async fn open_upstream(cfg: &RuntimeConfig) -> Result<(tokio::io::ReadHalf<TcpSt
     wr.flush().await?;
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
-    Ok((rd, Arc::new(Mutex::new(wr)), host))
+    Ok((rd, Arc::new(Mutex::new(wr))))
 }
 
 async fn relay_client(mut local: TcpStream, cfg: RuntimeConfig, target: TargetAddr, is_socks5: bool) -> Result<()> {
-    let (mut rd, writer, _) = open_upstream(&cfg).await?;
+    let (mut rd, writer) = open_upstream(&cfg).await?;
     let c = cipher(&cfg.key);
     let mut hello = format!("{}:{}\n", target.host, target.port).into_bytes();
     c.apply(&mut hello);
@@ -114,27 +114,40 @@ async fn relay_client(mut local: TcpStream, cfg: RuntimeConfig, target: TargetAd
 
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
     let writer_up = writer.clone();
+    let upload_cipher = c.clone();
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 { break; }
+            let mut payload = buf[..n].to_vec();
+            upload_cipher.apply(&mut payload);
             let mut w = writer_up.lock().await;
-            write_frame(&mut *w, &buf[..n], 2, true).await?;
+            write_frame(&mut *w, &payload, 2, true).await?;
         }
         Result::<()>::Ok(())
     });
 
+    let download_cipher = c;
     loop {
         let Some((opcode, mut payload)) = read_frame(&mut rd, Option::<&mut tokio::io::WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break; };
         match opcode {
-            2 => { c.apply(&mut payload); local_wr.write_all(&payload).await?; }
+            2 => { download_cipher.apply(&mut payload); local_wr.write_all(&payload).await?; }
             8 => break,
             _ => {}
         }
     }
     upload.abort();
     Ok(())
+}
+
+async fn handle_client_connection(mut local: TcpStream, cfg: RuntimeConfig) -> Result<()> {
+    let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
+    if command == SocksCommand::UdpAssociate {
+        return crate::runtime::handle_local_udp_proxy(local, cfg, target).await;
+    }
+    if command != SocksCommand::Connect { bail!("non-MUX client supports CONNECT or UDP ASSOCIATE only"); }
+    relay_client(local, cfg, target, is_socks5).await
 }
 
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
@@ -144,12 +157,9 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
-            match read_proxy_request(&mut stream.try_clone().unwrap_or_else(|_| unreachable!())) {
-                Ok(_) => {}
-                Err(_) => {}
+            if let Err(error) = handle_client_connection(stream, cfg2).await {
+                tracing::debug!(%peer, %error, "non-MUX client connection closed");
             }
-            drop(peer);
-            let _ = cfg2;
         });
     }
 }
@@ -180,21 +190,12 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     if opcode != 2 { bail!("invalid non-MUX target opcode"); }
     let c = cipher(&cfg.key);
     c.apply(&mut target_frame);
-    let target_line = String::from_utf8(target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
-    let target_line = target_line.trim();
-    let target = target_line.strip_prefix(&format!("{} ", cfg.key.as_deref().unwrap_or("__NO_KEY__")))
-        .unwrap_or(target_line);
-    if cfg.key.is_some() && !target_line.starts_with(&format!("{} ", cfg.key.as_deref().unwrap())) {
-        bail!("non-MUX authentication failed");
-    }
+    let target = String::from_utf8(target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
     let target = target.trim();
-    let stream_target = target.parse::<std::net::SocketAddr>()
-        .map(|a| TargetAddr { host: a.ip().to_string(), port: a.port() })
-        .or_else(|_| {
-            let (host, port) = target.rsplit_once(':').ok_or_else(|| anyhow!("invalid non-MUX target"))?;
-            Ok(TargetAddr { host: host.to_string(), port: port.parse::<u16>().map_err(|_| anyhow!("invalid non-MUX port"))? })
-        })?;
-    let addr = format!("{}:{}", stream_target.host, stream_target.port);
+    let (host, port_text) = target.rsplit_once(':').ok_or_else(|| anyhow!("invalid non-MUX target"))?;
+    let port = port_text.parse::<u16>().map_err(|_| anyhow!("invalid non-MUX target port"))?;
+    if port == 0 { bail!("invalid non-MUX target port"); }
+    let addr = format!("{}:{}", host, port);
     let target_stream = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&addr)).await??;
     let mut ok = b"OK\n".to_vec();
     c.apply(&mut ok);
@@ -202,14 +203,15 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
 
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     let writer_down = writer.clone();
+    let download_cipher = c.clone();
+    let buffer_size = cfg.buffer_size;
     let download = tokio::spawn(async move {
-        let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 { break; }
             let mut payload = buf[..n].to_vec();
-            // Server->client frames are XOR-transformed by the transport cipher.
-            c.apply(&mut payload);
+            download_cipher.apply(&mut payload);
             let mut w = writer_down.lock().await;
             write_frame(&mut *w, &payload, 2, false).await?;
         }
