@@ -131,7 +131,7 @@ async fn handle_mux_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHa
                                 .map_err(|e| anyhow!(e.to_string()))?;
                             let mut data = Vec::with_capacity(7 + initial.payload.len());
                             initial.encode(&mut data).map_err(|e| anyhow!(e.to_string()))?;
-                            if let Ok(owned) = MuxFrame::decode_owned(data) { let _ = tx.send(owned).await; }
+                            if let Ok(owned) = MuxFrame::decode_owned(data) { let _ = tx.send(StreamCommand::Data(owned)).await; }
                         }
                     }
                     Err(_) => { let _ = send_reset(&writer, frame.stream_id).await; }
@@ -139,7 +139,7 @@ async fn handle_mux_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHa
             }
             MuxCommand::Data => {
                 let tx = streams.lock().await.get(&frame.stream_id).map(|s| s.tx.clone());
-                if let Some(tx) = tx { if tx.send(frame).await.is_err() { streams.lock().await.remove(&frame.stream_id); } }
+                if let Some(tx) = tx { if tx.send(StreamCommand::Data(frame)).await.is_err() { streams.lock().await.remove(&frame.stream_id); } }
             }
             MuxCommand::Fin => {
                 let tx = streams.lock().await.get(&frame.stream_id).map(|s| s.tx.clone());
