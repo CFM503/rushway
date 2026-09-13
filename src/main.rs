@@ -41,12 +41,18 @@ struct Args {
     #[arg(long = "max-conn", value_parser = clap::value_parser!(usize).range(1..=1_000_000))]
     max_conn: Option<usize>,
     #[arg(long = "connection-timeout")] connection_timeout: Option<u64>,
+    #[arg(long = "log", default_value = "INFO")] log_level: String,
+    #[arg(long = "log-file")] log_file: Option<PathBuf>,
+    #[arg(long = "tui", default_value_t = false)] tui: bool,
+    #[arg(long = "cpuprofile")] cpu_profile: Option<PathBuf>,
+    #[arg(long = "cpuprofile-duration")] cpu_profile_duration: Option<u64>,
 }
 
 const LEGACY_LONG_FLAGS: &[&str] = &[
     "up", "fakehost", "mux", "no-mux", "mux-sessions", "allow-open", "verify-ssl",
     "socket-buffer", "no-tcp-nodelay", "no-tcp-keepalive", "dns", "block-local",
-    "no-block-local", "max-conn", "connection-timeout",
+    "no-block-local", "max-conn", "connection-timeout", "log", "log-file", "tui",
+    "version", "cpuprofile", "cpuprofile-duration",
 ];
 
 fn normalize_legacy_args<I, S>(args: I) -> Vec<String>
@@ -58,9 +64,7 @@ where
         for name in LEGACY_LONG_FLAGS {
             let exact = format!("-{name}");
             if arg == exact { return format!("--{name}"); }
-            if let Some(value) = arg.strip_prefix(&format!("{exact}=")) {
-                return format!("--{name}={value}");
-            }
+            if let Some(value) = arg.strip_prefix(&format!("{exact}=")) { return format!("--{name}={value}"); }
         }
         arg
     }).collect()
@@ -77,6 +81,16 @@ fn apply_listen_arg(cfg: &mut RuntimeConfig, value: &str) -> Result<()> {
     cfg.proxy_host = addr.ip().to_string();
     cfg.proxy_port = addr.port();
     Ok(())
+}
+
+fn tracing_filter(level: &str) -> String {
+    match level.trim().to_ascii_uppercase().as_str() {
+        "DEBUG" => "debug".into(),
+        "WARN" | "WARNING" => "warn".into(),
+        "ERROR" => "error".into(),
+        "OFF" => "off".into(),
+        _ => "info".into(),
+    }
 }
 
 async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
@@ -104,9 +118,15 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))).with_target(false).init();
-    let args = Args::parse_from(normalize_legacy_args(std::env::args()));
-    let mut cfg = if let Some(path) = args.config { load_json(path).await? } else { RuntimeConfig::default() };
+    let raw_args = normalize_legacy_args(std::env::args());
+    let args = Args::parse_from(&raw_args);
+    if args.version { unreachable!("clap handles --version before parsing Args") }
+    let filter = tracing_filter(&args.log_level);
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+    let mut cfg = if let Some(path) = args.config.clone() { load_json(path).await? } else { RuntimeConfig::default() };
+    if args.tui { tracing::warn!("-tui accepted for GoWay CLI compatibility; RushWay currently uses log output without a TUI dashboard"); }
+    if args.log_file.is_some() { tracing::warn!("-log-file accepted for GoWay CLI compatibility; file logging is not yet enabled"); }
+    if args.cpu_profile.is_some() || args.cpu_profile_duration.is_some() { tracing::warn!("CPU profiling flags accepted for GoWay CLI compatibility; profiling output is not yet enabled"); }
     if let Some(v) = args.port.as_deref() { apply_listen_arg(&mut cfg, v)?; }
     if let Some(v) = args.upstream { cfg.upstream = Some(v); }
     if let Some(v) = args.key { cfg.key = Some(v); }
@@ -148,8 +168,8 @@ mod tests {
     use clap::Parser;
     #[test]
     fn normalizes_goway_single_dash_long_flags() {
-        let got = normalize_legacy_args(["rushway", "-up=ws://127.0.0.1:8080/ws", "-fakehost", "edge.example.com", "-mux-sessions", "4", "-socket-buffer", "128", "-no-tcp-keepalive"]);
-        assert_eq!(got, vec!["rushway", "--up=ws://127.0.0.1:8080/ws", "--fakehost", "edge.example.com", "--mux-sessions", "4", "--socket-buffer", "128", "--no-tcp-keepalive"]);
+        let got = normalize_legacy_args(["rushway", "-up=ws://127.0.0.1:8080/ws", "-fakehost", "edge.example.com", "-mux-sessions", "4", "-socket-buffer", "128", "-no-tcp-keepalive", "-log", "ERROR", "-version"]);
+        assert_eq!(got, vec!["rushway", "--up=ws://127.0.0.1:8080/ws", "--fakehost", "edge.example.com", "--mux-sessions", "4", "--socket-buffer", "128", "--no-tcp-keepalive", "--log", "ERROR", "--version"]);
     }
     #[test]
     fn preserves_short_flags_and_values() {
@@ -158,10 +178,11 @@ mod tests {
     }
     #[test]
     fn parses_basic_runtime_args() {
-        let args = Args::parse_from(["rushway", "-p", ":9192", "--up", "ws://127.0.0.1:8080/ws"]);
+        let args = Args::parse_from(["rushway", "-p", ":9192", "--up", "ws://127.0.0.1:8080/ws", "--log", "ERROR"]);
         assert_eq!(args.port.as_deref(), Some(":9192"));
         assert_eq!(args.upstream.as_deref(), Some("ws://127.0.0.1:8080/ws"));
         assert_eq!(args.mux_sessions, 4);
+        assert_eq!(args.log_level, "ERROR");
     }
     #[test]
     fn parses_policy_args() {
