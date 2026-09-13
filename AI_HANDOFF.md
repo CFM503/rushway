@@ -2,41 +2,46 @@
 
 ## 2026-09-13 continuous checkpoint
 
-Latest code head: `7be62764ff49bcf06eae74c43b6396d07701bcad`.
+Latest code head: `f14f99c5b3295b3166cb95c98d9c3c6e54f9892e`.
 
-### Current status
+### Current implementation
 
-The client now has physical MUX session reuse for normal `ws://` traffic. Up to 4 physical WebSocket/MUX sessions are reused, local TCP connections become logical MUX streams, and the least-active session is selected.
+- Client `ws://` path now uses a physical MUX session pool with 4 prewarmed sessions and logical stream reuse.
+- Stream lifecycle hardening prevents duplicate active-count decrements and avoids holding the shared writer lock during network reads.
+- Existing server-side MUX forwarding, SOCKS5 TCP/UDP parsing, HTTP CONNECT, plain WebSocket and WSS client path remain present.
+- CI now uploads Linux x64, Windows x64, Debian 12 x64 and ARMv7 binaries as artifacts whenever the runner executes successfully.
+- `.github/workflows/release.yml` was added for tagged/manual release artifact generation.
 
-Latest hardening in `7be62764ff49bcf06eae74c43b6396d07701bcad`:
-- terminal FIN/RST removes a stream at most once;
-- active stream counts cannot underflow from duplicate cleanup;
-- the reader task does not hold the shared writer lock while waiting for network input;
-- dead physical sessions are retired and their stream map is cleared.
+### CI incident / build delivery status
 
-### CI status
+Runs 101 through 110 have failed before normal workflow steps execute (`steps: null`). This is a GitHub Actions runner-layer failure, not compiler output. Run 95 remains the last fully verified RushWay-only execution.
 
-Runs 101 through the latest pooled-client run are still failing before any job step starts (`steps: null`). Therefore the pooled client has not yet received compiler/test execution evidence from GitHub Actions.
+Because the current environment cannot execute Rust locally (no Cargo toolchain/cache and no outbound DNS) and GitHub Actions is failing before job startup, there is not yet a newly compiled pooled-client binary that can honestly be attached from this checkpoint.
 
-ARMv7 remains pinned to Rust 1.86.0; the main test path remains Rust 1.82.0.
-
-### Benchmark baseline to preserve
+### Verified performance baseline to preserve
 
 Run 95 remains the last fully verified RushWay-only baseline:
 - setup-inclusive median: c1 `43.31`, c8 `170.17`, c32 `345.55` MiB/s
 - steady-state median: c1 `43.06`, c8 `205.04`, c32 `349.28` MiB/s
+- MUX owned/reused decode: `1.54 ns/op`
 
 These are not GoWay comparison results.
 
-### Next sequence
+### Remaining compatibility work
 
-1. Obtain a normal Actions execution and compile/test the pooled client.
-2. Run pooled-client c1/c8/c32 setup-inclusive and steady-state medians.
-3. Compare with the Run 95 baseline.
-4. Run the pinned GoWay comparison when its benchmark path is available.
-5. Continue the remaining WSS UDP, QUIC, non-MUX, retry/dead-IP, interoperability and release work.
+The project is not honestly at 100% GoWay v1.8.4 parity yet. The specification still has open implementation/evidence requirements for WSS UDP, QUIC runtime, non-MUX mode, remote DNS/cache behavior, retry/dead-IP policy, full connection-pool semantics, complete CLI parity, and executable GoWay <-> RushWay interoperability coverage.
 
-Do not claim performance improvement or GoWay parity without execution evidence.
+### Continuous execution order
+
+1. Restore a normal GitHub Actions runner execution and compile the current pooled-client head.
+2. Download and manually test the Windows x64 binary first.
+3. Test SOCKS5 TCP / HTTP CONNECT through a real GoWay server and compare repeated c1/c8/c32 throughput.
+4. Build and test Debian 12 x64 and ARMv7 binaries.
+5. Continue WSS UDP, QUIC, non-MUX and retry/dead-IP implementation using SPEC-derived behavior only.
+6. Add executable interoperability tests for GoWay Client -> RushWay Server and RushWay Client -> GoWay Server.
+7. Only after all required execution evidence is green, mark v0.0.1 release-ready.
+
+Do not claim 100% compatibility, GoWay parity or performance improvement without execution evidence.
 
 ## Relay files
 
