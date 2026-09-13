@@ -1,5 +1,6 @@
 use std::io;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
 const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
-const CONCURRENCY: usize = 8;
+const CONCURRENCIES: &[usize] = &[1, 8, 32];
 
 async fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -89,23 +90,26 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> io::Result<TcpStre
     Ok(stream)
 }
 
-async fn one_flow(proxy_port: u16, target_port: u16, payload: Vec<u8>) -> io::Result<usize> {
+async fn one_flow(proxy_port: u16, target_port: u16, payload: Arc<[u8]>) -> io::Result<usize> {
     let mut stream = socks5_connect(proxy_port, target_port).await?;
     stream.write_all(&payload).await?;
     let mut echoed = vec![0u8; payload.len()];
     stream.read_exact(&mut echoed).await?;
-    if echoed != payload {
+    if echoed.as_slice() != payload.as_ref() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "echo payload mismatch"));
     }
     Ok(payload.len())
 }
 
-async fn run_case(proxy_port: u16, target_port: u16, concurrency: usize, payload: &[u8]) -> io::Result<f64> {
-    let start = Instant::now();
+async fn run_case(proxy_port: u16, target_port: u16, concurrency: usize, payload: Arc<[u8]>) -> io::Result<f64> {
     let mut tasks = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
-        tasks.push(tokio::spawn(one_flow(proxy_port, target_port, payload.to_vec())));
+        tasks.push(tokio::spawn(one_flow(proxy_port, target_port, Arc::clone(&payload))));
     }
+
+    // Measure only the proxy workload. Task creation and cheap Arc cloning are prepared
+    // before the timed section so benchmark setup overhead does not distort throughput.
+    let start = Instant::now();
     let mut total = 0usize;
     for task in tasks {
         total += task.await.map_err(|e| io::Error::other(e.to_string()))??;
@@ -137,16 +141,22 @@ async fn main() -> io::Result<()> {
         for (i, b) in payload.iter_mut().enumerate() {
             *b = ((i * 31 + 17) & 0xff) as u8;
         }
+        let payload: Arc<[u8]> = payload.into();
 
-        let single = run_case(client_port, target_port, 1, &payload).await?;
-        let concurrent = run_case(client_port, target_port, CONCURRENCY, &payload).await?;
-        println!(
-            "rushway_e2e payload_mib={} single_mib_s={:.2} concurrency={} concurrent_total_mib_s={:.2}",
-            payload.len() / (1024 * 1024),
-            single,
-            CONCURRENCY,
-            concurrent
+        let mut results = Vec::with_capacity(CONCURRENCIES.len());
+        for &concurrency in CONCURRENCIES {
+            let throughput = run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?;
+            results.push((concurrency, throughput));
+        }
+
+        print!(
+            "rushway_e2e payload_mib={} roundtrip_echo=1",
+            payload.len() / (1024 * 1024)
         );
+        for (concurrency, throughput) in results {
+            print!(" c{}_mib_s={:.2}", concurrency, throughput);
+        }
+        println!();
         Ok::<(), io::Error>(())
     }
     .await;
