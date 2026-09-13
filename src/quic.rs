@@ -6,6 +6,7 @@
 //! carries raw TCP bytes in both directions.
 
 use crate::runtime::RuntimeConfig;
+use crate::proxy::{parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
@@ -13,12 +14,10 @@ use rcgen::generate_simple_self_signed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const ALPN: &[&[u8]] = &[b"goway-quic", b"h3"];
@@ -77,161 +76,43 @@ fn server_config() -> Result<ServerConfig> {
 
 #[derive(Debug)]
 struct QuicNoCertificateVerification;
-
 impl ServerCertVerifier for QuicNoCertificateVerification {
-    fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-        ]
-    }
+    fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> std::result::Result<ServerCertVerified, rustls::Error> { Ok(ServerCertVerified::assertion()) }
+    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> { Ok(HandshakeSignatureValid::assertion()) }
+    fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> { Ok(HandshakeSignatureValid::assertion()) }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256, rustls::SignatureScheme::ECDSA_NISTP384_SHA384, rustls::SignatureScheme::ED25519, rustls::SignatureScheme::RSA_PSS_SHA256, rustls::SignatureScheme::RSA_PKCS1_SHA256] }
 }
 
-fn parse_upstream(input: &str) -> Result<(String, String)> {
-    let (scheme, rest) = if let Some(v) = input.strip_prefix("quic://") { ("quic", v) } else if let Some(v) = input.strip_prefix("quic+tls://") { ("quic+tls", v) } else { bail!("QUIC client requires quic:// or quic+tls:// upstream") };
-    let _ = scheme;
-    let (authority, path) = match rest.split_once('/') { Some((a, p)) => (a, format!("/{}", p)), None => (rest, "/".to_string()) };
+fn parse_upstream(input: &str) -> Result<String> {
+    let rest = input.strip_prefix("quic://").or_else(|| input.strip_prefix("quic+tls://")).ok_or_else(|| anyhow!("QUIC client requires quic:// or quic+tls:// upstream"))?;
+    let authority = match rest.split_once('/') { Some((a, _)) => a, None => rest };
     if authority.is_empty() { bail!("empty QUIC upstream authority"); }
-    let authority = if authority.starts_with('[') { authority.to_string() } else if authority.matches(':').count() == 1 { authority.to_string() } else { format!("{}:443", authority) };
-    Ok((authority, path))
+    Ok(if authority.starts_with('[') || authority.matches(':').count() == 1 { authority.to_string() } else { format!("{}:443", authority) })
 }
 
-async fn resolve_upstream(input: &str) -> Result<(SocketAddr, String)> {
-    let (authority, _) = parse_upstream(input)?;
-    let host = if authority.starts_with('[') {
-        let close = authority.find(']').ok_or_else(|| anyhow!("invalid QUIC IPv6 authority"))?;
-        authority[1..close].to_string()
-    } else {
-        authority.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_else(|| authority.clone())
-    };
-    let addr = tokio::net::lookup_host(authority.clone()).await?.next().ok_or_else(|| anyhow!("QUIC upstream DNS returned no address"))?;
+async fn resolve_upstream(input: &str) -> Result<(std::net::SocketAddr, String)> {
+    let authority = parse_upstream(input)?;
+    let host = if authority.starts_with('[') { let close=authority.find(']').ok_or_else(||anyhow!("invalid QUIC IPv6 authority"))?; authority[1..close].to_string() } else { authority.rsplit_once(':').map(|(h,_)|h.to_string()).unwrap_or_else(||authority.clone()) };
+    let addr = tokio::net::lookup_host(authority).await?.next().ok_or_else(||anyhow!("QUIC upstream DNS returned no address"))?;
     Ok((addr, host))
 }
 
-async fn read_line(stream: &mut quinn::RecvStream, limit: usize) -> Result<String> {
-    let mut buf = Vec::with_capacity(128);
-    while buf.len() < limit {
-        let mut one = [0u8; 1];
-        let n = stream.read(&mut one).await?;
-        if n == 0 { bail!("QUIC stream closed while reading header"); }
-        buf.push(one[0]);
-        if one[0] == b'\n' { return Ok(String::from_utf8(buf)?.trim().to_string()); }
-    }
+async fn read_quic_line(stream: &mut quinn::RecvStream, limit: usize) -> Result<String> {
+    let mut buf=Vec::with_capacity(128);
+    while buf.len()<limit { let mut one=[0u8;1]; let n=stream.read(&mut one).await?; if n==0{bail!("QUIC stream closed while reading header");} buf.push(one[0]); if one[0]==b'\n'{return Ok(String::from_utf8(buf)?.trim().to_string());} }
     bail!("QUIC header too large")
 }
 
-fn authenticated_target(line: &str, key: &Option<String>) -> Result<String> {
-    if let Some(expected) = key {
-        let (got, target) = line.split_once(' ').ok_or_else(|| anyhow!("QUIC authentication header missing key"))?;
-        if got != expected { bail!("QUIC authentication failed"); }
-        return Ok(target.trim().to_string());
-    }
-    Ok(line.trim().to_string())
-}
+fn authenticated_target(line:&str,key:&Option<String>)->Result<String>{if let Some(expected)=key{let(got,target)=line.split_once(' ').ok_or_else(||anyhow!("QUIC authentication header missing key"))?;if got!=expected{bail!("QUIC authentication failed");}return Ok(target.trim().to_string())}Ok(line.trim().to_string())}
 
-pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
-    let upstream = cfg.upstream.clone().ok_or_else(|| anyhow!("QUIC client requires upstream"))?;
-    let (server_addr, server_name) = resolve_upstream(&upstream).await?;
-    let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
-    endpoint.set_default_client_config(client_config(verify_ssl)?);
-    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
-    tracing::info!("RushWay QUIC client proxy listening on {}:{}", cfg.proxy_host, cfg.proxy_port);
-    loop {
-        let (mut local, peer) = listener.accept().await?;
-        let endpoint2 = endpoint.clone();
-        let cfg2 = cfg.clone();
-        let server_name2 = server_name.clone();
-        tokio::spawn(async move {
-            let result = async {
-                // QUIC is selected before MUX in GoWay; each local connection obtains a bidirectional stream.
-                let connecting = endpoint2.connect(server_addr, &server_name2)?;
-                let connection = timeout(Duration::from_secs(cfg2.connection_timeout.max(1)), connecting).await??;
-                let (mut send, mut recv) = connection.open_bi().await?;
-                let target = match crate::proxy::TargetAddr { host: "".into(), port: 0 };
-                let _ = target;
-                let target_line = format!("{}\n", "");
-                let _ = target_line;
-                bail!("QUIC local proxy control path requires proxy request integration")
-            }.await;
-            if let Err(error) = result { tracing::debug!(%peer, %error, "QUIC local connection closed"); }
-            drop(local);
-        });
-    }
-}
+async fn read_proxy_request(stream:&mut TcpStream)->Result<(SocksCommand,TargetAddr,bool)>{let first=stream.read_u8().await?;if first==SOCKS5_VERSION{let n=stream.read_u8().await? as usize;let mut methods=vec![0u8;n];stream.read_exact(&mut methods).await?;if !methods.contains(&0){stream.write_all(&[5,0xff]).await?;bail!("SOCKS5 no-auth unavailable")}stream.write_all(&[5,0]).await?;let mut head=[0u8;4];stream.read_exact(&mut head).await?;if head[1]!=SOCKS5_CONNECT&&head[1]!=SOCKS5_UDP_ASSOCIATE{stream.write_all(&[5,7,0,1,0,0,0,0,0,0]).await?;bail!("unsupported SOCKS5 command")}let mut req=head.to_vec();match head[3]{1=>{let mut b=[0u8;6];stream.read_exact(&mut b).await?;req.extend_from_slice(&b)},3=>{let mut n=[0u8;1];stream.read_exact(&mut n).await?;req.extend_from_slice(&n);let mut b=vec![0u8;n[0] as usize+2];stream.read_exact(&mut b).await?;req.extend_from_slice(&b)},4=>{let mut b=[0u8;18];stream.read_exact(&mut b).await?;req.extend_from_slice(&b)},_=>{stream.write_all(&[5,8,0,1,0,0,0,0,0,0]).await?;bail!("unsupported SOCKS5 address type")}}let parsed=parse_socks5_request(&req).map_err(|e|anyhow!(e.to_string()))?;return Ok((parsed.command,parsed.target,true))}if first==b'C'{let mut buf=vec![first];let mut tail=crate::ws::read_http_headers(stream).await?;buf.append(&mut tail);return Ok((SocksCommand::Connect,parse_http_connect(&buf).map_err(|e|anyhow!(e.to_string()))?,false))}bail!("unsupported local proxy protocol")}
 
-pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
-    let bind: SocketAddr = format!("{}:{}", cfg.proxy_host, cfg.proxy_port).parse()?;
-    let endpoint = Endpoint::server(server_config()?, bind)?;
-    tracing::info!("RushWay QUIC server listening on {}", bind);
-    while let Some(incoming) = endpoint.accept().await {
-        let cfg2 = cfg.clone();
-        tokio::spawn(async move {
-            match incoming.await {
-                Ok(connection) => {
-                    loop {
-                        match connection.accept_bi().await {
-                            Ok((send, recv)) => {
-                                let cfg3 = cfg2.clone();
-                                tokio::spawn(async move {
-                                    if let Err(error) = handle_server_stream(send, recv, cfg3).await {
-                                        tracing::debug!(%error, "QUIC stream closed");
-                                    }
-                                });
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "QUIC connection handshake failed"),
-            }
-        });
-    }
-    Ok(())
-}
+async fn relay_quic(mut local:TcpStream,cfg:RuntimeConfig,endpoint:Endpoint,server_addr:std::net::SocketAddr,server_name:String,target:TargetAddr,is_socks5:bool)->Result<()>{let connecting=endpoint.connect(server_addr,&server_name)?;let connection=timeout(Duration::from_secs(cfg.connection_timeout.max(1)),connecting).await??;let(mut send,mut recv)=connection.open_bi().await?;let mut header=if let Some(key)=cfg.key.as_deref(){format!("{} {}\n",key,format_target(&target))}else{format!("{}\n",format_target(&target))};send.write_all(header.as_bytes()).await?;let response=read_quic_line(&mut recv,8192).await?;if response!="OK"{bail!("QUIC upstream rejected target: {}",response)}if is_socks5{local.write_all(&socks5_success_response()).await?}else{local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?}let(lr,lw)=tokio::io::split(local);let mut send_task=send;let cfg_buf=cfg.buffer_size;let upload=tokio::spawn(async move{let mut buf=vec![0u8;cfg_buf.clamp(16*1024,1024*1024)];let mut r=lr;loop{let n=r.read(&mut buf).await?;if n==0{send_task.finish().await?;break}send_task.write_all(&buf[..n]).await?;}Result::<()>::Ok(())});let mut lw2=lw;let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)];loop{let n=recv.read(&mut buf).await?;if n==0{break}lw2.write_all(&buf[..n]).await?}let _=lw2.shutdown().await;upload.abort();Ok(())}
 
-async fn handle_server_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream, cfg: RuntimeConfig) -> Result<()> {
-    let line = read_line(&mut recv, 8192).await?;
-    if line.eq_ignore_ascii_case("UDP") || line.to_ascii_uppercase().starts_with("UDP ") {
-        send.write_all(b"OK\n").await?;
-        send.finish().await?;
-        return Ok(());
-    }
-    let target = authenticated_target(&line, &cfg.key)?;
-    let (host, port_text) = target.rsplit_once(':').ok_or_else(|| anyhow!("invalid QUIC target"))?;
-    let port = port_text.parse::<u16>().map_err(|_| anyhow!("invalid QUIC target port"))?;
-    if port == 0 { bail!("invalid QUIC target port"); }
-    let target_stream = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(format!("{}:{}", host, port))).await??;
-    let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
-    send.write_all(b"OK\n").await?;
-    let send_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
-        loop {
-            let n = target_rd.read(&mut buf).await?;
-            if n == 0 { break; }
-            send.write_all(&buf[..n]).await?;
-        }
-        send.finish().await?;
-        Result::<()>::Ok(())
-    });
-    let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
-    loop {
-        let n = recv.read(&mut buf).await?;
-        if n == 0 { break; }
-        target_wr.write_all(&buf[..n]).await?;
-    }
-    target_wr.shutdown().await?;
-    send_task.abort();
-    Ok(())
-}
+fn format_target(target:&TargetAddr)->String{format!("{}:{}",target.host,target.port)}
+
+pub async fn run_client(cfg:RuntimeConfig,verify_ssl:bool)->Result<()>{let upstream=cfg.upstream.clone().ok_or_else(||anyhow!("QUIC client requires upstream"))?;let(server_addr,server_name)=resolve_upstream(&upstream).await?;let mut endpoint=Endpoint::client("[::]:0".parse().unwrap())?;endpoint.set_default_client_config(client_config(verify_ssl)?);let listener=TcpListener::bind(format!("{}:{}",cfg.proxy_host,cfg.proxy_port)).await?;tracing::info!("RushWay QUIC client proxy listening on {}:{}",cfg.proxy_host,cfg.proxy_port);loop{let(stream,peer)=listener.accept().await?;let cfg2=cfg.clone();let ep=endpoint.clone();let name=server_name.clone();tokio::spawn(async move{match read_proxy_request(&mut stream.try_clone().unwrap_or_else(|_|panic!("tokio TcpStream clone unavailable"))).await{Ok((SocksCommand::Connect,target,is_socks5))=>{if let Err(e)=relay_quic(stream,cfg2,ep,server_addr,name,target,is_socks5).await{tracing::debug!(%peer,error=%e,"QUIC proxy connection closed")}},Ok((SocksCommand::UdpAssociate,_,_))=>{tracing::debug!(%peer,"QUIC UDP ASSOCIATE is not yet wired in the Rust client")},Err(e)=>tracing::debug!(%peer,error=%e,"QUIC proxy request rejected")}});}}
+
+pub async fn run_server(cfg:RuntimeConfig)->Result<()>{let bind:std::net::SocketAddr=format!("{}:{}",cfg.proxy_host,cfg.proxy_port).parse()?;let endpoint=Endpoint::server(server_config()?,bind)?;tracing::info!("RushWay QUIC server listening on {}",bind);while let Some(incoming)=endpoint.accept().await{let cfg2=cfg.clone();tokio::spawn(async move{match incoming.await{Ok(connection)=>{loop{match connection.accept_bi().await{Ok((send,recv))=>{let cfg3=cfg2.clone();tokio::spawn(async move{if let Err(error)=handle_server_stream(send,recv,cfg3).await{tracing::debug!(%error,"QUIC stream closed")}})},Err(_)=>break}}},Err(error)=>tracing::debug!(%error,"QUIC connection handshake failed")}})}Ok(())}
+
+async fn handle_server_stream(mut send:quinn::SendStream,mut recv:quinn::RecvStream,cfg:RuntimeConfig)->Result<()>{let line=read_quic_line(&mut recv,8192).await?;if line.eq_ignore_ascii_case("UDP")||line.to_ascii_uppercase().starts_with("UDP "){send.write_all(b"OK\n").await?;send.finish().await?;return Ok(())}let target=authenticated_target(&line,&cfg.key)?;let(host,port_text)=target.rsplit_once(':').ok_or_else(||anyhow!("invalid QUIC target"))?;let port=port_text.parse::<u16>().map_err(|_|anyhow!("invalid QUIC target port"))?;if port==0{bail!("invalid QUIC target port")}let target_stream=match timeout(Duration::from_secs(cfg.connection_timeout.max(1)),TcpStream::connect(format!("{}:{}",host,port))).await{Ok(Ok(s))=>s,_=>{send.write_all(b"ERR: DIAL_FAILED\n").await?;send.finish().await?;return Ok(())}};let(mut target_rd,mut target_wr)=tokio::io::split(target_stream);send.write_all(b"OK\n").await?;let send_task=tokio::spawn(async move{let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)];loop{let n=target_rd.read(&mut buf).await?;if n==0{break}send.write_all(&buf[..n]).await?;}let _=send.finish().await;Result::<()>::Ok(())});let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)];loop{let n=recv.read(&mut buf).await?;if n==0{break}target_wr.write_all(&buf[..n]).await?}target_wr.shutdown().await?;send_task.abort();Ok(())}
