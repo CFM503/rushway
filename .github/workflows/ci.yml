@@ -27,6 +27,12 @@ jobs:
         run: bash scripts/repeat_proxy_bench.sh rushway target/release/rushway 5
       - name: Repeated steady-state proxy benchmark median
         run: bash scripts/repeat_proxy_bench.sh rushway target/release/rushway 5 target/release/proxy_bench steady_state
+      - name: Upload Linux x64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rushway-linux-x64
+          path: target/release/rushway
+          if-no-files-found: error
 
   goway-comparison:
     runs-on: ubuntu-latest
@@ -84,6 +90,12 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - name: Build Windows x64
         run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Upload Windows x64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rushway-windows-x64
+          path: target/x86_64-pc-windows-gnu/release/rushway.exe
+          if-no-files-found: error
 
   debian-12-x64:
     runs-on: ubuntu-latest
@@ -97,6 +109,12 @@ jobs:
             -w /src \
             rust:1.82-bookworm \
             bash -c 'apt-get update && apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates && export PATH="/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH" && cargo build --release && file target/release/rushway'
+      - name: Upload Debian 12 x64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rushway-debian12-x64
+          path: target/release/rushway
+          if-no-files-found: error
 
   armv7-linux:
     runs-on: ubuntu-latest
@@ -105,9 +123,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ARMv7 cross compiler
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
-      # ARMv7 gets a fresh dependency resolution on CI. Rust 1.86 is pinned
-      # here because current transitive dependencies may use Edition 2024,
-      # while the main compatibility test remains pinned to Rust 1.82.0.
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.86.0
@@ -116,3 +131,9 @@ jobs:
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
         run: cargo build --release --target armv7-unknown-linux-gnueabihf
+      - name: Upload ARMv7 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rushway-armv7-linux
+          path: target/armv7-unknown-linux-gnueabihf/release/rushway
+          if-no-files-found: error
