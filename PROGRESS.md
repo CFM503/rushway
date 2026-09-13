@@ -5,7 +5,7 @@
 
 ## Current verified checkpoint — 2026-09-13
 
-**Overall engineering completion: ~50% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~52% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -16,25 +16,42 @@
 - Stage 7 v0.0.1 release: `[ ]`
 
 ### Current verified head / optimization infrastructure
-- Latest verified head: `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`.
+- Current head: `3bfad37bee0a7c783bef35d2365888e292182a80`.
 - Cross-proxy runner: `e10020e7437bf575b6f674591b2ca5c146233fe1`.
 - Repeated-sample wrapper: `872ca45b800ab06c8594e4317b91d2ed1128030b`.
 - CI median stage: `1b1a5cc01d6b2e0d5dfb3b707e0d6733ad12725c`.
 - GoWay address-format compatibility fix: `9d3bc56358218aec673af589334027d823a900a0`.
 - Optional pinned GoWay comparison CI: `a0e787a6642401003f34e941d09d31501dbb1422`.
-- Steady-state benchmark support: current head `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`.
+- Steady-state benchmark support: `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`.
+- Debian 12 CI fix: `994a52c7797f408654057d881effebb9e4af07f2`.
+- ARMv7 CI validation: `3bfad37bee0a7c783bef35d2365888e292182a80`.
 - Rust toolchain: `1.82.0`.
 
 ## Latest CI evidence
+
+### Run 99 — workflow `34756277983` — **fully green**
+Head: `994a52c7797f408654057d881effebb9e4af07f2`
+
+- `test`: **success** — Rust 1.82 tests, release build, MUX benchmark, formal e2e, common proxy runner, repeated setup-inclusive median and repeated steady-state median all passed.
+- `windows-x64`: **success**.
+- `debian-12-x64`: **success** — release binary built successfully inside `rust:1.82-bookworm`.
+- `goway-comparison`: **success**, but comparison steps were skipped because the optional private GoWay repository-read credential is not configured.
+
+This is the first verified CI run with Debian 12 x64 release-build coverage after fixing the container shell/PATH issue.
+
+### Run 100 — workflow `34756739632` — **in progress**
+Head: `3bfad37bee0a7c783bef35d2365888e292182a80`
+
+Added `armv7-unknown-linux-gnueabihf` cross-build validation using `gcc-arm-linux-gnueabihf`. ARMv7 is **not marked complete until this run finishes successfully**.
 
 ### Run 95 — workflow `34755206730` — **fully green**
 Head: `4ee6ef18697bb7fcc4549f7e49e8d1260a3b5a47`
 
 - `test`: **success** — Rust 1.82 tests, release build, MUX benchmark, formal e2e, common proxy runner, repeated setup-inclusive median and repeated steady-state median all passed.
 - `windows-x64`: **success**.
-- `goway-comparison`: **success**, but comparison steps were skipped because `WAY_READ_TOKEN` is not configured for the private sibling repository `CFM503/way`.
+- `goway-comparison`: **success**, but comparison steps were skipped because the optional private GoWay repository-read credential is not configured.
 
-The current RushWay-only benchmark evidence from this verified run is:
+The RushWay-only benchmark evidence from this verified run is:
 
 | Workload | c1 | c8 | c32 |
 |---|---:|---:|---:|
@@ -71,11 +88,11 @@ Run 76 / workflow `34752632479` formal baseline:
 
 `scripts/repeat_proxy_bench.sh` executes repeated samples and reports the median for c1/c8/c32. CI runs five samples.
 
-The benchmark now has two modes:
+The benchmark has two modes:
 - `setup_inclusive`: timer includes local SOCKS5 negotiation, upstream WebSocket setup, transfer and echo;
 - `steady_state`: a warm-up flow establishes the physical upstream WebSocket before the timed flows, so the timed interval focuses on new proxy streams plus data transfer.
 
-The optional `goway-comparison` job pins GoWay to `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc` and Go 1.25.0. Because `CFM503/way` is private, the job requires a repository-read token in `WAY_READ_TOKEN`; without it, the job safely skips rather than failing the main CI.
+The optional `goway-comparison` job pins GoWay to `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc` and Go 1.25.0. Because `CFM503/way` is private, the job requires a repository-read credential; without it, the job safely skips rather than failing the main CI.
 
 ## Current runtime performance state
 
@@ -131,17 +148,18 @@ Reference commit: `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
 
 Documented GoWay performance mechanisms include pooled WebSocket buffers, owned MUX DATA, physical MUX session pooling, active-stream-aware scheduling, byte-level backpressure, connection-pool prewarming/refill and optimized WebSocket masking. These are comparison targets, not claims of RushWay parity.
 
-There is still **no measured GoWay throughput number** because `WAY_READ_TOKEN` is unavailable to the optional CI comparison job.
+There is still **no measured GoWay throughput number** because the optional private sibling-repository credential is not configured.
 
 ## Immediate continuous sequence
 
-1. Enable the optional private-GoWay CI comparison with `WAY_READ_TOKEN`, then capture GoWay setup-inclusive and steady-state c1/c8/c32 medians using the identical runner.
-2. Put RushWay and GoWay results into one comparison table before changing runtime code for speed.
-3. Profile the slower/hotter path and only then optimize outbound MUX allocation, WS buffer reuse, writer contention or physical session pooling.
-4. After the core benchmark comparison is stable, continue WSS UDP, QUIC, non-MUX, retry/dead-IP/pool and broader compatibility work.
-5. Add Debian 12 x64 and KWRT/OpenWrt ARMv7 build jobs plus artifact packaging.
-6. Add true GoWay <-> RushWay interoperability tests.
-7. Only after required evidence is green, create v0.0.1 release.
+1. Finish ARMv7 CI validation and fix any cross-compilation errors without weakening the target build.
+2. Enable the optional private-GoWay CI comparison with the repository-read credential, then capture GoWay setup-inclusive and steady-state c1/c8/c32 medians using the identical runner.
+3. Put RushWay and GoWay results into one comparison table before changing runtime code for speed.
+4. Profile the slower/hotter path and only then optimize outbound MUX allocation, WS buffer reuse, writer contention or physical session pooling.
+5. Continue WSS UDP, QUIC, non-MUX, retry/dead-IP/pool and broader compatibility work.
+6. Package verified Windows x64 and Debian 12 x64 binaries; after ARMv7 passes, add the KWRT/OpenWrt release artifact path.
+7. Add true GoWay <-> RushWay interoperability tests.
+8. Only after required evidence is green, create v0.0.1 release.
 
 ## AI relay rule
 
