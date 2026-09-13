@@ -11,6 +11,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_WS_FRAME_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_HTTP_HEADER_SIZE: usize = 8192;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+const BROWSER_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+const BROWSER_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+const BROWSER_SEC_CH_UA: &str = "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\"";
 
 pub fn compute_accept_key(challenge: &str) -> String {
     let mut h = Sha1::new();
@@ -72,6 +76,9 @@ pub fn build_client_handshake_request(host: &str, path: &str, origin: Option<&st
     let path = if path.is_empty() { "/" } else { path };
     let site = sec_fetch_site.unwrap_or("cross-site");
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n");
+    req.push_str("Pragma: no-cache\r\nCache-Control: no-cache\r\n");
+    req.push_str(&format!("User-Agent: {BROWSER_UA}\r\nAccept-Language: {BROWSER_ACCEPT_LANGUAGE}\r\nAccept-Encoding: {BROWSER_ACCEPT_ENCODING}\r\n"));
+    req.push_str(&format!("Sec-CH-UA: {BROWSER_SEC_CH_UA}\r\nSec-CH-UA-Mobile: ?0\r\nSec-CH-UA-Platform: \"Windows\"\r\n"));
     if let Some(origin) = origin { req.push_str(&format!("Origin: {origin}\r\n")); }
     req.push_str(&format!("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: {site}\r\n\r\n"));
     (req.into_bytes(), key)
@@ -162,6 +169,14 @@ mod tests {
         let (request, key) = build_client_handshake_request("example.com", "/ws", Some("https://example.com"), Some("same-origin"));
         assert_eq!(validate_server_handshake(&request).unwrap(), key);
         validate_client_handshake_response(&build_server_handshake_response(&key), &key).unwrap();
+    }
+    #[test]
+    fn browser_headers_present() {
+        let (request, _) = build_client_handshake_request("example.com", "/ws", Some("https://example.com"), Some("same-origin"));
+        let text = std::str::from_utf8(&request).unwrap();
+        for header in ["Pragma: no-cache", "Cache-Control: no-cache", "User-Agent:", "Accept-Language:", "Accept-Encoding:", "Sec-CH-UA:", "Sec-CH-UA-Mobile: ?0", "Sec-CH-UA-Platform: \"Windows\""] {
+            assert!(text.contains(header), "missing {header}");
+        }
     }
     #[test]
     fn header_limit_is_hard() { assert!(validate_server_handshake(&vec![b'x'; MAX_HTTP_HEADER_SIZE + 1]).is_err()); }
