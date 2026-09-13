@@ -233,7 +233,12 @@ async fn handle_local_udp_proxy(mut control: TcpStream, cfg: RuntimeConfig, bind
     let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await??;
     let (mut rd, mut wr) = tokio::io::split(socket);
     let origin = Some(format!("https://{}", actual_host));
-    let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref());
+    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) {
+        "same-origin"
+    } else {
+        "cross-site"
+    };
+    let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref(), Some(sec_fetch_site));
     wr.write_all(&request).await?; wr.flush().await?;
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
@@ -271,7 +276,12 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
     let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await??;
     let (mut rd, mut wr) = tokio::io::split(socket);
     let origin = Some(format!("https://{}", actual_host));
-    let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref());
+    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) {
+        "same-origin"
+    } else {
+        "cross-site"
+    };
+    let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref(), Some(sec_fetch_site));
     wr.write_all(&request).await?; wr.flush().await?;
     let response = read_http_headers(&mut rd).await?; validate_client_handshake_response(&response, &key)?;
     let writer=Arc::new(Mutex::new(wr)); let cipher=configured_cipher(&cfg.key);
