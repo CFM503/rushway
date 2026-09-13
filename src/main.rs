@@ -120,9 +120,8 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
 async fn main() -> Result<()> {
     let raw_args = normalize_legacy_args(std::env::args());
     let args = Args::parse_from(&raw_args);
-    if args.version { unreachable!("clap handles --version before parsing Args") }
     let filter = tracing_filter(&args.log_level);
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::new(filter)).with_target(false).init();
     let mut cfg = if let Some(path) = args.config.clone() { load_json(path).await? } else { RuntimeConfig::default() };
     if args.tui { tracing::warn!("-tui accepted for GoWay CLI compatibility; RushWay currently uses log output without a TUI dashboard"); }
     if args.log_file.is_some() { tracing::warn!("-log-file accepted for GoWay CLI compatibility; file logging is not yet enabled"); }
