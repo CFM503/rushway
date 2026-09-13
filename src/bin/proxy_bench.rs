@@ -22,6 +22,10 @@ struct Args {
     /// Proxy executable path. The process is used for both server and client.
     #[arg(long)]
     bin: PathBuf,
+
+    /// Warm one flow before timing to exclude initial upstream connection setup.
+    #[arg(long)]
+    steady_state: bool,
 }
 
 async fn free_port() -> io::Result<u16> {
@@ -31,7 +35,7 @@ async fn free_port() -> io::Result<u16> {
 
 fn listen_arg(implementation: &str, port: u16) -> String {
     if implementation.eq_ignore_ascii_case("goway") {
-        format!(":{port}")
+        format(":{port}")
     } else {
         port.to_string()
     }
@@ -137,8 +141,6 @@ async fn run_case(
     concurrency: usize,
     payload: Arc<[u8]>,
 ) -> io::Result<f64> {
-    // Deliberately identical timing definition to the RushWay formal e2e benchmark:
-    // connection establishment + SOCKS5 + upstream handshake + data transfer + echo.
     let start = Instant::now();
     let mut tasks = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
@@ -198,6 +200,13 @@ async fn main() -> io::Result<()> {
         }
         let payload: Arc<[u8]> = payload.into();
 
+        if args.steady_state {
+            // Prime the physical upstream connection/session once. The timed cases
+            // then measure new SOCKS/MUX streams plus data transfer, without the
+            // initial WebSocket handshake dominating the result.
+            let _ = one_flow(client_port, target_port, Arc::clone(&payload)).await?;
+        }
+
         let mut results = Vec::with_capacity(CONCURRENCIES.len());
         for &concurrency in CONCURRENCIES {
             let throughput =
@@ -205,9 +214,11 @@ async fn main() -> io::Result<()> {
             results.push((concurrency, throughput));
         }
 
+        let mode = if args.steady_state { "steady_state" } else { "setup_inclusive" };
         print!(
-            "proxy_e2e implementation={} payload_mib={} roundtrip_echo=1",
+            "proxy_e2e implementation={} mode={} payload_mib={} roundtrip_echo=1",
             args.implementation,
+            mode,
             payload.len() / (1024 * 1024)
         );
         for (concurrency, throughput) in results {
