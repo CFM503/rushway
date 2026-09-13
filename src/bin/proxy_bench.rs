@@ -29,9 +29,22 @@ async fn free_port() -> io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn spawn_proxy(path: &Path, port: u16, upstream: Option<String>) -> io::Result<Child> {
+fn listen_arg(implementation: &str, port: u16) -> String {
+    if implementation.eq_ignore_ascii_case("goway") {
+        format(":{port}")
+    } else {
+        port.to_string()
+    }
+}
+
+fn spawn_proxy(
+    path: &Path,
+    port: u16,
+    implementation: &str,
+    upstream: Option<String>,
+) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    cmd.arg("-p").arg(port.to_string());
+    cmd.arg("-p").arg(listen_arg(implementation, port));
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
     }
@@ -167,10 +180,11 @@ async fn main() -> io::Result<()> {
     let client_port = free_port().await?;
     let (target_port, echo_task) = start_echo().await?;
 
-    let mut server = spawn_proxy(&args.bin, server_port, None)?;
+    let mut server = spawn_proxy(&args.bin, server_port, &args.implementation, None)?;
     let mut client = spawn_proxy(
         &args.bin,
         client_port,
+        &args.implementation,
         Some(format!("ws://127.0.0.1:{server_port}/")),
     )?;
 
