@@ -102,6 +102,23 @@ pub struct MuxFrame {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub struct OwnedMuxFrame {
+    pub stream_id: u32,
+    pub command: MuxCommand,
+    storage: Vec<u8>,
+}
+
+impl OwnedMuxFrame {
+    pub fn payload(&self) -> &[u8] {
+        &self.storage[MUX_HEADER_LEN..]
+    }
+
+    pub fn into_storage(self) -> Vec<u8> {
+        self.storage
+    }
+}
+
 impl MuxFrame {
     pub fn new(stream_id: u32, command: MuxCommand, payload: Vec<u8>) -> Result<Self, ProtocolError> {
         if payload.len() > MAX_MUX_PAYLOAD {
@@ -123,11 +140,9 @@ impl MuxFrame {
         })
     }
 
-    pub fn decode_owned(mut buf: Vec<u8>) -> Result<Self, ProtocolError> {
+    pub fn decode_owned(buf: Vec<u8>) -> Result<OwnedMuxFrame, ProtocolError> {
         let header = MuxHeader::parse(&buf)?;
-        let payload = buf.split_off(MUX_HEADER_LEN);
-        debug_assert_eq!(payload.len(), header.payload_len);
-        Ok(Self { stream_id: header.stream_id, command: header.command, payload })
+        Ok(OwnedMuxFrame { stream_id: header.stream_id, command: header.command, storage: buf })
     }
 }
 
@@ -218,13 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn owned_decode_transfers_payload_storage() {
+    fn owned_decode_keeps_original_payload_storage() {
         let mut encoded = Vec::with_capacity(MUX_HEADER_LEN + 4);
         write_frame_parts(&mut encoded, 7, MuxCommand::Data, &[1, 2, 3, 4]).unwrap();
         let ptr = encoded.as_ptr();
         let frame = MuxFrame::decode_owned(encoded).unwrap();
-        assert_eq!(frame.payload, vec![1, 2, 3, 4]);
-        assert_eq!(frame.payload.as_ptr(), unsafe { ptr.add(MUX_HEADER_LEN) });
+        assert_eq!(frame.payload(), &[1, 2, 3, 4]);
+        assert_eq!(frame.payload().as_ptr(), unsafe { ptr.add(MUX_HEADER_LEN) });
     }
 
     #[test]
