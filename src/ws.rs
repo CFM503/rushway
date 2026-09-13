@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::RngCore;
 use sha1::{Digest, Sha1};
+use std::cell::RefCell;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_WS_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -15,6 +16,31 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const BROWSER_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 const BROWSER_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 const BROWSER_SEC_CH_UA: &str = "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\"";
+const SMALL_FRAME_SIZE: usize = 512;
+
+thread_local! {
+    static MASK_STATE: RefCell<u64> = const { RefCell::new(0) };
+}
+
+fn next_mask() -> [u8; 4] {
+    MASK_STATE.with(|state| {
+        let mut value = state.borrow_mut();
+        if *value == 0 {
+            let mut seed = [0u8; 8];
+            rand::thread_rng().fill_bytes(&mut seed);
+            *value = u64::from_le_bytes(seed);
+            if *value == 0 {
+                *value = 0x9e3779b97f4a7c15;
+            }
+        }
+        let mut x = *value;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *value = x;
+        (x as u32).to_ne_bytes()
+    })
+}
 
 pub fn compute_accept_key(challenge: &str) -> String {
     let mut h = Sha1::new();
@@ -87,7 +113,7 @@ pub fn build_client_handshake_request(host: &str, path: &str, origin: Option<&st
 pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<()> {
     if response.len() > MAX_HTTP_HEADER_SIZE { bail!("header too large"); }
     let text = std::str::from_utf8(response).map_err(|_| anyhow!("invalid HTTP response"))?;
-    let first = text.lines().next().ok_or_else(|| anyhow!("empty websocket handshake response"))?;
+    let first = text.lines().next().ok_or_else(|| anyhow!("empty HTTP response"))?;
     let mut parts = first.splitn(3, ' ');
     let proto = parts.next().unwrap_or("");
     let status = parts.next().unwrap_or("");
@@ -116,24 +142,49 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8], opcode: u8, mask: bool) -> Result<()> {
     if payload.len() > MAX_WS_FRAME_SIZE { return Err(anyhow!("websocket frame too large")); }
     if opcode >= 0x8 && payload.len() > 125 { return Err(anyhow!("control frame payload exceeds 125 bytes")); }
-    let mut h = Vec::with_capacity(14);
-    h.push(0x80 | (opcode & 0x0f));
+
+    let mut header = [0u8; 14];
+    let header_len = if payload.len() <= 125 { 2 } else if payload.len() <= u16::MAX as usize { 4 } else { 10 };
+    header[0] = 0x80 | (opcode & 0x0f);
     let mask_bit = if mask { 0x80 } else { 0 };
-    match payload.len() {
-        0..=125 => h.push(mask_bit | payload.len() as u8),
-        126..=65535 => { h.push(mask_bit | 126); h.extend_from_slice(&(payload.len() as u16).to_be_bytes()); }
-        n => { h.push(mask_bit | 127); h.extend_from_slice(&(n as u64).to_be_bytes()); }
+    match header_len {
+        2 => header[1] = mask_bit | payload.len() as u8,
+        4 => {
+            header[1] = mask_bit | 126;
+            header[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        10 => {
+            header[1] = mask_bit | 127;
+            header[2..10].copy_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        _ => unreachable!(),
     }
-    let mut data = payload.to_vec();
-    if mask {
-        let mut key = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut key);
-        h.extend_from_slice(&key);
-        for (i, b) in data.iter_mut().enumerate() { *b ^= key[i & 3]; }
+
+    if !mask {
+        w.write_all(&header[..header_len]).await?;
+        w.write_all(payload).await?;
+        return Ok(());
     }
-    w.write_all(&h).await?;
-    w.write_all(&data).await?;
-    w.flush().await?;
+
+    let total = header_len + 4 + payload.len();
+    if total <= SMALL_FRAME_SIZE + 14 {
+        let mut frame = [0u8; SMALL_FRAME_SIZE + 14];
+        frame[..header_len].copy_from_slice(&header[..header_len]);
+        let key = next_mask();
+        frame[header_len..header_len + 4].copy_from_slice(&key);
+        frame[header_len + 4..total].copy_from_slice(payload);
+        for (i, byte) in frame[header_len + 4..total].iter_mut().enumerate() { *byte ^= key[i & 3]; }
+        w.write_all(&frame[..total]).await?;
+        return Ok(());
+    }
+
+    let mut frame = Vec::with_capacity(total);
+    frame.extend_from_slice(&header[..header_len]);
+    let key = next_mask();
+    frame.extend_from_slice(&key);
+    frame.extend_from_slice(payload);
+    for (i, byte) in frame[header_len + 4..].iter_mut().enumerate() { *byte ^= key[i & 3]; }
+    w.write_all(&frame).await?;
     Ok(())
 }
 
@@ -179,11 +230,20 @@ mod tests {
         }
     }
     #[test]
+    fn mask_generator_is_nonzero() { assert_ne!(next_mask(), [0, 0, 0, 0]); }
+    #[test]
     fn header_limit_is_hard() { assert!(validate_server_handshake(&vec![b'x'; MAX_HTTP_HEADER_SIZE + 1]).is_err()); }
     #[tokio::test]
     async fn round_trip_unmasked_binary() {
         let (mut a, mut b) = duplex(1024 * 1024); let data = vec![7u8; 70000]; let expected = data.clone();
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, false).await });
+        let mut buf = Vec::new(); let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
+        writer.await.unwrap().unwrap(); assert_eq!(got.0, 2); assert_eq!(got.1, expected);
+    }
+    #[tokio::test]
+    async fn round_trip_masked_binary() {
+        let (mut a, mut b) = duplex(1024 * 1024); let data = vec![11u8; 70000]; let expected = data.clone();
+        let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, true).await });
         let mut buf = Vec::new(); let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
         writer.await.unwrap().unwrap(); assert_eq!(got.0, 2); assert_eq!(got.1, expected);
     }
