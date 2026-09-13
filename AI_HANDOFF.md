@@ -26,14 +26,15 @@
 - `4ca5b78734f62056a309c762cafa8cc100d2a875` — QUIC upstream/server target DNS integration while preserving QUIC server name.
 - `9ab22dead3e778027ad770017261967cc67ace8e` — MUX proxy success response deferred until the upstream stream is actually established.
 - `3d23529bc08d09e7f0539b711b9a15c89af76296` — package version advanced to `0.0.2` for the formal release line.
+- `44054a3ea2282c0974a539d586522edcaa924a71` — remote DNS transaction-ID validation and focused mismatch test.
 
 ### Important interoperability findings
 
 GoWay's own integration tests use forms such as `-up ...`, `-log ERROR`, `-mux=true`, and `-block-local=false`; RushWay's parser now normalizes these into Clap-compatible arguments.
 
-The shared DNS resolver now covers server target resolution plus plain WS MUX, plain WS non-MUX, WSS and QUIC upstream/target hostname dialing. IP literals bypass DNS, and WSS/QUIC preserve the original logical hostname for TLS/HTTP identity.
+The shared DNS resolver now covers server target resolution plus plain WS MUX, plain WS non-MUX, WSS and QUIC upstream/target hostname dialing. IP literals bypass DNS, WSS/QUIC preserve the original logical hostname for TLS/HTTP identity, and remote DNS replies are transaction-ID checked.
 
-The MUX local proxy path now waits until the physical/logic stream is acquired before returning local CONNECT success. The remaining refinement is to consume the first upstream MUX response so a server-side RST can be converted into the exact local SOCKS5/HTTP failure response.
+The MUX local proxy path now waits until the physical/logical stream is acquired before returning local CONNECT success. The remaining refinement is to consume the first upstream MUX response so a server-side RST can be converted into the exact local SOCKS5/HTTP failure response.
 
 ### Current verification boundary
 
@@ -45,8 +46,8 @@ GitHub Actions remains **inconclusive** rather than a compiler result: the newes
 2. Cross-path TCP socket-policy audit for pooled MUX/WSS upstream connections (NODELAY, keepalive, send/recv buffer).
 3. SOCKS5 target-failure/error/FRAG/close parity and HTTP CONNECT malformed-request/status parity.
 4. QUIC retry/dead-IP/pool semantics and exact TLS/SNI audit.
-5. DNS protocol hardening tests, including transaction-ID validation and cache/fallback behavior.
-6. Obtain usable Rust 1.82 execution evidence; run fmt/check/test/release and fix actual failures.
+5. Execute DNS/cache/fallback tests after obtaining usable Rust 1.82 execution evidence.
+6. Run `cargo fmt -- --check`, `cargo check --all-targets`, `cargo test --all-targets --all-features`, and `cargo build --release`; fix actual failures.
 7. Run GoWay -> RushWay and RushWay -> GoWay TCP/UDP interoperability, 1/100/500/1000-stream stress, large payload and mixed slow/fast tests.
 8. Run c1/c8/c32 benchmarks and Windows/Debian/ARMv7 artifact smoke tests.
 9. Create and smoke-test `v0.0.2` only after executable evidence is complete.
