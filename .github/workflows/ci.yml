@@ -96,4 +96,4 @@ jobs:
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
             rust:1.82-bookworm \
-            bash -lc 'apt-get update && apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates && cargo build --release && file target/release/rushway'
+            bash -c 'apt-get update && apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates && export PATH="/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH" && cargo build --release && file target/release/rushway'
