@@ -105,9 +105,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ARMv7 cross compiler
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+      # ARMv7 gets a fresh dependency resolution on CI; current stable Cargo
+      # is required for transitive crates that now use Edition 2024. The main
+      # compatibility test remains pinned to Rust 1.82.0.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.82.0
           targets: armv7-unknown-linux-gnueabihf
       - name: Build ARMv7 Linux
         env:
