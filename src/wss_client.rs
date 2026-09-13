@@ -1,6 +1,7 @@
 //! WSS client paths for GoWay-compatible upstreams.
 
 use crate::crypto::XorCipher;
+use crate::dns;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION};
 use crate::runtime::RuntimeConfig;
@@ -30,6 +31,19 @@ struct WssConfig { proxy_host: String, proxy_port: u16, upstream: String, key: O
 fn cipher(key: &Option<String>) -> XorCipher { XorCipher::new(key.as_deref().unwrap_or("")) }
 fn configured_session_count() -> usize { std::env::var("RUSHWAY_MUX_SESSIONS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_SESSION_COUNT).clamp(1, MAX_SESSION_COUNT) }
 
+fn split_authority(authority: &str) -> Result<(String, u16)> {
+    if authority.starts_with('[') {
+        let close = authority.find(']').ok_or_else(|| anyhow!("invalid WSS IPv6 authority"))?;
+        let host = authority[1..close].to_string();
+        let port = authority.get(close + 1..).and_then(|s| s.strip_prefix(':')).unwrap_or("443").parse::<u16>()?;
+        return Ok((host, port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Ok((host.to_string(), port.parse::<u16>()?)),
+        None => Ok((authority.to_string(), 443)),
+    }
+}
+
 fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
     let rest=input.strip_prefix("wss://").ok_or_else(||anyhow!("WSS client requires wss:// upstream"))?;
     let(authority,path)=match rest.split_once('/') {Some((a,p))=>(a,format!("/{}",p)),None=>(rest,"/".to_string())};
@@ -40,7 +54,11 @@ fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
 }
 
 async fn open_upstream(cfg:&WssConfig)->Result<(BoxReader,Arc<Mutex<BoxWriter>>)> {
-    let(addr,host,path)=parse_wss_url(&cfg.upstream)?;let tcp=timeout(Duration::from_secs(cfg.connection_timeout.max(1)),TcpStream::connect(&addr)).await.context("WSS upstream TCP timeout")??;tcp.set_nodelay(true).ok();
+    let(addr,host,path)=parse_wss_url(&cfg.upstream)?;
+    let(dns_host,dns_port)=split_authority(&addr)?;
+    let resolved=dns::resolve_socket(&dns_host,dns_port).await?;
+    let tcp=timeout(Duration::from_secs(cfg.connection_timeout.max(1)),TcpStream::connect(resolved)).await.context("WSS upstream TCP timeout")??;
+    tcp.set_nodelay(true).ok();
     let tls_name=cfg.fakehost.as_deref().unwrap_or(&host);let tls_stream=tls::connect(tcp,tls_name,cfg.verify_ssl).await?;let boxed:BoxTransport=Box::new(tls_stream);let(mut rd,mut wr)=tokio::io::split(boxed);
     let header_host=cfg.fakehost.as_deref().unwrap_or(&host);let origin=format!("https://{}",host);let sec_fetch_site=if tls_name.eq_ignore_ascii_case(header_host){"same-origin"}else{"cross-site"};let(request,key)=build_client_handshake_request(header_host,&path,Some(&origin),Some(sec_fetch_site));wr.write_all(&request).await?;wr.flush().await?;let response=read_http_headers(&mut rd).await?;validate_client_handshake_response(&response,&key)?;Ok((rd,Arc::new(Mutex::new(wr))))
 }
@@ -75,3 +93,5 @@ impl WssSessionPool{fn new(cfg:WssConfig)->Arc<Self>{Arc::new(Self{cfg,sessions:
 async fn handle_connection(mut local:TcpStream,pool:Arc<WssSessionPool>)->Result<()>{let(command,target,is_socks5)=read_proxy_request(&mut local).await?;if command==SocksCommand::UdpAssociate{return handle_udp_proxy(local,pool.cfg.clone(),target).await}if command!=SocksCommand::Connect{bail!("WSS path only supports CONNECT or UDP ASSOCIATE")};let(session,stream_id,mut rx)=pool.acquire(&target).await?;let writer=session.writer.clone();let cipher=session.cipher.clone();if is_socks5{local.write_all(&socks5_success_response()).await?}else{local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?};let(mut local_rd,mut local_wr)=tokio::io::split(local);let buffer_size=pool.cfg.buffer_size.clamp(16*1024,1024*1024);let upload=tokio::spawn(async move{let mut buf=vec![0u8;buffer_size];loop{let n=local_rd.read(&mut buf).await?;if n==0{let _=send_mux_parts(&writer,&cipher,stream_id,MuxCommand::Fin,&[]).await;break}let mut off=0;while off<n{let end=(off+u16::MAX as usize).min(n);send_mux_parts(&writer,&cipher,stream_id,MuxCommand::Data,&buf[off..end]).await?;off=end}}Result::<()>::Ok(())});while let Some(frame)=rx.recv().await{match frame.command{MuxCommand::Data=>local_wr.write_all(frame.payload()).await?,MuxCommand::Fin=>{local_wr.shutdown().await?;break},MuxCommand::Rst=>break,MuxCommand::Syn=>{}}}upload.abort();Ok(())}
 
 pub async fn run_client_from_config(cfg:RuntimeConfig,verify_ssl:bool)->Result<()>{let upstream=cfg.upstream.clone().ok_or_else(||anyhow!("WSS client requires upstream"))?;let wc=WssConfig{proxy_host:cfg.proxy_host,proxy_port:cfg.proxy_port,upstream,key:cfg.key,fakehost:cfg.fakehost,buffer_size:cfg.buffer_size,connection_timeout:cfg.connection_timeout,verify_ssl};let pool=WssSessionPool::new(wc.clone());pool.prewarm().await;let listener=TcpListener::bind(format!("{}:{}",wc.proxy_host,wc.proxy_port)).await?;tracing::info!("RushWay WSS client proxy listening on {}:{}",wc.proxy_host,wc.proxy_port);loop{let(stream,peer)=listener.accept().await?;let pool2=pool.clone();tokio::spawn(async move{if let Err(e)=handle_connection(stream,pool2).await{tracing::debug!(%peer,error=%e,"WSS proxy connection closed")}})}}
+
+async fn run_non_mux_dummy(){}
