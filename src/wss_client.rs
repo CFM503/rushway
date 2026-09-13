@@ -5,11 +5,11 @@
 //! primitives. Server-side TLS is not claimed here.
 
 use crate::crypto::XorCipher;
-use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, SynPayload};
+use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_VERSION};
 use crate::runtime::RuntimeConfig;
 use crate::tls;
-use crate::ws::{build_client_handshake_request, read_frame, read_http_headers, validate_client_handshake_response, write_frame};
+use crate::ws::{build_client_handshake_request, read_frame, read_frame_owned, read_http_headers, validate_client_handshake_response, write_frame};
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -98,7 +98,7 @@ async fn handle_connection(mut local: TcpStream, cfg: WssConfig, id: u32) -> Res
     let id = id.max(1); let syn = SynPayload { target: format!("{}:{}", target.host, target.port).into_bytes(), initial_data: Vec::new() }; let syn = MuxFrame::new(id, MuxCommand::Syn, syn.encode().map_err(|e| anyhow!(e.to_string()))?).map_err(|e| anyhow!(e.to_string()))?; send_mux(&writer, &syn).await?;
     let (mut local_rd, mut local_wr) = tokio::io::split(local); let writer_up = writer.clone(); let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
     let upload = tokio::spawn(async move { let mut buf = vec![0u8; buffer_size]; loop { let n = local_rd.read(&mut buf).await?; if n == 0 { let _ = send_mux_parts(&writer_up, id, MuxCommand::Fin, &[]).await; break; } let mut off = 0; while off < n { let end = (off + u16::MAX as usize).min(n); send_mux_parts(&writer_up, id, MuxCommand::Data, &buf[off..end]).await?; off=end; } } Result::<()>::Ok(()) });
-    loop { let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await? else { break }; if opcode != 2 { continue }; let frame = MuxFrame::decode(&payload).map_err(|e| anyhow!(e.to_string()))?; if frame.stream_id != id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(&frame.payload).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
+    loop { let Some((opcode, payload)) = read_frame_owned(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await? else { break }; if opcode != 2 { continue }; let frame = MuxFrame::decode_owned(payload).map_err(|e| anyhow!(e.to_string()))?; if frame.stream_id != id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(frame.payload()).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
     upload.abort(); Ok(())
 }
 
