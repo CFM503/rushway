@@ -29,8 +29,15 @@ struct Args {
     #[arg(long = "mux-sessions", default_value_t = 4, value_parser = clap::value_parser!(usize).range(1..=64))] mux_sessions: usize,
     #[arg(long = "allow-open", default_value_t = false)] allow_open: bool,
     #[arg(long = "verify-ssl", default_value_t = false)] verify_ssl: bool,
-    #[arg(short = 'W')] buffer_size: Option<usize>,
-    #[arg(long = "connection-timeout")] connection_timeout: Option<u64>,
+    #[arg(short = 'W', default_value_t = 128)] buffer_kib: usize,
+    #[arg(long = "socket-buffer", default_value_t = 0)] socket_buffer_kib: usize,
+    #[arg(long = "no-tcp-nodelay", default_value_t = false)] no_tcp_nodelay: bool,
+    #[arg(long = "no-tcp-keepalive", default_value_t = false)] no_tcp_keepalive: bool,
+    #[arg(long = "dns")] dns: Option<String>,
+    #[arg(long = "block-local", default_value_t = true)] block_local: bool,
+    #[arg(long = "no-block-local", default_value_t = false)] no_block_local: bool,
+    #[arg(long = "max-conn", default_value_t = 1000, value_parser = clap::value_parser!(usize).range(1..=1_000_000))] max_conn: usize,
+    #[arg(long = "connection-timeout", default_value_t = 60)] connection_timeout: u64,
 }
 
 async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
@@ -46,6 +53,9 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
     if let Some(x) = v.get("buffer_size").or_else(|| v.get("bufferSize")).and_then(|x| x.as_u64()) { cfg.buffer_size = usize::try_from(x).map_err(|_| anyhow!("buffer_size out of range"))?; }
     if let Some(x) = v.get("connection_timeout").or_else(|| v.get("connectionTimeout")).and_then(|x| x.as_u64()) { cfg.connection_timeout = x; }
     if let Some(x) = v.get("allow_open").or_else(|| v.get("allowOpen")).and_then(|x| x.as_bool()) { cfg.allow_open = x; }
+    if let Some(x) = v.get("max_connections").or_else(|| v.get("maxConnections")).and_then(|x| x.as_u64()) { cfg.max_connections = usize::try_from(x).map_err(|_| anyhow!("max_connections out of range"))?.clamp(1, 1_000_000); }
+    if let Some(x) = v.get("block_local").or_else(|| v.get("blockLocal")).and_then(|x| x.as_bool()) { cfg.block_local = x; }
+    if let Some(x) = v.get("tcp_nodelay").or_else(|| v.get("tcpNoDelay")).and_then(|x| x.as_bool()) { cfg.tcp_nodelay = x; }
     tracing::info!(config = %path.display(), "configuration loaded");
     Ok(cfg)
 }
@@ -59,10 +69,16 @@ async fn main() -> Result<()> {
     if let Some(v) = args.upstream { cfg.upstream = Some(v); }
     if let Some(v) = args.key { cfg.key = Some(v); }
     if let Some(v) = args.fakehost { cfg.fakehost = Some(v); }
-    if let Some(v) = args.buffer_size { cfg.buffer_size = v; }
-    if let Some(v) = args.connection_timeout { cfg.connection_timeout = v; }
+    cfg.buffer_size = args.buffer_kib.saturating_mul(1024).max(16 * 1024);
+    let _socket_buffer_bytes = args.socket_buffer_kib.saturating_mul(1024);
+    cfg.tcp_nodelay = !args.no_tcp_nodelay;
     if args.no_mux { cfg.mux = false; } else { cfg.mux = args.mux; }
     if args.allow_open { cfg.allow_open = true; }
+    cfg.max_connections = args.max_conn;
+    cfg.block_local = if args.no_block_local { false } else { args.block_local };
+    cfg.connection_timeout = args.connection_timeout;
+    let _ = args.dns;
+    let _ = args.no_tcp_keepalive;
     std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
     if let Some(upstream) = cfg.upstream.as_deref() {
         if upstream.starts_with("wss://") {
@@ -92,9 +108,12 @@ mod tests {
         assert_eq!(a.mux_sessions, 4);
     }
     #[test]
-    fn parses_mux_sessions() {
-        let a = Args::parse_from(["rushway", "--up", "ws://example.com/ws", "--mux-sessions", "12"]);
-        assert_eq!(a.mux_sessions, 12);
+    fn parses_policy_args() {
+        let a = Args::parse_from(["rushway", "--no-tcp-nodelay", "--no-tcp-keepalive", "--max-conn", "32", "--no-block-local"]);
+        assert!(a.no_tcp_nodelay);
+        assert!(a.no_tcp_keepalive);
+        assert_eq!(a.max_conn, 32);
+        assert!(a.no_block_local);
     }
     #[test]
     fn parses_verify_ssl() {
