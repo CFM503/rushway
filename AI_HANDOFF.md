@@ -1,74 +1,45 @@
 # RushWay AI Relay Handoff
 
-## 2026-09-13 continuous engineering checkpoint
+## 2026-09-13 continuous checkpoint
 
-Latest code head: `590a818c843af81043277f107eaae2fc8bd375c8`.
+Latest code head: `7be62764ff49bcf06eae74c43b6396d07701bcad`.
 
-### CI / platform status
+### Current status
 
-- Run 100 (`34756739632`) proved the Rust 1.82 main test/release path and Windows/Debian paths; its real ARM failure was a transitive Edition 2024 dependency requiring a newer Cargo.
-- ARMv7 CI was then pinned to Rust 1.86.0 in `.github/workflows/ci.yml` while the main compatibility/test job remains Rust 1.82.0.
-- Runs 101-105 repeatedly failed at the GitHub Actions run/job layer with jobs reported as completed + failure but `steps: null`; no compile or test logs were produced. Treat these as CI infrastructure failures, not code evidence.
+The client now has physical MUX session reuse for normal `ws://` traffic. Up to 4 physical WebSocket/MUX sessions are reused, local TCP connections become logical MUX streams, and the least-active session is selected.
 
-### New runtime optimization work
+Latest hardening in `7be62764ff49bcf06eae74c43b6396d07701bcad`:
+- terminal FIN/RST removes a stream at most once;
+- active stream counts cannot underflow from duplicate cleanup;
+- the reader task does not hold the shared writer lock while waiting for network input;
+- dead physical sessions are retired and their stream map is cleared.
 
-Commits:
-- `f23ab32d8b5ef8343a81b9bfa4665da945d06e5b` — add `src/mux_pool.rs` with client-side physical MUX session pooling.
-- `590a818c843af81043277f107eaae2fc8bd375c8` — route normal `ws://` client mode through the pooled MUX client.
+### CI status
 
-The new client path changes the connection model:
-- prewarm up to 4 physical WebSocket/MUX sessions;
-- local TCP proxy connections become logical MUX streams;
-- choose the least-active reusable physical session;
-- maintain a per-session stream dispatch map and one reader task;
-- reuse the same physical WebSocket across repeated local TCP connections;
-- retain the existing WSS client path separately;
-- retain SOCKS5 UDP handling in the pooled client module.
+Runs 101 through the latest pooled-client run are still failing before any job step starts (`steps: null`). Therefore the pooled client has not yet received compiler/test execution evidence from GitHub Actions.
 
-This directly targets the largest currently visible client-side setup overhead: every local TCP connection previously created a fresh upstream WebSocket + MUX physical connection.
+ARMv7 remains pinned to Rust 1.86.0; the main test path remains Rust 1.82.0.
 
-### Current performance interpretation
+### Benchmark baseline to preserve
 
-This pooling change is an architectural optimization, not yet a measured speed claim. Existing RushWay-only benchmark evidence remains:
+Run 95 remains the last fully verified RushWay-only baseline:
+- setup-inclusive median: c1 `43.31`, c8 `170.17`, c32 `345.55` MiB/s
+- steady-state median: c1 `43.06`, c8 `205.04`, c32 `349.28` MiB/s
 
-| Mode | c1 | c8 | c32 |
-|---|---:|---:|---:|
-| Setup-inclusive median, Run 95 | 43.31 | 170.17 | 345.55 MiB/s |
-| Steady-state median, Run 95 | 43.06 | 205.04 | 349.28 MiB/s |
+These are not GoWay comparison results.
 
-Existing MUX ownership microbenchmark evidence remains directional only:
-- copied decode: `11456.35 ns/op`
-- owned/reused decode: `1.54 ns/op`
-- reported owned-vs-copy speedup: `7431.47x`
+### Next sequence
 
-No RushWay-vs-GoWay speed conclusion is permitted until the optional private GoWay comparison executes successfully.
+1. Obtain a normal Actions execution and compile/test the pooled client.
+2. Run pooled-client c1/c8/c32 setup-inclusive and steady-state medians.
+3. Compare with the Run 95 baseline.
+4. Run the pinned GoWay comparison when its benchmark path is available.
+5. Continue the remaining WSS UDP, QUIC, non-MUX, retry/dead-IP, interoperability and release work.
 
-### Static audit items before trusting the pooled client
+Do not claim performance improvement or GoWay parity without execution evidence.
 
-The new pool should be compiled and exercised before further optimization. Pay particular attention to:
-- stream active-counter lifecycle on terminal FIN/RST;
-- reader-loop WebSocket ping/pong handling without holding the shared writer lock across a network read;
-- session replacement after physical connection failure;
-- prewarm behavior when the upstream is unavailable;
-- repeated c1/c8/c32 setup-inclusive and steady-state medians versus the pre-pool baseline.
+## Relay files
 
-### Functional gaps still open
-
-- WSS UDP
-- runtime QUIC
-- runtime connection pool/reuse/retry/dead-IP beyond the new TCP MUX physical-session reuse
-- runtime non-MUX mode
-- true GoWay <-> RushWay interoperability evidence
-- Debian 12 x64 artifact packaging
-- KWRT/OpenWrt ARMv7 artifact packaging
-- v0.0.1 release
-
-Compiler warnings remain but are not current correctness evidence.
-
-## Relay operating rule
-
-1. Read `PROGRESS.md`, `AI_HANDOFF.md` and `SPEC.md` before changing code.
-2. Treat the latest repository head and latest Actions run as authoritative; old benchmark notes are historical.
-3. Make one logical runtime change at a time, validate it, then record exact commit/run/evidence.
-4. Never convert a microbenchmark, RushWay-only benchmark or documentation claim into a GoWay comparison claim.
-5. Keep `PROGRESS.md` as the canonical status table and this file as the chronological handoff log.
+- `PROGRESS.md` — canonical roadmap and verified status.
+- `AI_HANDOFF.md` — chronological AI relay log.
+- `SPEC.md` — compatibility and implementation specification.
