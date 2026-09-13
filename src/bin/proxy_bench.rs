@@ -31,7 +31,7 @@ async fn free_port() -> io::Result<u16> {
 
 fn listen_arg(implementation: &str, port: u16) -> String {
     if implementation.eq_ignore_ascii_case("goway") {
-        format(":{port}")
+        format!(":{port}")
     } else {
         port.to_string()
     }
