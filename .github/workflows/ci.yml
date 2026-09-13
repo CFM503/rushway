@@ -19,6 +19,8 @@ jobs:
         run: cargo build --release
       - name: MUX hot-path benchmark
         run: cargo run --release --bin mux_bench
+      - name: End-to-end proxy benchmark
+        run: cargo run --release --bin e2e_bench
 
   windows-x64:
     runs-on: ubuntu-latest
