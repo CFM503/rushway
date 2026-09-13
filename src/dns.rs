@@ -82,6 +82,7 @@ async fn resolve_remote(host: &str, server: IpAddr) -> Result<IpAddr> {
 
 async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<IpAddr>> {
     let request = build_query(host, qtype)?;
+    let expected_id = u16::from_be_bytes([request[0], request[1]]);
     let server_addr = SocketAddr::new(server, DNS_PORT);
     let socket = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
     socket.send_to(&request, server_addr).await?;
@@ -92,9 +93,11 @@ async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<I
         Err(_) => return Err(anyhow!("remote DNS UDP timeout")),
     };
     buf.truncate(size);
+    validate_transaction_id(&buf, expected_id)?;
     let (ip, truncated) = parse_response(&buf, qtype)?;
     if !truncated { return Ok(ip); }
     let response = dns_tcp_query(server_addr, &request).await?;
+    validate_transaction_id(&response, expected_id)?;
     Ok(parse_response(&response, qtype)?.0)
 }
 
@@ -110,6 +113,13 @@ async fn dns_tcp_query(server: SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
     let mut response = vec![0u8; size];
     timeout(RESOLVE_TIMEOUT, stream.read_exact(&mut response)).await??;
     Ok(response)
+}
+
+fn validate_transaction_id(buf: &[u8], expected: u16) -> Result<()> {
+    if buf.len() < 2 { bail!("DNS response too short for transaction ID"); }
+    let actual = u16::from_be_bytes([buf[0], buf[1]]);
+    if actual != expected { bail!("DNS transaction ID mismatch: expected {expected:#06x}, got {actual:#06x}"); }
+    Ok(())
 }
 
 fn build_query(host: &str, qtype: u16) -> Result<Vec<u8>> {
@@ -199,6 +209,12 @@ mod tests {
         let q = build_query("example.com", 1).unwrap();
         assert!(q.len() > 16);
         assert_eq!(u16::from_be_bytes([q[4], q[5]]), 1);
+    }
+    #[test]
+    fn transaction_id_mismatch_is_rejected() {
+        let response = [0x12, 0x35, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+        assert!(validate_transaction_id(&response, 0x1234).is_err());
+        assert!(validate_transaction_id(&response, 0x1235).is_ok());
     }
     #[test]
     fn parses_ipv4_answer() {
