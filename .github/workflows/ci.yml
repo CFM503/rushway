@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Skip GoWay comparison when sibling-repo token is not configured
         if: env.WAY_READ_TOKEN == ''
-        run: echo "GoWay comparison skipped; configure the optional WAY_READ_TOKEN secret to enable the pinned private-repo benchmark."
+        run: echo "GoWay comparison skipped; configure the optional repository-read credential to enable the pinned private-repo benchmark."
       - name: Check out RushWay
         if: env.WAY_READ_TOKEN != ''
         uses: actions/checkout@v4
@@ -84,3 +84,16 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - name: Build Windows x64
         run: cargo build --release --target x86_64-pc-windows-gnu
+
+  debian-12-x64:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binary inside Debian 12
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            rust:1.82-bookworm \
+            bash -lc 'apt-get update && apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates && cargo build --release && file target/release/rushway'
