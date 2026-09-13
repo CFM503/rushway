@@ -25,6 +25,8 @@ jobs:
         run: cargo run --release --bin proxy_bench -- --implementation rushway --bin target/release/rushway
       - name: Repeated cross-proxy benchmark median
         run: bash scripts/repeat_proxy_bench.sh rushway target/release/rushway 5
+      - name: Repeated steady-state proxy benchmark median
+        run: bash scripts/repeat_proxy_bench.sh rushway target/release/rushway 5 target/release/proxy_bench steady_state
 
   goway-comparison:
     runs-on: ubuntu-latest
@@ -65,6 +67,9 @@ jobs:
       - name: Run repeated RushWay-vs-GoWay comparison sample for GoWay
         if: env.WAY_READ_TOKEN != ''
         run: bash scripts/repeat_proxy_bench.sh goway "$GITHUB_WORKSPACE/goway-v1.8.4" 5
+      - name: Run repeated steady-state GoWay comparison sample
+        if: env.WAY_READ_TOKEN != ''
+        run: bash scripts/repeat_proxy_bench.sh goway "$GITHUB_WORKSPACE/goway-v1.8.4" 5 target/release/proxy_bench steady_state
 
   windows-x64:
     runs-on: ubuntu-latest
