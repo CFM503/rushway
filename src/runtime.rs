@@ -5,7 +5,7 @@
 //! TLS/QUIC/pooling/retry remain explicit follow-up layers.
 
 use crate::crypto::XorCipher;
-use crate::protocol::{MuxCommand, MuxFrame, SynPayload};
+use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, SynPayload};
 use crate::proxy::{parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION};
 use crate::ws::{build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers, validate_client_handshake_response, validate_server_handshake, write_frame};
 use anyhow::{anyhow, bail, Context, Result};
@@ -59,6 +59,13 @@ async fn send_frame(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, frame: &MuxFrame)
     write_frame(&mut *w, &bytes, 2, false).await
 }
 
+async fn send_mux_parts(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(7 + payload.len());
+    write_frame_parts(&mut bytes, stream_id, command, payload).map_err(|e| anyhow!(e.to_string()))?;
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &bytes, 2, false).await
+}
+
 async fn send_reset(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, id: u32) -> Result<()> {
     send_frame(writer, &MuxFrame::new(id, MuxCommand::Rst, Vec::new()).map_err(|e| anyhow!(e.to_string()))?).await
 }
@@ -67,13 +74,12 @@ async fn target_to_mux(id: u32, mut target: ReadHalf<TcpStream>, writer: Arc<Mut
     let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
     loop {
         match target.read(&mut buf).await {
-            Ok(0) => { let _ = send_frame(&writer, &MuxFrame::new(id, MuxCommand::Fin, Vec::new()).unwrap()).await; break; }
+            Ok(0) => { let _ = send_mux_parts(&writer, id, MuxCommand::Fin, &[]).await; break; }
             Ok(n) => {
                 let mut off = 0;
                 while off < n {
                     let end = (off + u16::MAX as usize).min(n);
-                    let frame = match MuxFrame::new(id, MuxCommand::Data, buf[off..end].to_vec()) { Ok(f) => f, Err(_) => return };
-                    if send_frame(&writer, &frame).await.is_err() { return; }
+                    if send_mux_parts(&writer, id, MuxCommand::Data, &buf[off..end]).await.is_err() { return; }
                     off = end;
                 }
             }
@@ -233,11 +239,7 @@ async fn handle_local_udp_proxy(mut control: TcpStream, cfg: RuntimeConfig, bind
     let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await??;
     let (mut rd, mut wr) = tokio::io::split(socket);
     let origin = Some(format!("https://{}", actual_host));
-    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) {
-        "same-origin"
-    } else {
-        "cross-site"
-    };
+    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) { "same-origin" } else { "cross-site" };
     let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref(), Some(sec_fetch_site));
     wr.write_all(&request).await?; wr.flush().await?;
     let response = read_http_headers(&mut rd).await?;
@@ -276,11 +278,7 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
     let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await??;
     let (mut rd, mut wr) = tokio::io::split(socket);
     let origin = Some(format!("https://{}", actual_host));
-    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) {
-        "same-origin"
-    } else {
-        "cross-site"
-    };
+    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) { "same-origin" } else { "cross-site" };
     let (request, key) = build_client_handshake_request(&actual_host, &path, origin.as_deref(), Some(sec_fetch_site));
     wr.write_all(&request).await?; wr.flush().await?;
     let response = read_http_headers(&mut rd).await?; validate_client_handshake_response(&response, &key)?;
@@ -292,7 +290,7 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
     if opcode!=2 { bail!("invalid MUX handshake response opcode") }
     transform_payload(&cipher,&mut ok); if ok!=b"OK\n" { bail!("upstream rejected MUX handshake") }
     let id=next_id.max(1); let target_text=format!("{}:{}",target.host,target.port); let syn=SynPayload{target:target_text.into_bytes(),initial_data:Vec::new()}; let syn_frame=MuxFrame::new(id,MuxCommand::Syn,syn.encode().map_err(|e|anyhow!(e.to_string()))?).map_err(|e|anyhow!(e.to_string()))?; send_frame(&writer,&syn_frame).await?;
-    let (mut local_rd,mut local_wr)=tokio::io::split(local); let writer_up=writer.clone(); let upload=tokio::spawn(async move { let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)]; loop { let n=local_rd.read(&mut buf).await?; if n==0 { let _=send_frame(&writer_up,&MuxFrame::new(id,MuxCommand::Fin,Vec::new()).unwrap()).await; break } let mut off=0; while off<n { let end=(off+u16::MAX as usize).min(n); let f=MuxFrame::new(id,MuxCommand::Data,buf[off..end].to_vec()).unwrap(); send_frame(&writer_up,&f).await?; off=end; } } Result::<()>::Ok(()) });
+    let (mut local_rd,mut local_wr)=tokio::io::split(local); let writer_up=writer.clone(); let upload=tokio::spawn(async move { let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)]; loop { let n=local_rd.read(&mut buf).await?; if n==0 { let _=send_mux_parts(&writer_up,id,MuxCommand::Fin,&[]).await; break } let mut off=0; while off<n { let end=(off+u16::MAX as usize).min(n); send_mux_parts(&writer_up,id,MuxCommand::Data,&buf[off..end]).await?; off=end; } } Result::<()>::Ok(()) });
     loop { let Some((opcode,payload))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { break }; if opcode!=2 { continue } let frame=MuxFrame::decode(&payload).map_err(|e|anyhow!(e.to_string()))?; if frame.stream_id!=id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(&frame.payload).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
     upload.abort(); Ok(())
 }
