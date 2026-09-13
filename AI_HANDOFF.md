@@ -11,6 +11,7 @@
 - Formal release target: `v0.0.2`
 - Targets: Windows x64, Debian 12 x64, KWRT/OpenWrt ARMv7
 - Branch: `main`
+- Current HEAD: `ad88a9d218af7f841f74d0231864e56723fff840`
 
 ### Newly completed in this continuation
 
@@ -21,6 +22,7 @@
 - `24728d10801439b733b45af2a9316b160b93ca8c` / `156785a8e550d967d2109990ac28e960443d436b` — WSS upstream sockets now reuse the same NODELAY/keepalive/buffer policy, WSS non-MUX target rejection maps to local failure, and WSS MUX CONNECT waits for the first upstream response without double-decrementing terminal stream state.
 - `75610b2123433a2b034eba577b61ddc161ac159f` — QUIC target-dial failure maps to local SOCKS5/HTTP failure and server target TCP sockets receive the shared socket policy; existing client pool retries once after failed `open_bi`.
 - `ce9e0cf4013c615c22f89b21e01389c741e09a39` — release dashboard updated for the hardened source state.
+- `ad88a9d218af7f841f74d0231864e56723fff840` — compatibility contract refreshed to reflect the hardened transport/error/socket-policy source state.
 
 ### Important interoperability findings
 
@@ -34,9 +36,11 @@ QUIC client connection reuse already clears the cached connection and retries wh
 
 ### Current verification boundary
 
-GitHub Actions is still **inconclusive rather than a compiler result**. HEAD `75610b2123433a2b034eba577b61ddc161ac159f` triggered `RushWay CI` run `34764563674` and `RushWay Build Smoke` run `34764563695`; both failed before exposing executable job steps, and the job-log endpoint returns `BlobNotFound`. This means no current-head compile/test/build result is honestly claimable from Actions yet.
+GitHub Actions remains **inconclusive rather than a compiler result**. Current HEAD `ad88a9d218af7f841f74d0231864e56723fff840` triggered `RushWay CI` run `34764680661` and `RushWay Build Smoke` run `34764680741`; both failed at the workflow-job level before exposing executable job steps. The earlier failed attempt on `75610b2123433a2b034eba577b61ddc161ac159f` also showed `runner_id=0` with empty steps/logs returning `BlobNotFound`. No current-head compile/test/build result is therefore honestly claimable from Actions.
 
 A prior same-day run (`34756277983`, commit `994a52c7797f408654057d881effebb9e4af07f2`) completed successfully, but it predates the final transport hardening commits and cannot certify the current HEAD.
+
+GitHub issue `#1` records the release-blocking Actions runner failure.
 
 ### Remaining work before the 100% gate
 
