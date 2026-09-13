@@ -4,162 +4,125 @@
 
 RushWay targets protocol-compatible behavior with GoWay v1.8.4 at commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.
 
-**Status rule:** `Implemented` means the current code contains the path; it does not mean current-head executable interop has passed.
+**Status rule:** `Implemented` means the current source contains the path. It does not mean current-head executable interoperability has passed.
 
-## High-level implementation status — 2026-09-13
+## Current status — 2026-09-13
 
-| Area | Current status |
+| Area | Status |
 |---|---|
-| Plain WS handshake | Implemented |
-| Plain WS MUX TCP | Implemented; execution evidence pending |
-| Plain WS physical MUX pooling | Implemented; stress evidence pending |
-| Plain WS SOCKS5 UDP | Implemented; execution evidence pending |
-| WSS TCP client | Implemented |
-| WSS physical MUX pooling | Implemented; execution evidence pending |
-| WSS non-MUX client | Implemented |
-| WSS UDP client | Implemented in code; execution evidence pending |
-| Non-MUX 1:1 TCP | Implemented in code; exact lifecycle/pool parity pending |
-| QUIC / QUIC+TLS TCP | Implemented in code; execution evidence pending |
-| QUIC UDP | Implemented in code; execution evidence pending |
+| Plain WS handshake/auth/XOR | Implemented |
+| Plain WS MUX TCP/pooling | Implemented; runtime evidence pending |
+| Plain WS non-MUX | Implemented; runtime evidence pending |
+| Plain WS UDP | Implemented; runtime evidence pending |
+| WSS MUX/non-MUX/UDP client paths | Implemented; runtime evidence pending |
+| QUIC / QUIC+TLS TCP/UDP paths | Implemented; runtime evidence pending |
 | Full GoWay interoperability | Not validated |
-| Current-head release artifacts | Not validated |
+| Current release artifacts | Not validated |
 
-## Confirmed protocol constants
+## Protocol constants
 
-- Version: `1.8.4`
+- GoWay version baseline: `1.8.4`
 - WebSocket maximum frame: 64 MiB
 - HTTP header hard limit: 8192 bytes
 - MUX header: 7 bytes: `uint32 StreamID` + `byte Command` + `uint16 PayloadLen`, big-endian
-- SYN `0x01`, DATA `0x02`, FIN `0x03`, RST `0x04`
-- DATA payload is chunked to `uint16::MAX`
+- Commands: SYN `0x01`, DATA `0x02`, FIN `0x03`, RST `0x04`
+- DATA is chunked to `uint16::MAX`
 
 ## CLI compatibility
 
-GoWay v1.8.4 defines its command-line options with Go `flag` names such as `up`, `fakehost`, `mux`, `no-mux`, `mux-sessions`, `W`, `socket-buffer`, `no-tcp-nodelay`, `no-tcp-keepalive`, `dns`, `block-local`, `no-block-local`, `max-conn`, `connection-timeout`, `allow-open` and `verify-ssl`. In normal usage these are invoked as single-hyphen multi-character options such as `-up`.
+GoWay uses single-hyphen multi-character options such as `-up`, `-fakehost`, `-mux`, `-no-mux`, `-mux-sessions`, `-W`, `-socket-buffer`, `-no-tcp-nodelay`, `-no-tcp-keepalive`, `-dns`, `-block-local`, `-no-block-local`, `-verify-ssl`, `-allow-open`, `-max-conn`, `-connection-timeout`, `-log`, `-log-file`, `-tui`, `-version`, `-cpuprofile`, and `-cpuprofile-duration`.
 
-RushWay currently exposes equivalent Clap long names and selected short options, but exact single-hyphen multi-character compatibility is **not yet complete**. Before the final compatibility gate, argv normalization must accept GoWay forms such as `-up ws://...`, `-fakehost host`, `-mux-sessions 4`, `-socket-buffer 128` and their existing GNU-style long equivalents without changing ordinary `-p`, `-k` and `-W` behavior.
+RushWay now normalizes these legacy single-hyphen forms before Clap parsing, preserves `-p`, `-k`, `-u`, `-W`, and handles GoWay boolean assignments such as `-mux=true` and `-block-local=false`. Parser tests cover these cases.
 
-The current code also contains parsed values for socket buffer, DNS and TCP keepalive that still require complete propagation through `RuntimeConfig` and final runtime wiring.
+`-log` changes the RushWay tracing level. `-log-file`, `-tui`, and CPU profiling options are accepted for CLI compatibility but are explicitly still stubs; they are not claimed as feature-complete parity.
 
 ## Authentication / XOR
 
-GoWay derives SHA-256 from the configured key, expands the digest to a 256 KiB repeating XOR buffer and resets the transform offset for each operation. Empty key means no transform.
-
-A compatibility audit established that MUX transforms apply to the **complete encoded MUX frame**, not only the payload. RushWay's plain and WSS MUX paths were updated toward that framing rule.
-
-## WebSocket
-
-RushWay supports functional RFC6455 non-fragmented data/control frames, client masking, server unmasked frames, Ping->Pong, Pong discard, Close->EOF, 64 MiB frame limit and 8192-byte HTTP header limit.
-
-Browser-profile fingerprint parity remains incomplete.
+GoWay derives SHA-256 from the configured key, expands it to a 256 KiB repeating XOR buffer, and resets the transform offset for each operation. Empty key means no transform. MUX framing requires XOR over the complete encoded frame including the 7-byte header.
 
 ## Proxy front-end
 
-Supported control paths in code:
+Supported code paths:
 
 - SOCKS5 no-auth CONNECT
 - HTTP CONNECT
 - SOCKS5 UDP ASSOCIATE
 
-UDP uses a dedicated transport (`UDP\n`) and must never be routed through TCP MUX DATA frames.
+UDP uses a dedicated `UDP\n` transport and is not routed through MUX DATA frames.
 
 ## Non-MUX
 
-The GoWay v1.8.4 non-MUX shape is implemented:
+The GoWay wire shape is implemented:
 
 1. WebSocket handshake.
-2. First binary payload is `host:port\n`, XOR transformed when a key exists.
-3. Server replies `OK\n` after successful target dialing.
-4. Later binary frames carry raw TCP data in both directions.
+2. First binary payload is `host:port\n`, XOR transformed when keyed.
+3. Server returns `OK\n` after successful target dialing.
+4. Later binary frames carry raw TCP bytes.
 
-Non-MUX physical connection pool/lifecycle parity and executable interop remain to be proven.
+## WSS
 
-## WSS / TLS
-
-RushWay caches verified and insecure rustls client configurations separately with `OnceLock`, preserves HTTP/1.1 ALPN and supports `wss://` TCP MUX, pooled MUX and non-MUX client paths. WSS UDP has a dedicated raw UDP WebSocket path.
-
-Server-side WSS listener behavior is not currently claimed as part of the GoWay origin compatibility contract until the source confirms that listener role is required; CDN/TLS-termination deployments may keep the origin at plain WS.
+Client-side WSS TCP MUX, pooled MUX, non-MUX and UDP code paths exist. HTTP/1.1 ALPN and certificate verification/insecure modes are represented. Browser-profile fingerprint parity and runtime interop remain unverified.
 
 ## QUIC
 
-GoWay v1.8.4 uses `quic-go` with:
+GoWay-derived behavior represented in source:
 
 - ALPN `goway-quic` and `h3`
 - 60-second max idle timeout
 - 15-second keepalive
-- client physical connection pooling with a single-flight dialing barrier
-- TCP stream bootstrap `<key> <target>\n` or `<target>\n`
-- target failure response `ERR: DIAL_FAILED\n`
+- stream/connection receive windows matching the current source-derived configuration
+- TCP bootstrap `<key> <target>\n` or `<target>\n`
+- `OK\n` / `ERR: DIAL_FAILED\n`
+- pooled physical connections with reconnect handling
+- UDP control `UDP\n` or `<key> UDP\n`
+- 2-byte big-endian UDP length framing
 
-RushWay now contains:
-
-- QUIC / QUIC+TLS client and server runtime
-- GoWay-derived TLS/ALPN/transport configuration
-- single-flight QUIC connection reuse
-- per-local-TCP bidirectional QUIC streams
-- QUIC UDP control line `UDP\n` or `<key> UDP\n`
-- 2-byte big-endian UDP frame length prefix
-- XOR protection of QUIC UDP packet payloads
-- SOCKS5 UDP envelope on return packets
-
-Exact retry/dead-IP behavior, full close/reset semantics and executable GoWay interop remain pending.
-
-## Low-level TCP options
-
-Current runtime configuration includes code paths for:
-
-- max concurrent connections
-- block-local target policy
-- TCP_NODELAY
-- TCP keepalive
-- socket send/receive buffer sizing
-
-Exact GoWay flag semantics and all CLI/config wiring still require final executable verification.
+Exact dead-IP/retry semantics, TLS/SNI edge cases and executable interoperability remain pending.
 
 ## DNS
 
-RushWay currently uses Tokio/system DNS resolution in the active runtime. Exact GoWay remote-DNS server selection, cache, timeout and fallback behavior is still a compatibility gap.
+The current RushWay resolver implements the source-derived GoWay strategy:
 
-## Final compatibility matrix
+- configured remote DNS server via `-dns` / JSON `dns`;
+- 5-second resolve timeout;
+- remote DNS first;
+- UDP query with TCP retry when truncated;
+- system DNS fallback after remote failure;
+- 5-minute positive cache;
+- IP literals bypass DNS.
 
-Must execute before release:
+Currently wired into server target resolution and plain non-MUX upstream/target resolution. Plain MUX upstream, WSS upstream and QUIC upstream hostname dialing still need integration.
 
-1. GoWay client -> RushWay server
-2. RushWay client -> GoWay server
-3. Authenticated WS
-4. Open WS where supported
-5. MUX enabled
-6. MUX disabled / 1:1
-7. WSS
-8. QUIC / QUIC+TLS
-9. SOCKS5 TCP
-10. HTTP CONNECT
-11. SOCKS5 UDP
-12. EOF / FIN
-13. RST
-14. disconnect/reconnect
-15. 1/100/500/1000 streams
-16. sustained large payloads
-17. mixed slow/fast streams
-18. invalid configuration/arguments
+## Socket policy
 
-## Resume order after interruption
-
-1. Normalize exact GoWay single-hyphen multi-character CLI forms.
-2. Fully propagate `socket-buffer`, keepalive and DNS settings into runtime configuration.
-3. Add parser tests for GoWay-style and GNU-style argument aliases.
-4. Compile and test the current head in a real Rust environment.
-5. Fix all compiler/test failures before moving to interoperability.
+Runtime and non-MUX currently apply TCP_NODELAY, keepalive and optional send/receive buffer sizing. MUX/WSS upstream paths still need final propagation audit.
 
 ## Release gate
 
-The implementation is not considered 100% complete until:
+100% completion requires executable evidence for:
 
-- current-head `cargo fmt -- --check` passes,
-- `cargo check --all-targets` passes,
-- `cargo test --all-targets --all-features` passes,
-- release build passes,
-- the full GoWay interoperability matrix passes,
-- stream stress and performance evidence is recorded,
-- Windows x64, Debian 12 x64 and ARMv7/OpenWrt artifacts are built and smoke-tested,
-- v0.0.1 is tagged and smoke-tested.
+1. `cargo fmt -- --check`
+2. `cargo check --all-targets`
+3. `cargo test --all-targets --all-features`
+4. release build
+5. GoWay client -> RushWay server
+6. RushWay client -> GoWay server
+7. WS MUX/non-MUX TCP + UDP
+8. WSS TCP + UDP
+9. QUIC TCP + UDP
+10. SOCKS5 TCP/UDP and HTTP CONNECT
+11. EOF/FIN/RST/disconnect/reconnect
+12. 1/100/500/1000 streams and sustained/slow-fast workloads
+13. current-head benchmark evidence
+14. Windows x64, Debian 12 x64 and ARMv7/OpenWrt artifacts
+15. v0.0.1 smoke test/tag
+
+Never convert source inspection into a runtime-pass claim.
+
+## Three-file relay contract
+
+Only these files are canonical handoff state:
+
+- `AI_HANDOFF.md`
+- `PROGRESS.md`
+- `SPEC.md`
