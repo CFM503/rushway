@@ -1,4 +1,7 @@
-use rushway::protocol::{write_frame_parts, MuxCommand, MuxFrame, MUX_HEADER_LEN};
+#[path = "../protocol.rs"]
+mod protocol;
+
+use protocol::{write_frame_parts, MuxCommand, MuxFrame, MUX_HEADER_LEN};
 use std::hint::black_box;
 use std::time::Instant;
 
