@@ -33,6 +33,14 @@ RushWay targets protocol-compatible behavior with GoWay v1.8.4 at commit `538dbe
 - SYN `0x01`, DATA `0x02`, FIN `0x03`, RST `0x04`
 - DATA payload is chunked to `uint16::MAX`
 
+## CLI compatibility
+
+GoWay v1.8.4 defines its command-line options with Go `flag` names such as `up`, `fakehost`, `mux`, `no-mux`, `mux-sessions`, `W`, `socket-buffer`, `no-tcp-nodelay`, `no-tcp-keepalive`, `dns`, `block-local`, `no-block-local`, `max-conn`, `connection-timeout`, `allow-open` and `verify-ssl`. In normal usage these are invoked as single-hyphen multi-character options such as `-up`.
+
+RushWay currently exposes equivalent Clap long names and selected short options, but exact single-hyphen multi-character compatibility is **not yet complete**. Before the final compatibility gate, argv normalization must accept GoWay forms such as `-up ws://...`, `-fakehost host`, `-mux-sessions 4`, `-socket-buffer 128` and their existing GNU-style long equivalents without changing ordinary `-p`, `-k` and `-W` behavior.
+
+The current code also contains parsed values for socket buffer, DNS and TCP keepalive that still require complete propagation through `RuntimeConfig` and final runtime wiring.
+
 ## Authentication / XOR
 
 GoWay derives SHA-256 from the configured key, expands the digest to a 256 KiB repeating XOR buffer and resets the transform offset for each operation. Empty key means no transform.
@@ -134,6 +142,14 @@ Must execute before release:
 16. sustained large payloads
 17. mixed slow/fast streams
 18. invalid configuration/arguments
+
+## Resume order after interruption
+
+1. Normalize exact GoWay single-hyphen multi-character CLI forms.
+2. Fully propagate `socket-buffer`, keepalive and DNS settings into runtime configuration.
+3. Add parser tests for GoWay-style and GNU-style argument aliases.
+4. Compile and test the current head in a real Rust environment.
+5. Fix all compiler/test failures before moving to interoperability.
 
 ## Release gate
 
