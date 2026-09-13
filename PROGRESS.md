@@ -17,7 +17,9 @@
 
 ### Current main / verified optimization baseline
 - Core benchmark commit: `7a5d4f2f72c021e6a9cb9aab5e7236e61718d5a2`.
-- Latest documentation/relay commit: `37ae3396a7c66eef0d0b9ec2277173eeea2c05b8`.
+- Latest code/CI setup commit: `16d92b3ee6c93404bcfc357b3701f4a3efee1d69`.
+- Cross-proxy runner implementation commit: `e10020e7437bf575b6f674591b2ca5c146233fe1`.
+- Latest relay-document synchronization commit: `afb954ce822b376955351d25da80126321b2e8dc` (AI_HANDOFF) with this document pending the same synchronization commit.
 - Rust toolchain: `1.82.0`.
 - Windows x64 GNU build is green in the latest verified CI.
 
@@ -53,6 +55,12 @@ Interpretation:
 - The timer starts immediately before concurrent proxy flows are spawned, so the result includes SOCKS5 setup and upstream WebSocket handshake cost.
 - Payload storage is shared via `Arc<[u8]>`, so setup cloning is not included in the timed region.
 
+### New cross-proxy benchmark infrastructure — verification pending
+- `src/bin/proxy_bench.rs` was added to run the exact same benchmark workload against a supplied proxy binary.
+- CI now includes a RushWay self-check of this runner on commit `16d92b3ee6c93404bcfc357b3701f4a3efee1d69`.
+- The GitHub connector has not yet exposed a workflow run for this newest commit, so the self-check is **not yet counted as verified evidence**.
+- GoWay has **not** yet been assigned a throughput number. The pinned GoWay binary still needs to be built/provided and then run through the common runner.
+
 ## MUX microbenchmark evidence
 
 Run 76 executed:
@@ -64,6 +72,19 @@ Measured output:
 - reported owned-vs-copy speedup: `7169.12x`
 
 This is directional microbenchmark evidence only. It must not be presented as end-to-end proxy speedup.
+
+## Cross-proxy benchmark definition
+
+`src/bin/proxy_bench.rs` intentionally uses the same workload definition for different proxy implementations:
+- 4 MiB deterministic payload per flow;
+- concurrency 1/8/32;
+- local TCP echo target;
+- local SOCKS5 no-auth client;
+- upstream WebSocket endpoint;
+- connection/setup + SOCKS5 + WebSocket handshake + transfer + echo included in the timer;
+- output format: `proxy_e2e implementation=... c1_mib_s=... c8_mib_s=... c32_mib_s=...`.
+
+GoWay v1.8.4 at `CFM503/way` commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc` exposes compatible `-p` and `-up` options. Its README/source also documents four default physical MUX sessions, pooled buffers, owned MUX DATA, active-stream-aware scheduling and byte-level backpressure, which are comparison targets rather than assumed RushWay features.
 
 ## Current runtime performance state
 
@@ -110,7 +131,7 @@ Do not change these simply because they look optimizable. Use the formal e2e ben
 
 ## Known cleanup backlog
 
-Latest CI is green, but compiler warnings remain. They are not current correctness failures.
+Latest verified CI is green, but compiler warnings remain. They are not current correctness failures.
 
 Examples recorded in Run 76:
 - unused `OwnedMuxFrame` fields/helpers in benchmark-only compilation contexts;
@@ -138,12 +159,12 @@ A fair GoWay-vs-RushWay benchmark must use the same runner class, payload size, 
 
 ## Immediate continuous sequence
 
-1. Build a dedicated GoWay v1.8.4 e2e benchmark matching the RushWay benchmark definition.
-2. Execute GoWay at concurrency 1/8/32 and capture exact throughput.
-3. Put GoWay and RushWay results into one comparable benchmark table.
-4. Identify the slower direction/path and profile that path before modifying RushWay.
-5. Only then optimize outbound MUX allocation, WebSocket receive-buffer reuse, writer contention, or session pooling according to evidence.
-6. Add steady-state transfer benchmarking separately from connection-establishment-inclusive benchmarking.
+1. Observe the first CI run for `16d92b3` and record the actual cross-proxy self-check output.
+2. Build/provide the pinned GoWay v1.8.4 binary and run the exact same `proxy_bench` command against GoWay.
+3. Put GoWay and RushWay results into one 1/8/32 comparison table.
+4. Identify the slower direction/path and profile that path before modifying runtime code for speed.
+5. Add a separate steady-state transfer benchmark that excludes connection setup.
+6. Only then optimize outbound MUX allocation, WebSocket receive-buffer reuse, writer contention, or session pooling according to evidence.
 7. Continue WSS, QUIC, non-MUX, pool/retry/dead-IP and release work only after core TCP/WS/MUX behavior is benchmarked and stable.
 8. Add Debian 12 x64 and KWRT/OpenWrt ARMv7 build jobs and artifact packaging.
 9. Only after required interoperability/platform evidence is green, create v0.0.1 release.
