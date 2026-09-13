@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}, Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 
@@ -31,7 +31,7 @@ async fn send_mux_parts(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, stream_id: u3
     write_frame(&mut *w, &bytes, 2, true).await
 }
 
-async fn parse_upstream(input: &str) -> Result<(String, String)> {
+fn parse_upstream(input: &str) -> Result<(String, String)> {
     let rest = input.strip_prefix("ws://").ok_or_else(|| anyhow!("pooled client requires ws:// upstream"))?;
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a.to_string(), format!("/{}", p)),
@@ -53,7 +53,7 @@ struct SessionState {
 impl SessionState {
     async fn connect(cfg: &RuntimeConfig) -> Result<Arc<Self>> {
         let upstream = cfg.upstream.as_deref().ok_or_else(|| anyhow!("client mode requires upstream"))?;
-        let (host, path) = parse_upstream(upstream).await?;
+        let (host, path) = parse_upstream(upstream)?;
         let actual_host = cfg.fakehost.clone().unwrap_or_else(|| host.clone());
         let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await.context("upstream connection timeout")??;
         let (mut rd, mut wr) = tokio::io::split(socket);
@@ -87,7 +87,7 @@ impl SessionState {
         });
         let reader_state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = client_reader_loop(rd, writer.clone(), reader_state.clone()).await {
+            if let Err(e) = client_reader_loop(rd, reader_state.clone()).await {
                 tracing::debug!(error=%e, "pooled MUX reader stopped");
             }
             reader_state.closed.store(true, Ordering::Release);
@@ -106,38 +106,38 @@ impl SessionState {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
         let (tx, rx) = mpsc::channel(32);
         self.streams.lock().await.insert(id, tx);
+        self.active.fetch_add(1, Ordering::AcqRel);
         let target_text = format!("{}:{}", target.host, target.port);
         let syn = SynPayload { target: target_text.into_bytes(), initial_data: Vec::new() };
         let syn_payload = syn.encode().map_err(|e| anyhow!(e.to_string()))?;
-        let send_result = send_mux_parts(&self.writer, id, MuxCommand::Syn, &syn_payload).await;
-        if let Err(e) = send_result {
-            self.streams.lock().await.remove(&id);
+        if let Err(e) = send_mux_parts(&self.writer, id, MuxCommand::Syn, &syn_payload).await {
+            if self.streams.lock().await.remove(&id).is_some() { self.active.fetch_sub(1, Ordering::AcqRel); }
             self.closed.store(true, Ordering::Release);
             return Err(e);
         }
-        self.active.fetch_add(1, Ordering::AcqRel);
         Ok((id, rx))
     }
 
     async fn close_stream(&self, id: u32) {
-        self.streams.lock().await.remove(&id);
-        self.active.fetch_sub(1, Ordering::AcqRel);
+        if self.streams.lock().await.remove(&id).is_some() { self.active.fetch_sub(1, Ordering::AcqRel); }
     }
 }
 
-async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHalf<TcpStream>>>, state: Arc<SessionState>) -> Result<()> {
+async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState>) -> Result<()> {
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
-        let Some((opcode, payload)) = read_frame_owned(&mut rd, Some(&mut *writer.lock().await), &mut frame_buf).await? else { break; };
+        // Do not hold the shared writer lock while awaiting network input. The current
+        // WebSocket codec ignores Ping frames when no reply writer is supplied; stream
+        // correctness is preserved, and DATA writers remain unblocked.
+        let Some((opcode, payload)) = read_frame_owned(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break; };
         if opcode != 2 { continue; }
         let frame = match MuxFrame::decode_owned(payload) { Ok(v) => v, Err(_) => continue };
         let id = frame.stream_id;
+        let terminal = matches!(frame.command, MuxCommand::Fin | MuxCommand::Rst);
         let tx = state.streams.lock().await.get(&id).cloned();
         if let Some(tx) = tx {
-            let terminal = matches!(frame.command, MuxCommand::Fin | MuxCommand::Rst);
             if tx.send(frame).await.is_err() || terminal {
-                state.streams.lock().await.remove(&id);
-                state.active.fetch_sub(1, Ordering::AcqRel);
+                if state.streams.lock().await.remove(&id).is_some() { state.active.fetch_sub(1, Ordering::AcqRel); }
             }
         }
     }
@@ -155,12 +155,8 @@ impl MuxSessionPool {
     async fn prewarm(self: &Arc<Self>) {
         for _ in 0..DEFAULT_SESSION_COUNT {
             match SessionState::connect(&self.cfg).await {
-                Ok(session) => {
-                    self.sessions.lock().await.push(session);
-                }
-                Err(e) => {
-                    tracing::debug!(error=%e, "MUX session prewarm failed");
-                }
+                Ok(session) => self.sessions.lock().await.push(session),
+                Err(e) => tracing::debug!(error=%e, "MUX session prewarm failed"),
             }
         }
     }
@@ -171,8 +167,10 @@ impl MuxSessionPool {
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
             if let Some(session) = sessions.iter().filter(|s| s.available()).min_by_key(|s| s.active.load(Ordering::Acquire)).cloned() {
                 drop(sessions);
-                if let Ok(result) = session.open_stream(target).await { return Ok((session, result.0, result.1)); }
-                continue;
+                match session.open_stream(target).await {
+                    Ok(result) => return Ok((session, result.0, result.1)),
+                    Err(_) => continue,
+                }
             }
             let need_new = sessions.len() < DEFAULT_SESSION_COUNT;
             drop(sessions);
@@ -183,13 +181,6 @@ impl MuxSessionPool {
             return Ok((new_session, result.0, result.1));
         }
     }
-}
-
-async fn dial_target(target: &TargetAddr, timeout_secs: u64) -> Result<TcpStream> {
-    let addr = format!("{}:{}", target.host, target.port);
-    let stream = timeout(Duration::from_secs(timeout_secs.max(1)), TcpStream::connect(&addr)).await.context("target connection timeout")??;
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
 }
 
 async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
@@ -236,7 +227,7 @@ async fn handle_udp_proxy(mut control: TcpStream, cfg: RuntimeConfig, bind_hint:
     resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
     control.write_all(&resp).await?;
     let upstream = cfg.upstream.clone().ok_or_else(|| anyhow!("client mode requires upstream"))?;
-    let (host, path) = parse_upstream(&upstream).await?;
+    let (host, path) = parse_upstream(&upstream)?;
     let actual_host = cfg.fakehost.clone().unwrap_or_else(|| host.clone());
     let socket = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&host)).await??;
     let (mut rd, mut wr) = tokio::io::split(socket);
