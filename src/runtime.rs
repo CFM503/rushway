@@ -5,9 +5,9 @@
 //! TLS/QUIC/pooling/retry remain explicit follow-up layers.
 
 use crate::crypto::XorCipher;
-use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, SynPayload};
+use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION};
-use crate::ws::{build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers, validate_client_handshake_response, validate_server_handshake, write_frame};
+use crate::ws::{build_client_handshake_request, build_server_handshake_response, read_frame, read_frame_owned, read_http_headers, validate_client_handshake_response, validate_server_handshake, write_frame};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -40,7 +40,7 @@ impl Default for RuntimeConfig {
 struct StreamEntry { tx: mpsc::Sender<StreamCommand> }
 
 #[derive(Debug)]
-enum StreamCommand { Data(Vec<u8>), Fin, Reset }
+enum StreamCommand { Data(OwnedMuxFrame), Fin, Reset }
 
 fn configured_cipher(key: &Option<String>) -> XorCipher { XorCipher::new(key.as_deref().unwrap_or("")) }
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) { cipher.apply(payload); }
@@ -93,7 +93,7 @@ async fn server_stream_task(id: u32, target: TcpStream, mut rx: mpsc::Receiver<S
     let reader = tokio::spawn(target_to_mux(id, rd, writer.clone(), buffer_size));
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            StreamCommand::Data(data) => { if wr.write_all(&data).await.is_err() { break; } }
+            StreamCommand::Data(frame) => { if wr.write_all(frame.payload()).await.is_err() { break; } }
             StreamCommand::Fin => { let _ = wr.shutdown().await; break; }
             StreamCommand::Reset => break,
         }
@@ -112,12 +112,12 @@ async fn handle_mux_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHa
     let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
-        let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
+        let Some((opcode, payload)) = read_frame_owned(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break };
         if opcode != 2 { continue; }
-        let frame = match MuxFrame::decode(&payload) { Ok(f) => f, Err(_) => continue };
+        let frame = match MuxFrame::decode_owned(payload) { Ok(f) => f, Err(_) => continue };
         match frame.command {
             MuxCommand::Syn => {
-                let syn = match SynPayload::decode(&frame.payload) { Ok(v) => v, Err(_) => { let _ = send_reset(&writer, frame.stream_id).await; continue; } };
+                let syn = match SynPayload::decode(frame.payload()) { Ok(v) => v, Err(_) => { let _ = send_reset(&writer, frame.stream_id).await; continue; } };
                 let target_text = match String::from_utf8(syn.target) { Ok(v) => v, Err(_) => { let _ = send_reset(&writer, frame.stream_id).await; continue; } };
                 let (host, port_text) = match target_text.rsplit_once(':') { Some(v) => v, None => { let _ = send_reset(&writer, frame.stream_id).await; continue; } };
                 let port = match port_text.parse::<u16>() { Ok(v) if v != 0 => v, _ => { let _ = send_reset(&writer, frame.stream_id).await; continue; } };
@@ -126,17 +126,23 @@ async fn handle_mux_parts(mut rd: ReadHalf<TcpStream>, writer: Arc<Mutex<WriteHa
                         let (tx, rx) = mpsc::channel(64);
                         streams.lock().await.insert(frame.stream_id, StreamEntry { tx: tx.clone() });
                         tokio::spawn(server_stream_task(frame.stream_id, target_stream, rx, writer.clone(), cfg.buffer_size));
-                        if !syn.initial_data.is_empty() { let _ = tx.send(StreamCommand::Data(syn.initial_data)).await; }
+                        if !syn.initial_data.is_empty() {
+                            let initial = MuxFrame::new(frame.stream_id, MuxCommand::Data, syn.initial_data)
+                                .map_err(|e| anyhow!(e.to_string()))?;
+                            let mut data = Vec::with_capacity(7 + initial.payload.len());
+                            initial.encode(&mut data).map_err(|e| anyhow!(e.to_string()))?;
+                            if let Ok(owned) = MuxFrame::decode_owned(data) { let _ = tx.send(owned).await; }
+                        }
                     }
                     Err(_) => { let _ = send_reset(&writer, frame.stream_id).await; }
                 }
             }
             MuxCommand::Data => {
                 let tx = streams.lock().await.get(&frame.stream_id).map(|s| s.tx.clone());
-                if let Some(tx) = tx { if tx.send(StreamCommand::Data(frame.payload)).await.is_err() { streams.lock().await.remove(&frame.stream_id); } }
+                if let Some(tx) = tx { if tx.send(frame).await.is_err() { streams.lock().await.remove(&frame.stream_id); } }
             }
-            MuxCommand::Fin => { if let Some(entry) = streams.lock().await.get(&frame.stream_id) { let _ = entry.tx.send(StreamCommand::Fin).await; } }
-            MuxCommand::Rst => { if let Some(entry) = streams.lock().await.remove(&frame.stream_id) { let _ = entry.tx.send(StreamCommand::Reset).await; } }
+            MuxCommand::Fin => { if let Some(entry) = streams.lock().await.get(&frame.stream_id) { let _ = entry.tx.send_command(Fin).await; } }
+            MuxCommand::Rst => { if let Some(entry) = streams.lock().await.remove(&frame.stream_id) { let _ = entry.tx.send_command(Reset).await; } }
         }
     }
     streams.lock().await.clear();
@@ -291,7 +297,7 @@ async fn handle_local_proxy(mut local: TcpStream, cfg: RuntimeConfig, next_id: u
     transform_payload(&cipher,&mut ok); if ok!=b"OK\n" { bail!("upstream rejected MUX handshake") }
     let id=next_id.max(1); let target_text=format!("{}:{}",target.host,target.port); let syn=SynPayload{target:target_text.into_bytes(),initial_data:Vec::new()}; let syn_frame=MuxFrame::new(id,MuxCommand::Syn,syn.encode().map_err(|e|anyhow!(e.to_string()))?).map_err(|e|anyhow!(e.to_string()))?; send_frame(&writer,&syn_frame).await?;
     let (mut local_rd,mut local_wr)=tokio::io::split(local); let writer_up=writer.clone(); let upload=tokio::spawn(async move { let mut buf=vec![0u8;cfg.buffer_size.clamp(16*1024,1024*1024)]; loop { let n=local_rd.read(&mut buf).await?; if n==0 { let _=send_mux_parts(&writer_up,id,MuxCommand::Fin,&[]).await; break } let mut off=0; while off<n { let end=(off+u16::MAX as usize).min(n); send_mux_parts(&writer_up,id,MuxCommand::Data,&buf[off..end]).await?; off=end; } } Result::<()>::Ok(()) });
-    loop { let Some((opcode,payload))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { break }; if opcode!=2 { continue } let frame=MuxFrame::decode(&payload).map_err(|e|anyhow!(e.to_string()))?; if frame.stream_id!=id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(&frame.payload).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
+    loop { let Some((opcode,payload))=read_frame_owned(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { break }; if opcode!=2 { continue } let frame=MuxFrame::decode_owned(payload).map_err(|e|anyhow!(e.to_string()))?; if frame.stream_id!=id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(frame.payload()).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
     upload.abort(); Ok(())
 }
 
@@ -307,7 +313,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     let listener=TcpListener::bind(format!("{}:{}",cfg.proxy_host,cfg.proxy_port)).await?;
     tracing::info!("RushWay client proxy listening on {}:{}",cfg.proxy_host,cfg.proxy_port);
     let counter=Arc::new(std::sync::atomic::AtomicU32::new(1));
-    loop { let (stream,peer)=listener.accept().await?; let cfg2=cfg.clone(); let id=counter.fetch_add(1,std::sync::atomic::Ordering::Relaxed); tokio::spawn(async move { if let Err(e)=handle_local_proxy(stream,cfg2,id).await { tracing::debug!(%peer,error=%e,"proxy connection closed"); } }); }
+    loop { let (stream,peer)=listener.accept().await?; let cfg2=cfg.clone(); let id=counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed); tokio::spawn(async move { if let Err(e)=handle_local_proxy(stream,cfg2,id).await { tracing::debug!(%peer,error=%e,"proxy connection closed"); } }); }
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
