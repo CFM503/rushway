@@ -60,7 +60,6 @@ impl fmt::Display for ProxyParseError {
 }
 impl std::error::Error for ProxyParseError {}
 
-/// Parse the SOCKS5 greeting. GoWay accepts the RFC1928 no-auth method.
 pub fn parse_socks5_greeting(buf: &[u8]) -> Result<(), ProxyParseError> {
     if buf.len() < 2 { return Err(ProxyParseError::Truncated); }
     if buf[0] != SOCKS5_VERSION { return Err(ProxyParseError::InvalidVersion(buf[0])); }
@@ -69,8 +68,6 @@ pub fn parse_socks5_greeting(buf: &[u8]) -> Result<(), ProxyParseError> {
     if buf[2..2+n].contains(&SOCKS5_NO_AUTH) { Ok(()) } else { Err(ProxyParseError::NoAcceptableMethod) }
 }
 
-/// Parse a complete RFC1928 request (CONNECT or UDP ASSOCIATE).
-/// UDP ASSOCIATE permits the conventional 0.0.0.0:0 placeholder.
 pub fn parse_socks5_request(buf: &[u8]) -> Result<SocksRequest, ProxyParseError> {
     if buf.len() < 4 { return Err(ProxyParseError::Truncated); }
     if buf[0] != SOCKS5_VERSION { return Err(ProxyParseError::InvalidVersion(buf[0])); }
@@ -107,12 +104,15 @@ pub fn parse_socks5_request(buf: &[u8]) -> Result<SocksRequest, ProxyParseError>
     Ok(SocksRequest { command, target: TargetAddr { host, port } })
 }
 
-/// SOCKS5 success response used by the GoWay client path: IPv4 zero bind addr.
 pub fn socks5_success_response() -> [u8; 10] {
     [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
 }
 
-/// Parse one SOCKS5 UDP datagram envelope. Returns target and payload.
+/// RFC 1928 general SOCKS5 failure, with an IPv4 zero bind address.
+pub fn socks5_failure_response() -> [u8; 10] {
+    [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+}
+
 pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), ProxyParseError> {
     if buf.len() < 4 { return Err(ProxyParseError::Truncated); }
     if buf[0] != 0 || buf[1] != 0 { return Err(ProxyParseError::InvalidHttpRequest); }
@@ -142,8 +142,6 @@ pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), Prox
     Ok((TargetAddr { host, port }, &buf[consumed + 2..]))
 }
 
-/// Parse the request line of an HTTP CONNECT request.
-/// Header framing itself must be bounded by MAX_HEADER_SIZE before calling this.
 pub fn parse_http_connect(buf: &[u8]) -> Result<TargetAddr, ProxyParseError> {
     let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|n| n + 4)
         .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|n| n + 2))
@@ -212,6 +210,11 @@ mod tests {
         let (target, data) = parse_socks5_udp_datagram(&pkt).unwrap();
         assert_eq!(target.port, 53);
         assert_eq!(data, b"dns");
+    }
+
+    #[test]
+    fn socks_failure_response_is_general_failure() {
+        assert_eq!(socks5_failure_response(), [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
