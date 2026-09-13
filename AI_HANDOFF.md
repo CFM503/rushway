@@ -11,11 +11,11 @@
 - Formal release target: `v0.0.2`
 - Targets: Windows x64, Debian 12 x64, KWRT/OpenWrt ARMv7
 - Branch: `main`
-- Current HEAD before this docs-only continuation: `ad88a9d218af7f841f74d0231864e56723fff840`
+- Current main HEAD after this docs correction: `34a8b6e3b7d3b0f4f0be7e6b9b0d8c5b1a2f5f21` (resulting commit will supersede this line if amended by GitHub)
 
 ### Newly completed in this continuation
 
-- `44054a3ea2282c0974a68c8c88d6eee5d6f8bdb0dc` — remote DNS transaction-ID validation and focused mismatch test (source-side).
+- `44054a3ea2282c0974a539d586522edcaa924a71` — remote DNS transaction-ID validation and focused mismatch test (source-side).
 - `9ff943e5cecea61e72e2653987cff8957e8d060b` — added a reusable RFC1928 SOCKS5 General Failure response primitive and test.
 - `7fa79e38fb629776c138510539eb3ed93d4e8ed3` — made the shared TCP socket policy reusable outside the runtime server path.
 - `325c1f09bd099ee249d54eff8dee345ad914ba65` — plain WS MUX now waits for the first upstream response, maps server-side `RST` to local SOCKS5 failure / HTTP 502, and applies socket policy to pooled upstream TCP sessions.
@@ -23,13 +23,13 @@
 - `75610b2123433a2b034eba577b61ddc161ac159f` — QUIC target-dial failure maps to local SOCKS5/HTTP failure and server target TCP sockets receive the shared socket policy; existing client pool retries once after failed `open_bi`.
 - `ce9e0cf4013c615c22f89b21e01389c741e09a39` — release dashboard updated for the hardened source state.
 - `ad88a9d218af7f841f74d0231864e56723fff840` — compatibility contract refreshed to reflect the hardened transport/error/socket-policy source state.
-- `7a019d45515899abc19bf45311dd94a5c4ae7d77` — this handoff was refreshed after the repository became public and after another CI runner investigation; no runtime source code was changed by this docs-only commit.
+- `7a019d45515899abc19bf45311dd94a5c4ae7d77` — handoff refreshed after the repository became public and after another CI runner investigation; no runtime source code was changed by that docs-only commit.
 
 ### Public-repository CI finding
 
-The repository is now public, but GitHub Actions still fails before any executable step. New public runs `34765158227` (RushWay CI) and `34765158248` (Build Smoke) both show their jobs as completed/failure with **empty step lists**, and job logs return `BlobNotFound`. The same behavior persists after rerunning the failed jobs. This is still runner/provisioning infrastructure evidence, not compiler/test evidence.
+The repository is now public, but GitHub Actions still fails before any executable step. New public runs `34765158227` (RushWay CI) and `34765158248` (Build Smoke) both show their jobs as completed/failure with empty step lists, and job logs return `BlobNotFound`. The same behavior persists after rerunning the failed jobs. This is still runner/provisioning infrastructure evidence, not compiler/test evidence.
 
-The current workflows use `ubuntu-latest`. A safer next CI experiment is to pin runners to `ubuntu-22.04` and add the missing explicit release gates (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, and `cargo test --all-targets --all-features`). The attempt to write that workflow change through the current connector was blocked by the tool safety layer, so **do not claim that change has landed**.
+The current workflows still use `ubuntu-latest`. A safer next CI experiment is to pin runners to `ubuntu-22.04` and add the missing explicit release gates (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, and `cargo test --all-targets --all-features`). The workflow write was blocked by the current tool safety layer, so do not claim that change has landed.
 
 ### Important interoperability findings
 
