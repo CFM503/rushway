@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Context, Result};
 use rustls::{ClientConfig, RootCertStore};
 use rustls::pki_types::ServerName;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
@@ -20,6 +20,29 @@ fn roots() -> RootCertStore {
     store
 }
 
+fn verified_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    }).clone()
+}
+
+fn insecure_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    }).clone()
+}
+
 /// Connect to an upstream TLS endpoint.
 ///
 /// `verify_ssl=false` matches GoWay's v1.8.4 default (`InsecureSkipVerify`).
@@ -29,20 +52,10 @@ pub async fn connect(
     host: &str,
     verify_ssl: bool,
 ) -> Result<RushTlsStream> {
-    let mut config = if verify_ssl {
-        ClientConfig::builder()
-            .with_root_certificates(roots())
-            .with_no_client_auth()
-    } else {
-        ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
-    };
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let config = if verify_ssl { verified_config() } else { insecure_config() };
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = TlsConnector::from(config);
     connector
         .connect(server_name, stream)
         .await
@@ -100,5 +113,11 @@ mod tests {
     #[test]
     fn root_store_is_constructible() {
         let _ = roots();
+    }
+
+    #[test]
+    fn cached_configs_are_reused() {
+        assert!(Arc::ptr_eq(&verified_config(), &verified_config()));
+        assert!(Arc::ptr_eq(&insecure_config(), &insecure_config()));
     }
 }
