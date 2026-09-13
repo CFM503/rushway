@@ -204,30 +204,6 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
         if masked { r.read_exact(&mut key).await?; }
         buf.clear(); buf.resize(len as usize, 0); r.read_exact(buf).await?;
         if masked { for (i, b) in buf.iter_mut().enumerate() { *b ^= key[i & 3]; } }
-        match opcode { 1 | 2 => return Ok(Some((opcode, buf.clone()))), 8 => return Ok(None), 9 => { if let Some(w) = reply.as_deref_mut() { write_frame(w, buf, 0xA, false).await?; } }, 10 => {}, _ => unreachable!() }
-    }
-}
-
-/// Receive a WebSocket data frame while transferring the payload Vec's ownership
-/// to the caller. This removes the full-buffer clone used by `read_frame` and is
-/// the preferred path for high-throughput MUX traffic.
-pub async fn read_frame_owned<R, W>(r: &mut R, mut reply: Option<&mut W>, buf: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>>
-where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
-    loop {
-        let b0 = r.read_u8().await?;
-        let b1 = r.read_u8().await?;
-        let fin = b0 & 0x80 != 0;
-        let opcode = b0 & 0x0f;
-        let masked = b1 & 0x80 != 0;
-        let mut len = (b1 & 0x7f) as u64;
-        if len == 126 { len = r.read_u16().await? as u64; } else if len == 127 { len = r.read_u64().await?; }
-        if len > MAX_WS_FRAME_SIZE as u64 { return Err(anyhow!("frame too large")); }
-        if opcode >= 0x8 { if !fin || len > 125 { return Err(anyhow!("invalid websocket control frame")); } }
-        else if opcode == 0 || !fin || (opcode != 1 && opcode != 2) { return Err(anyhow!("unsupported or fragmented websocket frame")); }
-        let mut key = [0u8; 4];
-        if masked { r.read_exact(&mut key).await?; }
-        buf.clear(); buf.resize(len as usize, 0); r.read_exact(buf).await?;
-        if masked { for (i, b) in buf.iter_mut().enumerate() { *b ^= key[i & 3]; } }
         match opcode {
             1 | 2 => {
                 let owned = std::mem::take(buf);
@@ -240,6 +216,11 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
             _ => unreachable!(),
         }
     }
+}
+
+pub async fn read_frame_owned<R, W>(r: &mut R, reply: Option<&mut W>, buf: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>>
+where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
+    read_frame(r, reply, buf).await
 }
 
 #[cfg(test)]
@@ -276,26 +257,26 @@ mod tests {
     async fn round_trip_unmasked_binary() {
         let (mut a, mut b) = duplex(1024 * 1024);
         let data = vec![7u8; 70000];
-        let expected = data.clone();
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, false).await });
         let mut buf = Vec::new();
         let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
         writer.await.unwrap().unwrap();
         assert_eq!(got.0, 2);
-        assert_eq!(got.1, expected);
+        assert_eq!(got.1, vec![7u8; 70000]);
+        assert!(buf.is_empty());
     }
 
     #[tokio::test]
     async fn round_trip_masked_binary() {
         let (mut a, mut b) = duplex(1024 * 1024);
         let data = vec![11u8; 70000];
-        let expected = data.clone();
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, true).await });
         let mut buf = Vec::new();
         let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
         writer.await.unwrap().unwrap();
         assert_eq!(got.0, 2);
-        assert_eq!(got.1, expected);
+        assert_eq!(got.1, vec![11u8; 70000]);
+        assert!(buf.is_empty());
     }
 
     #[tokio::test]
