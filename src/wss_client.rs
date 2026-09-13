@@ -40,7 +40,6 @@ async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWrite
     let (addr, host, path) = parse_wss_url(&cfg.upstream)?;
     let tcp = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&addr)).await.context("WSS upstream TCP timeout")??;
     tcp.set_nodelay(true).ok();
-    tcp.set_keepalive(Some(Duration::from_secs(30))).ok();
     let tls_name = cfg.fakehost.as_deref().unwrap_or(&host);
     let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl).await?;
     let boxed: BoxTransport = Box::new(tls_stream);
@@ -86,8 +85,8 @@ async fn handle_connection(mut local: TcpStream, cfg: WssConfig, id: u32) -> Res
     if is_socks5 { local.write_all(&socks5_success_response()).await?; } else { local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?; }
     let id = id.max(1); let syn = SynPayload { target: format!("{}:{}", target.host, target.port).into_bytes(), initial_data: Vec::new() }; let syn = MuxFrame::new(id, MuxCommand::Syn, syn.encode().map_err(|e| anyhow!(e.to_string()))?).map_err(|e| anyhow!(e.to_string()))?; send_mux(&writer, &syn).await?;
     let (mut local_rd, mut local_wr) = tokio::io::split(local); let writer_up = writer.clone(); let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
-    let upload = tokio::spawn(async move { let mut buf = vec![0u8; buffer_size]; loop { let n = local_rd.read(&mut buf).await?; if n == 0 { let _ = send_mux(&writer_up, &MuxFrame::new(id, MuxCommand::Fin, Vec::new()).unwrap()).await; break; } let mut off = 0; while off < n { let end = (off + u16::MAX as usize).min(n); let frame = MuxFrame::new(id, MuxCommand::Data, buf[off..end].to_vec()).unwrap(); send_mux(&writer_up, &frame).await?; off = end; } } Result::<()>::Ok(()) });
-    loop { let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await? else { break }; if opcode != 2 { continue; } let frame = MuxFrame::decode(&payload).map_err(|e| anyhow!(e.to_string()))?; if frame.stream_id != id { continue; } match frame.command { MuxCommand::Data => local_wr.write_all(&frame.payload).await?, MuxCommand::Fin => { local_wr.shutdown().await?; break; }, MuxCommand::Rst => break, MuxCommand::Syn => {} } }
+    let upload = tokio::spawn(async move { let mut buf = vec![0u8; buffer_size]; loop { let n = local_rd.read(&mut buf).await?; if n == 0 { let _ = send_mux(&writer_up, &MuxFrame::new(id, MuxCommand::Fin, Vec::new()).unwrap()).await; break; } let mut off = 0; while off < n { let end = (off + u16::MAX as usize).min(n); let frame = MuxFrame::new(id, MuxCommand::Data, buf[off..end].to_vec()).unwrap(); send_mux(&writer_up, &frame).await?; off=end; } } Result::<()>::Ok(()) });
+    loop { let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await? else { break }; if opcode != 2 { continue }; let frame = MuxFrame::decode(&payload).map_err(|e| anyhow!(e.to_string()))?; if frame.stream_id != id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(&frame.payload).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
     upload.abort(); Ok(())
 }
 
