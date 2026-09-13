@@ -3,7 +3,7 @@
 > Compatibility baseline: GoWay v1.8.4, stable commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc` from `CFM503/way/goway`.
 > Goal: tested, protocol-compatible Rust replacement with standalone Windows x64, Debian 12 x64 and KWRT/OpenWrt ARMv7 executables.
 
-## Current verified checkpoint — 2026-09-13
+## Current checkpoint — 2026-09-13
 
 **Overall engineering completion: ~60% (estimate).** This is migration progress, not a claim of production readiness.
 
@@ -12,22 +12,26 @@
 - Stage 3 Rust implementation: `[~]`
 - Stage 4 compatibility tests: `[ ]`
 - Stage 5 release builds: `[~]`
-- Stage 6 GitHub Actions: `[~]` — runner execution is currently failing before steps start
+- Stage 6 GitHub Actions: `[~]` — jobs continue to fail before executable workflow steps start
 - Stage 7 v0.0.1 release: `[ ]`
 
 ### Current head / optimization work
-- Current code head: `1c16c2195d4a01a2f1b901bdee73763719665134`.
+- Current code head: `f20c19924e70b843338da2c245bb8668f7125bb3`.
 - Client-side physical MUX session pooling is implemented for normal `ws://` traffic.
-- `--mux-sessions` now controls the physical pool through `RUSHWAY_MUX_SESSIONS`, clamped to 1..64.
+- `--mux-sessions` controls the physical pool through `RUSHWAY_MUX_SESSIONS`, clamped to 1..64.
 - Per-session logical stream capacity is 256.
 - Stream lifecycle handling was hardened to avoid duplicate active-count decrements and to avoid holding the shared writer lock during network reads.
+- TCP MUX serialization buffer reuse is implemented on the client hot path.
+- WSS TLS `rustls::ClientConfig` construction is now cached separately for verified and insecure modes, reducing repeated config/root-store construction without changing certificate policy.
 - Build-smoke workflow is present for Linux x64 and Windows x64.
 
-## Latest CI status
+## Latest CI / environment evidence
 
-Latest push head `f2b15f6b66e008bc305555cfadb8200fd23929b1` triggered both the main CI and Build Smoke workflows. Both failed immediately with jobs reporting `steps: []` / no runner execution; dependent platform jobs were skipped. This is runner/infrastructure evidence, not compiler/test evidence. Do not infer code failure from these runs.
+RushWay CI run #128 and Build Smoke run #9 were triggered by documentation commit `9668fad1dbfafdfa8865154864f29af9a49329b8`. Both failed before any workflow step executed; jobs reported no runner execution / no usable step logs. A retry was attempted and did not produce executable steps. Treat this as GitHub Actions runner/infrastructure evidence, not compiler/test evidence.
 
-The last fully verified RushWay-only baseline remains Run 95 (`34755206730`).
+The environment used for this relay could not resolve `github.com`, so no local repository clone or build was possible. Do not claim a local build/test pass for the current head.
+
+The last fully verified RushWay-only performance baseline remains Run 95 (`34755206730`).
 
 ## Verified performance baseline — RushWay only
 
@@ -44,7 +48,7 @@ MUX ownership microbenchmark:
 - owned/reused decode: `1.54 ns/op`
 - reported directional speedup: `7431.47x`
 
-These are RushWay-only/local measurements and are not GoWay comparison evidence.
+These are RushWay-only historical measurements and are not current-head speed claims or GoWay comparison evidence.
 
 ## Cross-proxy benchmark infrastructure
 
@@ -72,7 +76,7 @@ The optional pinned GoWay comparison job remains disabled when the private sibli
 - [x] DATA payload is forwarded without cloning.
 - [x] WebSocket binary data-frame receive transfers ownership.
 
-### Completed pooling work
+### Completed pooling / reuse work
 - [x] Client-side physical MUX session reuse for normal `ws://` client traffic.
 - [x] Least-active physical session selection.
 - [x] Logical stream dispatch from one physical WebSocket to multiple local TCP connections.
@@ -80,9 +84,11 @@ The optional pinned GoWay comparison job remains disabled when the private sibli
 - [x] User-configurable physical session count via `--mux-sessions`.
 - [x] Per-session logical stream limit of 256.
 - [x] Stream lifecycle active-count hardening.
+- [x] TCP hot-path MUX serialization buffer reuse.
+- [x] WSS TLS client configuration reuse through `OnceLock`.
 
 ### Still requiring profiling / validation
-- [ ] Outbound MUX frame allocation per DATA write.
+- [ ] Outbound WebSocket masking allocation per large DATA frame.
 - [ ] WebSocket receive-buffer capacity reuse.
 - [ ] Shared WebSocket writer-lock contention.
 - [ ] Robust stream/session lifecycle stress testing.
@@ -122,9 +128,9 @@ The optional pinned GoWay comparison job remains disabled when the private sibli
 
 ## Immediate accelerated sequence
 
-1. Restore a normal Actions execution path and obtain real compile/test logs; do not treat runner failures as code evidence.
-2. Run the pooled-client setup-inclusive and steady-state c1/c8/c32 medians and compare against Run 95.
-3. Remove remaining hot-path allocation/lock overhead in MUX DATA forwarding based on profiling, not guesswork.
+1. Obtain executable CI/build evidence on a commit containing the current WSS TLS optimization.
+2. Run the pooled TCP MUX setup-inclusive and steady-state c1/c8/c32 medians and compare against Run 95.
+3. Remove remaining WebSocket masking allocation/lock overhead based on profiling, not guesswork.
 4. Implement WSS physical-session reuse without weakening TLS verification or compatibility behavior.
 5. Implement WSS UDP relay and validate packet framing/end-to-end behavior.
 6. Implement non-MUX transport mode and matching server handshake.
