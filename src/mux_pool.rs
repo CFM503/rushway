@@ -19,7 +19,16 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 
 const DEFAULT_SESSION_COUNT: usize = 4;
+const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 256;
+
+fn configured_session_count() -> usize {
+    std::env::var("RUSHWAY_MUX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, MAX_SESSION_COUNT))
+        .unwrap_or(DEFAULT_SESSION_COUNT)
+}
 
 fn configured_cipher(key: &Option<String>) -> XorCipher { XorCipher::new(key.as_deref().unwrap_or("")) }
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) { cipher.apply(payload); }
@@ -126,9 +135,6 @@ impl SessionState {
 async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState>) -> Result<()> {
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
-        // Do not hold the shared writer lock while awaiting network input. The current
-        // WebSocket codec ignores Ping frames when no reply writer is supplied; stream
-        // correctness is preserved, and DATA writers remain unblocked.
         let Some((opcode, payload)) = read_frame_owned(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await? else { break; };
         if opcode != 2 { continue; }
         let frame = match MuxFrame::decode_owned(payload) { Ok(v) => v, Err(_) => continue };
@@ -153,7 +159,8 @@ impl MuxSessionPool {
     fn new(cfg: RuntimeConfig) -> Arc<Self> { Arc::new(Self { cfg, sessions: Mutex::new(Vec::new()) }) }
 
     async fn prewarm(self: &Arc<Self>) {
-        for _ in 0..DEFAULT_SESSION_COUNT {
+        let session_count = configured_session_count();
+        for _ in 0..session_count {
             match SessionState::connect(&self.cfg).await {
                 Ok(session) => self.sessions.lock().await.push(session),
                 Err(e) => tracing::debug!(error=%e, "MUX session prewarm failed"),
@@ -162,6 +169,7 @@ impl MuxSessionPool {
     }
 
     async fn acquire(self: &Arc<Self>, target: &TargetAddr) -> Result<(Arc<SessionState>, u32, mpsc::Receiver<OwnedMuxFrame>)> {
+        let session_count = configured_session_count();
         loop {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
@@ -172,7 +180,7 @@ impl MuxSessionPool {
                     Err(_) => continue,
                 }
             }
-            let need_new = sessions.len() < DEFAULT_SESSION_COUNT;
+            let need_new = sessions.len() < session_count;
             drop(sessions);
             if !need_new { bail!("all pooled MUX sessions are at stream capacity"); }
             let new_session = SessionState::connect(&self.cfg).await?;
@@ -308,9 +316,10 @@ async fn handle_tcp_proxy(mut local: TcpStream, cfg: RuntimeConfig, pool: Arc<Mu
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     if !cfg.mux { bail!("non-MUX runtime is not implemented yet"); }
     let pool = MuxSessionPool::new(cfg.clone());
+    let session_count = configured_session_count();
     pool.prewarm().await;
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
-    tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)", cfg.proxy_host, cfg.proxy_port, DEFAULT_SESSION_COUNT, MAX_STREAMS_PER_SESSION);
+    tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)", cfg.proxy_host, cfg.proxy_port, session_count, MAX_STREAMS_PER_SESSION);
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = cfg.clone();
