@@ -6,15 +6,16 @@
 
 use crate::crypto::XorCipher;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
-use crate::proxy::{parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_VERSION};
+use crate::proxy::{parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION};
 use crate::runtime::RuntimeConfig;
 use crate::tls;
 use crate::ws::{build_client_handshake_request, read_frame, read_frame_owned, read_http_headers, validate_client_handshake_response, write_frame};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}, Arc};
+use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 
@@ -134,11 +135,11 @@ async fn read_proxy_request(local: &mut TcpStream) -> Result<(SocksCommand, Targ
         local.write_all(&[5, 0]).await?;
         let mut head = [0u8; 4];
         local.read_exact(&mut head).await?;
-        if head[1] != SOCKS5_CONNECT {
+        if head[1] != SOCKS5_CONNECT && head[1] != SOCKS5_UDP_ASSOCIATE {
             local
                 .write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])
                 .await?;
-            bail!("WSS path supports SOCKS5 CONNECT only");
+            bail!("WSS path supports SOCKS5 CONNECT and UDP ASSOCIATE only");
         }
         let mut req = head.to_vec();
         match head[3] {
@@ -204,6 +205,84 @@ async fn send_mux_parts(
         .map_err(|e| anyhow!(e.to_string()))?;
     let mut w = writer.lock().await;
     write_frame(&mut *w, &data, 2, true).await
+}
+
+async fn handle_udp_proxy(mut control: TcpStream, cfg: WssConfig, bind_hint: TargetAddr) -> Result<()> {
+    let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host.is_empty() {
+        "0.0.0.0"
+    } else {
+        bind_hint.host.as_str()
+    };
+    let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
+    let bound = udp.local_addr()?;
+    let mut resp = [0u8; 10];
+    resp[0] = 5;
+    resp[1] = 0;
+    resp[2] = 0;
+    resp[3] = 1;
+    if let std::net::IpAddr::V4(ip) = bound.ip() {
+        resp[4..8].copy_from_slice(&ip.octets());
+    }
+    resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
+    control.write_all(&resp).await?;
+
+    let (mut rd, writer) = open_upstream(&cfg).await?;
+    let c = cipher(&cfg.key);
+    let mut hello = b"UDP\n".to_vec();
+    c.apply(&mut hello);
+    {
+        let mut w = writer.lock().await;
+        write_frame(&mut *w, &hello, 2, true).await?;
+    }
+    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let Some((opcode, mut ok)) =
+        read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
+    else {
+        bail!("WSS upstream closed during UDP handshake");
+    };
+    if opcode != 2 {
+        bail!("invalid WSS UDP handshake response opcode");
+    }
+    c.apply(&mut ok);
+    if ok != b"OK\n" {
+        bail!("WSS upstream rejected UDP handshake");
+    }
+
+    let latest_client = Arc::new(Mutex::new(None::<SocketAddr>));
+    let udp_send = udp.clone();
+    let writer_send = writer.clone();
+    let cipher_send = cipher(&cfg.key);
+    let latest_send = latest_client.clone();
+    let upload = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let (n, peer) = udp_send.recv_from(&mut buf).await?;
+            *latest_send.lock().await = Some(peer);
+            let mut packet = buf[..n].to_vec();
+            cipher_send.apply(&mut packet);
+            let mut w = writer_send.lock().await;
+            write_frame(&mut *w, &packet, 2, true).await?;
+        }
+        Result::<()>::Ok(())
+    });
+
+    loop {
+        let Some((opcode, mut packet)) =
+            read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
+        else {
+            break;
+        };
+        if opcode != 2 {
+            continue;
+        }
+        c.apply(&mut packet);
+        if let Some(peer) = *latest_client.lock().await {
+            let _ = udp.send_to(&packet, peer).await;
+        }
+    }
+    upload.abort();
+    control.shutdown().await.ok();
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -405,8 +484,11 @@ impl WssSessionPool {
 
 async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> Result<()> {
     let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
+    if command == SocksCommand::UdpAssociate {
+        return handle_udp_proxy(local, pool.cfg.clone(), target).await;
+    }
     if command != SocksCommand::Connect {
-        bail!("WSS path only supports CONNECT");
+        bail!("WSS path only supports CONNECT or UDP ASSOCIATE");
     }
 
     let (session, stream_id, mut rx) = pool.acquire(&target).await?;
