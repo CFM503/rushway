@@ -35,7 +35,7 @@ async fn free_port() -> io::Result<u16> {
 
 fn listen_arg(implementation: &str, port: u16) -> String {
     if implementation.eq_ignore_ascii_case("goway") {
-        format(":{port}")
+        format!(":{port}")
     } else {
         port.to_string()
     }
@@ -214,7 +214,11 @@ async fn main() -> io::Result<()> {
             results.push((concurrency, throughput));
         }
 
-        let mode = if args.steady_state { "steady_state" } else { "setup_inclusive" };
+        let mode = if args.steady_state {
+            "steady_state"
+        } else {
+            "setup_inclusive"
+        };
         print!(
             "proxy_e2e implementation={} mode={} payload_mib={} roundtrip_echo=1",
             args.implementation,
