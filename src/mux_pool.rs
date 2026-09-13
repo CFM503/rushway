@@ -1,8 +1,4 @@
 //! Client-side physical MUX session pool.
-//!
-//! A local proxy TCP connection becomes a logical MUX stream. Physical WebSocket
-//! connections are reused across many streams so repeated local connections do
-//! not pay a new TCP + WebSocket + MUX handshake.
 
 use crate::crypto::XorCipher;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
@@ -22,9 +18,7 @@ const DEFAULT_SESSION_COUNT: usize = 4;
 const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
-fn configured_session_count() -> usize {
-    std::env::var("RUSHWAY_MUX_SESSIONS").ok().and_then(|v| v.parse::<usize>().ok()).map(|v| v.clamp(1, MAX_SESSION_COUNT)).unwrap_or(DEFAULT_SESSION_COUNT)
-}
+fn configured_session_count() -> usize { std::env::var("RUSHWAY_MUX_SESSIONS").ok().and_then(|v| v.parse::<usize>().ok()).map(|v| v.clamp(1, MAX_SESSION_COUNT)).unwrap_or(DEFAULT_SESSION_COUNT) }
 fn configured_cipher(key: &Option<String>) -> XorCipher { XorCipher::new(key.as_deref().unwrap_or("")) }
 
 async fn send_mux_parts_reuse(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, cipher: &XorCipher, stream_id: u32, command: MuxCommand, payload: &[u8], scratch: &mut Vec<u8>) -> Result<()> {
@@ -35,10 +29,7 @@ async fn send_mux_parts_reuse(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, cipher:
     let mut w = writer.lock().await;
     write_frame(&mut *w, scratch, 2, true).await
 }
-async fn send_mux_parts(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, cipher: &XorCipher, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<()> {
-    let mut bytes = Vec::with_capacity(7 + payload.len());
-    send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut bytes).await
-}
+async fn send_mux_parts(writer: &Arc<Mutex<WriteHalf<TcpStream>>>, cipher: &XorCipher, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<()> { let mut bytes = Vec::with_capacity(7 + payload.len()); send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut bytes).await }
 fn parse_upstream(input: &str) -> Result<(String, String)> {
     let rest = input.strip_prefix("ws://").ok_or_else(|| anyhow!("pooled client requires ws:// upstream"))?;
     let (authority, path) = match rest.split_once('/') { Some((a,p)) => (a.to_string(), format!("/{}",p)), None => (rest.to_string(), "/".to_string()) };
@@ -50,25 +41,35 @@ struct SessionState { writer: Arc<Mutex<WriteHalf<TcpStream>>>, cipher: XorCiphe
 impl SessionState {
     async fn connect(cfg: &RuntimeConfig) -> Result<Arc<Self>> {
         let upstream = cfg.upstream.as_deref().ok_or_else(|| anyhow!("client mode requires upstream"))?;
-        let (host,path)=parse_upstream(upstream); let (host,path)=(host?,path?);
+        let (host,path)=parse_upstream(upstream)?;
         let actual_host=cfg.fakehost.clone().unwrap_or_else(||host.clone());
         let socket=timeout(Duration::from_secs(cfg.connection_timeout.max(1)),TcpStream::connect(&host)).await.context("upstream connection timeout")??;
-        let (mut rd,mut wr)=tokio::io::split(socket); let origin=Some(format!("https://{}",actual_host)); let sec_fetch_site=if host.eq_ignore_ascii_case(&actual_host){"same-origin"}else{"cross-site"};
-        let (request,key)=build_client_handshake_request(&actual_host,&path,origin.as_deref(),Some(sec_fetch_site)); wr.write_all(&request).await?; wr.flush().await?;
+        let (mut rd,mut wr)=tokio::io::split(socket);
+        let origin=Some(format!("https://{}",actual_host));
+        let sec_fetch_site=if host.eq_ignore_ascii_case(&actual_host){"same-origin"}else{"cross-site"};
+        let (request,key)=build_client_handshake_request(&actual_host,&path,origin.as_deref(),Some(sec_fetch_site));
+        wr.write_all(&request).await?; wr.flush().await?;
         let response=read_http_headers(&mut rd).await?; validate_client_handshake_response(&response,&key)?;
-        let writer=Arc::new(Mutex::new(wr)); let cipher=configured_cipher(&cfg.key); let mut hello=b"MUX\n".to_vec(); cipher.apply(&mut hello);
+        let writer=Arc::new(Mutex::new(wr));
+        let cipher=configured_cipher(&cfg.key);
+        let mut hello=b"MUX\n".to_vec(); cipher.apply(&mut hello);
         { let mut w=writer.lock().await; write_frame(&mut *w,&hello,2,true).await?; }
-        let mut frame_buf=Vec::with_capacity(64*1024); let Some((opcode,mut ok))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { bail!("upstream closed during MUX handshake"); };
-        if opcode!=2 { bail!("invalid MUX handshake response opcode"); } cipher.apply(&mut ok); if ok!=b"OK\n" { bail!("upstream rejected MUX handshake"); }
+        let mut frame_buf=Vec::with_capacity(64*1024);
+        let Some((opcode,mut ok))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await? else { bail!("upstream closed during MUX handshake"); };
+        if opcode!=2 { bail!("invalid MUX handshake response opcode"); }
+        cipher.apply(&mut ok); if ok!=b"OK\n" { bail!("upstream rejected MUX handshake"); }
         let state=Arc::new(Self{writer:writer.clone(),cipher:cipher.clone(),streams:Arc::new(Mutex::new(HashMap::new())),next_id:AtomicU32::new(1),active:AtomicUsize::new(0),closed:AtomicBool::new(false)});
-        let reader_state=state.clone(); tokio::spawn(async move { if let Err(e)=client_reader_loop(rd,reader_state.clone()).await { tracing::debug!(error=%e,"pooled MUX reader stopped"); } reader_state.closed.store(true,Ordering::Release); reader_state.active.store(0,Ordering::Release); reader_state.streams.lock().await.clear(); }); Ok(state)
+        let reader_state=state.clone();
+        tokio::spawn(async move { if let Err(e)=client_reader_loop(rd,reader_state.clone()).await { tracing::debug!(error=%e,"pooled MUX reader stopped"); } reader_state.closed.store(true,Ordering::Release); reader_state.active.store(0,Ordering::Release); reader_state.streams.lock().await.clear(); });
+        Ok(state)
     }
     fn available(&self)->bool { !self.closed.load(Ordering::Acquire) && self.active.load(Ordering::Acquire)<MAX_STREAMS_PER_SESSION }
     async fn open_stream(self:&Arc<Self>,target:&TargetAddr)->Result<(u32,mpsc::Receiver<OwnedMuxFrame>)> {
         if !self.available(){bail!("MUX session is full or closed");}
         let id=self.next_id.fetch_add(1,Ordering::Relaxed).max(1); let(tx,rx)=mpsc::channel(32); self.streams.lock().await.insert(id,tx); self.active.fetch_add(1,Ordering::AcqRel);
         let syn=SynPayload{target:format!("{}:{}",target.host,target.port).into_bytes(),initial_data:Vec::new()}; let syn_payload=syn.encode().map_err(|e|anyhow!(e.to_string()))?;
-        if let Err(e)=send_mux_parts(&self.writer,&self.cipher,id,MuxCommand::Syn,&syn_payload).await { if self.streams.lock().await.remove(&id).is_some(){self.active.fetch_sub(1,Ordering::AcqRel);} self.closed.store(true,Ordering::Release); return Err(e); } Ok((id,rx))
+        if let Err(e)=send_mux_parts(&self.writer,&self.cipher,id,MuxCommand::Syn,&syn_payload).await { if self.streams.lock().await.remove(&id).is_some(){self.active.fetch_sub(1,Ordering::AcqRel);} self.closed.store(true,Ordering::Release); return Err(e); }
+        Ok((id,rx))
     }
     async fn close_stream(&self,id:u32){if self.streams.lock().await.remove(&id).is_some(){self.active.fetch_sub(1,Ordering::AcqRel);}}
 }
@@ -81,7 +82,7 @@ async fn handle_udp_proxy(mut control:TcpStream,cfg:RuntimeConfig,bind_hint:Targ
     let bind_ip=if bind_hint.host=="0.0.0.0"||bind_hint.host.is_empty(){"0.0.0.0"}else{bind_hint.host.as_str()}; let udp=Arc::new(UdpSocket::bind(format!("{}:0",bind_ip)).await?); let bound=udp.local_addr()?;
     let mut resp=[0u8;10];resp[0]=5;resp[1]=0;resp[2]=0;resp[3]=1;if let IpAddr::V4(ip)=bound.ip(){resp[4..8].copy_from_slice(&ip.octets());}resp[8..10].copy_from_slice(&bound.port().to_be_bytes());control.write_all(&resp).await?;
     let upstream=cfg.upstream.clone().ok_or_else(||anyhow!("client mode requires upstream"))?;let(host,path)=parse_upstream(&upstream)?;let actual_host=cfg.fakehost.clone().unwrap_or_else(||host.clone());let socket=timeout(Duration::from_secs(cfg.connection_timeout.max(1)),TcpStream::connect(&host)).await??;let(mut rd,mut wr)=tokio::io::split(socket);let origin=Some(format!("https://{}",actual_host));let sec_fetch_site=if host.eq_ignore_ascii_case(&actual_host){"same-origin"}else{"cross-site"};let(request,key)=build_client_handshake_request(&actual_host,&path,origin.as_deref(),Some(sec_fetch_site));wr.write_all(&request).await?;wr.flush().await?;let response=read_http_headers(&mut rd).await?;validate_client_handshake_response(&response,&key)?;let writer=Arc::new(Mutex::new(wr));let cipher=configured_cipher(&cfg.key);let mut hello=b"UDP\n".to_vec();cipher.apply(&mut hello);{let mut w=writer.lock().await;write_frame(&mut *w,&hello,2,true).await?;}let mut frame_buf=Vec::with_capacity(64*1024);let Some((opcode,mut ok))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await?else{bail!("upstream closed during UDP handshake")};if opcode!=2{bail!("invalid UDP handshake response opcode")};cipher.apply(&mut ok);if ok!=b"OK\n"{bail!("upstream rejected UDP handshake")};
-    let latest_client:Arc<Mutex<Option<SocketAddr>>>=Arc::new(Mutex::new(None));let udp_send=udp.clone();let writer_send=writer.clone();let cipher_send=configured_cipher(&cfg.key);let latest_send=latest_client.clone();
+    let latest_client:Arc<Mutex<Option<SocketAddr>>>=Arc::new(Mutex::new(None));let udp_send=udp.clone();let writer_send=writer.clone();let cipher_send=cipher.clone();let latest_send=latest_client.clone();
     let upload=tokio::spawn(async move { let mut buf=vec![0u8;64*1024]; loop { let(n,peer)=udp_send.recv_from(&mut buf).await?; *latest_send.lock().await=Some(peer); let mut data=buf[..n].to_vec(); cipher_send.apply(&mut data); let mut w=writer_send.lock().await; write_frame(&mut *w,&data,2,true).await?; } Result::<()>::Ok(()) });
     loop { let Some((opcode,mut packet))=read_frame(&mut rd,Option::<&mut WriteHalf<TcpStream>>::None,&mut frame_buf).await?else{break;};if opcode!=2{continue;}cipher.apply(&mut packet);let(_src,payload)=parse_socks5_udp_datagram(&packet).map_err(|e|anyhow!(e.to_string()))?;if let Some(peer)=*latest_client.lock().await{let _=udp.send_to(payload,peer).await;}}
     upload.abort();control.shutdown().await.ok();Ok(())
