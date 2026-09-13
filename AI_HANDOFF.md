@@ -2,38 +2,31 @@
 
 ## 2026-09-13 verified checkpoint
 
-Current verified code baseline:
-- `f36b75767531c05e83d0cdd9a336b4d1ebc50a64` — `perf: make default WebSocket receive path ownership based`
-- Latest documentation/relay record commit: `d76e279a4b7f809f48ab371efbacba2c6e046f07`
+Current code baseline:
+- `24d36bc2fed4c85518ccdd104da23a56e5d86138` — corrected MUX benchmark to prevent compiler elimination of the copied decode input.
+- Prior stable runtime baseline: `f36b75767531c05e83d0cdd9a336b4d1ebc50a64`.
 
-Latest verified CI:
-- Workflow run `34746698462` / Run 56
-- Linux tests: 6/6 mux_bench protocol tests + 28/28 main tests passed
-- Linux release build: passed
-- Windows x64 GNU build: passed
-- Rust: 1.82.0
+Latest verified CI before benchmark correction:
+- Run 59 / workflow `34747270574`: Linux tests passed, Linux release build passed, Windows x64 GNU passed.
+- Rust toolchain: 1.82.0.
 
-Latest benchmark:
-- `rushway_mux_decode_owned_reused`
-- 200,000 iterations
-- 32 KiB payload
-- `1.55 ns/op`
-- `20,206,592.20 MB/s` reported by the benchmark
+Important benchmark finding:
+- Run 59 originally reported `decode_copy = 0.62 ns/op` and `decode_owned_reused = 1.65 ns/op` for 32 KiB payloads.
+- That result is NOT trusted because the copied decode input was not passed through `black_box`; compiler elimination may have made the copy path unrealistically cheap.
+- Benchmark has now been corrected in `24d36bc` by changing the copied path to `MuxFrame::decode(black_box(encoded.as_slice()))`.
+- Do not use the old 0.62 ns/op result for performance decisions.
 
-Important interpretation:
-- The MUX header parsing/owned decode micro-path is already extremely cheap.
-- The current remaining MUX performance bottleneck is not `MuxHeader::parse` itself.
-- The runtime still uses `MuxFrame::decode(&payload)` in the server and client MUX DATA paths, so the runtime currently performs an additional payload allocation/copy.
+Runtime performance status:
+- `ws.rs` now has an owned frame receive helper, but the main runtime still uses the established `read_frame`/`MuxFrame::decode` path.
+- `OwnedMuxFrame` exists and has tests proving the original payload storage is retained without copying.
+- Do not wire OwnedMuxFrame into runtime until a fair benchmark demonstrates an actual benefit and CI validates ownership/lifetime correctness.
 
-Immediate next task:
-1. Change server `handle_mux_parts` to use `MuxFrame::decode_owned(payload)`.
-2. Carry `OwnedMuxFrame` through the per-stream command channel for DATA frames.
-3. In `server_stream_task`, write `frame.payload()` directly to the target socket.
-4. Change the client reverse path to use `decode_owned(payload)` and write `frame.payload()` directly to the local socket.
-5. Preserve SYN parsing semantics; only DATA fast paths need ownership transfer first.
-6. Run GitHub Actions immediately after the change.
-7. If CI fails, fix the smallest ownership/lifetime issue and rerun.
-8. Record exact commit/run evidence in `PROGRESS.md`.
+Immediate next steps:
+1. Wait for CI on `24d36bc` and record the corrected copy-vs-owned benchmark result.
+2. Only if owned decode is measurably beneficial, implement the smallest runtime integration: server MUX DATA first, then client reverse DATA path.
+3. Preserve SYN parsing as-is; optimize DATA fast paths first.
+4. Record every meaningful commit and exact Actions run evidence in `PROGRESS.md`.
+5. Keep Rust 1.82.0 compatibility.
 
 Do not claim:
 - GoWay/RushWay interoperability
@@ -47,5 +40,4 @@ without execution evidence.
 Canonical documents to read first:
 - `PROGRESS.md`
 - `SPEC.md`
-
-The project must remain compatible with Rust 1.82.0 and the GoWay v1.8.4 wire contract.
+- this file
