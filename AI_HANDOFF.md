@@ -20,7 +20,7 @@ The implementation was expanded substantially beyond the earlier WSS pooling che
 - QUIC / QUIC+TLS module added with GoWay-derived ALPN, timeout/window values, TCP stream bootstrap and UDP framing.
 - QUIC client physical-connection reuse with single-flight dialing barrier is implemented.
 - QUIC UDP framing uses a 2-byte big-endian length prefix and applies the configured XOR transform to payloads.
-- QUIC UDP authentication now follows GoWay's `<key> UDP\n` form when a key is configured.
+- QUIC UDP authentication now follows GoWay's `<key> UDP\\n` form when a key is configured.
 - MUX XOR compatibility audit identified that GoWay transforms the complete encoded 7-byte MUX frame plus payload; RushWay plain runtime and WSS/MUX paths were moved toward full-frame XOR handling.
 - Runtime now has `max_connections`, `block_local`, `tcp_nodelay`, `tcp_keepalive` and `socket_buffer` configuration fields.
 - TCP socket policy wiring was added through `socket2` for NODELAY, send/receive buffer sizing and keepalive behavior on the server runtime.
@@ -51,12 +51,30 @@ The implementation was expanded substantially beyond the earlier WSS pooling che
 - Low-level runtime option support is substantially wired.
 - Implementation coverage is roughly **90% by code surface**, but this is an engineering estimate, not test coverage.
 
+## 2026-09-13 — Interruption-resume compatibility checkpoint
+
+### Confirmed against GoWay v1.8.4 source
+
+- GoWay defines CLI options with Go `flag` names such as `up`, `mux`, `no-mux`, `mux-sessions`, `W`, `socket-buffer`, `no-tcp-nodelay`, etc. These are presented as single-hyphen multi-character options such as `-up`, not only GNU-style `--up` forms.
+- RushWay `src/main.rs` currently defines the multi-character options with Clap long forms (`--up`, `--fakehost`, `--mux`, etc.) plus `-u` for `upstream`; exact GoWay single-hyphen multi-character compatibility therefore remains a **known CLI gap** and must be fixed before the final compatibility gate.
+- Current `main` also parses `socket-buffer`, `dns`, and `no-tcp-keepalive` but does not yet fully propagate every one of those values into `RuntimeConfig`; the compatibility implementation is therefore not complete at the CLI/config boundary.
+
+### Safe next implementation step
+
+In a runnable Rust environment, before transport testing:
+
+1. Add a small argv-normalization layer before `Args::parse()` that translates exact GoWay single-hyphen multi-character names (`-up`, `-fakehost`, `-mux`, `-no-mux`, `-mux-sessions`, `-W`, `-socket-buffer`, `-no-tcp-nodelay`, `-no-tcp-keepalive`, `-dns`, `-block-local`, `-no-block-local`, `-max-conn`, `-connection-timeout`, `-verify-ssl`, `-allow-open`) into Clap-compatible long names without changing ordinary negative values or positional arguments.
+2. Extend `RuntimeConfig` JSON/CLI propagation for `socket_buffer`, `tcp_keepalive`, and DNS configuration rather than assigning them to throwaway locals.
+3. Add parser tests covering both GoWay-style `-up ...` and GNU-style `--up ...` equivalents.
+4. Only after those compile cleanly, enter the unified runtime test gate.
+
 ### Important unverified boundary
 
 The current execution environment still has **no usable `cargo` or `rustc`** and cannot fetch the repository/dependencies directly. Therefore none of the newest transport-expansion commits have current-head compiler/test evidence here.
 
 Do NOT claim any of the following as passed yet:
 
+- `cargo fmt`
 - `cargo check`
 - `cargo test`
 - authenticated GoWay <-> RushWay transfer
@@ -69,34 +87,31 @@ Do NOT claim any of the following as passed yet:
 
 ### Known remaining implementation/parity gaps
 
-- Main CLI still has a compatibility cleanup pending for exact GoWay option handling, especially legacy multi-letter forms and fully applying every parsed low-level option.
-- Exact remote DNS server/cache/fallback behavior is not yet reproduced; `--dns` remains a compatibility item.
-- Complete SOCKS5 REP/error/FRAG/reply/close parity still needs executable evidence.
-- HTTP CONNECT error/close parity still needs executable evidence.
-- Browser TLS/HTTP fingerprint parity is not complete.
-- Full GoWay dead-IP/retry/pool semantics still need executable validation.
-- WSS server-side mode is not claimed complete unless the GoWay baseline actually exposes that listener role; current implementation primarily targets GoWay-compatible WSS client/upstream behavior.
-- Release artifact validation remains outstanding.
+- Exact GoWay CLI single-hyphen multi-character option handling.
+- Full propagation of parsed low-level options, especially `--dns`, `--socket-buffer` and `--no-tcp-keepalive`.
+- Exact remote DNS server/cache/fallback behavior.
+- Complete SOCKS5 REP/error/FRAG/reply/close parity with executable evidence.
+- HTTP CONNECT error/close parity with executable evidence.
+- Browser TLS/HTTP fingerprint parity.
+- Full GoWay dead-IP/retry/pool semantics with executable evidence.
+- Release artifact validation.
 
-### Next action
-
-In a runnable Rust environment, execute the implementation-first gate:
+### Final test gate after implementation reaches 100%
 
 1. `cargo fmt -- --check`
 2. `cargo check --all-targets`
 3. `cargo test --all-targets --all-features`
 4. `cargo build --release`
-5. authenticated plain WS MUX/non-MUX TCP
-6. plain WS UDP
-7. WSS MUX/non-MUX TCP + UDP
-8. QUIC TCP + UDP
-9. GoWay -> RushWay and RushWay -> GoWay interoperability
-10. 1/100/500/1000 stream stress and large/slow-fast mixed workloads
-11. current-head c1/c8/c32 benchmarks
-12. Windows/Debian/ARMv7 release artifacts and smoke tests
-13. v0.0.1 tag/release
+5. plain WS authenticated MUX/non-MUX TCP + UDP
+6. WSS MUX/non-MUX TCP + UDP
+7. QUIC TCP + UDP
+8. GoWay -> RushWay and RushWay -> GoWay interoperability
+9. 1/100/500/1000 stream stress, large payloads, mixed slow/fast streams
+10. current-head c1/c8/c32 benchmarks
+11. Windows/Debian/ARMv7 release artifacts and smoke tests
+12. v0.0.1 tag/release
 
-Never call the implementation 100% complete merely because the source paths exist. The 100% gate is executable evidence plus release validation.
+Never call the implementation 100% complete merely because source paths exist. The 100% gate requires executable evidence plus release validation.
 
 ### Three-file relay contract
 
