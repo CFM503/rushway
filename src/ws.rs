@@ -1,4 +1,5 @@
 //! RFC 6455 transport pieces used by the GoWay-compatible transport.
+//!
 //! The codec deliberately does not implement fragmentation: GoWay v1.8.4
 //! accepts complete data frames and handles Ping/Pong/Close itself.
 
@@ -29,9 +30,7 @@ fn next_mask() -> [u8; 4] {
             let mut seed = [0u8; 8];
             rand::thread_rng().fill_bytes(&mut seed);
             *value = u64::from_le_bytes(seed);
-            if *value == 0 {
-                *value = 0x9e3779b97f4a7c15;
-            }
+            if *value == 0 { *value = 0x9e3779b97f4a7c15; }
         }
         let mut x = *value;
         x ^= x << 13;
@@ -133,7 +132,7 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
         }
     }
     if !token_contains(header_value(text, "Upgrade").ok_or_else(|| anyhow!("missing Upgrade header"))?, "websocket") { bail!("handshake failed: missing Upgrade: websocket"); }
-    if !token_contains(header_value(text, "Connection").ok_or_else(|| anyhow!("missing Connection header"))?, "Upgrade") { bail!("handshake failed: missing Connection: Upgrade"); }
+    if !token_contains(header_value(text, "Connection").ok_or_else(|| anyhow!("missing Connection: Upgrade"))?, "Upgrade") { bail!("handshake failed: missing Connection: Upgrade"); }
     let accept = header_value(text, "Sec-WebSocket-Accept").ok_or_else(|| anyhow!("handshake failed: missing Sec-WebSocket-Accept"))?;
     if accept != compute_accept_key(key) { bail!("handshake failed: invalid Sec-WebSocket-Accept"); }
     Ok(())
@@ -209,18 +208,55 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
     }
 }
 
+/// Receive a WebSocket data frame while transferring the payload Vec's ownership
+/// to the caller. This removes the full-buffer clone used by `read_frame` and is
+/// the preferred path for high-throughput MUX traffic.
+pub async fn read_frame_owned<R, W>(r: &mut R, mut reply: Option<&mut W>, buf: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>>
+where R: AsyncRead + Unpin, W: AsyncWrite + Unpin {
+    loop {
+        let b0 = r.read_u8().await?;
+        let b1 = r.read_u8().await?;
+        let fin = b0 & 0x80 != 0;
+        let opcode = b0 & 0x0f;
+        let masked = b1 & 0x80 != 0;
+        let mut len = (b1 & 0x7f) as u64;
+        if len == 126 { len = r.read_u16().await? as u64; } else if len == 127 { len = r.read_u64().await?; }
+        if len > MAX_WS_FRAME_SIZE as u64 { return Err(anyhow!("frame too large")); }
+        if opcode >= 0x8 { if !fin || len > 125 { return Err(anyhow!("invalid websocket control frame")); } }
+        else if opcode == 0 || !fin || (opcode != 1 && opcode != 2) { return Err(anyhow!("unsupported or fragmented websocket frame")); }
+        let mut key = [0u8; 4];
+        if masked { r.read_exact(&mut key).await?; }
+        buf.clear(); buf.resize(len as usize, 0); r.read_exact(buf).await?;
+        if masked { for (i, b) in buf.iter_mut().enumerate() { *b ^= key[i & 3]; } }
+        match opcode {
+            1 | 2 => {
+                let owned = std::mem::take(buf);
+                *buf = Vec::new();
+                return Ok(Some((opcode, owned)));
+            }
+            8 => return Ok(None),
+            9 => { if let Some(w) = reply.as_deref_mut() { write_frame(w, buf, 0xA, false).await?; } }
+            10 => {}
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
     #[test]
     fn rfc6455_accept_key_vector() { assert_eq!(compute_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="); }
+
     #[test]
     fn handshake_request_and_response_validate() {
         let (request, key) = build_client_handshake_request("example.com", "/ws", Some("https://example.com"), Some("same-origin"));
         assert_eq!(validate_server_handshake(&request).unwrap(), key);
         validate_client_handshake_response(&build_server_handshake_response(&key), &key).unwrap();
     }
+
     #[test]
     fn browser_headers_present() {
         let (request, _) = build_client_handshake_request("example.com", "/ws", Some("https://example.com"), Some("same-origin"));
@@ -229,28 +265,59 @@ mod tests {
             assert!(text.contains(header), "missing {header}");
         }
     }
+
     #[test]
     fn mask_generator_is_nonzero() { assert_ne!(next_mask(), [0, 0, 0, 0]); }
+
     #[test]
     fn header_limit_is_hard() { assert!(validate_server_handshake(&vec![b'x'; MAX_HTTP_HEADER_SIZE + 1]).is_err()); }
+
     #[tokio::test]
     async fn round_trip_unmasked_binary() {
-        let (mut a, mut b) = duplex(1024 * 1024); let data = vec![7u8; 70000]; let expected = data.clone();
+        let (mut a, mut b) = duplex(1024 * 1024);
+        let data = vec![7u8; 70000];
+        let expected = data.clone();
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, false).await });
-        let mut buf = Vec::new(); let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
-        writer.await.unwrap().unwrap(); assert_eq!(got.0, 2); assert_eq!(got.1, expected);
+        let mut buf = Vec::new();
+        let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(got.0, 2);
+        assert_eq!(got.1, expected);
     }
+
     #[tokio::test]
     async fn round_trip_masked_binary() {
-        let (mut a, mut b) = duplex(1024 * 1024); let data = vec![11u8; 70000]; let expected = data.clone();
+        let (mut a, mut b) = duplex(1024 * 1024);
+        let data = vec![11u8; 70000];
+        let expected = data.clone();
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, true).await });
-        let mut buf = Vec::new(); let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
-        writer.await.unwrap().unwrap(); assert_eq!(got.0, 2); assert_eq!(got.1, expected);
+        let mut buf = Vec::new();
+        let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(got.0, 2);
+        assert_eq!(got.1, expected);
     }
+
+    #[tokio::test]
+    async fn owned_binary_frame_transfers_storage_without_clone() {
+        let (mut a, mut b) = duplex(1024 * 1024);
+        let data = vec![23u8; 70000];
+        let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, false).await });
+        let mut buf = Vec::with_capacity(70000);
+        let (opcode, owned) = read_frame_owned(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(opcode, 2);
+        assert_eq!(owned, vec![23u8; 70000]);
+        assert!(buf.is_empty());
+    }
+
     #[tokio::test]
     async fn close_frame_returns_eof_marker() {
-        let (mut a, mut b) = duplex(1024); let writer = tokio::spawn(async move { write_frame(&mut a, b"", 8, false).await });
-        let mut buf = Vec::new(); let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap();
-        writer.await.unwrap().unwrap(); assert!(got.is_none());
+        let (mut a, mut b) = duplex(1024);
+        let writer = tokio::spawn(async move { write_frame(&mut a, b"", 8, false).await });
+        let mut buf = Vec::new();
+        let got = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await.unwrap();
+        writer.await.unwrap().unwrap();
+        assert!(got.is_none());
     }
 }
