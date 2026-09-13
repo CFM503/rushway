@@ -14,43 +14,48 @@
 
 ### Newly completed in this continuation
 
-- `133d6fad53053b889c96233c122cfdfc68191290` — normalized GoWay single-hyphen multi-character CLI options before Clap parsing; propagated socket buffer and keepalive options; added parser tests.
-- `1cf7e24e00896fefb7f41491ed9b2309de04bfea` — synchronized AI interruption handoff.
-- `c09a22be2780a68023526ec86f4a19edc9b957a8` — added a centralized remote-DNS resolver with 5-second timeout, UDP DNS, TCP fallback on truncated response, system DNS fallback, and 5-minute positive cache.
-- `051463bc552d402db61355effce6d79b2370c530` — enabled CLI/JSON DNS configuration through the centralized resolver.
-- `8c54f465e0fc11f005596138be21336fadf89510` — routed server-side runtime target TCP/UDP hostname resolution through the centralized resolver.
-- `dd54bd4f02a89129e8c88c59fb19211b4e130991` — routed non-MUX upstream/target hostname resolution through the centralized resolver and applied the configured TCP socket policy on those connections.
+- `133d6fad53053b889c96233c122cfdfc68191290` — GoWay single-hyphen CLI normalization, socket option propagation and parser tests.
+- `c09a22be2780a68023526ec86f4a19edc9b957a8` — centralized GoWay-style remote DNS resolver.
+- `051463bc552d402db61355effce6d79b2370c530` — CLI/JSON DNS configuration.
+- `8c54f465e0fc11f005596138be21336fadf89510` — server runtime target DNS integration.
+- `dd54bd4f02a89129e8c88c59fb19211b4e130991` — non-MUX DNS and socket-policy integration.
+- `da7c6bf6e4f39e19441976d7b465667cbf6f278c` — accepted GoWay logging/profiling CLI names.
+- `3cd5d6af6b28885cc6e4922d8296a2567ff2ea18` — fixed the invalid Clap `args.version` reference from the prior CLI expansion.
+- `cb24a792a072bd3f16f598e27cd80bdbe5de9f61` — normalized GoWay boolean forms such as `-mux=true`, `-mux=false`, `-block-local=false`, and `-no-tcp-keepalive=false` into valid Clap semantics.
+
+### Important CLI compatibility result
+
+GoWay's own v1.8.4 integration test starts processes with forms including `-log ERROR`, `-mux=true`, and `-block-local=false`. RushWay now accepts these single-hyphen forms and translates boolean `=true/=false` values to the corresponding positive/negative Clap flags. This is an important interoperability prerequisite.
+
+The GoWay CLI names `-log`, `-log-file`, `-tui`, `-version`, `-cpuprofile`, and `-cpuprofile-duration` are now accepted. `-log` changes RushWay's tracing level; file/TUI/profiling functionality is still explicitly reported as compatibility stubs rather than falsely claimed as fully implemented.
 
 ### Current DNS implementation boundary
 
-The resolver now exists as a shared process-level component and follows the source-derived GoWay shape:
+Central resolver behavior:
 
-- remote DNS server selected by `-dns` or JSON `dns` / `dnsServer`;
-- remote DNS query first;
-- 5-second resolve timeout;
-- UDP query with TCP retry when the response is truncated;
+- configured remote DNS server via `-dns` or JSON `dns` / `dnsServer`;
+- 5-second resolution timeout;
+- UDP lookup;
+- TCP retry when UDP response is truncated;
 - system DNS fallback after remote failure;
 - 5-minute positive cache;
 - IP literals bypass DNS.
 
-It is currently integrated into the core server target path and plain non-MUX path. MUX upstream, WSS upstream and QUIC upstream hostname dialing still need the same resolver integration before DNS compatibility can be considered complete.
+Currently integrated into server-side target dialing and the plain non-MUX client/server path. MUX upstream, WSS upstream and QUIC upstream hostname dialing still require integration.
 
 ### CI reality check
 
-The repository's GitHub Actions pipeline has previously completed successfully on the same day (for example run `34756277983`, commit `994a52c7797f408654057d881effebb9e4af07f2`). New runs after the continuation commits are failing almost immediately (about four seconds) and the GitHub connector cannot retrieve the job logs; this is not sufficient evidence of a Rust compiler/test failure. Treat the CI state as **inconclusive infrastructure/setup failure**, not as a code-pass and not as a proven compiler failure.
+A same-day earlier run `34756277983` on commit `994a52c7797f408654057d881effebb9e4af07f2` completed successfully. Every continuation push since then has produced GitHub Actions runs that terminate in about four seconds with `failure`, while the connector cannot expose job steps/logs. This pattern is treated as an **inconclusive Actions infrastructure/setup failure**, not as a proven Rust compile failure. Do not mark any compile/test/build gate passed from these red checks.
 
-Do not claim current-head `cargo check`, `cargo test`, release build, runtime interop or artifact builds as passed until an actual job log or local compiler result proves them.
+### Remaining implementation priority
 
-### Important remaining implementation work
-
-1. Integrate the central DNS resolver into plain MUX upstream, WSS upstream and QUIC upstream dialing.
-2. Ensure socket buffer/keepalive/NODELAY policy is applied consistently to all TCP upstream paths, not only runtime/non-MUX paths.
-3. Complete GoWay CLI compatibility for remaining named flags (`-log`, `-log-file`, `-tui`, `-version`, profiling options) or explicitly prove they are non-functional/diagnostic-only in the baseline compatibility surface.
-4. Audit SOCKS5 REP/error/FRAG/close parity and HTTP CONNECT malformed/header failure responses.
-5. Audit QUIC retry/dead-IP/pool semantics and exact TLS/SNI behavior.
-6. Obtain a real Rust 1.82 build/test environment; run fmt/check/test/release and fix every compiler/test issue.
-7. Run the full GoWay interoperability, stress, benchmark and three-platform artifact matrix.
-8. Only after all executable evidence passes, tag/smoke-test `v0.0.1` and call the project 100% complete.
+1. Integrate central DNS into plain MUX upstream, WSS upstream and QUIC upstream dialing while preserving original hostname/SNI where required.
+2. Apply socket buffer/keepalive/NODELAY consistently across MUX/WSS upstream TCP connections.
+3. Finish SOCKS5 REP/error/FRAG/close parity and HTTP CONNECT malformed-request/status parity.
+4. Finish QUIC retry/dead-IP/pool and exact TLS/SNI audit.
+5. Obtain a real Rust environment and run fmt/check/test/release; fix every actual compiler/test error.
+6. Execute GoWay -> RushWay and RushWay -> GoWay transport matrix, stress 1/100/500/1000 streams, large and slow/fast mixed workloads, benchmarks and target builds.
+7. Tag/smoke-test `v0.0.1` only after executable evidence is complete.
 
 ### Three-file relay contract
 
@@ -59,9 +64,5 @@ Only these three files are canonical handoff state:
 1. `AI_HANDOFF.md` — chronological decisions/blockers/next step.
 2. `PROGRESS.md` — compact project dashboard.
 3. `SPEC.md` — source-derived GoWay compatibility contract.
-
-## Historical transport expansion
-
-The major transport families already represented in code remain: plain WS, WSS, non-MUX, QUIC/QUIC+TLS; MUX pooling exists for plain WS/WSS and QUIC has physical connection reuse. Runtime socket policy and protocol framing work must still be proven by executable tests before release.
 
 Never call the implementation 100% complete merely because source paths exist. The 100% gate requires executable evidence plus release validation.
