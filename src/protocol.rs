@@ -49,6 +49,52 @@ impl TryFrom<u8> for MuxCommand {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxHeader {
+    pub stream_id: u32,
+    pub command: MuxCommand,
+    pub payload_len: usize,
+}
+
+impl MuxHeader {
+    pub fn parse(buf: &[u8]) -> Result<Self, ProtocolError> {
+        if buf.len() < MUX_HEADER_LEN {
+            return Err(ProtocolError::TruncatedHeader(buf.len()));
+        }
+        let stream_id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        let command = MuxCommand::try_from(buf[4])?;
+        let payload_len = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
+        if buf.len() != MUX_HEADER_LEN + payload_len {
+            return Err(ProtocolError::LengthMismatch {
+                declared: payload_len,
+                available: buf.len().saturating_sub(MUX_HEADER_LEN),
+            });
+        }
+        Ok(Self { stream_id, command, payload_len })
+    }
+
+    pub fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        &buf[MUX_HEADER_LEN..MUX_HEADER_LEN + self.payload_len]
+    }
+}
+
+pub fn encode_header(out: &mut Vec<u8>, stream_id: u32, command: MuxCommand, payload_len: usize) -> Result<(), ProtocolError> {
+    if payload_len > MAX_MUX_PAYLOAD {
+        return Err(ProtocolError::PayloadTooLarge(payload_len));
+    }
+    out.reserve(MUX_HEADER_LEN);
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.push(command.as_u8());
+    out.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    Ok(())
+}
+
+pub fn write_frame_parts(out: &mut Vec<u8>, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<(), ProtocolError> {
+    encode_header(out, stream_id, command, payload.len())?;
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxFrame {
     pub stream_id: u32,
@@ -65,34 +111,15 @@ impl MuxFrame {
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
-        if self.payload.len() > MAX_MUX_PAYLOAD {
-            return Err(ProtocolError::PayloadTooLarge(self.payload.len()));
-        }
-        out.reserve(MUX_HEADER_LEN + self.payload.len());
-        out.extend_from_slice(&self.stream_id.to_be_bytes());
-        out.push(self.command.as_u8());
-        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
-        out.extend_from_slice(&self.payload);
-        Ok(())
+        write_frame_parts(out, self.stream_id, self.command, &self.payload)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
-        if buf.len() < MUX_HEADER_LEN {
-            return Err(ProtocolError::TruncatedHeader(buf.len()));
-        }
-        let stream_id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-        let command = MuxCommand::try_from(buf[4])?;
-        let payload_len = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
-        if buf.len() != MUX_HEADER_LEN + payload_len {
-            return Err(ProtocolError::LengthMismatch {
-                declared: payload_len,
-                available: buf.len().saturating_sub(MUX_HEADER_LEN),
-            });
-        }
+        let header = MuxHeader::parse(buf)?;
         Ok(Self {
-            stream_id,
-            command,
-            payload: buf[MUX_HEADER_LEN..].to_vec(),
+            stream_id: header.stream_id,
+            command: header.command,
+            payload: header.payload(buf).to_vec(),
         })
     }
 }
@@ -170,6 +197,17 @@ mod tests {
         assert_eq!(&encoded[..7], &[1, 2, 3, 4, MUX_DATA, 0, 3]);
         assert_eq!(encoded.len(), MUX_HEADER_LEN + 3);
         assert_eq!(MuxFrame::decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn zero_copy_header_parse_round_trip() {
+        let mut encoded = Vec::new();
+        write_frame_parts(&mut encoded, 0x01020304, MuxCommand::Data, &[1, 2, 3, 4]).unwrap();
+        let header = MuxHeader::parse(&encoded).unwrap();
+        assert_eq!(header.stream_id, 0x01020304);
+        assert_eq!(header.command, MuxCommand::Data);
+        assert_eq!(header.payload_len, 4);
+        assert_eq!(header.payload(&encoded), &[1, 2, 3, 4]);
     }
 
     #[test]
