@@ -102,14 +102,13 @@ async fn one_flow(proxy_port: u16, target_port: u16, payload: Arc<[u8]>) -> io::
 }
 
 async fn run_case(proxy_port: u16, target_port: u16, concurrency: usize, payload: Arc<[u8]>) -> io::Result<f64> {
+    let start = Instant::now();
     let mut tasks = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         tasks.push(tokio::spawn(one_flow(proxy_port, target_port, Arc::clone(&payload))));
     }
 
-    // Measure only the proxy workload. Task creation and cheap Arc cloning are prepared
-    // before the timed section so benchmark setup overhead does not distort throughput.
-    let start = Instant::now();
+    // Count the full concurrent proxy flow, including SOCKS5 setup and upstream handshakes.
     let mut total = 0usize;
     for task in tasks {
         total += task.await.map_err(|e| io::Error::other(e.to_string()))??;
