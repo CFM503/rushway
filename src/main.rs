@@ -10,7 +10,7 @@ mod udp_relay;
 mod ws;
 mod wss_client;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use runtime::RuntimeConfig;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "rushway", version, about = "Rust forwarding service compatible with GoWay")]
 struct Args {
     #[arg(short, long)] config: Option<PathBuf>,
-    #[arg(short = 'p')] port: Option<u16>,
+    #[arg(short = 'p')] port: Option<String>,
     #[arg(short = 'u', long = "up")] upstream: Option<String>,
     #[arg(short = 'k')] key: Option<String>,
     #[arg(long = "fakehost")] fakehost: Option<String>,
@@ -38,6 +38,19 @@ struct Args {
     #[arg(long = "no-block-local", default_value_t = false)] no_block_local: bool,
     #[arg(long = "max-conn", default_value_t = 1000, value_parser = clap::value_parser!(usize).range(1..=1_000_000))] max_conn: usize,
     #[arg(long = "connection-timeout", default_value_t = 60)] connection_timeout: u64,
+}
+
+fn apply_listen_arg(cfg: &mut RuntimeConfig, value: &str) -> Result<()> {
+    if let Ok(port) = value.parse::<u16>() { cfg.proxy_port = port; return Ok(()); }
+    let trimmed = value.trim();
+    if let Some(port_text) = trimmed.strip_prefix(':') {
+        cfg.proxy_port = port_text.parse::<u16>().map_err(|_| anyhow!("invalid listen address: {value}"))?;
+        return Ok(());
+    }
+    let addr: std::net::SocketAddr = trimmed.parse().map_err(|_| anyhow!("invalid listen address: {value}"))?;
+    cfg.proxy_host = addr.ip().to_string();
+    cfg.proxy_port = addr.port();
+    Ok(())
 }
 
 async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
@@ -65,7 +78,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))).with_target(false).init();
     let args = Args::parse();
     let mut cfg = if let Some(path) = args.config { load_json(path).await? } else { RuntimeConfig::default() };
-    if let Some(v) = args.port { cfg.proxy_port = v; }
+    if let Some(v) = args.port.as_deref() { apply_listen_arg(&mut cfg, v)?; }
     if let Some(v) = args.upstream { cfg.upstream = Some(v); }
     if let Some(v) = args.key { cfg.key = Some(v); }
     if let Some(v) = args.fakehost { cfg.fakehost = Some(v); }
@@ -81,10 +94,7 @@ async fn main() -> Result<()> {
     let _ = args.no_tcp_keepalive;
     std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
     if let Some(upstream) = cfg.upstream.as_deref() {
-        if upstream.starts_with("wss://") {
-            if cfg.mux { return wss_client::run_client_from_config(cfg, args.verify_ssl).await; }
-            return wss_client::run_non_mux_from_config(cfg, args.verify_ssl).await;
-        }
+        if upstream.starts_with("wss://") { if cfg.mux { return wss_client::run_client_from_config(cfg, args.verify_ssl).await; } return wss_client::run_non_mux_from_config(cfg, args.verify_ssl).await; }
         if upstream.starts_with("quic://") || upstream.starts_with("quic+tls://") { return quic::run_client(cfg, args.verify_ssl).await; }
         if cfg.mux { mux_pool::run_client(cfg).await } else { nonmux::run_client(cfg).await }
     } else if cfg.mux {
@@ -101,23 +111,11 @@ mod tests {
     use super::*;
     use clap::Parser;
     #[test]
-    fn parses_basic_runtime_args() {
-        let a = Args::parse_from(["rushway", "-p", "9192", "--up", "ws://127.0.0.1:8080/ws"]);
-        assert_eq!(a.port, Some(9192));
-        assert_eq!(a.upstream.as_deref(), Some("ws://127.0.0.1:8080/ws"));
-        assert_eq!(a.mux_sessions, 4);
-    }
+    fn parses_basic_runtime_args() { let a=Args::parse_from(["rushway","-p",":9192","--up","ws://127.0.0.1:8080/ws"]);assert_eq!(a.port.as_deref(),Some(":9192"));assert_eq!(a.upstream.as_deref(),Some("ws://127.0.0.1:8080/ws"));assert_eq!(a.mux_sessions,4); }
     #[test]
-    fn parses_policy_args() {
-        let a = Args::parse_from(["rushway", "--no-tcp-nodelay", "--no-tcp-keepalive", "--max-conn", "32", "--no-block-local"]);
-        assert!(a.no_tcp_nodelay);
-        assert!(a.no_tcp_keepalive);
-        assert_eq!(a.max_conn, 32);
-        assert!(a.no_block_local);
-    }
+    fn parses_policy_args(){let a=Args::parse_from(["rushway","--no-tcp-nodelay","--no-tcp-keepalive","--max-conn","32","--no-block-local"]);assert!(a.no_tcp_nodelay);assert!(a.no_tcp_keepalive);assert_eq!(a.max_conn,32);assert!(a.no_block_local);}
     #[test]
-    fn parses_verify_ssl() {
-        let a = Args::parse_from(["rushway", "--up", "wss://example.com/ws", "--verify-ssl"]);
-        assert!(a.verify_ssl);
-    }
+    fn parses_verify_ssl(){let a=Args::parse_from(["rushway","--up","wss://example.com/ws","--verify-ssl"]);assert!(a.verify_ssl);}
+    #[test]
+    fn parses_listen_forms(){let mut cfg=RuntimeConfig::default();apply_listen_arg(&mut cfg,"127.0.0.1:1080").unwrap();assert_eq!(cfg.proxy_host,"127.0.0.1");assert_eq!(cfg.proxy_port,1080);apply_listen_arg(&mut cfg,"9192").unwrap();assert_eq!(cfg.proxy_port,9192);}
 }
