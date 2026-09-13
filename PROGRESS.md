@@ -5,52 +5,31 @@
 
 ## Current verified checkpoint — 2026-09-13
 
-**Overall engineering completion: ~55% (estimate).** This is migration progress, not a claim of production readiness.
+**Overall engineering completion: ~60% (estimate).** This is migration progress, not a claim of production readiness.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
 - Stage 3 Rust implementation: `[~]`
 - Stage 4 compatibility tests: `[ ]`
 - Stage 5 release builds: `[~]`
-- Stage 6 GitHub Actions: `[~]` — run layer currently unstable
+- Stage 6 GitHub Actions: `[~]` — runner execution is currently failing before steps start
 - Stage 7 v0.0.1 release: `[ ]`
 
 ### Current head / optimization work
-- Current code head: `590a818c843af81043277f107eaae2fc8bd375c8`.
-- Added client-side physical MUX session pool in `f23ab32d8b5ef8343a81b9bfa4665da945d06e5b`.
-- Routed normal `ws://` client mode through the pool in `590a818c843af81043277f107eaae2fc8bd375c8`.
-- Debian 12 CI fix: `994a52c7797f408654057d881effebb9e4af07f2`.
-- ARMv7 is now pinned to Rust 1.86.0 because fresh target dependency resolution can require Edition 2024 support; the main test job remains Rust 1.82.0.
+- Current code head: `1c16c2195d4a01a2f1b901bdee73763719665134`.
+- Client-side physical MUX session pooling is implemented for normal `ws://` traffic.
+- `--mux-sessions` now controls the physical pool through `RUSHWAY_MUX_SESSIONS`, clamped to 1..64.
+- Per-session logical stream capacity is 256.
+- Stream lifecycle handling was hardened to avoid duplicate active-count decrements and to avoid holding the shared writer lock during network reads.
+- Build-smoke workflow is present for Linux x64 and Windows x64.
 
 ## Latest CI status
 
-### Run 100 — workflow `34756739632`
-- Main test/release path passed.
-- Windows x64 and Debian 12 x64 passed.
-- ARMv7 failed for a real dependency/toolchain reason: a transitive package selected Edition 2024, unavailable to Cargo 1.82.0.
+Latest push head `f2b15f6b66e008bc305555cfadb8200fd23929b1` triggered both the main CI and Build Smoke workflows. Both failed immediately with jobs reporting `steps: []` / no runner execution; dependent platform jobs were skipped. This is runner/infrastructure evidence, not compiler/test evidence. Do not infer code failure from these runs.
 
-### Runs 101–105 — workflow layer failure
-Runs `34756815694`, `34758696973`, `34758732812`, `34759343302`, and the later run on head `590a818c...` repeatedly show jobs as failed with `steps: null` and no compile/test log output; downstream jobs are skipped. These runs are not usable as code correctness evidence.
+The last fully verified RushWay-only baseline remains Run 95 (`34755206730`).
 
-The workflow itself still contains the intended ARMv7 build using Rust 1.86.0. Do not mark ARM complete until a normal run executes actual build steps and succeeds.
-
-## New client-side MUX pooling architecture
-
-`src/mux_pool.rs` now provides a normal `ws://` client path that:
-- prewarms up to 4 physical WebSocket/MUX sessions;
-- maps each local TCP proxy connection onto a logical MUX stream;
-- selects the least-active reusable physical session;
-- maintains per-session stream dispatch via an async channel map;
-- keeps the physical WebSocket alive across many local TCP connections;
-- replaces a dead physical session instead of forcing every local stream to create one;
-- keeps WSS handling in the existing dedicated client path;
-- retains a SOCKS5 UDP path in the pooled client module.
-
-This specifically removes repeated upstream TCP + WebSocket + MUX handshake cost from sequential local TCP connections. It is an architectural optimization only; no throughput improvement is claimed before benchmark execution.
-
-## Previous benchmark evidence — RushWay only
-
-Run 95 (`34755206730`) was fully green before the ARM toolchain change:
+## Verified performance baseline — RushWay only
 
 | Workload | c1 | c8 | c32 |
 |---|---:|---:|---:|
@@ -75,7 +54,7 @@ These are RushWay-only/local measurements and are not GoWay comparison evidence.
 - both use `--up ws://127.0.0.1:<server>/` on the client side;
 - same 4 MiB deterministic payload, concurrency 1/8/32, SOCKS5 no-auth and local TCP echo.
 
-`scripts/repeat_proxy_bench.sh` executes repeated samples and reports the median for c1/c8/c32. CI runs five samples.
+`scripts/repeat_proxy_bench.sh` executes repeated samples and reports the median for c1/c8/c32.
 
 Modes:
 - `setup_inclusive`: local SOCKS5 negotiation + upstream WebSocket setup + transfer + echo;
@@ -93,11 +72,14 @@ The optional pinned GoWay comparison job remains disabled when the private sibli
 - [x] DATA payload is forwarded without cloning.
 - [x] WebSocket binary data-frame receive transfers ownership.
 
-### Newly implemented
+### Completed pooling work
 - [x] Client-side physical MUX session reuse for normal `ws://` client traffic.
 - [x] Least-active physical session selection.
 - [x] Logical stream dispatch from one physical WebSocket to multiple local TCP connections.
 - [x] Basic session retirement on physical reader termination.
+- [x] User-configurable physical session count via `--mux-sessions`.
+- [x] Per-session logical stream limit of 256.
+- [x] Stream lifecycle active-count hardening.
 
 ### Still requiring profiling / validation
 - [ ] Outbound MUX frame allocation per DATA write.
@@ -122,11 +104,11 @@ The optional pinned GoWay comparison job remains disabled when the private sibli
 - [x] Local EOF -> MUX FIN.
 - [x] Remote MUX FIN -> local half-close.
 - [x] Remote MUX RST -> local connection termination.
-- [x] SOCKS5 UDP relay implementation slice.
-- [x] TLS/WSS client TCP forwarding path compiles on prior verified Linux/Windows CI.
+- [x] SOCKS5 UDP relay implementation slice for plain `ws://`.
+- [x] TLS/WSS client TCP forwarding path.
 - [ ] WSS UDP.
 - [ ] Runtime QUIC.
-- [ ] Retry/dead-IP/connection-pool parity beyond the new physical MUX reuse.
+- [ ] Retry/dead-IP/connection-pool parity beyond physical MUX reuse.
 - [ ] Runtime non-MUX mode.
 - [ ] True GoWay <-> RushWay interoperability evidence.
 
@@ -138,21 +120,24 @@ The optional pinned GoWay comparison job remains disabled when the private sibli
 - [ ] KWRT/OpenWrt ARMv7 release artifact packaging.
 - [ ] v0.0.1 release.
 
-## Immediate continuous sequence
+## Immediate accelerated sequence
 
-1. Get one normal GitHub Actions execution with actual steps; verify Rust 1.86 ARMv7 build and compile the new MUX pool.
-2. Fix any real compiler/test findings from that execution immediately.
-3. Run setup-inclusive and steady-state c1/c8/c32 medians on the pooled client and compare with Run 95.
-4. Execute the pinned GoWay comparison when the optional private repository-read credential is available.
-5. Profile any remaining throughput/CPU/allocation hotspot before further optimization.
-6. Continue WSS UDP, QUIC, non-MUX, retry/dead-IP, interoperability and release artifact work.
-7. Synchronize `PROGRESS.md` and `AI_HANDOFF.md` after every verified milestone.
+1. Restore a normal Actions execution path and obtain real compile/test logs; do not treat runner failures as code evidence.
+2. Run the pooled-client setup-inclusive and steady-state c1/c8/c32 medians and compare against Run 95.
+3. Remove remaining hot-path allocation/lock overhead in MUX DATA forwarding based on profiling, not guesswork.
+4. Implement WSS physical-session reuse without weakening TLS verification or compatibility behavior.
+5. Implement WSS UDP relay and validate packet framing/end-to-end behavior.
+6. Implement non-MUX transport mode and matching server handshake.
+7. Add retry/dead-IP and connection-pool parity, then execute true GoWay interoperability tests.
+8. Complete QUIC runtime and release artifact packaging for Windows x64, Debian 12 x64 and ARMv7/OpenWrt.
+9. Synchronize `PROGRESS.md` and `AI_HANDOFF.md` after every verified milestone.
+10. Cut v0.0.1 only after implementation and execution evidence are complete.
 
 ## AI relay rule
 
 **Use both relay documents, but keep their roles distinct:**
 
-- `PROGRESS.md` — canonical roadmap, stage status, verified CI/performance baseline, current blockers and next sequence.
+- `PROGRESS.md` — canonical roadmap, verified CI/performance baseline, current blockers and next sequence.
 - `AI_HANDOFF.md` — chronological AI-to-AI handoff log, exact commit history, incidents, benchmark caveats and operational context.
 
 Any future/relay AI must:
