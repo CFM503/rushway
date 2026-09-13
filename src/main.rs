@@ -6,6 +6,7 @@ mod proxy;
 mod quic;
 mod runtime;
 mod tls;
+mod udp_relay;
 mod ws;
 mod wss_client;
 
@@ -68,9 +69,7 @@ async fn main() -> Result<()> {
             if cfg.mux { return wss_client::run_client_from_config(cfg, args.verify_ssl).await; }
             return wss_client::run_non_mux_from_config(cfg, args.verify_ssl).await;
         }
-        if upstream.starts_with("quic://") || upstream.starts_with("quic+tls://") {
-            return quic::run_client(cfg, args.verify_ssl).await;
-        }
+        if upstream.starts_with("quic://") || upstream.starts_with("quic+tls://") { return quic::run_client(cfg, args.verify_ssl).await; }
         if cfg.mux { mux_pool::run_client(cfg).await } else { nonmux::run_client(cfg).await }
     } else if cfg.mux {
         let (tcp_result, _quic_result) = tokio::join!(runtime::run_server(cfg.clone()), quic::run_server(cfg));
