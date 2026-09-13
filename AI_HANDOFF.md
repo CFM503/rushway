@@ -14,47 +14,44 @@
 
 ### Newly completed in this continuation
 
-- `133d6fad53053b889c96233c122cfdfc68191290` — GoWay single-hyphen multi-letter CLI normalization and socket-option propagation.
-- `c09a22be2780a68023526ec86f4a19edc9b957a8` — centralized remote DNS resolver: 5s timeout, UDP, TCP fallback for truncated replies, system fallback, 5-minute positive cache.
-- `051463bc552d402db61355effce6d79b2370c530` / `8c54f465e0fc11f005596138be21336fadf89510` — CLI/JSON DNS configuration and server target integration.
-- `dd54bd4f02a89129e8c88c59fb19211b4e130991` — plain non-MUX DNS/socket-policy integration.
-- `da7c6bf6e4f39e19441976d7b465667cbf6f278c` — GoWay diagnostic/profiling flag acceptance.
-- `3cd5d6af6b28885cc6e4922d8296a2567ff2ea18` — removed invalid Clap version-field usage.
-- `cb24a792a072bd3f16f598e27cd80bdbe5de9f61` — GoWay boolean `=true/=false` option compatibility.
-- `57031ac11159183696d4fe9c5d7d24804124f009` — pooled plain-WS MUX upstream DNS integration.
-- `b8618409d9ab3360c581b563e443e9b3c7c15222` — WSS upstream DNS integration while preserving TLS/Host identity.
-- `4ca5b78734f62056a309c762cafa8cc100d2a875` — QUIC upstream/server target DNS integration while preserving QUIC server name.
-- `9ab22dead3e778027ad770017261967cc67ace8e` — MUX proxy success response deferred until the upstream stream is actually established.
-- `3d23529bc08d09e7f0539b711b9a15c89af76296` — package version advanced to `0.0.2` for the formal release line.
-- `44054a3ea2282c0974a539d586522edcaa924a71` — remote DNS transaction-ID validation and focused mismatch test.
+- `44054a3ea2282c0974a539d586522edcaa924a71` — remote DNS transaction-ID validation and focused mismatch test (source-side).
+- `9ff943e5cecea61e72e2653987cff8957e8d060b` — added a reusable RFC1928 SOCKS5 General Failure response primitive and test.
+- `7fa79e38fb629776c138510539eb3ed93d4e8ed3` — made the shared TCP socket policy reusable outside the runtime server path.
+- `325c1f09bd099ee249d54eff8dee345ad914ba65` — plain WS MUX now waits for the first upstream response, maps server-side `RST` to local SOCKS5 failure / HTTP 502, and applies socket policy to pooled upstream TCP sessions.
+- `24728d10801439b733b45af2a9316b160b93ca8c` / `156785a8e550d967d2109990ac28e960443d436b` — WSS upstream sockets now reuse the same NODELAY/keepalive/buffer policy, WSS non-MUX target rejection maps to local failure, and WSS MUX CONNECT waits for the first upstream response without double-decrementing terminal stream state.
+- `75610b2123433a2b034eba577b61ddc161ac159f` — QUIC target-dial failure maps to local SOCKS5/HTTP failure and server target TCP sockets receive the shared socket policy; existing client pool retries once after failed `open_bi`.
+- `ce9e0cf4013c615c22f89b21e01389c741e09a39` — release dashboard updated for the hardened source state.
 
 ### Important interoperability findings
 
-GoWay's own integration tests use forms such as `-up ...`, `-log ERROR`, `-mux=true`, and `-block-local=false`; RushWay's parser now normalizes these into Clap-compatible arguments.
+GoWay's own integration tests use forms such as `-up ...`, `-log ERROR`, `-mux=true`, and `-block-local=false`; RushWay's parser normalizes these into Clap-compatible arguments.
 
-The shared DNS resolver now covers server target resolution plus plain WS MUX, plain WS non-MUX, WSS and QUIC upstream/target hostname dialing. IP literals bypass DNS, WSS/QUIC preserve the original logical hostname for TLS/HTTP identity, and remote DNS replies are transaction-ID checked.
+The shared DNS resolver now covers server target resolution plus plain WS MUX, plain WS non-MUX, WSS and QUIC hostname dialing/target resolution. IP literals bypass DNS, WSS/QUIC preserve the original logical hostname for TLS/HTTP identity, and remote DNS replies are transaction-ID checked.
 
-The MUX local proxy path now waits until the physical/logical stream is acquired before returning local CONNECT success. The remaining refinement is to consume the first upstream MUX response so a server-side RST can be converted into the exact local SOCKS5/HTTP failure response.
+The local CONNECT paths for plain-WS MUX and WSS MUX no longer announce success merely because a logical stream was created. They consume the first upstream frame: `RST` is reported as SOCKS5 General Failure / HTTP 502; `DATA` is forwarded after success; `FIN` produces clean EOF after success.
+
+QUIC client connection reuse already clears the cached connection and retries when opening a bidirectional stream fails. QUIC target-dial failure now returns a local SOCKS5/HTTP failure instead of silently closing. The QUIC server preserves the resolved host name for TLS server-name selection and now applies the common TCP socket policy to the actual target socket after connect.
 
 ### Current verification boundary
 
-GitHub Actions remains **inconclusive** rather than a compiler result: the newest `v0.0.2` CI run (`34764182241`, head `3d23529bc08d09e7f0539b711b9a15c89af76296`) again marked the `test` job failed without exposing any job steps/logs; dependent artifact jobs were skipped. A same-day earlier run (`34756277983`, commit `994a52c7797f408654057d881effebb9e4af07f2`) completed successfully. No current-head `cargo fmt`, `cargo check`, `cargo test`, release build, binary build, or runtime interoperability result is claimed as passed.
+GitHub Actions is still **inconclusive rather than a compiler result**. HEAD `75610b2123433a2b034eba577b61ddc161ac159f` triggered `RushWay CI` run `34764563674` and `RushWay Build Smoke` run `34764563695`; both failed before exposing executable job steps, and the job-log endpoint returns `BlobNotFound`. This means no current-head compile/test/build result is honestly claimable from Actions yet.
+
+A prior same-day run (`34756277983`, commit `994a52c7797f408654057d881effebb9e4af07f2`) completed successfully, but it predates the final transport hardening commits and cannot certify the current HEAD.
 
 ### Remaining work before the 100% gate
 
-1. Finish the MUX first-response/RST local failure mapping so target dial failures do not appear as successful CONNECTs.
-2. Cross-path TCP socket-policy audit for pooled MUX/WSS upstream connections (NODELAY, keepalive, send/recv buffer).
-3. SOCKS5 target-failure/error/FRAG/close parity and HTTP CONNECT malformed-request/status parity.
-4. QUIC retry/dead-IP/pool semantics and exact TLS/SNI audit.
-5. Execute DNS/cache/fallback tests after obtaining usable Rust 1.82 execution evidence.
-6. Run `cargo fmt -- --check`, `cargo check --all-targets`, `cargo test --all-targets --all-features`, and `cargo build --release`; fix actual failures.
-7. Run GoWay -> RushWay and RushWay -> GoWay TCP/UDP interoperability, 1/100/500/1000-stream stress, large payload and mixed slow/fast tests.
-8. Run c1/c8/c32 benchmarks and Windows/Debian/ARMv7 artifact smoke tests.
-9. Create and smoke-test `v0.0.2` only after executable evidence is complete.
+1. Finish exact SOCKS5 error/FRAG/close and HTTP CONNECT malformed/error lifecycle parity across every transport.
+2. Execute QUIC dead-IP/connection-state/TLS-SNI interoperability checks against GoWay.
+3. Add focused integration tests for MUX/WSS first-response RST, transport-specific target failures, and socket-option propagation.
+4. Execute DNS transaction-ID, cache and truncated-response fallback tests in a usable Rust 1.82 environment.
+5. Run `cargo fmt -- --check`, `cargo check --all-targets`, `cargo test --all-targets --all-features`, and `cargo build --release`; fix actual compiler/test failures rather than inferring them.
+6. Run GoWay -> RushWay and RushWay -> GoWay TCP/UDP interop, 1/100/500/1000-stream stress, large payload and mixed slow/fast tests.
+7. Run c1/c8/c32 benchmarks and Windows x64/Debian 12/ARMv7 artifact smoke tests.
+8. Create and smoke-test `v0.0.2` only after executable evidence is complete.
 
 ### Release/tag constraint
 
-`Cargo.toml` is now `0.0.2`. The current GitHub connector exposes branch/commit writes but no tag/ref-creation write operation, so `v0.0.2` has **not** been falsely claimed as tagged. The tag must point to the final verified release commit once tag creation is available.
+`Cargo.toml` is `0.0.2`. The current GitHub connector exposes branch/commit writes but no tag/ref creation write operation, and the tag lookup currently does not show a `v0.0.2` reference. The tag must point to the final verified release commit once tag creation is available.
 
 ### Three-file relay contract
 
