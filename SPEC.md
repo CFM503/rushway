@@ -1,4 +1,4 @@
-# RushWay v0.0.1 — GoWay v1.8.4 Compatibility Specification
+# RushWay v0.0.2 — GoWay v1.8.4 Compatibility Specification
 
 ## Purpose
 
@@ -42,12 +42,13 @@ The shared resolver now follows the GoWay implementation shape:
 - configured DNS server via `-dns` or JSON `dns` / `dnsServer`;
 - 5-second timeout;
 - remote UDP query;
+- transaction-ID validation;
 - TCP retry for truncated UDP responses;
 - system DNS fallback after remote failure;
 - 5-minute positive cache;
 - IP literals bypass DNS.
 
-It is integrated into server target dialing and plain WS MUX/non-MUX, WSS and QUIC hostname dialing. Remaining validation includes transaction-ID checking and executable fallback/cache tests.
+It is integrated into server target dialing and plain WS MUX/non-MUX, WSS and QUIC hostname dialing. Executable fallback/cache coverage still requires a usable Rust test environment.
 
 ## Low-level TCP policy
 
@@ -95,6 +96,6 @@ The project is not 100% complete until all of the following are true:
 7. 1/100/500/1000 stream stress plus large and mixed slow/fast workloads passes.
 8. c1/c8/c32 benchmarks are recorded.
 9. Windows x64, Debian 12 x64 and ARMv7/OpenWrt artifacts build and smoke-test.
-10. `v0.0.1` is tagged and smoke-tested.
+10. `v0.0.2` is tagged and smoke-tested.
 
 Never label the project 100% complete solely from source inspection.
