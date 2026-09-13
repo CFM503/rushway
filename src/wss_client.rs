@@ -5,7 +5,7 @@
 //! primitives. Server-side TLS is not claimed here.
 
 use crate::crypto::XorCipher;
-use crate::protocol::{MuxCommand, MuxFrame, SynPayload};
+use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, SynPayload};
 use crate::proxy::{parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_VERSION};
 use crate::runtime::RuntimeConfig;
 use crate::tls;
@@ -74,7 +74,19 @@ async fn read_proxy_request(local: &mut TcpStream) -> Result<(SocksCommand, Targ
     bail!("unsupported local proxy protocol")
 }
 
-async fn send_mux(writer: &Arc<Mutex<BoxWriter>>, frame: &MuxFrame) -> Result<()> { let mut data = Vec::with_capacity(7 + frame.payload.len()); frame.encode(&mut data).map_err(|e| anyhow!(e.to_string()))?; let mut w = writer.lock().await; write_frame(&mut *w, &data, 2, true).await }
+async fn send_mux(writer: &Arc<Mutex<BoxWriter>>, frame: &MuxFrame) -> Result<()> {
+    let mut data = Vec::with_capacity(7 + frame.payload.len());
+    frame.encode(&mut data).map_err(|e| anyhow!(e.to_string()))?;
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &data, 2, true).await
+}
+
+async fn send_mux_parts(writer: &Arc<Mutex<BoxWriter>>, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<()> {
+    let mut data = Vec::with_capacity(7 + payload.len());
+    write_frame_parts(&mut data, stream_id, command, payload).map_err(|e| anyhow!(e.to_string()))?;
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &data, 2, true).await
+}
 
 async fn handle_connection(mut local: TcpStream, cfg: WssConfig, id: u32) -> Result<()> {
     let (command, target, is_socks5) = read_proxy_request(&mut local).await?; if command != SocksCommand::Connect { bail!("WSS path only supports CONNECT"); }
@@ -85,7 +97,7 @@ async fn handle_connection(mut local: TcpStream, cfg: WssConfig, id: u32) -> Res
     if is_socks5 { local.write_all(&socks5_success_response()).await?; } else { local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?; }
     let id = id.max(1); let syn = SynPayload { target: format!("{}:{}", target.host, target.port).into_bytes(), initial_data: Vec::new() }; let syn = MuxFrame::new(id, MuxCommand::Syn, syn.encode().map_err(|e| anyhow!(e.to_string()))?).map_err(|e| anyhow!(e.to_string()))?; send_mux(&writer, &syn).await?;
     let (mut local_rd, mut local_wr) = tokio::io::split(local); let writer_up = writer.clone(); let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
-    let upload = tokio::spawn(async move { let mut buf = vec![0u8; buffer_size]; loop { let n = local_rd.read(&mut buf).await?; if n == 0 { let _ = send_mux(&writer_up, &MuxFrame::new(id, MuxCommand::Fin, Vec::new()).unwrap()).await; break; } let mut off = 0; while off < n { let end = (off + u16::MAX as usize).min(n); let frame = MuxFrame::new(id, MuxCommand::Data, buf[off..end].to_vec()).unwrap(); send_mux(&writer_up, &frame).await?; off=end; } } Result::<()>::Ok(()) });
+    let upload = tokio::spawn(async move { let mut buf = vec![0u8; buffer_size]; loop { let n = local_rd.read(&mut buf).await?; if n == 0 { let _ = send_mux_parts(&writer_up, id, MuxCommand::Fin, &[]).await; break; } let mut off = 0; while off < n { let end = (off + u16::MAX as usize).min(n); send_mux_parts(&writer_up, id, MuxCommand::Data, &buf[off..end]).await?; off=end; } } Result::<()>::Ok(()) });
     loop { let Some((opcode, payload)) = read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await? else { break }; if opcode != 2 { continue }; let frame = MuxFrame::decode(&payload).map_err(|e| anyhow!(e.to_string()))?; if frame.stream_id != id { continue } match frame.command { MuxCommand::Data=>local_wr.write_all(&frame.payload).await?, MuxCommand::Fin=>{local_wr.shutdown().await?;break}, MuxCommand::Rst=>break, MuxCommand::Syn=>{} } }
     upload.abort(); Ok(())
 }
