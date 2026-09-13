@@ -39,12 +39,14 @@ fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
 async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
     let (addr, host, path) = parse_wss_url(&cfg.upstream)?;
     let tcp = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), TcpStream::connect(&addr)).await.context("WSS upstream TCP timeout")??;
+    tcp.set_nodelay(true).ok();
+    tcp.set_keepalive(Some(Duration::from_secs(30))).ok();
     let tls_name = cfg.fakehost.as_deref().unwrap_or(&host);
     let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl).await?;
     let boxed: BoxTransport = Box::new(tls_stream);
     let (mut rd, mut wr) = tokio::io::split(boxed);
     let header_host = cfg.fakehost.as_deref().unwrap_or(&host);
-    let origin = format!("https://{}", header_host);
+    let origin = format!("https://{}", host);
     let sec_fetch_site = if tls_name.eq_ignore_ascii_case(&header_host) { "same-origin" } else { "cross-site" };
     let (request, key) = build_client_handshake_request(header_host, &path, Some(&origin), Some(sec_fetch_site));
     wr.write_all(&request).await?;
@@ -57,7 +59,7 @@ async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWrite
 async fn read_proxy_request(local: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
     let first = local.read_u8().await?;
     if first == SOCKS5_VERSION {
-        let n = local.read_u8().await? as usize; let mut methods = vec![0u8; n]; local.read_exact(&mut methods).await?;
+        let n = local.read_u8().await?; let mut methods = vec![0u8; n as usize]; local.read_exact(&mut methods).await?;
         if !methods.contains(&0) { local.write_all(&[5, 0xff]).await?; bail!("SOCKS5 no-auth unavailable"); }
         local.write_all(&[5, 0]).await?; let mut head = [0u8; 4]; local.read_exact(&mut head).await?;
         if head[1] != SOCKS5_CONNECT { local.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?; bail!("WSS path supports SOCKS5 CONNECT only"); }
