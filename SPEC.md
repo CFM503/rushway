@@ -14,6 +14,7 @@ RushWay targets protocol-compatible behavior with GoWay v1.8.4 at `538dbee86b9fb
 - WSS TCP MUX/non-MUX and UDP client paths are implemented.
 - QUIC/QUIC+TLS TCP and UDP client/server paths are implemented with GoWay-derived ALPN and transport values.
 - SOCKS5 CONNECT, UDP ASSOCIATE and HTTP CONNECT front-ends are implemented.
+- Plain-WS MUX, WSS MUX and QUIC target-failure paths now have explicit local failure responses instead of premature success/silent close.
 
 ## CLI compatibility
 
@@ -48,11 +49,11 @@ The shared resolver now follows the GoWay implementation shape:
 - 5-minute positive cache;
 - IP literals bypass DNS.
 
-It is integrated into server target dialing and plain WS MUX/non-MUX, WSS and QUIC hostname dialing. Executable fallback/cache coverage still requires a usable Rust test environment.
+It is integrated into server target dialing and plain WS MUX/non-MUX, WSS and QUIC hostname dialing. Source-side transaction-ID coverage exists; executable cache/fallback coverage still requires a usable Rust test environment.
 
 ## Low-level TCP policy
 
-Runtime configuration includes max connections, local-target blocking, TCP_NODELAY, TCP keepalive and socket buffer sizing. Cross-path application to every pooled upstream TCP socket still requires final audit.
+Runtime configuration includes max connections, local-target blocking, TCP_NODELAY, TCP keepalive and socket buffer sizing. The shared policy is now reusable by the server, pooled plain-WS MUX, WSS upstream sockets and QUIC server target sockets. Final executable socket-option smoke coverage remains required.
 
 ## SOCKS5 / HTTP
 
@@ -63,9 +64,10 @@ Supported:
 - HTTP CONNECT;
 - IPv4, domain and IPv6 target forms;
 - 8192-byte HTTP header ceiling;
-- SOCKS5 UDP `FRAG=0` only.
+- SOCKS5 UDP `FRAG=0` only;
+- explicit SOCKS5 General Failure response primitive (`0x05`).
 
-Remaining work is exact target-failure REP mapping, malformed-request/close behavior and executable parity against GoWay.
+Remaining work is exact malformed-request/close behavior across every transport and executable parity against GoWay.
 
 ## QUIC
 
@@ -77,11 +79,13 @@ GoWay-derived settings:
 - receive windows matching the compatibility baseline;
 - TCP stream bootstrap `<key> <target>\n` or `<target>\n`;
 - failure response `ERR: DIAL_FAILED\n`;
-- client physical connection reuse;
+- client physical connection reuse with one retry after `open_bi` failure;
 - UDP length-prefix framing with 2-byte big-endian lengths;
-- keyed XOR for UDP payloads.
+- keyed XOR for UDP payloads;
+- upstream DNS resolution preserves the logical hostname used as QUIC TLS server name;
+- server target TCP sockets receive the common TCP policy after connect.
 
-Retry/dead-IP/pool/TLS-SNI exact parity still requires executable evidence.
+Exact dead-IP/connection-state/TLS-SNI interoperability still requires executable evidence.
 
 ## 100% release gate
 
