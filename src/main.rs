@@ -64,10 +64,8 @@ async fn main() -> Result<()> {
     std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
     if let Some(upstream) = cfg.upstream.as_deref() {
         if upstream.starts_with("wss://") {
-            if !cfg.mux {
-                return Err(anyhow!("WSS non-MUX client path is not implemented yet"));
-            }
-            return wss_client::run_client_from_config(cfg, args.verify_ssl).await;
+            if cfg.mux { return wss_client::run_client_from_config(cfg, args.verify_ssl).await; }
+            return wss_client::run_non_mux_from_config(cfg, args.verify_ssl).await;
         }
         if cfg.mux { mux_pool::run_client(cfg).await } else { nonmux::run_client(cfg).await }
     } else if cfg.mux {
