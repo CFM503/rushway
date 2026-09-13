@@ -5,7 +5,7 @@
 
 ## Current checkpoint — 2026-09-13
 
-**Overall engineering completion: ~60% estimate.** This is migration progress, not production-readiness evidence.
+**Overall engineering completion: ~65% estimate.** This is migration progress, not production-readiness evidence.
 
 - Stage 1 bootstrap: `[~]`
 - Stage 2 v1.8.4 extraction: `[~]`
@@ -17,7 +17,7 @@
 
 ## Current head and completed implementation
 
-Latest code optimization head: `f20c19924e70b843338da2c245bb8668f7125bb3`.
+Latest code head for the WSS pooling milestone: `3de81c63fb06062183004c75e5928f0cfb851319`.
 
 ### Client front-end
 
@@ -69,8 +69,8 @@ Latest code optimization head: `f20c19924e70b843338da2c245bb8668f7125bb3`.
 - [x] Insecure rustls `ClientConfig` cached separately with `OnceLock`.
 - [x] TLS verification behavior and HTTP/1.1 ALPN preserved.
 - [x] Unit pointer-reuse check for cached TLS configs.
-- [ ] WSS physical-session pooling.
-- [ ] WSS pooled TCP functional validation.
+- [x] WSS physical-session pooling implementation.
+- [ ] WSS pooled TCP executable/functional validation.
 - [ ] WSS pooled throughput benchmark.
 - [ ] WSS UDP.
 - [ ] Server-side WSS runtime.
@@ -94,7 +94,8 @@ A proposed large-frame masking-reuse rewrite was deliberately not committed beca
 - [x] Plain `ws://` MUX TCP forwarding.
 - [x] Plain `ws://` SOCKS5 UDP slice.
 - [x] WSS TCP forwarding.
-- [ ] WSS physical-session pooling.
+- [x] WSS physical-session pooling implementation.
+- [ ] WSS pooled TCP executable validation.
 - [ ] WSS UDP.
 - [ ] Runtime QUIC (`quic://`, `quic+tls://`).
 - [ ] Full retry/dead-IP/connection-pool parity.
@@ -162,23 +163,23 @@ These are historical only. Do not use them as current-head speed or GoWay compar
 ### Performance backlog
 
 1. Current-head pooled MUX c1/c8/c32 setup-inclusive and steady-state medians.
-2. Large outbound WebSocket masking allocation reuse.
-3. Receive buffer capacity reuse.
-4. Shared writer-lock contention.
-5. Stream/session lifecycle stress.
-6. Re-benchmark every transport optimization after correctness evidence.
+2. Current-head WSS pooled TCP c1/c8/c32 setup-inclusive and steady-state medians.
+3. Large outbound WebSocket masking allocation reuse.
+4. Receive buffer capacity reuse.
+5. Shared writer-lock contention.
+6. Stream/session lifecycle stress.
+7. Re-benchmark every transport optimization after correctness evidence.
 
 ## CI / build evidence
 
-Latest known evidence:
+Latest known evidence before the WSS pooling commits:
 
-- RushWay CI run #131, id `34761172740`, triggered from docs commit `c90d8ca70bd7c9c33c472e1b46d2e60af1c43bc4`: failed before executable workflow steps.
-- RushWay Build Smoke run #12, id `34761172747`, same trigger: failed before executable workflow steps.
+- RushWay CI run #136, id `34761469476`, triggered from docs commit `a3e8f36836793635a967c17b1319d860e186ac16`: failed at the job level before executable workflow steps; `test` and `goway-comparison` failed, platform jobs were skipped.
+- RushWay Build Smoke run #17, id `34761469458`, same trigger: failed at the job level before executable workflow steps.
 - No compiler/test logs were produced, so these are runner/infrastructure failures rather than compile failures.
 - Relay environment could not resolve `github.com`; current-head local clone/build was therefore unavailable.
-- Current `f20c199` has no executable CI evidence yet.
 
-Do not claim current-head build/test success until a workflow or local execution produces logs.
+The WSS pooling commits `5f171ec` and `3de81c6` therefore still require fresh executable build/test evidence. Do not claim current-head compile/test success until a new workflow or local execution produces logs.
 
 ## Platform / release
 
@@ -193,19 +194,17 @@ Do not claim current-head build/test success until a workflow or local execution
 
 ## Accelerated implementation sequence
 
-1. Obtain executable CI/build evidence for the current head.
-2. Run current-head pooled MUX benchmark and record exact run/artifact IDs.
-3. Fix compile/test failures, if any.
-4. Implement WSS physical-session pooling.
-5. Validate WSS pooled TCP and benchmark it.
-6. Implement WSS UDP with raw WebSocket UDP framing.
-7. Complete GoWay compatibility extraction for SOCKS5/HTTP/DNS/options/limits.
-8. Implement runtime non-MUX behavior.
-9. Implement QUIC and `quic+tls` from the source-derived contract.
-10. Execute the full GoWay <-> RushWay interop matrix.
-11. Stress 1/100/500/1000 streams, large payloads, slow/fast concurrency, EOF/RST and reconnect.
-12. Validate release artifacts on Windows x64, Debian 12 x64 and ARMv7/OpenWrt.
-13. Cut v0.0.1 only after execution evidence and smoke tests are green.
+1. Obtain executable CI/build evidence for the current WSS pooling head.
+2. Fix compile/test failures, if any.
+3. Run current-head plain MUX and WSS pooled TCP benchmarks at c1/c8/c32 and compare with the historical Run 95 baseline.
+4. Implement WSS UDP with raw WebSocket UDP framing.
+5. Complete GoWay compatibility extraction for SOCKS5/HTTP/DNS/options/limits.
+6. Implement runtime non-MUX behavior.
+7. Implement QUIC and `quic+tls` from the source-derived contract.
+8. Execute the full GoWay <-> RushWay interop matrix.
+9. Stress 1/100/500/1000 streams, large payloads, slow/fast concurrency, EOF/RST and reconnect.
+10. Validate release artifacts on Windows x64, Debian 12 x64 and ARMv7/OpenWrt.
+11. Cut v0.0.1 only after execution evidence and smoke tests are green.
 
 ## AI relay rules
 
