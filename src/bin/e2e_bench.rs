@@ -16,11 +16,9 @@ async fn free_port() -> io::Result<u16> {
 
 fn child_path() -> io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
-    let name = if cfg!(windows) { "rushway.exe" } else { "rushway" };
     let path = exe
         .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join(name))
+        .map(|p| p.join(if cfg!(windows) { "rushway.exe" } else { "rushway" }))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot locate sibling rushway binary"))?;
     if !path.exists() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing {}", path.display())));
@@ -30,7 +28,7 @@ fn child_path() -> io::Result<std::path::PathBuf> {
 
 fn spawn_rushway(path: &std::path::Path, port: u16, upstream: Option<String>) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    cmd.arg("-p").arg(port.to_string()).arg("--no-mux").arg("--mux");
+    cmd.arg("-p").arg(port.to_string());
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
     }
