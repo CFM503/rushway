@@ -22,45 +22,42 @@ jobs:
 
           mux = Path('src/mux_pool.rs')
           s = mux.read_text()
-          s = s.replace(
-              'use tokio::sync::{mpsc, Mutex, Semaphore};',
-              'use tokio::sync::{mpsc, Mutex, Semaphore};'
-          )
-          old = '''            if !need_new {
-                bail!("all pooled MUX sessions are at stream capacity")
-            };
-            let s = SessionState::connect(&self.cfg).await?;
-            let r = s.open_stream(target).await?;
-            self.sessions.lock().await.push(s.clone());
-            return Ok((s, r.0, r.1));'''
+          old = '            if !need_new {\n                bail!("all pooled MUX sessions are at stream capacity")\n            };'
           new = '''            if !need_new {
-                // RushWay treats stream capacity as backpressure, not a connection
-                // failure. Wait for an existing logical stream to finish and retry.
-                // This keeps the local proxy stable when a burst temporarily fills
-                // every physical MUX session.
-                drop(sessions);
+                // RushWay uses backpressure instead of dropping a local connection
+                // when all physical MUX sessions are temporarily full.
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 continue;
-            }
-            let s = SessionState::connect(&self.cfg).await?;
-            let r = s.open_stream(target).await?;
-            self.sessions.lock().await.push(s.clone());
-            return Ok((s, r.0, r.1));'''
+            }'''
           if old not in s:
-              raise SystemExit('mux_pool.rs pool-capacity block not found')
+              raise SystemExit('mux capacity guard not found')
           s = s.replace(old, new, 1)
-          s = s.replace(
-              'let permit = match semaphore.clone().try_acquire_owned() {\n                Ok(v) => v,\n                Err(_) => {\n                    tracing::debug!(%peer,"maximum client connections reached");\n                    continue;\n                }\n            };',
-              'let permit = semaphore.clone().acquire_owned().await?;'
-          )
+          old = '''let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(%peer,"maximum client connections reached");
+                continue;
+            }
+        };'''
+          new = 'let permit = semaphore.clone().acquire_owned().await?;'
+          if old not in s:
+              raise SystemExit('client semaphore block not found')
+          s = s.replace(old, new, 1)
           mux.write_text(s)
 
           runtime = Path('src/runtime.rs')
           s = runtime.read_text()
-          s = s.replace(
-              'let permit = match semaphore.clone().try_acquire_owned() {\n            Ok(v) => v,\n            Err(_) => {\n                tracing::debug!(%peer,"maximum concurrent connections reached");\n                continue;\n            }\n        };',
-              'let permit = semaphore.clone().acquire_owned().await?;'
-          )
+          old = '''let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(%peer,"maximum concurrent connections reached");
+                continue;
+            }
+        };'''
+          new = 'let permit = semaphore.clone().acquire_owned().await?;'
+          if old not in s:
+              raise SystemExit('server semaphore block not found')
+          s = s.replace(old, new, 1)
           old = '''                let stream_limit_reached = {
                     let guard = streams.lock().await;
                     guard.len() >= 256
@@ -79,10 +76,8 @@ jobs:
                     .insert(stream_id, StreamEntry { tx: tx.clone() });'''
           new = '''                let (tx, mut rx) = mpsc::channel(64);
 
-                // Reserve the logical stream slot and register its channel in the
-                // same critical section. The old check-then-insert sequence could
-                // over-admit concurrent SYN bursts beyond the 256-stream session
-                // limit.
+                // Atomically admit and register the logical stream. This removes
+                // the check-then-insert race during large concurrent SYN bursts.
                 let admitted = {
                     let mut guard = streams.lock().await;
                     if guard.len() >= 256 || guard.contains_key(&stream_id) {
@@ -92,23 +87,20 @@ jobs:
                         true
                     }
                 };
-
                 if !admitted {
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                     continue;
                 }'''
           if old not in s:
-              raise SystemExit('runtime.rs stream admission block not found')
+              raise SystemExit('stream admission block not found')
           s = s.replace(old, new, 1)
           runtime.write_text(s)
           PY
-
       - name: Validate formatting and tests
         run: |
           cargo fmt --all -- --check
           cargo check --all-targets --all-features
           cargo test --all-targets --all-features
-
       - name: Commit native refactor and remove one-shot workflow
         run: |
           git config user.name "github-actions[bot]"
