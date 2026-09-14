@@ -2,243 +2,76 @@
 
 > Chronological AI-to-AI engineering handoff. Read this together with `PROGRESS.md` and `SPEC.md` before changing code.
 
-## 2026-09-14 — clean-source recovery checkpoint
+## 2026-09-14 — v0.0.3 test-track checkpoint
 
 ### Target
-
 - Repository: `CFM503/rushway`
 - GoWay baseline: v1.8.4, commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
-- Formal release target: `v0.0.2`
+- Target version: `v0.0.3` test build; not yet a final release
 - Targets: Windows x64, Debian 12 x64, KWRT/OpenWrt ARMv7
 - Branch: `main`
 
-### Recovery completed
+### Local validated build
+Local commit `400c3de7267966f457e4437f9d57bd1dd00cd0b1` passed:
+- `cargo fmt -- --check`
+- `cargo check --all-targets`
+- `cargo test --all-targets --all-features` — 38 passed, 0 failed
+- `cargo build --release`
+- `target/release/rushway.exe --help`
 
-- `main` was explicitly reset to `07675eb094f40a78655aa33ad30fc087547a013f` to discard the later malformed compiler-repair commits.
-- `src/mux_pool.rs` is now back on the requested clean-source checkpoint before the accidental follow-up constructor rewrite.
-- The temporary compiler diagnostic and source-repair files are intentionally still present at this checkpoint; they will be removed only after the real source compiles cleanly.
+### Direct source repairs in 400c3de
+1. `src/mux_pool.rs` — remove the stray semicolon after `Arc::new(Self { ... })` in `MuxSessionPool::new`.
+2. `src/wss_client.rs` — remove the stray semicolon after `Arc::new(Self { ... })` in `WssSessionPool::new`.
+3. `src/quic.rs` — wrap both QUIC receive-window `VarInt::from_u64` calls with `expect(...)`.
+4. `src/quic.rs` — remove the stray semicolon after `Arc::new(Self { ... })` in `QuicClientPool::new`.
 
-### Exact remaining source repairs
+### Packaging
+- `Cargo.toml` version is `0.0.3`.
+- `Cargo.lock` added.
+- `.gitignore` added with `target/` and `*.pdb`.
 
-The remaining known compiler blockers are limited to five edits:
+### Local GoWay interoperability
+GoWay: `D:\SOFT\ROUTER\goflyway_windows_386\goway.exe`, `GOWAY v1.8.4`.
 
-1. `src/mux_pool.rs` — `MuxSessionPool::new`: remove the stray semicolon after the `Arc::new(Self { ... })` tail expression.
-2. `src/wss_client.rs` — `WssSessionPool::new`: remove the stray semicolon after the `Arc::new(Self { ... })` tail expression.
-3. `src/quic.rs` — `QuicClientPool::new`: remove the stray semicolon after the `Arc::new(Self { ... })` tail expression.
-4. `src/quic.rs` — `TransportConfig::stream_receive_window`: unwrap `VarInt::from_u64(8 * 1024 * 1024)` with `expect("8MiB fits QUIC VarInt")`.
-5. `src/quic.rs` — `TransportConfig::receive_window`: unwrap `VarInt::from_u64(16 * 1024 * 1024)` with `expect("16MiB fits QUIC VarInt")`.
+Topology:
+- GoWay: `127.0.0.1:18880`, key `test123`.
+- RushWay: `127.0.0.1:11080`, upstream `ws://127.0.0.1:18880`.
 
-Do not run or restore `scripts/repair_compiler_issues.py` as part of the formal build. Do not treat a temporary repair workflow as permanent build logic.
+Observed:
+- 4 physical MUX sessions became active on GoWay.
+- WebSocket/MUX physical establishment PASS.
+- SOCKS5 to public HTTPS FAIL at TLS (`curl` error 35).
+- SOCKS5 to local HTTP with `--no-block-local` hung / later closed.
+- No GoWay business connection was observed.
 
-### Mandatory next gate
+Conclusion: runtime SOCKS → MUX stream → GoWay business forwarding is not proven.
 
-After those five source edits:
+### Cloud CI incident — 2026-09-14
+The `400c3de` v0.0.3 test commit was pushed to `main`.
+The old CI contained a source-mutating repair step that ran `scripts/repair_compiler_issues.py` and could commit/push to `main`.
+That step reintroduced three constructor semicolons and pushed:
+`5d553ab455f5fe8a827255fb5a2771de88131a25` — `fix: repair compiler blockers`.
 
-1. Remove `.github/workflows/compiler-diagnostic.yml`.
-2. Remove `.github/workflows/source-repair-once.yml`.
-3. Remove `scripts/repair_compiler_issues.py`.
-4. Run clean `fmt -> cargo check --all-targets --all-features -> cargo test --all-targets --all-features -> cargo build --release`.
-5. Record actual executable results in this file and `PROGRESS.md`.
+The resulting cloud build failed `cargo check` on the same three constructor return types.
+This is a CI automation defect, not a failure of the locally validated 400c3de source.
 
-### Release work after the compiler gate
+### CI hardening
+The CI workflow has been changed to:
+- remove the source-mutating repair step;
+- use `contents: read` permission.
 
-- c1/c8/c32 benchmark measurements.
-- Windows x64, Debian 12 x64 and ARMv7/OpenWrt smoke artifacts.
-- GoWay <-> RushWay bidirectional WS/WSS/QUIC TCP+UDP interoperability.
-- dead-IP, connection-state and TLS-SNI interoperability cases.
-- 1/100/500/1000-stream stress plus large-payload and mixed slow/fast workloads.
-- Final `v0.0.2` tag and GitHub Release only after executable evidence is green.
+The current GoWay comparison job is still skipped because `WAY_READ_TOKEN` is not configured, so it is not yet a real cloud RushWay ↔ GoWay interoperability test.
 
-### Release rule
+### Release gate
+Do not call v0.0.3 100% and do not create a final tag/release yet.
+Remaining proof includes clean cloud CI, actual GoWay v1.8.4 interoperability, SOCKS5/HTTP lifecycle/error matrix, WS/WSS/QUIC TCP+UDP interoperability, 1/100/500/1000 stream tests, benchmark evidence, Windows/Debian/ARMv7 smoke, and final release verification.
 
-`Cargo.toml` may be `0.0.2`, but RushWay is not 100% complete and `v0.0.2` is not released until the executable gate and release smoke validation are green.
+### Next action
+Restore `main` to the validated 400c3de source while retaining the hardened CI workflow; then remove obsolete source-repair workflow/script, run clean cloud CI, and establish a real GoWay interoperability job when the private-repo credential is available.
 
-### Three-file relay contract
-
+## Three-file relay contract
 1. `AI_HANDOFF.md` — decisions, commits, blockers, next step.
 2. `PROGRESS.md` — compact progress dashboard.
 3. `SPEC.md` — source-derived GoWay compatibility contract.
 
 Never call the project 100% complete merely because source paths exist.
-
-## 2026-09-14 本地修复与互通验证更新
-
-### 当前分支
-
-`fix/v0.0.2-compiler-clean`
-
-### 本地源码修复
-
-在本地工作区直接修复了以下编译错误：
-
-1. `src/mux_pool.rs`
-
-   * 修复 `MuxSessionPool::new()` 中 `Arc::new(Self { ... });`
-   * 删除末尾多余 `;`
-
-2. `src/wss_client.rs`
-
-   * 修复 `WssSessionPool::new()` 中 `Arc::new(Self { ... });`
-   * 删除末尾多余 `;`
-
-3. `src/quic.rs`
-
-   * `VarInt::from_u64(8 * 1024 * 1024)` 增加 `.expect("8MiB fits QUIC VarInt")`
-   * `VarInt::from_u64(16 * 1024 * 1024)` 增加 `.expect("16MiB fits QUIC VarInt")`
-   * 修复 `QuicClientPool::new()` 中 `Arc::new(Self { ... });`
-   * 删除末尾多余 `;`
-
-### 编译与测试结果
-
-`cargo fmt -- --check`
-
-* PASS
-
-`cargo check --all-targets`
-
-* PASS
-* 无 error
-* 当前仍存在若干 Rust warnings，但不阻塞编译
-
-`cargo test --all-targets --all-features`
-
-* PASS
-* 38 passed
-* 0 failed
-* 0 ignored
-
-`cargo build --release`
-
-* PASS
-* Release binary 已生成
-
-Windows Release 文件：
-
-* `target/release/rushway.exe`
-* 大小约 3,974,144 bytes
-
-`rushway.exe --help`
-
-* PASS
-* 程序可以正常启动并显示帮助
-
-### GoWay 基线
-
-已确认本地 GoWay：
-
-* 路径：`D:\SOFT\ROUTER\goflyway_windows_386\goway.exe`
-* 版本：`GOWAY v1.8.4`
-
-### 本地 GoWay ↔ RushWay WebSocket/MUX 测试
-
-GoWay 服务端启动：
-
-`127.0.0.1:18880`
-
-* TCP/WebSocket 正常监听
-* QUIC UDP 同端口监听
-* key：`test123`
-
-RushWay 客户端启动：
-
-`127.0.0.1:11080`
-
-* upstream：`ws://127.0.0.1:18880`
-* 默认 4 physical MUX sessions
-
-GoWay 日志确认：
-
-* 4 个 Mux Session requested
-* 4 个 Mux Session active
-* RushWay → GoWay WebSocket/MUX 建连成功
-
-### 当前互通测试结果
-
-测试公网 HTTPS：
-
-`curl.exe -v --proxy socks5h://127.0.0.1:11080 https://example.com/ -I`
-
-结果：
-
-* SOCKS connection 可以建立
-* TLS handshake 阶段失败
-* `Recv failure: Connection was aborted`
-* `curl: (35)`
-
-测试本机 HTTP 时，RushWay 默认 `block-local` 导致请求被关闭。
-
-随后 RushWay 使用：
-
-`--no-block-local`
-
-重新启动。
-
-本机 HTTP 服务：
-
-* `python -m http.server 18080 --bind 127.0.0.1`
-* `127.0.0.1:18080`
-
-关闭 `block-local` 后重新测试：
-
-`curl.exe -v --proxy socks5h://127.0.0.1:11080 http://127.0.0.1:18080/`
-
-当前现象：
-
-* curl 长时间停留在 `Trying 127.0.0.1:11080...`
-* GoWay 没有出现新的业务连接日志
-* GoWay 只显示 MUX Session active
-* 因此 MUX 物理连接已经建立，但 SOCKS 请求到实际业务 stream 的处理仍未完成
-
-### 当前判断
-
-源码层面：
-
-* `fmt` PASS
-* `check` PASS
-* `test` PASS
-* `release build` PASS
-
-当前未完成的是运行时互通。
-
-目前故障范围已经缩小到：
-`RushWay 本地 SOCKS 接入 → MUX stream 创建/发送 → GoWay server 业务处理`
-
-不能把项目称为 100%。
-
-### 下一步
-
-下一步不要修改 GoWay，也不要继续测试 QUIC。
-
-应该继续检查 RushWay 在收到 SOCKS 请求后的运行日志，确认：
-
-1. 是否进入 SOCKS5 请求解析；
-2. 是否成功创建 mux stream；
-3. 是否发送 CONNECT/目标地址；
-4. 是否等待远端 response；
-5. 是否发生 channel / stream / protocol 阻塞。
-
-重点测试仍然是：
-
-`RushWay SOCKS5 → WebSocket MUX → GoWay v1.8.4 → TCP target`
-
-待该链路成功后，再依次验证：
-
-* HTTP proxy
-* WSS
-* QUIC TCP
-* QUIC UDP
-* UDP ASSOCIATE
-* 多 stream
-* 压力测试
-* 最终 v0.0.2 release gate
-
-### 重要说明
-
-当前本地工作区已经不是 clean baseline：
-正式源码修复已直接写入以下文件：
-
-* `src/mux_pool.rs`
-* `src/wss_client.rs`
-* `src/quic.rs`
-
-在运行时互通完全通过以前，不应宣称 100%，也不应创建 `v0.0.2` 正式 tag/release。
