@@ -47,6 +47,7 @@ fn child_path() -> io::Result<std::path::PathBuf> {
 fn transport_mode() -> &'static str {
     match std::env::var("RUSHWAY_E2E_TRANSPORT").ok().as_deref() {
         Some("quic") => "quic",
+        Some("wss") => "wss",
         _ => "ws",
     }
 }
@@ -54,6 +55,7 @@ fn transport_mode() -> &'static str {
 fn upstream_url(server_port: u16) -> String {
     match transport_mode() {
         "quic" => format!("quic://127.0.0.1:{server_port}"),
+        "wss" => format!("wss://127.0.0.1:{server_port}/"),
         _ => format!("ws://127.0.0.1:{server_port}/"),
     }
 }
@@ -64,6 +66,7 @@ fn spawn_rushway(
     upstream: Option<String>,
     key: &str,
     allow_local_targets: bool,
+    wss_server: bool,
 ) -> io::Result<Child> {
     let mut cmd = Command::new(path);
     cmd.arg("-p")
@@ -74,6 +77,9 @@ fn spawn_rushway(
         .arg("ERROR");
     if allow_local_targets {
         cmd.arg("--no-block-local");
+    }
+    if wss_server {
+        cmd.arg("--wss-server");
     }
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
@@ -224,13 +230,14 @@ async fn main() -> io::Result<()> {
     let (target_port, echo_task) = start_echo().await?;
     let mode = transport_mode();
 
-    let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY, true)?;
+    let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY, true, mode == "wss")?;
     let mut client = spawn_rushway(
         &rushway,
         client_port,
         Some(upstream_url(server_port)),
         TEST_KEY,
         true,
+        false,
     )?;
 
     let result = match timeout(E2E_TIMEOUT, async {
