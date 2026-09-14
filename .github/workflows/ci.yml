@@ -59,11 +59,12 @@ jobs:
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_E2E_INCLUDE_1000: '1'
-          RUSHWAY_MUX_SESSIONS: '8'
+          RUSHWAY_MUX_SESSIONS: '16'
           RUSHWAY_E2E_DIAGNOSTIC: '1'
         run: |
           ulimit -n 8192
           echo "stress_nofile=$(ulimit -n)"
+          echo "diagnostic_mux_sessions=$RUSHWAY_MUX_SESSIONS"
           cargo run --release --bin e2e_bench
       - name: WSS 1/100/500 stream stress
         env:
