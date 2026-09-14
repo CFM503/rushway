@@ -59,7 +59,7 @@ jobs:
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_E2E_INCLUDE_1000: '1'
-          RUSHWAY_MUX_SESSIONS: '16'
+          RUSHWAY_MUX_SESSIONS: '64'
           RUSHWAY_E2E_DIAGNOSTIC: '1'
         run: |
           ulimit -n 8192
