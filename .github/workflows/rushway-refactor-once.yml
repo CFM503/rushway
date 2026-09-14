@@ -19,45 +19,43 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           mux = Path('src/mux_pool.rs')
           s = mux.read_text()
-          old = '            if !need_new {\n                bail!("all pooled MUX sessions are at stream capacity")\n            };'
-          new = '''            if !need_new {
+          s, n = re.subn(
+              r'(?m)^            if !need_new \{\n                bail!\("all pooled MUX sessions are at stream capacity"\)\n            \};',
+              '''            if !need_new {
                 // RushWay uses backpressure instead of dropping a local connection
                 // when all physical MUX sessions are temporarily full.
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 continue;
-            }'''
-          if old not in s:
-              raise SystemExit('mux capacity guard not found')
-          s = s.replace(old, new, 1)
-          old = '''let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum client connections reached");
-                continue;
-            }
-        };'''
-          new = 'let permit = semaphore.clone().acquire_owned().await?;'
-          if old not in s:
-              raise SystemExit('client semaphore block not found')
-          s = s.replace(old, new, 1)
+            }''',
+              s,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit(f'mux capacity guard replacements={n}')
+          s, n = re.subn(
+              r'let permit = match semaphore\.clone\(\)\.try_acquire_owned\(\) \{\n\s+Ok\(v\) => v,\n\s+Err\(_\) => \{\n\s+tracing::debug!\(%peer,"maximum client connections reached"\);\n\s+continue;\n\s+\}\n\s+\};',
+              'let permit = semaphore.clone().acquire_owned().await?;',
+              s,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit(f'client semaphore replacements={n}')
           mux.write_text(s)
 
           runtime = Path('src/runtime.rs')
           s = runtime.read_text()
-          old = '''let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum concurrent connections reached");
-                continue;
-            }
-        };'''
-          new = 'let permit = semaphore.clone().acquire_owned().await?;'
-          if old not in s:
-              raise SystemExit('server semaphore block not found')
-          s = s.replace(old, new, 1)
+          s, n = re.subn(
+              r'let permit = match semaphore\.clone\(\)\.try_acquire_owned\(\) \{\n\s+Ok\(v\) => v,\n\s+Err\(_\) => \{\n\s+tracing::debug!\(%peer,"maximum concurrent connections reached"\);\n\s+continue;\n\s+\}\n\s+\};',
+              'let permit = semaphore.clone().acquire_owned().await?;',
+              s,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit(f'server semaphore replacements={n}')
           old = '''                let stream_limit_reached = {
                     let guard = streams.lock().await;
                     guard.len() >= 256
