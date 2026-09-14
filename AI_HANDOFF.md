@@ -10,21 +10,46 @@
 - GoWay baseline: v1.8.4, pinned commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
 - Branch: `main`
 
-### Locally validated source
-Validated source commit: `400c3de7267966f457e4437f9d57bd1dd00cd0b1`
+### Current cloud state
+Latest relevant CI run before this fix: Run #289, ID `34807474279`, commit `1dc812eb3d76c477dda76281eecd6f28b700f3be`.
+- Rust format check: PASS
+- Rust check: PASS
+- Tests: PASS
+- Release build: PASS
+- MUX hot-path benchmark: PASS
+- End-to-end proxy benchmark: STUCK in progress for 30+ minutes
+- GoWay comparison: job reported success only because `WAY_READ_TOKEN` was unset and the comparison was skipped; this is not GoWay interoperability evidence.
+
+### E2E hang root cause
+`src/bin/e2e_bench.rs` used `127.0.0.1` as the echo target while the RushWay client retained the default `block_local=true` policy. `mux_pool::handle_tcp_proxy()` calls `pool.acquire(&target)`, which enforces the local-target policy before producing a SOCKS5 success/failure response. The client-side e2e flow then waited indefinitely in `read_exact()` for a SOCKS5 reply.
+
+This was a test-harness bug / missing timeout, not evidence that proxy throughput itself needed 30+ minutes.
+
+### E2E fix committed
+Commit: `fca8ec2e628e7e8dd03deb41ee1dde64b296e475`
+
+Changes in `src/bin/e2e_bench.rs`:
+- Added `--no-block-local` to both e2e RushWay child processes because the echo target is intentionally local.
+- Added a 30-second timeout around every individual proxy flow.
+- Timeout now reports `e2e flow timed out after 30s` instead of allowing an indefinite CI hang.
+- Existing child stderr diagnostics and early-exit detection remain enabled.
+
+A push of this commit should cancel the stuck run under the workflow concurrency rule and start a fresh CI run.
+
+### Locally validated source baseline
+Validated source commit before the e2e harness fix: `400c3de7267966f457e4437f9d57bd1dd00cd0b1`.
 - `cargo fmt -- --check` PASS
 - `cargo check --all-targets` PASS
 - `cargo test --all-targets --all-features` PASS — 38 passed, 0 failed
 - `cargo build --release` PASS
-- `target/release/rushway.exe --help` PASS
 
-Direct source repairs in 400c3de:
+Direct source repairs in that baseline:
 - `src/mux_pool.rs`: `MuxSessionPool::new()` constructor tail semicolon removed.
 - `src/wss_client.rs`: `WssSessionPool::new()` constructor tail semicolon removed.
-- `src/quic.rs`: both receive-window `VarInt::from_u64` calls use checked `expect(...)`.
+- `src/quic.rs`: receive-window `VarInt::from_u64` calls use checked `expect(...)`.
 - `src/quic.rs`: `QuicClientPool::new()` constructor tail semicolon removed.
 
-Packaging:
+### Packaging
 - `Cargo.toml` version `0.0.3`.
 - `Cargo.lock` added.
 - `.gitignore` added for `target/` and `*.pdb`.
@@ -55,17 +80,14 @@ This was a CI automation defect, not a failure of 400c3de.
 - `.github/workflows/compiler-diagnostic.yml` removed.
 - `.github/workflows/source-repair-once.yml` removed.
 - `scripts/repair_compiler_issues.py` removed.
-- `main` was restored to validated 400c3de source plus hardened CI in `38d64a2b3283344aec48f1536a21ac9ed18faa49`.
-- Latest cleanup commit removing the obsolete repair script is `cf32df03c7579109c15c97bc4745498a07ec31a0`.
-
-The current RushWay CI run for cleanup is pending. The obsolete repair workflows are no longer part of the current tree.
+- `main` was restored to validated 400c3de source plus hardened CI.
 
 The GoWay comparison job still skips actual GoWay v1.8.4 execution because `WAY_READ_TOKEN` is not configured. Therefore cloud CI is not yet a real RushWay ↔ GoWay interoperability test.
 
 ### Release gate
 Do not call v0.0.3 100% and do not create a final tag/release yet.
 Remaining proof:
-1. Clean cloud CI.
+1. Clean cloud CI after the e2e harness fix.
 2. Actual cloud GoWay v1.8.4 interoperability.
 3. SOCKS5/HTTP lifecycle and error matrix.
 4. WS/WSS/QUIC TCP+UDP interoperability.
@@ -75,7 +97,7 @@ Remaining proof:
 8. Final v0.0.3 release/tag verification.
 
 ### Next action
-Read the current CI result from the cleanup commit. Once clean, design/enable a true GoWay v1.8.4 interoperability job; do not use the missing secret as a false-positive pass. Then continue the runtime SOCKS/MUX investigation before final release.
+Monitor the fresh CI run triggered by `fca8ec2e628e7e8dd03deb41ee1dde64b296e475`. If e2e now completes, inspect its throughput and continue to the remaining proxy benchmarks. Then enable real GoWay v1.8.4 comparison using the optional repository-read credential; never treat the skipped job as interoperability proof.
 
 ## Three-file relay contract
 1. `AI_HANDOFF.md` — decisions, commits, blockers, next step.
