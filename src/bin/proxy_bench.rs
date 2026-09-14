@@ -11,6 +11,7 @@ use tokio::time::sleep;
 
 const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
+const TEST_KEY: &str = "rushway-proxy-bench-test-key";
 
 #[derive(Parser, Debug)]
 #[command(about = "Identical end-to-end benchmark runner for RushWay and GoWay")]
@@ -48,7 +49,13 @@ fn spawn_proxy(
     upstream: Option<String>,
 ) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    cmd.arg("-p").arg(listen_arg(implementation, port));
+    cmd.arg("-p")
+        .arg(listen_arg(implementation, port))
+        .arg("-k")
+        .arg(TEST_KEY)
+        .arg("--no-block-local")
+        .arg("--log")
+        .arg("ERROR");
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
     }
