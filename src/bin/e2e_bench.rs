@@ -90,7 +90,7 @@ fn spawn_rushway(
         .arg("-k")
         .arg(key)
         .arg("--log")
-        .arg("DEBUG");
+        .arg("ERROR");
     if allow_local_targets {
         cmd.arg("--no-block-local");
     }
