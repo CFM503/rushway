@@ -360,3 +360,198 @@ Status
 
 ### Next action
 - Push the fix and inspect the GitHub Actions stress results, especially WS 1000.
+
+## 2026-09-15 — Astra-mode RushWay native refactor plan (NEW DIRECTION)
+
+### Decision
+RushWay is no longer treated as a GoWay port whose internal architecture must converge on GoWay. GoWay interoperability is a **late acceptance gate**, not the architectural design authority.
+
+The objective of this phase is to make RushWay a self-consistent, high-concurrency MUX proxy with its own runtime contracts, lifecycle model, scheduling policy, backpressure, recovery behavior, diagnostics, and stress suite. Existing wire compatibility is preserved where already required, but internal design may be restructured when the evidence shows the current model is limiting RushWay.
+
+### Astra engineering method
+Use the public Astra-style engineering loop: **decompose → inspect/reference → implement → execute/verify → record evidence → continue**. Astra's published engineering guidance emphasizes repository-wide understanding, multi-step execution, verification through real toolchains, and recovery from failed steps rather than single-shot code generation. This project adopts that discipline without treating any model's hidden chain-of-thought as a project artifact.
+
+Rules for this refactor:
+1. Establish a concrete runtime invariant before changing each subsystem.
+2. Change one architectural responsibility at a time.
+3. Validate each layer with executable tests before stacking the next layer.
+4. Treat CI failures as evidence and update the hypothesis; do not patch symptoms blindly.
+5. Preserve protocol/security boundaries unless a deliberate RushWay-native protocol change is specified and tested.
+6. Never declare a milestone complete from source inspection alone.
+7. Every meaningful code change must leave an AI handoff record with commit, validation, evidence, risk, and next action.
+
+### RushWay-native target architecture
+
+```text
+                         RushWay Runtime
+                               |
+             +-----------------+------------------+
+             |                 |                  |
+      Connection Manager   Session Manager   Stream Manager
+             |                 |                  |
+       admission/limits   MUX lifecycle      logical streams
+       SOCKS/HTTP         health/recovery    state machine
+             |                 |                  |
+             +-----------------+------------------+
+                               |
+                       Backpressure Layer
+                               |
+                       Transport Adapter
+                         /      |       \
+                       WS      WSS      QUIC
+```
+
+#### 1. Connection Manager
+- Incoming local connections must never be silently dropped merely because the configured concurrency budget is temporarily full.
+- Admission uses asynchronous backpressure.
+- Connection lifecycle owns permit acquisition/release and cancellation.
+- SOCKS5/HTTP parsing errors must be observable by phase, not collapsed into generic EOF.
+
+#### 2. MUX Session Manager
+- A physical MUX session is an independently observable resource.
+- Session health, stream occupancy, closure reason, reconnect state, and creation/destruction are explicit.
+- Session count is a policy, not a fixed architectural assumption.
+- The pool may grow within configured bounds when demand rises and must recover when a session fails.
+- Stream capacity must not be confused with physical-session capacity.
+
+#### 3. Stream Manager
+Every logical stream gets an explicit lifecycle:
+
+```text
+NEW
+ -> ADMITTED
+ -> SYN_SENT
+ -> DIALING
+ -> ESTABLISHED
+ -> HALF_CLOSED_LOCAL / HALF_CLOSED_REMOTE
+ -> CLOSING
+ -> CLOSED
+```
+
+Required invariants:
+- exactly one owner is responsible for final stream cleanup;
+- every admitted stream eventually reaches CLOSED or an explicit terminal failure;
+- stream slot reservation and stream registration cannot race;
+- FIN/RST during DIALING must cancel or invalidate the dial task immediately;
+- a terminal stream event must not delete state before its owner has consumed the event;
+- physical-session shutdown must terminate every child stream deterministically.
+
+#### 4. Backpressure
+- Resource exhaustion becomes waiting/backpressure where safe, not connection loss.
+- Per-session stream limits, global connection limits, and transport write pressure are separate budgets.
+- Avoid busy-spin retry loops; waits should use bounded async scheduling or notification primitives.
+- Backpressure must remain observable through metrics/logging.
+
+#### 5. Failure recovery
+- Distinguish local connection failure, MUX protocol failure, target dial failure, physical session failure, and transport failure.
+- A failed logical stream must not poison unrelated streams.
+- A failed physical session must release all stream resources and allow the pool to recover.
+- Recovery must be idempotent and cancellation-safe.
+
+#### 6. Diagnostics / observability
+Replace generic `flow N: early eof` with phase-aware evidence:
+
+```text
+flow=411 phase=socks5_connect result=error error=early_eof
+flow=411 phase=mux_acquire session=3 result=wait
+flow=411 phase=syn result=sent
+flow=411 phase=syn_ack result=timeout
+```
+
+Stress summary must report:
+- accepted
+- SOCKS handshake success/failure
+- MUX stream admission success/failure
+- SYN sent/ACKed
+- target dial success/failure
+- data started/completed
+- FIN/RST counts
+- peak streams
+- peak sessions
+- session failures
+- stream failures by phase
+
+### RushWay-native stress ladder
+Do not use GoWay as the definition of success.
+
+1. **Core:** 1 / 100 / 500 / 1000 streams on WS.
+2. **Transport:** repeat 1 / 100 / 500 / 1000 on WSS and QUIC.
+3. **Sustained:** 10 × 1000-stream rounds without process restart.
+4. **Scale:** 2000 streams with dynamic session scaling.
+5. **Recovery:** kill/restart one physical MUX session during load and verify unrelated streams continue.
+6. **Backpressure:** deliberately hit connection/session/stream limits and verify waiting rather than silent EOF.
+7. **Lifecycle:** FIN/RST/cancel during SYN, DIALING, ESTABLISHED, and half-close states.
+8. **Only after native gates pass:** GoWay bidirectional interoperability.
+
+### Current implementation changes already initiated
+The first native refactor batch has been started on `main`:
+
+- `src/mux_pool.rs`: client connection admission now waits asynchronously for a semaphore permit instead of immediately dropping connections at the limit.
+- `src/mux_pool.rs`: pooled stream-capacity exhaustion is being treated as backpressure rather than an immediate local connection failure.
+- `src/runtime.rs`: server connection admission now waits asynchronously for a semaphore permit.
+- `src/runtime.rs`: server logical-stream admission is being made atomic by combining capacity validation and stream registration under one lock, removing the check-then-insert race during concurrent SYN bursts.
+
+The implementation is being validated by GitHub Actions before this batch is considered complete.
+
+### Phase order — CONTINUOUS EXECUTION
+
+**Phase A — Stabilize primitives**
+1. Finish semaphore/backpressure changes.
+2. Repair/verify atomic stream admission.
+3. Ensure no busy-spin and no permit leak.
+4. Run format/check/unit tests.
+
+**Phase B — Make lifecycle explicit**
+1. Centralize stream ownership and terminal cleanup.
+2. Implement cancellation while DIALING.
+3. Make physical-session shutdown deterministic.
+4. Add lifecycle-focused unit/integration tests.
+
+**Phase C — Rebuild session scheduling**
+1. Separate session health from stream occupancy.
+2. Add demand-based session creation within a configured upper bound.
+3. Add session failure recovery and stream redistribution.
+4. Test sustained 1000+ stream load.
+
+**Phase D — Upgrade stress diagnostics**
+1. Add phase-specific SOCKS/MUX error reporting.
+2. Add machine-readable stress summaries.
+3. Record per-session occupancy and failure reasons.
+4. Make the first failing event observable rather than only the first joined task failure.
+
+**Phase E — Native scale/recovery**
+1. 1000 × repeated rounds.
+2. 2000 streams.
+3. session failure under load.
+4. limit/backpressure tests.
+5. FIN/RST/cancellation matrix.
+
+**Phase F — Release hardening**
+1. WS/WSS/QUIC complete matrix.
+2. SOCKS5/HTTP error matrix.
+3. Windows/Linux/ARM/OpenWrt smoke.
+4. performance regression checks.
+5. security/target-policy regression checks.
+6. only then GoWay interoperability.
+7. only after all evidence is green: final release/tag.
+
+### Definition of Done for the native refactor
+The native refactor is complete only when:
+- 1000 streams pass repeatedly on WS/WSS/QUIC;
+- no unexplained `early eof` remains;
+- stream/session/connection lifecycle invariants are covered by executable tests;
+- sustained 10×1000 passes;
+- 2000-stream test passes within configured resource limits;
+- physical-session failure recovery is demonstrated;
+- backpressure tests show waiting rather than silent connection loss;
+- diagnostics identify failure phase and resource owner;
+- existing protocol/security requirements remain green;
+- GoWay interoperability is tested separately as a compatibility gate, not used to dictate RushWay internals.
+
+### Current status
+**Native refactor: IN PROGRESS.**
+
+Do not mark v0.0.3 final. Do not claim GoWay interoperability. Do not claim 1000-stream stability until executable evidence proves it.
+
+### Immediate next action
+Finish the current native concurrency batch, wait for CI evidence, then move directly into explicit stream lifecycle ownership and cancellation. Continue through the phases without reverting to GoWay-driven architecture.
