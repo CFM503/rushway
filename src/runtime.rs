@@ -354,7 +354,14 @@ async fn handle_mux_parts(
                         MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
                             .map_err(|e| anyhow!(e.to_string()))?;
 
-                    tx.send(StreamCommand::Data(initial))
+                    let mut encoded = Vec::with_capacity(7 + initial.payload.len());
+                    initial
+                        .encode(&mut encoded)
+                        .map_err(|e| anyhow!(e.to_string()))?;
+                    let owned = MuxFrame::decode_owned(encoded)
+                        .map_err(|e| anyhow!(e.to_string()))?;
+
+                    tx.send(StreamCommand::Data(owned))
                         .await
                         .map_err(|_| anyhow!("stream task exited before initial data"))?;
                 }

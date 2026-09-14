@@ -225,3 +225,22 @@ Never call the project 100% complete merely because source paths exist.
 ### Next action
 - Commit the one-line compile correction together with this handoff entry and push.
 - Re-run CI and inspect `cargo check`, unit tests, and WS 1000 stress before making any completion claim.
+## 2026-09-14 — Astra correction: OwnedMuxFrame conversion was still missing
+
+### Correction
+- CI Run #343 (`34856683716`) confirmed that the previous handoff note incorrectly stated the `OwnedMuxFrame` conversion was already correct.
+- Actual compiler error: `StreamCommand::Data` requires `OwnedMuxFrame`, while `syn.initial_data` construction produced a `MuxFrame`.
+
+### Fix
+- Encode the initial `MuxFrame` into an owned byte buffer.
+- Decode it with `MuxFrame::decode_owned`.
+- Send the resulting `OwnedMuxFrame` through `StreamCommand::Data`.
+
+### Validation
+- Local `git diff --check`: passed.
+- Local runtime diff contains only the intended `MuxFrame` → `OwnedMuxFrame` conversion.
+- CI Run #343 reached `cargo check` and reported only this remaining compile error; `MAX_STREAMS_PER_SESSION` visibility was already corrected.
+
+### Status
+- Awaiting the next CI compile validation.
+- No functional/stress completion claim is made.
