@@ -197,7 +197,7 @@ async fn target_to_mux(
                     {
                         return;
                     }
-                    off = end
+                    off = end;
                 }
             }
             Err(_) => {
@@ -340,6 +340,17 @@ async fn handle_mux_parts(
                                 MuxFrame::decode_owned(d).map_err(|e| anyhow!(e.to_string()))?;
                             let _ = tx.send(StreamCommand::Data(owned)).await;
                         }
+                        // A successful SYN must be acknowledged before the local SOCKS5
+                        // client can send application data. An empty DATA frame is the
+                        // existing client-side success signal and carries no application bytes.
+                        send_mux_parts_encrypted(
+                            &writer,
+                            &cipher,
+                            frame.stream_id,
+                            MuxCommand::Data,
+                            &[],
+                        )
+                        .await?;
                     }
                     Err(_) => {
                         let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
