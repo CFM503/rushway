@@ -11,6 +11,7 @@ const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
 const STRESS_PAYLOAD_SIZE: usize = 64 * 1024;
 const STRESS_CONCURRENCIES: &[usize] = &[1, 100, 500];
+const STRESS_DIAGNOSTIC_CONCURRENCY: usize = 1000;
 const TEST_KEY: &str = "rushway-e2e-test-key";
 const FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 const E2E_TIMEOUT: Duration = Duration::from_secs(120);
@@ -20,7 +21,18 @@ fn diagnostic_mode() -> bool {
     matches!(std::env::var("RUSHWAY_E2E_DIAGNOSTIC").ok().as_deref(), Some("1" | "true" | "yes"))
 }
 
-async fn free_port() -> io::Result<u16> {
+fn include_1000_stress() -> bool {
+    matches!(
+        std::env::var("RUSHWAY_E2E_INCLUDE_1000").ok().as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+fn free_port() -> io::Result<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr().map(|a| a.port())
+}
+
+async fn free_port_async() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     Ok(listener.local_addr()?.port())
 }
@@ -144,8 +156,8 @@ fn kill_child(child: &mut Child) { let _ = child.kill(); let _ = child.wait(); }
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> io::Result<()> {
     let rushway = child_path()?;
-    let server_port = free_port().await?;
-    let client_port = free_port().await?;
+    let server_port = free_port_async().await?;
+    let client_port = free_port_async().await?;
     let (target_port, echo_task) = start_echo().await?;
     let mode = transport_mode();
     let stress = stress_mode();
@@ -165,6 +177,12 @@ async fn main() -> io::Result<()> {
             for &concurrency in STRESS_CONCURRENCIES {
                 let elapsed = run_stress_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?;
                 println!("rushway_stream_stress transport={} pattern={} payload_kib={} streams={} completed={} elapsed_ms={}", mode, pattern, payload.len() / 1024, concurrency, concurrency, elapsed.as_millis());
+            }
+            if include_1000_stress() {
+                let concurrency = STRESS_DIAGNOSTIC_CONCURRENCY;
+                eprintln!("stress diagnostic: running non-blocking {}-stream case", concurrency);
+                let elapsed = run_stress_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?;
+                println!("rushway_stream_stress_diagnostic transport={} pattern={} payload_kib={} streams={} completed={} elapsed_ms={}", mode, pattern, payload.len() / 1024, concurrency, concurrency, elapsed.as_millis());
             }
         } else {
             let mut payload = vec![0u8; PAYLOAD_SIZE];
