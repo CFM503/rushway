@@ -374,6 +374,9 @@ async fn main() -> Result<()> {
     } else {
         RuntimeConfig::default()
     };
+    if args.config.is_none() && args.max_conn.is_none() {
+        cfg.max_connections = 4096;
+    }
     if args.tui {
         tracing::warn!("-tui accepted for GoWay CLI compatibility; RushWay currently uses log output without a TUI dashboard");
     }
