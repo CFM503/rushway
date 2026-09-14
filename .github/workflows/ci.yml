@@ -33,6 +33,10 @@ jobs:
         run: cargo run --release --bin mux_bench
       - name: End-to-end proxy benchmark
         run: cargo run --release --bin e2e_bench
+      - name: Standalone WSS end-to-end benchmark
+        env:
+          RUSHWAY_E2E_TRANSPORT: wss
+        run: cargo run --release --bin e2e_bench
       - name: Standalone QUIC end-to-end benchmark
         env:
           RUSHWAY_E2E_TRANSPORT: quic
