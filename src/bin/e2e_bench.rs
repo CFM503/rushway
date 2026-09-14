@@ -24,7 +24,13 @@ async fn free_port() -> io::Result<u16> {
 fn child_path() -> io::Result<std::path::PathBuf> {
     let path = std::env::current_exe()?
         .parent()
-        .map(|p| p.join(if cfg!(windows) { "rushway.exe" } else { "rushway" }))
+        .map(|p| {
+            p.join(if cfg!(windows) {
+                "rushway.exe"
+            } else {
+                "rushway"
+            })
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -311,11 +317,7 @@ async fn main() -> io::Result<()> {
         false,
     )?;
 
-    let timeout_limit = if stress {
-        STRESS_TIMEOUT
-    } else {
-        E2E_TIMEOUT
-    };
+    let timeout_limit = if stress { STRESS_TIMEOUT } else { E2E_TIMEOUT };
     let result = match timeout(timeout_limit, async {
         wait_for_port(server_port, &mut server, "server").await?;
         wait_for_port(client_port, &mut client, "client").await?;
