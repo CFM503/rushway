@@ -47,21 +47,30 @@ jobs:
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_MUX_SESSIONS: '8'
-        run: cargo run --release --bin e2e_bench
+        run: |
+          ulimit -n 8192
+          echo "stress_nofile=$(ulimit -n)"
+          cargo run --release --bin e2e_bench
       - name: WSS 1/100/500/1000 stream stress
         env:
           RUSHWAY_E2E_TRANSPORT: wss
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_MUX_SESSIONS: '8'
-        run: cargo run --release --bin e2e_bench
+        run: |
+          ulimit -n 8192
+          echo "stress_nofile=$(ulimit -n)"
+          cargo run --release --bin e2e_bench
       - name: QUIC 1/100/500/1000 stream stress
         env:
           RUSHWAY_E2E_TRANSPORT: quic
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_MUX_SESSIONS: '8'
-        run: cargo run --release --bin e2e_bench
+        run: |
+          ulimit -n 8192
+          echo "stress_nofile=$(ulimit -n)"
+          cargo run --release --bin e2e_bench
       - name: Cross-proxy benchmark runner self-check
         run: cargo run --release --bin proxy_bench -- --implementation rushway --bin target/release/rushway
       - name: Repeated cross-proxy benchmark median
@@ -172,7 +181,7 @@ jobs:
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
         run: cargo build --release --target armv7-unknown-linux-gnueabihf
-      - name: Upload ARMv7 Linux binary
+      - name: Upload ARMv7 Linux release artifact
         uses: actions/upload-artifact@v4
         with:
           name: rushway-armv7-linux
