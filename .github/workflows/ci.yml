@@ -76,6 +76,21 @@ jobs:
           ulimit -n 8192
           echo "stress_nofile=$(ulimit -n)"
           cargo run --release --bin e2e_bench
+      - name: WSS 1000 stream diagnostic stress (non-blocking)
+        continue-on-error: true
+        env:
+          RUSHWAY_E2E_TRANSPORT: wss
+          RUSHWAY_E2E_STRESS: '1'
+          RUSHWAY_E2E_STRESS_PATTERN: staged
+          RUSHWAY_E2E_INCLUDE_1000: '1'
+          RUSHWAY_MUX_SESSIONS: '64'
+          RUSHWAY_E2E_DIAGNOSTIC: '1'
+        run: |
+          ulimit -n 8192
+          echo "stress_nofile=$(ulimit -n)"
+          echo "diagnostic_transport=$RUSHWAY_E2E_TRANSPORT"
+          echo "diagnostic_mux_sessions=$RUSHWAY_MUX_SESSIONS"
+          cargo run --release --bin e2e_bench
       - name: QUIC 1/100/500 stream stress
         env:
           RUSHWAY_E2E_TRANSPORT: quic
@@ -85,6 +100,21 @@ jobs:
         run: |
           ulimit -n 8192
           echo "stress_nofile=$(ulimit -n)"
+          cargo run --release --bin e2e_bench
+      - name: QUIC 1000 stream diagnostic stress (non-blocking)
+        continue-on-error: true
+        env:
+          RUSHWAY_E2E_TRANSPORT: quic
+          RUSHWAY_E2E_STRESS: '1'
+          RUSHWAY_E2E_STRESS_PATTERN: staged
+          RUSHWAY_E2E_INCLUDE_1000: '1'
+          RUSHWAY_MUX_SESSIONS: '64'
+          RUSHWAY_E2E_DIAGNOSTIC: '1'
+        run: |
+          ulimit -n 8192
+          echo "stress_nofile=$(ulimit -n)"
+          echo "diagnostic_transport=$RUSHWAY_E2E_TRANSPORT"
+          echo "diagnostic_mux_sessions=$RUSHWAY_MUX_SESSIONS"
           cargo run --release --bin e2e_bench
       - name: Cross-proxy benchmark runner self-check
         run: cargo run --release --bin proxy_bench -- --implementation rushway --bin target/release/rushway
