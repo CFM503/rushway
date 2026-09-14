@@ -2,7 +2,7 @@
 
 > Compatibility baseline: GoWay v1.8.4 at `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.
 
-## Current checkpoint — 2026-09-13
+## Current checkpoint — 2026-09-14
 
 **Implementation coverage: ~99% estimate. Overall project/release completion: ~85% estimate.** These are engineering estimates, not test scores.
 
@@ -15,6 +15,8 @@
 - [x] QUIC pooled connection already retries once after `open_bi` failure; target-dial rejection now maps to local SOCKS5 failure / HTTP 502.
 - [x] QUIC server target TCP sockets now receive the shared socket policy after successful connect.
 - [x] `proxy.rs` now exposes and tests an RFC1928 General Failure response primitive.
+- [x] Dependency stack is pinned for Rust 1.85-era toolchains: Quinn 0.11.9, ring-backed TLS, time 0.3.44 and cpufeatures 0.2.17.
+- [x] Rustfmt now passes on the repaired source tree in Actions.
 
 ### Completed compatibility work
 
@@ -30,39 +32,21 @@
 | Area | Source path | Current status |
 |---|---|---|
 | Plain WS handshake/auth | `src/ws.rs` | Implemented |
-| Plain WS MUX | `src/mux_pool.rs`, `src/runtime.rs` | Implemented; executable evidence pending |
-| Plain WS non-MUX | `src/nonmux.rs` | Implemented; executable evidence pending |
-| Plain WS UDP | runtime/mux client paths | Implemented; executable evidence pending |
-| WSS MUX/non-MUX/UDP | `src/wss_client.rs` | Implemented; executable evidence pending |
-| QUIC/QUIC+TLS TCP/UDP | `src/quic.rs` | Implemented; executable evidence pending |
+| Plain WS MUX | `src/mux_pool.rs`, `src/runtime.rs` | Implemented; executable compile currently being repaired |
+| Plain WS non-MUX | `src/nonmux.rs` | Implemented; executable compile currently being repaired |
+| Plain WS UDP | runtime/mux client paths | Implemented; executable compile currently being repaired |
+| WSS MUX/non-MUX/UDP | `src/wss_client.rs` | Implemented; executable compile currently being repaired |
+| QUIC/QUIC+TLS TCP/UDP | `src/quic.rs` | Implemented; executable compile currently being repaired |
 | SOCKS5 TCP/UDP | `src/proxy.rs` + transport frontends | Implemented; cross-transport edge parity pending |
 | HTTP CONNECT | `src/proxy.rs` + transport frontends | Implemented; malformed/error lifecycle parity pending |
 
-### DNS coverage
+### Current compiler blocker
 
-- [x] Remote DNS configuration.
-- [x] UDP query.
-- [x] TCP retry for truncated UDP response.
-- [x] System DNS fallback.
-- [x] Positive cache.
-- [x] Transaction-ID validation.
-- [x] Server target.
-- [x] Plain WS MUX upstream.
-- [x] Plain WS non-MUX upstream/target.
-- [x] WSS upstream.
-- [x] QUIC upstream.
-- [ ] Executable cache/fallback/transaction-ID tests on the final release commit.
-
-### Remaining code work
-
-1. Audit SOCKS5 error/FRAG/close parity and HTTP CONNECT malformed/error lifecycle across every transport, not just the primary MUX paths.
-2. Finish exact QUIC dead-IP/connection-state/TLS-SNI parity against GoWay with executable interop evidence.
-3. Remove or formally justify the remaining compatibility stubs (`-tui`, file logging and CPU profiling) against the release scope.
-4. Add/execute focused integration tests for target-dial failure, first-response RST, and cross-path socket-policy behavior.
+Actions now exposes full compiler diagnostics through a temporary artifact workflow. The active source-repair pass is correcting 31 mechanical Rust errors across MUX pool lifecycles, QUIC API names, socket keepalive ownership, WSS state derives, runtime IP matching and Clap range parsers. `cargo fmt --check` is green; `cargo check --all-targets --all-features` is the current gate.
 
 ### Verification gate
 
-**Current-head executable verification is still not passed.** HEAD is `75610b2123433a2b034eba577b61ddc161ac159f`. Both the `RushWay CI` run `34764563674` and `RushWay Build Smoke` run `34764563695` failed at the workflow-job level before exposing any steps; the `test`/smoke logs endpoint currently returns `BlobNotFound`. This is inconclusive GitHub Actions infrastructure/setup behavior, not evidence that the code compiled or failed to compile.
+**Current-head executable verification is still not passed.** The clean formal CI has reached the real `cargo check` stage; the GoWay comparison job is skipped only because `CFM503/way` is private and the optional `WAY_READ_TOKEN` is not configured.
 
 The final 100% gate still requires successful executable evidence for:
 
@@ -79,7 +63,7 @@ The final 100% gate still requires successful executable evidence for:
 
 ### Release/tag constraint
 
-The package version is `0.0.2`, but `v0.0.2` is **not claimed as an existing Git tag**. The current GitHub connector exposes commit/branch writes but no tag/ref creation write operation. Tagging must be done against the final verified release commit once the required write capability is available.
+The package version is `0.0.2`, but `v0.0.2` is **not claimed as an existing Git tag**. Tagging must be done against the final verified release commit once the required write capability is available.
 
 ### Three-file relay contract
 
