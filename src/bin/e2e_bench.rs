@@ -16,6 +16,10 @@ const FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 const E2E_TIMEOUT: Duration = Duration::from_secs(120);
 const STRESS_TIMEOUT: Duration = Duration::from_secs(180);
 
+fn diagnostic_mode() -> bool {
+    matches!(std::env::var("RUSHWAY_E2E_DIAGNOSTIC").ok().as_deref(), Some("1" | "true" | "yes"))
+}
+
 async fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     Ok(listener.local_addr()?.port())
@@ -24,24 +28,10 @@ async fn free_port() -> io::Result<u16> {
 fn child_path() -> io::Result<std::path::PathBuf> {
     let path = std::env::current_exe()?
         .parent()
-        .map(|p| {
-            p.join(if cfg!(windows) {
-                "rushway.exe"
-            } else {
-                "rushway"
-            })
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "cannot locate sibling rushway binary",
-            )
-        })?;
+        .map(|p| p.join(if cfg!(windows) { "rushway.exe" } else { "rushway" }))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot locate sibling rushway binary"))?;
     if !path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("missing {}", path.display()),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing {}", path.display())));
     }
     Ok(path)
 }
@@ -55,10 +45,7 @@ fn transport_mode() -> &'static str {
 }
 
 fn stress_mode() -> bool {
-    matches!(
-        std::env::var("RUSHWAY_E2E_STRESS").ok().as_deref(),
-        Some("1" | "true" | "yes")
-    )
+    matches!(std::env::var("RUSHWAY_E2E_STRESS").ok().as_deref(), Some("1" | "true" | "yes"))
 }
 
 fn stress_pattern() -> &'static str {
@@ -85,12 +72,7 @@ fn spawn_rushway(
     wss_server: bool,
 ) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    cmd.arg("-p")
-        .arg(port.to_string())
-        .arg("-k")
-        .arg(key)
-        .arg("--log")
-        .arg("ERROR");
+    cmd.arg("-p").arg(port.to_string()).arg("-k").arg(key).arg("--log").arg(if diagnostic_mode() { "DEBUG" } else { "ERROR" });
     if allow_local_targets {
         cmd.arg("--no-block-local");
     }
@@ -109,18 +91,13 @@ async fn wait_for_port(port: u16, child: &mut Child, role: &str) -> io::Result<(
             Ok(_) => return Ok(()),
             Err(_) => {
                 if let Some(status) = child.try_wait()? {
-                    return Err(io::Error::other(format!(
-                        "{role} RushWay exited before opening port {port}: {status}"
-                    )));
+                    return Err(io::Error::other(format!("{role} RushWay exited before opening port {port}: {status}")));
                 }
                 sleep(Duration::from_millis(25)).await;
             }
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("{role} RushWay port {port} did not open"),
-    ))
+    Err(io::Error::new(io::ErrorKind::TimedOut, format!("{role} RushWay port {port} did not open")))
 }
 
 async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -128,9 +105,7 @@ async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
     let port = listener.local_addr()?.port();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
+            let Ok((mut socket, _)) = listener.accept().await else { break; };
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
@@ -138,9 +113,7 @@ async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    if socket.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
+                    if socket.write_all(&buf[..n]).await.is_err() { break; }
                 }
             });
         }
@@ -148,147 +121,107 @@ async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
     Ok((port, task))
 }
 
+async fn socks5_stage<T>(stage: &'static str, future: T) -> io::Result<T::Output>
+where
+    T: std::future::Future,
+{
+    timeout(Duration::from_secs(10), future)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("SOCKS5 stage {stage} timed out after 10s")))
+}
+
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> io::Result<TcpStream> {
-    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
-    stream.write_all(&[5, 1, 0]).await?;
+    let mut stream = socks5_stage("tcp_connect", TcpStream::connect(("127.0.0.1", proxy_port))).await??;
+    socks5_stage("greeting_write", stream.write_all(&[5, 1, 0])).await??;
     let mut method = [0u8; 2];
-    stream.read_exact(&mut method).await?;
+    socks5_stage("method_read", stream.read_exact(&mut method)).await??;
     if method != [5, 0] {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "SOCKS5 no-auth was rejected",
-        ));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "SOCKS5 no-auth was rejected"));
     }
     let port = target_port.to_be_bytes();
-    stream
-        .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, port[0], port[1]])
-        .await?;
+    socks5_stage("connect_write", stream.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, port[0], port[1]])).await??;
     let mut reply = [0u8; 10];
-    stream.read_exact(&mut reply).await?;
+    socks5_stage("connect_reply_read", stream.read_exact(&mut reply)).await??;
     if reply[1] != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("SOCKS5 connect failed: {}", reply[1]),
-        ));
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("SOCKS5 connect failed: {}", reply[1])));
     }
     Ok(stream)
 }
 
-async fn one_flow(
-    index: usize,
-    proxy_port: u16,
-    target_port: u16,
-    payload: Arc<[u8]>,
-) -> io::Result<usize> {
+async fn one_flow(index: usize, proxy_port: u16, target_port: u16, payload: Arc<[u8]>) -> io::Result<usize> {
     let result = timeout(FLOW_TIMEOUT, async {
         let mut stream = socks5_connect(proxy_port, target_port)
             .await
             .map_err(|e| io::Error::other(format!("flow {index} connect: {e}")))?;
-        stream
-            .write_all(&payload)
-            .await
-            .map_err(|e| io::Error::other(format!("flow {index} write: {e}")))?;
+        stream.write_all(&payload).await.map_err(|e| io::Error::other(format!("flow {index} write: {e}")))?;
         let mut echoed = vec![0u8; payload.len()];
-        stream
-            .read_exact(&mut echoed)
-            .await
-            .map_err(|e| io::Error::other(format!("flow {index} read echo: {e}")))?;
+        stream.read_exact(&mut echoed).await.map_err(|e| io::Error::other(format!("flow {index} read echo: {e}")))?;
         if echoed.as_slice() != payload.as_ref() {
-            return Err(io::Error::other(format!(
-                "flow {index} echo payload mismatch"
-            )));
+            return Err(io::Error::other(format!("flow {index} echo payload mismatch")));
         }
         Ok(payload.len())
-    })
-    .await;
+    }).await;
     match result {
         Ok(value) => value,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("flow {index} timed out after 30s"),
-        )),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, format!("flow {index} timed out after 30s"))),
     }
 }
 
-async fn run_case(
-    proxy_port: u16,
-    target_port: u16,
-    concurrency: usize,
-    payload: Arc<[u8]>,
-) -> io::Result<f64> {
+async fn run_case(proxy_port: u16, target_port: u16, concurrency: usize, payload: Arc<[u8]>) -> io::Result<f64> {
     let start = Instant::now();
-    let tasks = (0..concurrency)
-        .map(|i| tokio::spawn(one_flow(i, proxy_port, target_port, Arc::clone(&payload))))
-        .collect::<Vec<_>>();
+    let tasks = (0..concurrency).map(|i| tokio::spawn(one_flow(i, proxy_port, target_port, Arc::clone(&payload)))).collect::<Vec<_>>();
     let mut total = 0usize;
-    for task in tasks {
-        total += task.await.map_err(|e| io::Error::other(e.to_string()))??;
-    }
+    for task in tasks { total += task.await.map_err(|e| io::Error::other(e.to_string()))??; }
     Ok((total as f64 / (1024.0 * 1024.0)) / start.elapsed().as_secs_f64())
 }
 
-async fn run_stress_case(
-    proxy_port: u16,
-    target_port: u16,
-    concurrency: usize,
-    payload: Arc<[u8]>,
-) -> io::Result<Duration> {
+async fn run_stress_case(proxy_port: u16, target_port: u16, concurrency: usize, payload: Arc<[u8]>) -> io::Result<Duration> {
     let start = Instant::now();
     let pattern = stress_pattern();
     let mut tasks = Vec::with_capacity(concurrency);
     let batch_size = 100usize;
-
     if pattern == "staged" {
         for batch_start in (0..concurrency).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(concurrency);
-            eprintln!(
-                "stress launch batch start={batch_start} end={batch_end} total={concurrency}"
-            );
+            eprintln!("stress launch batch start={batch_start} end={batch_end} total={concurrency}");
             for index in batch_start..batch_end {
-                tasks.push(tokio::spawn(one_flow(
-                    index,
-                    proxy_port,
-                    target_port,
-                    Arc::clone(&payload),
-                )));
+                tasks.push(tokio::spawn(one_flow(index, proxy_port, target_port, Arc::clone(&payload))));
             }
             sleep(Duration::from_millis(50)).await;
         }
     } else {
         for index in 0..concurrency {
-            tasks.push(tokio::spawn(one_flow(
-                index,
-                proxy_port,
-                target_port,
-                Arc::clone(&payload),
-            )));
+            tasks.push(tokio::spawn(one_flow(index, proxy_port, target_port, Arc::clone(&payload))));
         }
     }
-
     for (index, task) in tasks.into_iter().enumerate() {
-        task.await
-            .map_err(|e| io::Error::other(format!("stress task {index} join: {e}")))??;
+        task.await.map_err(|e| io::Error::other(format!("stress task {index} join: {e}")))??;
     }
     Ok(start.elapsed())
 }
 
-fn child_stderr(child: &mut Child) -> String {
-    child
-        .stderr
-        .take()
-        .map(|mut stderr| {
-            use std::io::Read;
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            text
-        })
-        .unwrap_or_default()
+fn process_fd_count(pid: u32) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir(format!("/proc/{pid}/fd")).ok().map(|it| it.count())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn child_stderr(child: &mut Child) -> String {
+    child.stderr.take().map(|mut stderr| {
+        use std::io::Read;
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    }).unwrap_or_default()
 }
+
+fn kill_child(child: &mut Child) { let _ = child.kill(); let _ = child.wait(); }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> io::Result<()> {
@@ -299,89 +232,40 @@ async fn main() -> io::Result<()> {
     let mode = transport_mode();
     let stress = stress_mode();
     let pattern = stress_pattern();
-
-    let mut server = spawn_rushway(
-        &rushway,
-        server_port,
-        None,
-        TEST_KEY,
-        true,
-        mode == "wss",
-    )?;
-    let mut client = spawn_rushway(
-        &rushway,
-        client_port,
-        Some(upstream_url(server_port)),
-        TEST_KEY,
-        true,
-        false,
-    )?;
+    let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY, true, mode == "wss")?;
+    let mut client = spawn_rushway(&rushway, client_port, Some(upstream_url(server_port)), TEST_KEY, true, false)?;
+    let server_pid = server.id();
+    let client_pid = client.id();
 
     let timeout_limit = if stress { STRESS_TIMEOUT } else { E2E_TIMEOUT };
     let result = match timeout(timeout_limit, async {
         wait_for_port(server_port, &mut server, "server").await?;
         wait_for_port(client_port, &mut client, "client").await?;
-
         if stress {
             let mut payload = vec![0u8; STRESS_PAYLOAD_SIZE];
-            for (i, b) in payload.iter_mut().enumerate() {
-                *b = ((i * 31 + 17) & 0xff) as u8;
-            }
+            for (i, b) in payload.iter_mut().enumerate() { *b = ((i * 31 + 17) & 0xff) as u8; }
             let payload: Arc<[u8]> = payload.into();
-
             for &concurrency in STRESS_CONCURRENCIES {
-                let elapsed = run_stress_case(
-                    client_port,
-                    target_port,
-                    concurrency,
-                    Arc::clone(&payload),
-                )
-                .await?;
-                println!(
-                    "rushway_stream_stress transport={} pattern={} payload_kib={} streams={} completed={} elapsed_ms={}",
-                    mode,
-                    pattern,
-                    payload.len() / 1024,
-                    concurrency,
-                    concurrency,
-                    elapsed.as_millis()
-                );
+                let elapsed = run_stress_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?;
+                println!("rushway_stream_stress transport={} pattern={} payload_kib={} streams={} completed={} elapsed_ms={}", mode, pattern, payload.len() / 1024, concurrency, concurrency, elapsed.as_millis());
             }
         } else {
             let mut payload = vec![0u8; PAYLOAD_SIZE];
-            for (i, b) in payload.iter_mut().enumerate() {
-                *b = ((i * 31 + 17) & 0xff) as u8;
-            }
+            for (i, b) in payload.iter_mut().enumerate() { *b = ((i * 31 + 17) & 0xff) as u8; }
             let payload: Arc<[u8]> = payload.into();
             let mut results = Vec::with_capacity(CONCURRENCIES.len());
-            for &concurrency in CONCURRENCIES {
-                results.push((
-                    concurrency,
-                    run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?,
-                ));
-            }
-            print!(
-                "rushway_e2e transport={} payload_mib={} roundtrip_echo=1",
-                mode,
-                payload.len() / (1024 * 1024)
-            );
-            for (concurrency, throughput) in results {
-                print!(" c{}_mib_s={:.2}", concurrency, throughput);
-            }
+            for &concurrency in CONCURRENCIES { results.push((concurrency, run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?)); }
+            print!("rushway_e2e transport={} payload_mib={} roundtrip_echo=1", mode, payload.len() / (1024 * 1024));
+            for (concurrency, throughput) in results { print!(" c{}_mib_s={:.2}", concurrency, throughput); }
             println!();
         }
         Ok::<(), io::Error>(())
-    })
-    .await
-    {
+    }).await {
         Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "e2e benchmark exceeded {}s overall timeout",
-                timeout_limit.as_secs()
-            ),
-        )),
+        Err(_) => {
+            eprintln!("stress trap: overall timeout; server_pid={} server_fd={:?} client_pid={} client_fd={:?}", server_pid, process_fd_count(server_pid), client_pid, process_fd_count(client_pid));
+            Err(io::Error::new(io::ErrorKind::TimedOut, format!("e2e benchmark exceeded {}s overall timeout", timeout_limit.as_secs())))
+        }
     };
 
     if result.is_err() {
@@ -389,15 +273,9 @@ async fn main() -> io::Result<()> {
         kill_child(&mut server);
         let client_log = child_stderr(&mut client);
         let server_log = child_stderr(&mut server);
-        if !server_log.is_empty() {
-            eprintln!("e2e server stderr:\n{server_log}");
-        }
-        if !client_log.is_empty() {
-            eprintln!("e2e client stderr:\n{client_log}");
-        }
-        if let Err(ref e) = result {
-            eprintln!("e2e benchmark failed: {e}");
-        }
+        if !server_log.is_empty() { eprintln!("e2e server stderr:\n{server_log}"); }
+        if !client_log.is_empty() { eprintln!("e2e client stderr:\n{client_log}"); }
+        if let Err(ref e) = result { eprintln!("e2e benchmark failed: {e}"); }
     } else {
         kill_child(&mut client);
         kill_child(&mut server);
