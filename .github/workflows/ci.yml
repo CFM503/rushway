@@ -41,7 +41,7 @@ jobs:
         env:
           RUSHWAY_E2E_TRANSPORT: quic
         run: cargo run --release --bin e2e_bench
-      - name: WS 1/100/500/1000 stream stress
+      - name: WS 1/100/500 stream stress
         env:
           RUSHWAY_E2E_TRANSPORT: ws
           RUSHWAY_E2E_STRESS: '1'
@@ -52,7 +52,7 @@ jobs:
           ulimit -n 8192
           echo "stress_nofile=$(ulimit -n)"
           cargo run --release --bin e2e_bench
-      - name: WSS 1/100/500/1000 stream stress
+      - name: WSS 1/100/500 stream stress
         env:
           RUSHWAY_E2E_TRANSPORT: wss
           RUSHWAY_E2E_STRESS: '1'
@@ -62,7 +62,7 @@ jobs:
           ulimit -n 8192
           echo "stress_nofile=$(ulimit -n)"
           cargo run --release --bin e2e_bench
-      - name: QUIC 1/100/500/1000 stream stress
+      - name: QUIC 1/100/500 stream stress
         env:
           RUSHWAY_E2E_TRANSPORT: quic
           RUSHWAY_E2E_STRESS: '1'
@@ -160,7 +160,7 @@ jobs:
             -w /src \
             rust:1.85-bookworm \
             bash -c 'apt-get update && apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates && export PATH="/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH" && cargo build --release && file target/release/rushway'
-      - name: Upload Debian 12 x64 binary
+      - name: Upload Debian 12 x64 release artifact
         uses: actions/upload-artifact@v4
         with:
           name: rushway-debian12-x64

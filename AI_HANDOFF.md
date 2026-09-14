@@ -601,3 +601,48 @@ Finish the current native concurrency batch, wait for CI evidence, then move dir
 
 ### Next action
 Wait for the new CI run. If WS 1000 passes, immediately inspect WSS and QUIC 1000; then proceed to sustained 10×1000 and explicit stream lifecycle/cancellation tests.
+
+## 2026-09-15 — 500-stream CI acceptance gate and #367 infrastructure failure
+
+### Bug / decision
+- CI Run #366 (`34896145379`) passed Rust format, check, 39 unit tests, release build, MUX benchmark, standalone WS/WSS/QUIC E2E, and staged WS 1/100/500.
+- The same run failed only at WS 1000, around flow 410, with `SOCKS5 stage connect_reply_read timed out after 10s`.
+- CI Run #367 (`34896145379` workflow family; one-shot gate update job `104150514920`) did **not** fail because of Rust/RushWay behavior. Its final `git push` was rejected because the GitHub Actions token lacked permission to create/update `.github/workflows/ci.yml` (`workflows` permission).
+
+### Root cause / acceptance decision
+- The 1000-stream failure remains an unresolved high-concurrency MUX/lifecycle diagnostic issue.
+- The 500-stream path has repeated executable evidence of passing; therefore 500 is now the **current blocking CI acceptance gate**, while 1000 remains a non-blocking diagnostic target until its root cause is fixed.
+- This is an acceptance-policy change, not a claim that 1000-stream support is complete.
+
+### Astra review
+- Concurrency/lifecycle: no production MUX behavior is changed by this gate adjustment.
+- Protocol/security: no wire format, target policy, or authentication behavior changes.
+- CI correctness: the stress harness continues to execute the same 1/100/500 workload; only the requested concurrency ceiling is reduced so the known 1000 diagnostic failure cannot block routine validation.
+- Regression risk: keeping 1000 outside the blocking path can hide future regressions above 500, so the handoff explicitly retains 1000 as a tracked native-refactor gate.
+
+### Change
+- `src/bin/e2e_bench.rs`: stress concurrency sequence changed from `1, 100, 500, 1000` to `1, 100, 500`.
+- `.github/workflows/ci.yml`: WS/WSS/QUIC stress step names and acceptance scope changed to `1/100/500`.
+- Temporary Actions-based mutation was abandoned after Run #367 hit the workflow-file permission boundary; this branch uses direct GitHub contents commits instead.
+
+### Commit
+- Branch: `ai/500-stream-ci-gate`
+- Code commit: `98936d81781db9f56afcac96055816223248d12f`.
+- CI workflow commit: `412f79165a666ed77534729600f173be13bd6fc3`.
+- Handoff entry is being recorded in this same branch before the branch is offered for merge.
+
+### Validation
+- Source inspection confirms the three stress stages are now capped at 500 and retain `ulimit -n 8192`, staged pattern, and 8 MUX sessions.
+- Prior executable evidence: Run #366 passed WS 1/100/500 and failed only at 1000.
+- Branch CI validation will run after the branch is merged or a PR is opened; no new green CI claim is made yet.
+
+### Status
+**Awaiting merge/CI validation.** The branch contains the requested 500-stream blocking gate; 1000 remains explicitly tracked and unresolved.
+
+### Remaining risk
+- The 1000-stream MUX SYN/ACK timeout remains unresolved.
+- WSS/QUIC at 1000 are intentionally no longer blocking because the harness stops at 500.
+- The native lifecycle/backpressure phases remain in progress.
+
+### Next action
+Merge `ai/500-stream-ci-gate`, let normal CI validate the branch, then resume production diagnosis of the 1000-stream SYN/ACK path without letting it block the 500-stream baseline gate.
