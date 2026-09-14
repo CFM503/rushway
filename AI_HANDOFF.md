@@ -290,3 +290,33 @@ Never call the project 100% complete merely because source paths exist.
 
 ### Next action
 - Commit this code fix together with this handoff entry, push `main`, then inspect the new CI run with priority on WS 1000 stress and exact failure diagnostics.
+
+## 2026-09-14 — Astra diagnostic instrumentation for WS 1000 EOF
+
+Bug / evidence
+- CI Run #34861096430 passed Rust format, cargo check, 39 unit tests, release build, MUX benchmark, WS/WSS/QUIC single E2E.
+- WS staged stress still fails at 1000 concurrent streams with `flow 413 connect: early eof`.
+- Previous capacity fix changed the failure point only marginally and did not eliminate the failure.
+
+Astra review
+- Concurrency: production MUX admission logic is not changed in this diagnostic step.
+- Protocol/state machine: no protocol behavior is changed.
+- Lifecycle/cancellation/cleanup: no production lifecycle behavior is changed.
+- Performance: only the E2E child-process log level is changed.
+- Security/target policy: unchanged.
+- Regression scope: test harness only.
+- Testability: improved visibility of internal MUX acquisition failures.
+
+Change
+- `src/bin/e2e_bench.rs` now starts the RushWay test children with `--log DEBUG` instead of `--log ERROR`.
+- Purpose: expose the actual server/client-side MUX failure behind the `early eof` observed by the stress harness.
+
+Validation
+- `git diff --check` passed.
+- Diff is exactly one line: `ERROR` -> `DEBUG`.
+- CI validation is pending for this diagnostic change.
+
+Status
+- Not complete.
+- The WS 1000-stream failure remains unresolved.
+- Next action: inspect the new CI logs for the first internal MUX/session error associated with the failing flow, then make the smallest production fix supported by that evidence.
