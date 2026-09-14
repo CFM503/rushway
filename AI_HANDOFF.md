@@ -198,3 +198,30 @@ Current gates:
 3. `SPEC.md` — source-derived GoWay compatibility contract.
 
 Never call the project 100% complete merely because source paths exist.
+## 2026-09-14 — Astra CI compile correction after MUX SYN concurrency patch
+
+### Bug
+- CI Run #342 (`34855669677`), commit `81908775dfc667ca422bbd3aae12ccaeb33a3d3e`, passed Rust format check but failed during `cargo check --all-targets --all-features`.
+
+### Root cause
+- `src/runtime.rs` referenced `MAX_STREAMS_PER_SESSION`, but the existing constant is private to `mux_pool.rs`.
+- `StreamCommand::Data` requires `OwnedMuxFrame`; this conversion was already correctly implemented in the committed `8190877` source and was not the remaining failure.
+
+### Astra review
+- Concurrency architecture remains the intended per-stream spawned dial task with physical MUX reader decoupling.
+- Protocol success ACK and target-policy checks remain in place.
+- The current correction changes only the stream-limit reference from the inaccessible constant to the existing value `256`; no concurrency behavior is changed.
+
+### Validation
+- Run #342: Rust format check passed.
+- Run #342: Rust check failed only on the inaccessible `MAX_STREAMS_PER_SESSION` reference after the committed source parsed successfully.
+- Local `git diff --check` passes after the correction.
+- Local diff contains exactly one runtime code-line change.
+
+### Status
+- **Awaiting CI revalidation.**
+- Functional/stress evidence for WS 1/100/500/1000 remains outstanding.
+
+### Next action
+- Commit the one-line compile correction together with this handoff entry and push.
+- Re-run CI and inspect `cargo check`, unit tests, and WS 1000 stress before making any completion claim.

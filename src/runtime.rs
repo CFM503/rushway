@@ -334,7 +334,7 @@ async fn handle_mux_parts(
 
                 let stream_limit_reached = {
                     let guard = streams.lock().await;
-                    guard.len() >= MAX_STREAMS_PER_SESSION
+                    guard.len() >= 256
                 };
 
                 if stream_limit_reached {
