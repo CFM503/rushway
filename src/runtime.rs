@@ -258,6 +258,7 @@ async fn handle_mux_parts(
         write_frame(&mut *w, &ok, 2, false).await?
     };
     let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut stream_tasks = Vec::new();
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
         let Some((opcode, mut payload)) = read_frame_owned(
@@ -318,44 +319,89 @@ async fn handle_mux_parts(
                 match dial_target(&target, cfg.connection_timeout, &cfg).await {
                     Ok(target_stream) => {
                         let (tx, rx) = mpsc::channel(64);
-                        streams
-                            .lock()
-                            .await
-                            .insert(frame.stream_id, StreamEntry { tx: tx.clone() });
-                        tokio::spawn(server_stream_task(
-                            frame.stream_id,
-                            target_stream,
-                            rx,
-                            writer.clone(),
-                            cfg.buffer_size,
-                            cipher.clone(),
-                        ));
-                        if !syn.initial_data.is_empty() {
-                            let initial =
-                                MuxFrame::new(frame.stream_id, MuxCommand::Data, syn.initial_data)
-                                    .map_err(|e| anyhow!(e.to_string()))?;
-                            let mut d = Vec::with_capacity(7 + initial.payload.len());
-                            initial.encode(&mut d).map_err(|e| anyhow!(e.to_string()))?;
-                            let owned =
-                                MuxFrame::decode_owned(d).map_err(|e| anyhow!(e.to_string()))?;
-                            let _ = tx.send(StreamCommand::Data(owned)).await;
-                        }
-                        // A successful SYN must be acknowledged before the local SOCKS5
-                        // client can send application data. An empty DATA frame is the
-                        // existing client-side success signal and carries no application bytes.
-                        send_mux_parts_encrypted(
-                            &writer,
-                            &cipher,
-                            frame.stream_id,
-                            MuxCommand::Data,
-                            &[],
-                        )
-                        .await?;
-                    }
-                    Err(_) => {
-                        let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
-                    }
-                };
+let stream_id = frame.stream_id;
+let (tx, mut rx) = mpsc::channel(64);
+
+let inserted = {
+    let mut table = streams.lock().await;
+    if table.contains_key(&stream_id) {
+        false
+    } else {
+        table.insert(stream_id, StreamEntry { tx: tx.clone() });
+        true
+    }
+};
+
+if !inserted {
+    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+    continue;
+}
+
+if !syn.initial_data.is_empty() {
+    let initial =
+        MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
+            .map_err(|e| anyhow!(e.to_string()))?;
+    let mut d = Vec::with_capacity(7 + initial.payload.len());
+    initial
+        .encode(&mut d)
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let owned =
+        MuxFrame::decode_owned(d).map_err(|e| anyhow!(e.to_string()))?;
+    let _ = tx.send(StreamCommand::Data(owned)).await;
+}
+
+let task_streams = streams.clone();
+let task_writer = writer.clone();
+let task_cipher = cipher.clone();
+let task_cfg = cfg.clone();
+
+let task = tokio::spawn(async move {
+    let target_stream = match dial_target(&target, task_cfg.connection_timeout, &task_cfg).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            let _ = send_reset_encrypted(
+                &task_writer,
+                &task_cipher,
+                stream_id,
+            )
+            .await;
+            task_streams.lock().await.remove(&stream_id);
+            return;
+        }
+    };
+
+    let (rd, mut wr) = tokio::io::split(target_stream);
+
+    let reader = tokio::spawn(target_to_mux(
+        stream_id,
+        rd,
+        task_writer.clone(),
+        task_cfg.buffer_size,
+        task_cipher.clone(),
+    ));
+
+    while let Some(command) = rx.recv().await {
+        match command {
+            StreamCommand::Data(frame) => {
+                if wr.write_all(frame.payload()).await.is_err() {
+                    break;
+                }
+            }
+            StreamCommand::Fin => {
+                let _ = wr.shutdown().await;
+                break;
+            }
+            StreamCommand::Reset => {
+                break;
+            }
+        }
+    }
+
+    reader.abort();
+    task_streams.lock().await.remove(&stream_id);
+});
+
+stream_tasks.push(task);
             }
             MuxCommand::Data => {
                 let id = frame.stream_id;
