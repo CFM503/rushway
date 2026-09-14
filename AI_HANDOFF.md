@@ -158,6 +158,40 @@ Current gates:
 - Never replace failed or skipped evidence with source-level assumptions.
 - Never silently omit a bug-fix handoff entry.
 
+## 2026-09-14 — Astra MUX SYN asynchronous dispatch attempt
+
+### Bug
+- WS staged 1000-stream stress previously failed around flow 411 with `connect: early eof` because `handle_mux_parts()` synchronously awaited target DNS/TCP dialing inside the physical MUX reader loop.
+
+### Root cause
+- The physical MUX reader serialized logical SYN processing behind an individual `dial_target()` future, preventing timely dispatch of later logical streams on the same physical session.
+
+### Astra review
+- Concurrency: stream registration was moved before target dialing and per-stream dial work was moved into a spawned task.
+- Protocol: the existing encrypted zero-length `MuxCommand::Data` success ACK was restored after successful dial.
+- Cleanup: per-stream tasks are tracked and aborted when the physical MUX session exits.
+- Security: existing `enforce_target_policy()` path was preserved.
+- Regression risk: the current implementation still has a lifecycle gap for FIN/RST while dialing and requires further review after the syntax/build failure is corrected.
+
+### Change
+- `src/runtime.rs`: commit `b3b3413617ee5234056fb27085e2cebbdf67fad1` introduced asynchronous per-stream dialing and stream task tracking.
+- `src/runtime.rs`: commit `c27f1e645e088d1fa77a03f5144eeb9baaf9e597` restored the zero-length SYN success ACK and added physical-session task abort cleanup.
+
+### Validation
+- CI Run #339: `34853350247`, head `b3b3413617ee5234056fb27085e2cebbdf67fad1` — failed before stress; further source correction required.
+- CI Run #340: `34854203024`, head `c27f1e645e088d1fa77a03f5144eeb9baaf9e597` — failed at `Rust format check` before compilation/stress.
+- Exact Run #340 failure: `src/runtime.rs:592:3` reports an unclosed delimiter, with the parser tracing the mismatch to the MUX SYN block around lines 247/263/320/419.
+
+### Status
+- **Partially fixed / still failing.** The intended reader-loop serialization was removed conceptually, but the committed source does not currently parse, so no concurrency claim is valid yet.
+
+### Remaining risk
+- Source-level inspection indicates pending FIN/RST while a target dial is in progress are still not handled as immediate cancellation; those commands are queued until the dial future completes.
+- The current malformed source must be repaired before any functional or stress evidence can be collected.
+
+### Next action
+- Repair the `src/runtime.rs` MUX SYN block so the obsolete outer `match dial_target(...)` wrapper is removed completely, then run `cargo fmt`, `cargo check`, and `cargo test`. Only after those pass should WS 1/100/500/1000 stress be rerun.
+
 ## Three-file relay contract
 1. `AI_HANDOFF.md` — decisions, commits, blockers, bug-fix history, and next action.
 2. `PROGRESS.md` — compact progress dashboard.
