@@ -283,10 +283,9 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
             Err(_) => continue,
         };
         let id = frame.stream_id;
-        let terminal = matches!(frame.command, MuxCommand::Fin | MuxCommand::Rst);
         let tx = state.streams.lock().await.get(&id).cloned();
         if let Some(tx) = tx {
-            if tx.send(frame).await.is_err() || terminal {
+            if tx.send(frame).await.is_err() {
                 if state.streams.lock().await.remove(&id).is_some() {
                     state.active.fetch_sub(1, Ordering::AcqRel);
                 }
