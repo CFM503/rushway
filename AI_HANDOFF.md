@@ -11,25 +11,35 @@
 - Branch: `main`
 
 ### Latest validated CI
-- Run #305: `34818400219`, head `27c44a68036e99fda07eecea74f688276517de03` — full core validation passed.
+- Run #313: `34821431764`, head `ae24c2a4a22d9c51eb256ec3d652e7392300657d` — full core validation passed before the WSS server feature work.
 - Rust format/check/test/release passed; 38 unit tests passed.
-- MUX hot-path benchmark passed: owned-vs-copy speedup `7047.11x`.
-- E2E proxy benchmark passed: c1 `119.64`, c8 `172.55`, c32 `170.66` MiB/s.
-- Repeated setup-inclusive RushWay median (5 samples): c1 `58.16`, c8 `153.60`, c32 `173.25` MiB/s.
-- Repeated steady-state RushWay median (5 samples): c1 `130.39`, c8 `170.01`, c32 `171.87` MiB/s.
+- MUX hot-path benchmark passed; owned-vs-copy speedup `580.86x` in Run #313.
+- Standalone WS E2E passed: c1 `170.57`, c8 `175.28`, c32 `212.82` MiB/s.
+- Standalone QUIC E2E passed: c1 `222.99`, c8 `187.92`, c32 `291.62` MiB/s.
+- Repeated setup-inclusive RushWay median: c1 `189.61`, c8 `190.32`, c32 `220.37` MiB/s.
+- Repeated steady-state RushWay median: c1 `207.60`, c8 `189.00`, c32 `218.76` MiB/s.
 - Windows x64, Debian 12 x64, and ARMv7 Linux release builds all passed.
 - GoWay comparison job is still skipped because `WAY_READ_TOKEN` is unset; a green skipped job is not interoperability evidence.
 
 ### Standalone server/client validation
-- Confirmed from `src/main.rs`: when `--up` is absent, RushWay enters server mode and requires `-k` unless `--allow-open`; when `--up` is present, RushWay enters client mode and selects WS/WSS/QUIC according to the upstream URL.
-- `src/bin/e2e_bench.rs` launches two separate RushWay child processes from the same release binary: one server with no `--up`, one client with `--up ws://127.0.0.1:<server_port>/`.
-- The client exposes a separate local SOCKS5 port, connects through the server process to an independent local echo target, and round-trips a 4 MiB payload at c1/c8/c32.
-- Run #305 passed this complete subprocess path. Therefore RushWay can independently run as a server process and as a client process for the WS+MUX path. This proves RushWay↔RushWay standalone operation; it is not proof of GoWay interoperability.
+- Confirmed from `src/main.rs`: when `--up` is absent, RushWay enters server mode and requires `-k` unless `--allow-open`; when `--up` is present, RushWay client mode selects WS/WSS/QUIC according to the upstream URL.
+- `src/bin/e2e_bench.rs` launches two separate RushWay child processes from the same release binary and validates a separate local SOCKS5 listener against an independent local echo target.
+- WS+MUX standalone path is proven from Run #305.
+- QUIC standalone path is proven from Run #313, including a real two-process server/client round trip.
+- WSS server mode is now implemented in `src/main.rs` with `--wss-server`, using TLS termination plus a private loopback WS runtime; `src/tls.rs` now provides a standalone self-signed WSS acceptor. A dedicated WSS E2E mode is wired into CI, but the first feature run was blocked only by rustfmt and has not yet produced WSS executable evidence.
+
+### WSS implementation design
+- External listener accepts TLS and RFC6455 WebSocket handshake.
+- After the external 101 response, the process connects to an ephemeral loopback plain-WS runtime running the existing `runtime::run_server` implementation.
+- The WSS side performs an internal WS client handshake and then transparently bridges already-framed RFC6455 bytes with `copy_bidirectional`.
+- This preserves the existing WS/MUX protocol implementation rather than duplicating it in a new TLS-specific transport.
+- Default WSS server certificate is self-signed for `localhost`; the existing WSS client defaults to insecure verification unless `--verify-ssl` is supplied.
 
 ### E2E harness fixes
 1. Local echo target requires `--no-block-local` in both e2e RushWay children.
 2. Each e2e flow has a 30-second timeout.
 3. Child diagnostic handling was hardened so stderr collection cannot become a second deadlock.
+4. `RUSHWAY_E2E_TRANSPORT` now supports `ws`, `wss`, and `quic` modes.
 
 ### Real MUX protocol finding and fix
 Run #292 exposed a real CONNECT deadlock:
@@ -60,15 +70,16 @@ Fix: commit `302be63036fe4435d99efbc5bdf890c22ace3f43` (`test: fix proxy benchma
 Do not call v0.0.3 100% and do not create a final tag/release yet.
 Remaining proof:
 1. Actual cloud GoWay v1.8.4 interoperability.
-2. SOCKS5/HTTP lifecycle and error matrix.
-3. WS/WSS/QUIC TCP+UDP interoperability.
-4. 1/100/500/1000 stream stress and mixed workloads.
-5. Repeated c1/c8/c32 benchmark evidence beyond the current local RushWay-vs-RushWay samples.
-6. Windows x64, Debian 12 x64, ARMv7/OpenWrt smoke; current CI covers the first three, OpenWrt still pending.
-7. Final v0.0.3 release/tag verification.
+2. WSS executable server/client E2E result after the current WSS implementation passes CI.
+3. SOCKS5/HTTP lifecycle and error matrix.
+4. WS/WSS/QUIC TCP+UDP interoperability.
+5. 1/100/500/1000 stream stress and mixed workloads.
+6. Repeated c1/c8/c32 benchmark evidence beyond current local RushWay-vs-RushWay samples.
+7. Windows x64, Debian 12 x64, ARMv7/OpenWrt smoke; current CI covers the first three, OpenWrt still pending.
+8. Final v0.0.3 release/tag verification.
 
 ### Next action
-Preserve the proven standalone server/client path, then execute the remaining compatibility gates in order. Enable the real GoWay v1.8.4 comparison using the optional repository-read credential. Never treat the skipped GoWay comparison as proof.
+Complete the current WSS CI cycle. Once WSS E2E is green, move directly to SOCKS5/HTTP lifecycle plus 1/100/500/1000 stream stress, then enable the real GoWay v1.8.4 comparison using the optional repository-read credential. Never treat the skipped GoWay comparison as proof.
 
 ## Three-file relay contract
 1. `AI_HANDOFF.md` — decisions, commits, blockers, next step.
