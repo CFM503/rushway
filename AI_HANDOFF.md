@@ -320,3 +320,43 @@ Status
 - Not complete.
 - The WS 1000-stream failure remains unresolved.
 - Next action: inspect the new CI logs for the first internal MUX/session error associated with the failing flow, then make the smallest production fix supported by that evidence.
+
+## 2026-09-15 — Astra fix: complete MUX FIN lifecycle cleanup
+
+### Bug
+- WS staged stress reached the 1000-stream phase but failed around flow 408 with `connect: early eof`.
+- The failure accumulated across the sequential 1/100/500/1000 stress cases.
+
+### Root cause
+- Server-side logical MUX streams remain registered after `target_to_mux()` sends FIN.
+- The server stream task exits and removes its stream state only after receiving client-side `StreamCommand::Fin`.
+- The client received remote FIN, stopped its local forwarding loop, aborted the upload task, and removed only its local stream state without sending FIN back to the server.
+- This left server-side logical stream entries leaked across successive stress cases.
+
+### Astra review
+- Concurrency: no new shared-state lock is introduced.
+- Protocol: this completes the existing bidirectional FIN lifecycle without changing frame format.
+- Resource ownership: client now acknowledges remote FIN at the MUX layer before local stream cleanup.
+- Security: target-policy enforcement is unchanged.
+- Performance: one zero-payload FIN frame per remote-half-close.
+- Regression risk: duplicate FIN can be safely ignored after server stream cleanup.
+
+### Change
+- `src/mux_pool.rs::handle_tcp_proxy`
+- Track `remote_fin`.
+- When remote FIN is received, send a matching encrypted MUX FIN back to the server before local stream cleanup.
+
+### Validation
+- `git diff --check` passed.
+- Local Rust compilation is unavailable because Cargo/Rust is not installed on the development machine.
+- GitHub Actions validation is required for cargo check/test and WS/WSS/QUIC stress.
+
+### Status
+- Awaiting CI validation.
+
+### Remaining risk
+- The WS 1000-stream stress must pass before this is considered fixed.
+- WSS and QUIC stress remain to be validated.
+
+### Next action
+- Push the fix and inspect the GitHub Actions stress results, especially WS 1000.

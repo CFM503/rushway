@@ -619,6 +619,7 @@ async fn handle_tcp_proxy(
         Result::<()>::Ok(())
     });
     let mut result = Result::<()>::Ok(());
+    let mut remote_fin = false;
     while let Some(frame) = rx.recv().await {
         match frame.command {
             MuxCommand::Data => {
@@ -629,6 +630,7 @@ async fn handle_tcp_proxy(
             }
             MuxCommand::Fin => {
                 let _ = local_wr.shutdown().await;
+                remote_fin = true;
                 break;
             }
             MuxCommand::Rst => {
@@ -639,6 +641,17 @@ async fn handle_tcp_proxy(
         }
     }
     upload.abort();
+    if remote_fin {
+        let _ = send_mux_parts(
+            &session.writer,
+            &session.cipher,
+            id,
+            MuxCommand::Fin,
+            &[],
+        )
+        .await;
+    }
+
     session.close_stream(id).await;
     result
 }
