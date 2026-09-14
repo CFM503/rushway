@@ -64,9 +64,7 @@ pub fn standalone_server_acceptor() -> Result<TlsAcceptor> {
     let cert = generate_simple_self_signed(vec!["localhost".into()])
         .context("generate WSS server certificate")?;
     let cert_der: CertificateDer<'static> = cert.cert.der().clone();
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        cert.key_pair.serialize_der(),
-    ));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
