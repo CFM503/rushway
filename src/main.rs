@@ -15,6 +15,9 @@ use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use runtime::RuntimeConfig;
 use std::path::PathBuf;
+use tokio::io::{copy_bidirectional, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, Duration};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -44,6 +47,8 @@ struct Args {
     allow_open: bool,
     #[arg(long = "verify-ssl", default_value_t = false)]
     verify_ssl: bool,
+    #[arg(long = "wss-server", default_value_t = false)]
+    wss_server: bool,
     #[arg(short = 'W')]
     buffer_kib: Option<usize>,
     #[arg(long = "socket-buffer")]
@@ -285,6 +290,67 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
     Ok(cfg)
 }
 
+async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
+    let public_bind = format!("{}:{}", cfg.proxy_host, cfg.proxy_port);
+    let listener = TcpListener::bind(&public_bind).await?;
+    let internal_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let internal_port = internal_listener.local_addr()?.port();
+    drop(internal_listener);
+
+    let mut internal_cfg = cfg.clone();
+    internal_cfg.proxy_host = "127.0.0.1".into();
+    internal_cfg.proxy_port = internal_port;
+    tokio::spawn(async move {
+        if let Err(error) = runtime::run_server(internal_cfg).await {
+            tracing::error!(%error, "private WS runtime stopped");
+        }
+    });
+
+    let acceptor = tls::standalone_server_acceptor()?;
+    tracing::info!("RushWay WSS server listening on {public_bind}");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut tls_stream = acceptor.accept(stream).await?;
+                let request = ws::read_http_headers(&mut tls_stream).await?;
+                let key = ws::validate_server_handshake(&request)?;
+                tls_stream
+                    .write_all(&ws::build_server_handshake_response(&key))
+                    .await?;
+
+                let mut internal = None;
+                for _ in 0..100 {
+                    match TcpStream::connect(("127.0.0.1", internal_port)).await {
+                        Ok(stream) => {
+                            internal = Some(stream);
+                            break;
+                        }
+                        Err(_) => sleep(Duration::from_millis(20)).await,
+                    }
+                }
+                let mut internal = internal.ok_or_else(|| anyhow!("private WS runtime did not start"))?;
+                let (request, key) = ws::build_client_handshake_request(
+                    &format!("127.0.0.1:{internal_port}"),
+                    "/",
+                    None,
+                    Some("same-origin"),
+                );
+                internal.write_all(&request).await?;
+                let response = ws::read_http_headers(&mut internal).await?;
+                ws::validate_client_handshake_response(&response, &key)?;
+                copy_bidirectional(&mut tls_stream, &mut internal).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::debug!(%peer, %error, "WSS connection closed");
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let raw_args = normalize_legacy_args(std::env::args());
@@ -379,6 +445,9 @@ async fn main() -> Result<()> {
     }
     if cfg.key.is_none() && !cfg.allow_open {
         bail!("server mode without -k requires --allow-open");
+    }
+    if args.wss_server {
+        return run_wss_server(cfg).await;
     }
     if cfg.mux {
         let (tcp_result, _quic_result) =
