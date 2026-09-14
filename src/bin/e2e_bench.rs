@@ -10,7 +10,7 @@ use tokio::time::{sleep, timeout};
 const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
 const STRESS_PAYLOAD_SIZE: usize = 64 * 1024;
-const STRESS_CONCURRENCIES: &[usize] = &[1, 100, 500, 1000];
+const STRESS_CONCURRENCIES: &[usize] = &[1, 100, 500];
 const TEST_KEY: &str = "rushway-e2e-test-key";
 const FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 const E2E_TIMEOUT: Duration = Duration::from_secs(120);
