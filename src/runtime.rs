@@ -250,16 +250,20 @@ async fn handle_mux_parts(
     transform_payload(&cipher, &mut hello);
     if hello != b"MUX\n" {
         bail!("invalid MUX handshake")
-    };
+    }
+
     let mut ok = b"OK\n".to_vec();
     transform_payload(&cipher, &mut ok);
     {
         let mut w = writer.lock().await;
         write_frame(&mut *w, &ok, 2, false).await?
     };
-    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let mut stream_tasks = Vec::new();
     let mut frame_buf = Vec::with_capacity(64 * 1024);
+
     loop {
         let Some((opcode, mut payload)) = read_frame_owned(
             &mut rd,
@@ -270,161 +274,211 @@ async fn handle_mux_parts(
         else {
             break;
         };
+
         if opcode != 2 {
             continue;
         }
+
         transform_payload(&cipher, &mut payload);
+
         let frame = match MuxFrame::decode_owned(payload) {
             Ok(f) => f,
             Err(_) => continue,
         };
+
         match frame.command {
             MuxCommand::Syn => {
+                let stream_id = frame.stream_id;
+
                 let syn = match SynPayload::decode(frame.payload()) {
                     Ok(v) => v,
                     Err(_) => {
-                        let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                         continue;
                     }
                 };
+
                 let target_text = match String::from_utf8(syn.target) {
                     Ok(v) => v,
                     Err(_) => {
-                        let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                         continue;
                     }
                 };
+
                 let (host, port_text) = match target_text.rsplit_once(':') {
                     Some(v) => v,
                     None => {
-                        let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                         continue;
                     }
                 };
+
                 let port = match port_text.parse::<u16>() {
                     Ok(v) if v != 0 => v,
                     _ => {
-                        let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                         continue;
                     }
                 };
+
                 let target = TargetAddr {
                     host: host.to_string(),
                     port,
                 };
-                if let Err(_) = enforce_target_policy(&cfg, &target) {
-                    let _ = send_reset_encrypted(&writer, &cipher, frame.stream_id).await;
+
+                if enforce_target_policy(&cfg, &target).is_err() {
+                    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                     continue;
                 }
-                match dial_target(&target, cfg.connection_timeout, &cfg).await {
-                    Ok(target_stream) => {
-                        let (tx, rx) = mpsc::channel(64);
-let stream_id = frame.stream_id;
-let (tx, mut rx) = mpsc::channel(64);
 
-let inserted = {
-    let mut table = streams.lock().await;
-    if table.contains_key(&stream_id) {
-        false
-    } else {
-        table.insert(stream_id, StreamEntry { tx: tx.clone() });
-        true
-    }
-};
+                let stream_limit_reached = {
+                    let guard = streams.lock().await;
+                    guard.len() >= MAX_STREAMS_PER_SESSION
+                };
 
-if !inserted {
-    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
-    continue;
-}
-
-if !syn.initial_data.is_empty() {
-    let initial =
-        MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
-            .map_err(|e| anyhow!(e.to_string()))?;
-    let mut d = Vec::with_capacity(7 + initial.payload.len());
-    initial
-        .encode(&mut d)
-        .map_err(|e| anyhow!(e.to_string()))?;
-    let owned =
-        MuxFrame::decode_owned(d).map_err(|e| anyhow!(e.to_string()))?;
-    let _ = tx.send(StreamCommand::Data(owned)).await;
-}
-
-let task_streams = streams.clone();
-let task_writer = writer.clone();
-let task_cipher = cipher.clone();
-let task_cfg = cfg.clone();
-
-let task = tokio::spawn(async move {
-    let target_stream = match dial_target(&target, task_cfg.connection_timeout, &task_cfg).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            let _ = send_reset_encrypted(
-                &task_writer,
-                &task_cipher,
-                stream_id,
-            )
-            .await;
-            task_streams.lock().await.remove(&stream_id);
-            return;
-        }
-    };
-
-    if send_mux_parts_encrypted(
-        &task_writer,
-        &task_cipher,
-        stream_id,
-        MuxCommand::Data,
-        &[],
-    )
-    .await
-    .is_err()
-    {
-        task_streams.lock().await.remove(&stream_id);
-        return;
-    }
-
-    let (rd, mut wr) = tokio::io::split(target_stream);
-
-    let reader = tokio::spawn(target_to_mux(
-        stream_id,
-        rd,
-        task_writer.clone(),
-        task_cfg.buffer_size,
-        task_cipher.clone(),
-    ));
-
-    while let Some(command) = rx.recv().await {
-        match command {
-            StreamCommand::Data(frame) => {
-                if wr.write_all(frame.payload()).await.is_err() {
-                    break;
+                if stream_limit_reached {
+                    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+                    continue;
                 }
-            }
-            StreamCommand::Fin => {
-                let _ = wr.shutdown().await;
-                break;
-            }
-            StreamCommand::Reset => {
-                break;
-            }
-        }
-    }
 
-    reader.abort();
-    task_streams.lock().await.remove(&stream_id);
-});
+                let (tx, mut rx) = mpsc::channel(64);
 
-stream_tasks.push(task);
+                streams
+                    .lock()
+                    .await
+                    .insert(stream_id, StreamEntry { tx: tx.clone() });
+
+                if !syn.initial_data.is_empty() {
+                    let initial =
+                        MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
+                            .map_err(|e| anyhow!(e.to_string()))?;
+
+                    tx.send(StreamCommand::Data(initial))
+                        .await
+                        .map_err(|_| anyhow!("stream task exited before initial data"))?;
+                }
+
+                let streams_task = streams.clone();
+                let writer_task = writer.clone();
+                let cipher_task = cipher.clone();
+                let cfg_task = cfg.clone();
+
+                let task = tokio::spawn(async move {
+                    let mut pending = Vec::new();
+
+                    let target_stream = loop {
+                        tokio::select! {
+                            dial = dial_target(
+                                &target,
+                                cfg_task.connection_timeout,
+                                &cfg_task,
+                            ) => {
+                                match dial {
+                                    Ok(stream) => break stream,
+                                    Err(_) => {
+                                        let _ = send_reset_encrypted(
+                                            &writer_task,
+                                            &cipher_task,
+                                            stream_id,
+                                        )
+                                        .await;
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                }
+                            }
+
+                            command = rx.recv() => {
+                                match command {
+                                    Some(StreamCommand::Data(frame)) => {
+                                        pending.push(frame);
+                                    }
+                                    Some(StreamCommand::Fin)
+                                    | Some(StreamCommand::Reset)
+                                    | None => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    while let Ok(command) = rx.try_recv() {
+                        match command {
+                            StreamCommand::Data(frame) => pending.push(frame),
+                            StreamCommand::Fin | StreamCommand::Reset => {
+                                streams_task.lock().await.remove(&stream_id);
+                                return;
+                            }
+                        }
+                    }
+
+                    if send_mux_parts_encrypted(
+                        &writer_task,
+                        &cipher_task,
+                        stream_id,
+                        MuxCommand::Data,
+                        &[],
+                    )
+                    .await
+                    .is_err()
+                    {
+                        streams_task.lock().await.remove(&stream_id);
+                        return;
+                    }
+
+                    let (rd_target, mut wr_target) = tokio::io::split(target_stream);
+
+                    let reader = tokio::spawn(target_to_mux(
+                        stream_id,
+                        rd_target,
+                        writer_task.clone(),
+                        cfg_task.buffer_size,
+                        cipher_task.clone(),
+                    ));
+
+                    for frame in pending {
+                        if wr_target.write_all(frame.payload()).await.is_err() {
+                            reader.abort();
+                            streams_task.lock().await.remove(&stream_id);
+                            return;
+                        }
+                    }
+
+                    while let Some(command) = rx.recv().await {
+                        match command {
+                            StreamCommand::Data(frame) => {
+                                if wr_target.write_all(frame.payload()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            StreamCommand::Fin => {
+                                let _ = wr_target.shutdown().await;
+                                break;
+                            }
+                            StreamCommand::Reset => break,
+                        }
+                    }
+
+                    reader.abort();
+                    streams_task.lock().await.remove(&stream_id);
+                });
+
+                stream_tasks.push(task);
             }
+
             MuxCommand::Data => {
                 let id = frame.stream_id;
+
                 if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {
                     if tx.send(StreamCommand::Data(frame)).await.is_err() {
                         streams.lock().await.remove(&id);
                     }
                 }
             }
+
             MuxCommand::Fin => {
                 if let Some(tx) = streams
                     .lock()
@@ -435,19 +489,26 @@ stream_tasks.push(task);
                     let _ = tx.send(StreamCommand::Fin).await;
                 }
             }
+
             MuxCommand::Rst => {
-                let tx = streams.lock().await.remove(&frame.stream_id).map(|s| s.tx);
+                let tx = streams
+                    .lock()
+                    .await
+                    .remove(&frame.stream_id)
+                    .map(|s| s.tx);
+
                 if let Some(tx) = tx {
                     let _ = tx.send(StreamCommand::Reset).await;
                 }
             }
         }
     }
-    streams.lock().await.clear();
 
     for task in stream_tasks {
         task.abort();
     }
+
+    streams.lock().await.clear();
 
     Ok(())
 }
