@@ -9,9 +9,12 @@ use tokio::time::{sleep, timeout};
 
 const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
+const STRESS_PAYLOAD_SIZE: usize = 64 * 1024;
+const STRESS_CONCURRENCIES: &[usize] = &[1, 100, 500, 1000];
 const TEST_KEY: &str = "rushway-e2e-test-key";
 const FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 const E2E_TIMEOUT: Duration = Duration::from_secs(120);
+const STRESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 async fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -50,6 +53,13 @@ fn transport_mode() -> &'static str {
         Some("wss") => "wss",
         _ => "ws",
     }
+}
+
+fn stress_mode() -> bool {
+    matches!(
+        std::env::var("RUSHWAY_E2E_STRESS").ok().as_deref(),
+        Some("1" | "true" | "yes")
+    )
 }
 
 fn upstream_url(server_port: u16) -> String {
@@ -194,7 +204,6 @@ async fn run_case(
         )));
     }
 
-    // Count the full concurrent proxy flow, including SOCKS5 setup and upstream handshakes.
     let mut total = 0usize;
     for task in tasks {
         total += task.await.map_err(|e| io::Error::other(e.to_string()))??;
@@ -202,6 +211,35 @@ async fn run_case(
     let secs = start.elapsed().as_secs_f64();
     let mib = total as f64 / (1024.0 * 1024.0);
     Ok(mib / secs)
+}
+
+async fn run_stress_case(
+    proxy_port: u16,
+    target_port: u16,
+    concurrency: usize,
+    payload: Arc<[u8]>,
+) -> io::Result<Duration> {
+    let start = Instant::now();
+    let mut tasks = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        tasks.push(tokio::spawn(one_flow(
+            proxy_port,
+            target_port,
+            Arc::clone(&payload),
+        )));
+    }
+
+    let mut completed = 0usize;
+    for task in tasks {
+        task.await.map_err(|e| io::Error::other(e.to_string()))??;
+        completed += 1;
+    }
+    if completed != concurrency {
+        return Err(io::Error::other(format!(
+            "stress completion mismatch: completed={completed} expected={concurrency}"
+        )));
+    }
+    Ok(start.elapsed())
 }
 
 fn child_stderr(child: &mut Child) -> String {
@@ -229,6 +267,7 @@ async fn main() -> io::Result<()> {
     let client_port = free_port().await?;
     let (target_port, echo_task) = start_echo().await?;
     let mode = transport_mode();
+    let stress = stress_mode();
 
     let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY, true, mode == "wss")?;
     let mut client = spawn_rushway(
@@ -240,32 +279,61 @@ async fn main() -> io::Result<()> {
         false,
     )?;
 
-    let result = match timeout(E2E_TIMEOUT, async {
+    let timeout_limit = if stress { STRESS_TIMEOUT } else { E2E_TIMEOUT };
+    let result = match timeout(timeout_limit, async {
         wait_for_port(server_port, &mut server, "server").await?;
         wait_for_port(client_port, &mut client, "client").await?;
-        let mut payload = vec![0u8; PAYLOAD_SIZE];
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b = ((i * 31 + 17) & 0xff) as u8;
-        }
-        let payload: Arc<[u8]> = payload.into();
 
-        let mut results = Vec::with_capacity(CONCURRENCIES.len());
-        for &concurrency in CONCURRENCIES {
-            results.push((
-                concurrency,
-                run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?,
-            ));
+        if stress {
+            let mut payload = vec![0u8; STRESS_PAYLOAD_SIZE];
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b = ((i * 31 + 17) & 0xff) as u8;
+            }
+            let payload: Arc<[u8]> = payload.into();
+
+            for &concurrency in STRESS_CONCURRENCIES {
+                let elapsed = run_stress_case(
+                    client_port,
+                    target_port,
+                    concurrency,
+                    Arc::clone(&payload),
+                )
+                .await?;
+                println!(
+                    "rushway_stream_stress transport={} payload_kib={} streams={} completed={} elapsed_ms={}",
+                    mode,
+                    payload.len() / 1024,
+                    concurrency,
+                    concurrency,
+                    elapsed.as_millis()
+                );
+            }
+        } else {
+            let mut payload = vec![0u8; PAYLOAD_SIZE];
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b = ((i * 31 + 17) & 0xff) as u8;
+            }
+            let payload: Arc<[u8]> = payload.into();
+
+            let mut results = Vec::with_capacity(CONCURRENCIES.len());
+            for &concurrency in CONCURRENCIES {
+                results.push((
+                    concurrency,
+                    run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?,
+                ));
+            }
+
+            print!(
+                "rushway_e2e transport={} payload_mib={} roundtrip_echo=1",
+                mode,
+                payload.len() / (1024 * 1024)
+            );
+            for (concurrency, throughput) in results {
+                print!(" c{}_mib_s={:.2}", concurrency, throughput);
+            }
+            println!();
         }
 
-        print!(
-            "rushway_e2e transport={} payload_mib={} roundtrip_echo=1",
-            mode,
-            payload.len() / (1024 * 1024)
-        );
-        for (concurrency, throughput) in results {
-            print!(" c{}_mib_s={:.2}", concurrency, throughput);
-        }
-        println!();
         Ok::<(), io::Error>(())
     })
     .await
@@ -273,7 +341,11 @@ async fn main() -> io::Result<()> {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "e2e benchmark exceeded 120s overall timeout",
+            if stress {
+                "stream stress benchmark exceeded 180s overall timeout"
+            } else {
+                "e2e benchmark exceeded 120s overall timeout"
+            },
         )),
     };
 
