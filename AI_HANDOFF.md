@@ -646,3 +646,44 @@ Wait for the new CI run. If WS 1000 passes, immediately inspect WSS and QUIC 100
 
 ### Next action
 Merge `ai/500-stream-ci-gate`, let normal CI validate the branch, then resume production diagnosis of the 1000-stream SYN/ACK path without letting it block the 500-stream baseline gate.
+
+## 2026-09-15 — Astra diagnostic validation: WSS and QUIC 1000-stream behavior
+
+### Decision / evidence
+- PR #11 (`test: add WSS and QUIC 1000-stream diagnostics`) was merged into `main` as merge commit `89615e5039207d2e51628e968e383677f6a11a8b`.
+- PR #11 CI Run #383: `34907505435`, job `104187472681`, passed the complete `test` job and all Windows x64, Debian 12 x64 and ARMv7 build jobs.
+- The diagnostic steps are `continue-on-error` and therefore remain evidence-gathering, not release gates.
+
+### Astra review
+- Concurrency: WSS and QUIC use the same 1000-stream staged workload and 64 physical MUX sessions that allowed the WS diagnostic to pass; no production concurrency logic was changed by PR #11.
+- Resource validity: `ulimit -n 8192` is explicitly printed and active for both 1000-stream diagnostics, removing the previously identified benchmark FD ceiling.
+- Protocol: no MUX wire-format or SOCKS semantics were changed.
+- Transport isolation: WSS and QUIC are tested in separate diagnostic steps, so a WSS failure does not prevent the QUIC diagnostic from running.
+- Regression risk: the 1000 diagnostics do not replace the blocking 1/100/500 stress gates.
+
+### Validation
+- Run #383 WS 1000 diagnostic: **failed** at `flow 400 connect: SOCKS5 stage connect_reply_read timed out after 10s`.
+- Run #383 WSS 1000 diagnostic: **failed** at `flow 406 connect: early eof`.
+- Run #383 QUIC 1000 diagnostic: **passed**, with `rushway_stream_stress_diagnostic transport=quic pattern=staged payload_kib=64 streams=1000 completed=1000 elapsed_ms=571`.
+- Run #383 blocking WS/WSS/QUIC 1/100/500 all passed.
+- Run #383 Rust format/check/test/release all passed; 39 unit tests passed.
+- Run #383 repeated RushWay benchmark medians also passed.
+
+### Important interpretation
+- The merged PR #11 did **not** prove WSS 1000 stability. WSS still fails around the same high-concurrency region even with 64 MUX sessions and `RLIMIT_NOFILE=8192`.
+- QUIC 1000 now has one successful executable diagnostic at 64 MUX sessions.
+- WS 1000 evidence must be treated carefully: Run #381 had passed at 64 MUX sessions, but Run #383 on the PR merge base failed at flow 400. Therefore WS 1000 is **not** yet a repeatable acceptance result; the transport behavior is not sufficiently deterministic to promote the gate.
+- The WSS failure is now the clearest active 1000-stream blocker. Do not invent a root cause from the flow number alone.
+
+### Current status
+**1000-stream diagnostics: mixed / not release-ready.** QUIC has one passing diagnostic; WSS fails; WS has both pass and fail evidence. The 500-stream blocking baseline remains green.
+
+### Remaining risk
+- WSS high-concurrency failure is unresolved.
+- WS/QUIC 1000 need repeated successful rounds, not one-shot evidence.
+- Lifecycle/error, TCP+UDP interoperability, OpenWrt/real-device smoke and actual GoWay v1.8.4 interoperability remain unverified.
+- GoWay CI comparison is still skipped because `WAY_READ_TOKEN` is absent.
+- Existing compiler warnings include unreachable expressions and unused items; these should not be conflated with the 1000-stream failure.
+
+### Next action
+Wait for merge-triggered Run #384 to finish, then prioritize evidence-driven WSS/WS 1000 investigation and repeatability before moving to the lifecycle/error and TCP+UDP matrices.
