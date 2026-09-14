@@ -370,6 +370,20 @@ let task = tokio::spawn(async move {
         }
     };
 
+    if send_mux_parts_encrypted(
+        &task_writer,
+        &task_cipher,
+        stream_id,
+        MuxCommand::Data,
+        &[],
+    )
+    .await
+    .is_err()
+    {
+        task_streams.lock().await.remove(&stream_id);
+        return;
+    }
+
     let (rd, mut wr) = tokio::io::split(target_stream);
 
     let reader = tokio::spawn(target_to_mux(
@@ -430,6 +444,11 @@ stream_tasks.push(task);
         }
     }
     streams.lock().await.clear();
+
+    for task in stream_tasks {
+        task.abort();
+    }
+
     Ok(())
 }
 async fn resolve_udp_target(target: &TargetAddr) -> Result<SocketAddr> {
