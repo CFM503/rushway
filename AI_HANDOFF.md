@@ -244,3 +244,49 @@ Never call the project 100% complete merely because source paths exist.
 ### Status
 - Awaiting the next CI compile validation.
 - No functional/stress completion claim is made.
+
+## 2026-09-14 — Astra fix: atomic MUX stream-slot admission
+
+### Bug
+- WS staged 1000-stream stress in CI Run #344 (`34857876740`) failed around flow 410 with `connect: early eof`.
+- The failure occurs in the high-concurrency MUX client path and remained after the physical MUX reader-loop SYN dialing was made asynchronous.
+
+### Root cause
+- `src/mux_pool.rs::SessionState::open_stream()` previously performed a non-atomic capacity check through `available()` and then incremented `active` separately with `fetch_add()`.
+- Concurrent acquisitions could all observe capacity before any increment became visible, oversubscribing the per-session 256-stream limit.
+- This is an evidence-backed concurrency defect consistent with the high-concurrency failure pattern; executable confirmation is still pending on the corrected revision.
+
+### Astra review
+- Concurrency: stream admission is now serialized with the stream-table mutex and uses `compare_exchange_weak` for atomic slot reservation.
+- Lifecycle: the slot is reserved before stream registration and rolled back when SYN transmission fails.
+- Session shutdown: the existing closed-state cleanup and stream removal paths are preserved.
+- Protocol: no MUX wire-format or command semantics were changed.
+- Security/target policy: target-policy enforcement remains unchanged.
+- Regression scope: the change is limited to client-side MUX stream admission.
+
+### Change
+- `src/mux_pool.rs`
+- Replace the non-atomic `available()` + `active.fetch_add()` admission sequence with an atomic capacity reservation.
+- Recheck `closed` after acquiring the stream-table lock.
+- Register the logical stream only after successful slot reservation.
+
+### Commit
+- Pending local commit on `main`.
+
+### Validation
+- Local `git diff --check`: passed.
+- Local diff inspection: only `src/mux_pool.rs::SessionState::open_stream()` changed.
+- CI validation is pending for the corrected revision.
+- Previous CI Run #344 (`34857876740`) established the pre-fix failure: WS staged 1000 streams failed at approximately flow 410 with `early eof`.
+
+### Status
+- **Awaiting CI evidence.**
+- The race fix is implemented locally but 1000-stream stability is not yet proven.
+
+### Remaining risk
+- WS 1000 may expose an additional independent bottleneck after the admission race is removed.
+- WSS and QUIC stress remain unverified at 1000 streams.
+- The full release gates remain open.
+
+### Next action
+- Commit this code fix together with this handoff entry, push `main`, then inspect the new CI run with priority on WS 1000 stress and exact failure diagnostics.

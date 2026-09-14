@@ -198,19 +198,47 @@ impl SessionState {
         self: &Arc<Self>,
         target: &TargetAddr,
     ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>)> {
-        if !self.available() {
-            bail!("MUX session is full or closed")
-        };
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
-        let (tx, rx) = mpsc::channel(32);
-        self.streams.lock().await.insert(id, tx);
-        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.closed.load(Ordering::Acquire) {
+            bail!("MUX session is closed")
+        }
+
         let syn_payload = SynPayload {
             target: format!("{}:{}", target.host, target.port).into_bytes(),
             initial_data: Vec::new(),
         }
         .encode()
         .map_err(|e| anyhow!(e.to_string()))?;
+
+        let mut streams = self.streams.lock().await;
+
+        if self.closed.load(Ordering::Acquire) {
+            bail!("MUX session is closed")
+        }
+
+        loop {
+            let active = self.active.load(Ordering::Acquire);
+            if active >= MAX_STREAMS_PER_SESSION {
+                bail!("MUX session is full")
+            }
+            if self
+                .active
+                .compare_exchange_weak(
+                    active,
+                    active + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let (tx, rx) = mpsc::channel(32);
+        streams.insert(id, tx);
+        drop(streams);
+
         if let Err(e) = send_mux_parts(
             &self.writer,
             &self.cipher,
