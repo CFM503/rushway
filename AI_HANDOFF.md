@@ -555,3 +555,49 @@ Do not mark v0.0.3 final. Do not claim GoWay interoperability. Do not claim 1000
 
 ### Immediate next action
 Finish the current native concurrency batch, wait for CI evidence, then move directly into explicit stream lifecycle ownership and cancellation. Continue through the phases without reverting to GoWay-driven architecture.
+
+## 2026-09-15 — Astra correction: CI stress harness file-descriptor ceiling
+
+### Bug
+- CI Run #358 (`34891912821`), job `104136740182`, passed format, check, 39 unit tests, release build, MUX benchmark, and standalone WS/WSS/QUIC E2E.
+- The staged WS 1000-stream test failed at `flow 409 connect: early eof`.
+- The same harness keeps one proxy TCP socket per active flow and the in-process echo server also keeps one accepted TCP socket per active flow, so the benchmark process can require roughly two descriptors per simultaneous flow before accounting for listeners, stdio, child pipes, and other descriptors.
+
+### Root cause assessment
+- The failure is now strongly explained by the **benchmark process resource ceiling**, not yet by a new RushWay MUX protocol defect.
+- Run #358 executed on GitHub-hosted Ubuntu 22.04. The stress harness is a single process (`src/bin/e2e_bench.rs`) that owns both the 1000 proxy-side sockets and the 1000 echo-side sockets.
+- Linux enforces a per-process `RLIMIT_NOFILE`; attempts to exceed it fail with `EMFILE`. The benchmark collapsed such an environmental/socket-allocation failure into the generic `flow N connect: early eof`, making the threshold look like a RushWay stream-lifecycle failure.
+- The repeated failure near flow 409 is consistent with descriptor exhaustion after subtracting the process's pre-existing descriptors and transient sockets. This is a strong root-cause hypothesis, but the next CI run is the executable confirmation: raising the limit must move or eliminate the failure.
+
+### Astra review
+- Concurrency: no production MUX code is changed in this fix.
+- Lifecycle/protocol: no wire protocol or stream ownership semantics are changed.
+- Resource model: the stress harness must provision enough OS descriptors for the concurrency it explicitly requests.
+- Test validity: a 1000-stream test that cannot create its own 1000 client + 1000 echo sockets is not a valid 1000-stream product test.
+- Regression risk: increasing the CI process descriptor ceiling does not increase RushWay's production connection limits; it only removes an artificial test-runner ceiling.
+- Security: no target-policy or transport security behavior is changed.
+
+### Change
+- `.github/workflows/ci.yml`
+- For WS/WSS/QUIC 1/100/500/1000 stress steps, set `ulimit -n 8192` before launching `e2e_bench` and print the resulting limit as `stress_nofile=...`.
+- Keep the existing 8 physical MUX sessions and staged stress pattern unchanged.
+
+### Commit
+- CI harness fix commit: `4086deb4aee77be58cccb8060b2669c1d2929b52` on `main`.
+- `AI_HANDOFF.md` is being updated immediately in the same engineering cycle as required by the relay contract.
+
+### Validation
+- Pre-fix evidence: Run #358 (`34891912821`) failed at `flow 409 connect: early eof` after launching all 10 staged batches through `900..1000`.
+- The pre-fix run did not print the process file-descriptor limit, so `EMFILE` is not retroactively proven from the log.
+- Post-fix validation is pending on the new Actions run. The decisive evidence is whether WS 1000 passes and whether the log reports `stress_nofile=8192`; if it still fails, return to production MUX lifecycle investigation with the environmental ceiling removed.
+
+### Status
+**Awaiting executable confirmation.** This is a test-harness/resource-limit fix, not a declaration that the RushWay 1000-stream production path is fixed.
+
+### Remaining risk
+- If WS 1000 still fails with `ulimit -n 8192`, the next investigation must instrument the SOCKS/MUX establishment phases and inspect the first internal stream/session failure.
+- WSS/QUIC 1000 remain unverified until their stress steps execute.
+- The native lifecycle/backpressure refactor remains in progress.
+
+### Next action
+Wait for the new CI run. If WS 1000 passes, immediately inspect WSS and QUIC 1000; then proceed to sustained 10×1000 and explicit stream lifecycle/cancellation tests.
