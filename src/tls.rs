@@ -1,16 +1,12 @@
-//! TLS client transport primitives for GoWay-compatible WSS.
-//!
-//! GoWay v1.8.4 uses TLS 1.2-1.3 for WSS and defaults to insecure certificate
-//! verification unless `-verify-ssl` is enabled. This module deliberately keeps
-//! certificate policy separate from the WebSocket framing layer so the existing
-//! plain `ws://` path is unchanged while WSS integration is completed.
+//! TLS primitives for GoWay-compatible WSS.
 
 use anyhow::{anyhow, Context, Result};
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
+use rcgen::generate_simple_self_signed;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_rustls::{client::TlsStream, server::TlsAcceptor, TlsConnector};
 
 pub type RushTlsStream = TlsStream<TcpStream>;
 
@@ -48,9 +44,6 @@ fn insecure_config() -> Arc<ClientConfig> {
 }
 
 /// Connect to an upstream TLS endpoint.
-///
-/// `verify_ssl=false` matches GoWay's v1.8.4 default (`InsecureSkipVerify`).
-/// `verify_ssl=true` uses the platform-independent WebPKI root set.
 pub async fn connect(stream: TcpStream, host: &str, verify_ssl: bool) -> Result<RushTlsStream> {
     let config = if verify_ssl {
         verified_config()
@@ -64,6 +57,22 @@ pub async fn connect(stream: TcpStream, host: &str, verify_ssl: bool) -> Result<
         .connect(server_name, stream)
         .await
         .context("TLS handshake failed")
+}
+
+/// Build a self-signed HTTP/1.1 TLS acceptor for standalone WSS server mode.
+pub fn standalone_server_acceptor() -> Result<TlsAcceptor> {
+    let cert = generate_simple_self_signed(vec!["localhost".into()])
+        .context("generate WSS server certificate")?;
+    let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        cert.key_pair.serialize_der(),
+    ));
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key)
+        .context("build WSS server TLS config")?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 #[derive(Debug)]
@@ -123,5 +132,10 @@ mod tests {
     fn cached_configs_are_reused() {
         assert!(Arc::ptr_eq(&verified_config(), &verified_config()));
         assert!(Arc::ptr_eq(&insecure_config(), &insecure_config()));
+    }
+
+    #[test]
+    fn standalone_server_acceptor_is_constructible() {
+        assert!(standalone_server_acceptor().is_ok());
     }
 }
