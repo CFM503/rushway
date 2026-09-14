@@ -11,6 +11,7 @@ const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
 const TEST_KEY: &str = "rushway-e2e-test-key";
 const FLOW_TIMEOUT: Duration = Duration::from_secs(30);
+const E2E_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -217,7 +218,7 @@ async fn main() -> io::Result<()> {
         true,
     )?;
 
-    let result = async {
+    let result = match timeout(E2E_TIMEOUT, async {
         wait_for_port(server_port, &mut server, "server").await?;
         wait_for_port(client_port, &mut client, "client").await?;
         let mut payload = vec![0u8; PAYLOAD_SIZE];
@@ -242,10 +243,19 @@ async fn main() -> io::Result<()> {
         }
         println!();
         Ok::<(), io::Error>(())
-    }
-    .await;
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "e2e benchmark exceeded 120s overall timeout",
+        )),
+    };
 
-    if let Err(ref e) = result {
+    if result.is_err() {
+        kill_child(&mut client);
+        kill_child(&mut server);
         let server_log = child_stderr(&mut server);
         let client_log = child_stderr(&mut client);
         if !server_log.is_empty() {
@@ -254,11 +264,14 @@ async fn main() -> io::Result<()> {
         if !client_log.is_empty() {
             eprintln!("e2e client stderr:\n{client_log}");
         }
-        eprintln!("e2e benchmark failed: {e}");
+        if let Err(ref e) = result {
+            eprintln!("e2e benchmark failed: {e}");
+        }
+    } else {
+        kill_child(&mut client);
+        kill_child(&mut server);
     }
 
-    kill_child(&mut client);
-    kill_child(&mut server);
     echo_task.abort();
     result
 }
