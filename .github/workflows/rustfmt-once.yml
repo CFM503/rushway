@@ -17,9 +17,20 @@ jobs:
         with:
           toolchain: 1.82.0
           components: rustfmt
+      - name: Repair residual compressed syntax
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for path in Path('src').rglob('*.rs'):
+              text = path.read_text()
+              fixed = text.replace('.send_to(payload,peer).await}}upload.abort();', '.send_to(payload,peer).await?;}}upload.abort();')
+              if fixed != text:
+                  path.write_text(fixed)
+          PY
       - name: Format all Rust sources
         run: cargo fmt --all
-      - name: Commit formatted tree and remove this workflow
+      - name: Commit repaired and formatted tree
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
