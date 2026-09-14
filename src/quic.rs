@@ -32,10 +32,8 @@ fn transport_config() -> Arc<TransportConfig> {
     let mut cfg = TransportConfig::default();
     cfg.max_idle_timeout(Some(Duration::from_secs(60).try_into().expect("60s fits")));
     cfg.keep_alive_interval(Some(Duration::from_secs(15)));
-    cfg.initial_stream_receive_window(VarInt::from_u64(2 * 1024 * 1024));
-    cfg.max_stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));
-    cfg.initial_connection_receive_window(VarInt::from_u64(4 * 1024 * 1024));
-    cfg.max_connection_receive_window(VarInt::from_u64(16 * 1024 * 1024));
+    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));
+    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));
     cfg.max_concurrent_uni_streams(0u32.into());
     Arc::new(cfg)
 }
@@ -70,7 +68,7 @@ fn client_config(verify_ssl: bool) -> Result<ClientConfig> {
 fn server_config() -> Result<ServerConfig> {
     let cert = generate_simple_self_signed(vec!["localhost".into()])
         .context("generate QUIC certificate")?;
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
     let cert_der: CertificateDer<'static> = cert.cert.der().clone();
     let mut rustls = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -245,7 +243,7 @@ impl QuicClientPool {
             server_name,
             connection: Arc::new(Mutex::new(None)),
             timeout_secs,
-        })
+        });
     }
     async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         for _ in 0..2 {
@@ -513,7 +511,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                     }
                 }
             }
-        })
+        });
     }
 }
 
@@ -542,7 +540,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                                     {
                                         tracing::debug!(%error,"QUIC stream closed")
                                     }
-                                })
+                                });
                             }
                             Err(_) => break,
                         }
@@ -550,7 +548,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 }
                 Err(error) => tracing::debug!(%error,"QUIC connection handshake failed"),
             }
-        })
+        });
     }
     Ok(())
 }

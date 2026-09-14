@@ -47,8 +47,7 @@ fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
         let _ = sock.set_recv_buffer_size(bytes);
     }
     if cfg.tcp_keepalive {
-        let mut ka = socket2::TcpKeepalive::new();
-        ka.with_time(Duration::from_secs(30));
+        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
         let _ = sock.set_tcp_keepalive(&ka);
     }
 }
@@ -266,7 +265,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
             if let Err(error) = handle_client_connection(stream, cfg2).await {
                 tracing::debug!(%peer,%error,"non-MUX client connection closed")
             }
-        })
+        });
     }
 }
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
@@ -293,7 +292,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
             if let Err(error) = handle_server(stream, cfg2).await {
                 tracing::debug!(%peer,%error,"non-MUX transport closed")
             }
-        })
+        });
     }
 }
 async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {

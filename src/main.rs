@@ -38,7 +38,7 @@ struct Args {
     mux: bool,
     #[arg(long = "no-mux", default_value_t = false)]
     no_mux: bool,
-    #[arg(long = "mux-sessions", default_value_t = 4, value_parser = clap::value_parser!(usize).range(1..=64))]
+    #[arg(long = "mux-sessions", default_value_t = 4, value_parser = clap::value_parser!(usize))]
     mux_sessions: usize,
     #[arg(long = "allow-open", default_value_t = false)]
     allow_open: bool,
@@ -58,7 +58,7 @@ struct Args {
     block_local: bool,
     #[arg(long = "no-block-local", default_value_t = false)]
     no_block_local: bool,
-    #[arg(long = "max-conn", value_parser = clap::value_parser!(usize).range(1..=1_000_000))]
+    #[arg(long = "max-conn", value_parser = clap::value_parser!(usize))]
     max_conn: Option<usize>,
     #[arg(long = "connection-timeout")]
     connection_timeout: Option<u64>,
@@ -289,6 +289,14 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
 async fn main() -> Result<()> {
     let raw_args = normalize_legacy_args(std::env::args());
     let args = Args::parse_from(&raw_args);
+    if !(1..=64).contains(&args.mux_sessions) {
+        return Err(anyhow!("mux-sessions must be between 1 and 64"));
+    }
+    if let Some(v) = args.max_conn {
+        if !(1..=1_000_000).contains(&v) {
+            return Err(anyhow!("max-conn must be between 1 and 1000000"));
+        }
+    }
     let filter = tracing_filter(&args.log_level);
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(filter))

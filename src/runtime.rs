@@ -76,7 +76,17 @@ fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
 }
 pub(crate) fn is_blocked_local_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified();
+        return match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
+            }
+        };
     }
     false
 }
@@ -98,8 +108,7 @@ pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
         let _ = sock.set_recv_buffer_size(bytes);
     }
     if cfg.tcp_keepalive {
-        let mut ka = socket2::TcpKeepalive::new();
-        ka.with_time(Duration::from_secs(30));
+        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
         let _ = sock.set_tcp_keepalive(&ka);
     }
 }
@@ -109,7 +118,9 @@ async fn dial_target(
     cfg: &RuntimeConfig,
 ) -> Result<TcpStream> {
     let stream = timeout(Duration::from_secs(timeout_secs.max(1)), async {
-        let addr = resolve_socket(&target.host, target.port).await?;
+        let addr = resolve_socket(&target.host, target.port)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         TcpStream::connect(addr).await
     })
     .await
@@ -500,6 +511,6 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
             if let Err(e) = result {
                 tracing::debug!(%peer,error=%e,"transport connection closed")
             }
-        })
+        });
     }
 }

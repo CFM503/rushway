@@ -104,7 +104,6 @@ fn parse_upstream(input: &str) -> Result<(String, String)> {
     Ok((authority, path))
 }
 
-#[derive(Debug)]
 struct SessionState {
     writer: Arc<Mutex<WriteHalf<TcpStream>>>,
     cipher: XorCipher,
@@ -222,7 +221,7 @@ impl SessionState {
         .await
         {
             if self.streams.lock().await.remove(&id).is_some() {
-                self.active.fetch_sub(1, Ordering::AcqRel)
+                self.active.fetch_sub(1, Ordering::AcqRel);
             }
             self.closed.store(true, Ordering::Release);
             return Err(e);
@@ -231,7 +230,7 @@ impl SessionState {
     }
     async fn close_stream(&self, id: u32) {
         if self.streams.lock().await.remove(&id).is_some() {
-            self.active.fetch_sub(1, Ordering::AcqRel)
+            self.active.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -261,7 +260,7 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
         if let Some(tx) = tx {
             if tx.send(frame).await.is_err() || terminal {
                 if state.streams.lock().await.remove(&id).is_some() {
-                    state.active.fetch_sub(1, Ordering::AcqRel)
+                    state.active.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         }
@@ -277,7 +276,7 @@ impl MuxSessionPool {
         Arc::new(Self {
             cfg,
             sessions: Mutex::new(Vec::new()),
-        })
+        });
     }
     async fn prewarm(self: &Arc<Self>) {
         for _ in 0..configured_session_count() {
@@ -376,7 +375,7 @@ async fn handle_udp_proxy(
     cfg: RuntimeConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
-    enforce_target_policy(&cfg, &bind_hint).or_else(|_| Ok(()))?;
+    let _ = enforce_target_policy(&cfg, &bind_hint);
     let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host.is_empty() {
         "0.0.0.0"
     } else {
@@ -639,6 +638,6 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
             if let Err(e) = handle_tcp_proxy(stream, cfg2, pool2).await {
                 tracing::debug!(%peer,error=%e,"pooled proxy connection closed")
             }
-        })
+        });
     }
 }

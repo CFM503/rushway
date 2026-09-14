@@ -422,11 +422,10 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
             if let Err(e) = handle_non_mux_connection(stream, cfg2).await {
                 tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")
             }
-        })
+        });
     }
 }
 
-#[derive(Debug)]
 struct WssSessionState {
     writer: Arc<Mutex<BoxWriter>>,
     cipher: XorCipher,
@@ -507,7 +506,7 @@ impl WssSessionState {
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 bail!("WSS physical session closed")
             }
-            streams.insert(id, tx)
+            streams.insert(id, tx);
         }
         let syn_payload = SynPayload {
             target: format!("{}:{}", target.host, target.port).into_bytes(),
@@ -571,13 +570,12 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
         if let Some(tx) = sender {
             if tx.send(frame).await.is_err() || terminal {
                 session.streams.lock().await.remove(&id);
-                session.active.fetch_sub(1, Ordering::AcqRel)
+                session.active.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
 }
 
-#[derive(Debug)]
 struct WssSessionPool {
     cfg: WssConfig,
     sessions: Mutex<Vec<Arc<WssSessionState>>>,
@@ -587,7 +585,7 @@ impl WssSessionPool {
         Arc::new(Self {
             cfg,
             sessions: Mutex::new(Vec::new()),
-        })
+        });
     }
     async fn prewarm(self: &Arc<Self>) {
         for _ in 0..configured_session_count() {
@@ -769,7 +767,7 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
             if let Err(e) = handle_connection(stream, pool2).await {
                 tracing::debug!(%peer,error=%e,"WSS proxy connection closed")
             }
-        })
+        });
     }
 }
 
