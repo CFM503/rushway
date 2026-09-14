@@ -33,6 +33,10 @@ jobs:
         run: cargo run --release --bin mux_bench
       - name: End-to-end proxy benchmark
         run: cargo run --release --bin e2e_bench
+      - name: Standalone QUIC end-to-end benchmark
+        env:
+          RUSHWAY_E2E_TRANSPORT: quic
+        run: cargo run --release --bin e2e_bench
       - name: Cross-proxy benchmark runner self-check
         run: cargo run --release --bin proxy_bench -- --implementation rushway --bin target/release/rushway
       - name: Repeated cross-proxy benchmark median
