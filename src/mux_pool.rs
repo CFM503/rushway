@@ -222,12 +222,7 @@ impl SessionState {
             }
             if self
                 .active
-                .compare_exchange_weak(
-                    active,
-                    active + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -340,8 +335,11 @@ impl MuxSessionPool {
             let need_new = sessions.len() < n;
             drop(sessions);
             if !need_new {
-                bail!("all pooled MUX sessions are at stream capacity")
-            };
+                // RushWay uses backpressure instead of dropping a local connection
+                // when all physical MUX sessions are temporarily full.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                continue;
+            }
             let s = SessionState::connect(&self.cfg).await?;
             let r = s.open_stream(target).await?;
             self.sessions.lock().await.push(s.clone());
@@ -641,14 +639,7 @@ async fn handle_tcp_proxy(
     }
     upload.abort();
     if remote_fin {
-        let _ = send_mux_parts(
-            &session.writer,
-            &session.cipher,
-            id,
-            MuxCommand::Fin,
-            &[],
-        )
-        .await;
+        let _ = send_mux_parts(&session.writer, &session.cipher, id, MuxCommand::Fin, &[]).await;
     }
 
     session.close_stream(id).await;
@@ -664,13 +655,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,session_count,MAX_STREAMS_PER_SESSION);
     loop {
         let (stream, peer) = listener.accept().await?;
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum client connections reached");
-                continue;
-            }
-        };
+        let permit = semaphore.clone().acquire_owned().await?;
         let cfg2 = cfg.clone();
         let pool2 = pool.clone();
         tokio::spawn(async move {

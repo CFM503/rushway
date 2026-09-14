@@ -259,8 +259,7 @@ async fn handle_mux_parts(
         write_frame(&mut *w, &ok, 2, false).await?
     };
 
-    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut stream_tasks = Vec::new();
     let mut frame_buf = Vec::with_capacity(64 * 1024);
 
@@ -332,34 +331,34 @@ async fn handle_mux_parts(
                     continue;
                 }
 
-                let stream_limit_reached = {
-                    let guard = streams.lock().await;
-                    guard.len() >= 256
-                };
+                let (tx, mut rx) = mpsc::channel(64);
 
-                if stream_limit_reached {
+                // Atomically admit and register the logical stream. This removes
+                // the check-then-insert race during large concurrent SYN bursts.
+                let admitted = {
+                    let mut guard = streams.lock().await;
+                    if guard.len() >= 256 || guard.contains_key(&stream_id) {
+                        false
+                    } else {
+                        guard.insert(stream_id, StreamEntry { tx: tx.clone() });
+                        true
+                    }
+                };
+                if !admitted {
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                     continue;
                 }
 
-                let (tx, mut rx) = mpsc::channel(64);
-
-                streams
-                    .lock()
-                    .await
-                    .insert(stream_id, StreamEntry { tx: tx.clone() });
-
                 if !syn.initial_data.is_empty() {
-                    let initial =
-                        MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
-                            .map_err(|e| anyhow!(e.to_string()))?;
+                    let initial = MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
+                        .map_err(|e| anyhow!(e.to_string()))?;
 
                     let mut encoded = Vec::with_capacity(7 + initial.payload.len());
                     initial
                         .encode(&mut encoded)
                         .map_err(|e| anyhow!(e.to_string()))?;
-                    let owned = MuxFrame::decode_owned(encoded)
-                        .map_err(|e| anyhow!(e.to_string()))?;
+                    let owned =
+                        MuxFrame::decode_owned(encoded).map_err(|e| anyhow!(e.to_string()))?;
 
                     tx.send(StreamCommand::Data(owned))
                         .await
@@ -498,11 +497,7 @@ async fn handle_mux_parts(
             }
 
             MuxCommand::Rst => {
-                let tx = streams
-                    .lock()
-                    .await
-                    .remove(&frame.stream_id)
-                    .map(|s| s.tx);
+                let tx = streams.lock().await.remove(&frame.stream_id).map(|s| s.tx);
 
                 if let Some(tx) = tx {
                     let _ = tx.send(StreamCommand::Reset).await;
@@ -612,13 +607,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     );
     loop {
         let (stream, peer) = listener.accept().await?;
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum concurrent connections reached");
-                continue;
-            }
-        };
+        let permit = semaphore.clone().acquire_owned().await?;
         let cfg2 = cfg.clone();
         apply_socket_options(&stream, &cfg2);
         tokio::spawn(async move {
