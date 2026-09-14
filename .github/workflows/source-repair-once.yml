@@ -17,54 +17,63 @@ jobs:
         with:
           toolchain: 1.85.0
           components: rustfmt
-      - name: Apply mechanical compiler repairs
+      - name: Apply regex compiler sweep
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          def patch(path, replacements):
+          import re
+
+          def sub(path, pattern, repl, flags=re.M):
               p = Path(path)
               s = p.read_text()
-              for old, new in replacements:
-                  if old not in s:
-                      print(f'SKIP {path}: pattern not found: {old[:100]!r}')
-                  else:
-                      s = s.replace(old, new)
-              p.write_text(s)
+              n, out = re.subn(pattern, repl, s, flags=flags)
+              print(f'{path}: {n} replacements for {pattern[:90]!r}')
+              p.write_text(out)
 
-          patch('src/mux_pool.rs', [
-              ('        tracing::debug!(%peer,error=%e,"pooled proxy connection closed")\n            }\n        })\n    }', '        tracing::debug!(%peer,error=%e,"pooled proxy connection closed")\n            }\n        });\n    }'),
-          ])
+          # MUX pool: expression statements need termination; target policy has a concrete Result type.
+          sub('src/mux_pool.rs', r'(?m)^([ \t]*(?:state|self)\.active\.fetch_sub\(1, Ordering::AcqRel\))$', r'\1;')
+          sub('src/mux_pool.rs', r'^[ \t]*enforce_target_policy\(&cfg, &bind_hint\)\.or_else\(\|_\| Ok\(\(\)\)\)\?;$', r'    let _ = enforce_target_policy(&cfg, &bind_hint);')
+          sub('src/mux_pool.rs', r'(?m)^#\[derive\(Debug\)\]\n(?=struct [A-Za-z0-9_]+ \{\n(?:.|\n)*?cipher: XorCipher,)', '', flags=re.S)
+          sub('src/mux_pool.rs', r'(?m)^(\s*)\}\)\n(\s*\})$', r'\1});\n\2')
 
-          patch('src/nonmux.rs', [
-              ('            if let Err(error) = handle_client_connection(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX client connection closed")\n            }\n        })\n    }', '            if let Err(error) = handle_client_connection(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX client connection closed")\n            }\n        });\n    }'),
-              ('            if let Err(error) = handle_server(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX transport closed")\n            }\n        })\n    }', '            if let Err(error) = handle_server(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX transport closed")\n            }\n        });\n    }'),
-          ])
+          # Socket keepalive builder consumes self in socket2 0.5.
+          for path in ['src/nonmux.rs', 'src/runtime.rs']:
+              sub(path, r'(?m)^([ \t]*)let mut ka = socket2::TcpKeepalive::new\(\);\n\1ka\.with_time\(Duration::from_secs\(30\)\);$', r'\1let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));')
 
-          patch('src/quic.rs', [
-              ('    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));', '    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("QUIC stream window fits VarInt"));'),
-              ('    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));', '    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("QUIC connection window fits VarInt"));'),
-              ('                                })\n                            }\n                            Err(_) => break,', '                                });\n                            }\n                            Err(_) => break,'),
-              ('                Err(_) => return,\n            }\n        })\n    }', '                Err(_) => return,\n            }\n        });\n    }'),
-              ('                        }\n                    }\n                })\n    }', '                        }\n                    }\n                });\n    }'),
-              ('                        })\n                    }\n                }\n                Err(_) => break,', '                        });\n                    }\n                }\n                Err(_) => break,'),
-          ])
+          # Runtime local-address policy must distinguish IPv4 and IPv6 methods.
+          sub('src/runtime.rs', r'(?m)^([ \t]*)return ip\.is_loopback\(\) \|\| ip\.is_private\(\) \|\| ip\.is_link_local\(\) \|\| ip\.is_unspecified\(\);$', r'''\1return match ip {
+\1    IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
+\1    IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local(),
+\1};''')
+          sub('src/runtime.rs', r'(?m)^([ \t]*)let addr = resolve_socket\(&target\.host, target\.port\)\.await\?;$', r'\1let addr = resolve_socket(&target.host, target.port).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;')
+          sub('src/runtime.rs', r'(?m)^(\s*)\}\)\n(\s*\}\n)$', r'\1});\n\2')
 
-          patch('src/runtime.rs', [
-              ('let addr = resolve_socket(&target.host, target.port).await.map_err(anyhow::Error::from)?;', 'let addr = resolve_socket(&target.host, target.port).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;'),
-              ('                write_frame(&mut *w, &packet, 2, false).await?\n        }\n        Result::<()>::Ok(())', '                write_frame(&mut *w, &packet, 2, false).await?\n        }\n        Result::<()>::Ok(())'),
-              ('            }\n        })\n    }\n}', '            }\n        });\n    }\n}'),
-          ])
+          # QUIC 0.11.9 exposes aggregate receive-window setters.
+          sub('src/quic.rs', r'(?ms)^\s*cfg\.initial_stream_receive_window\(VarInt::from_u64\(2 \* 1024 \* 1024\)\);\s*\ncfg\.max_stream_receive_window\(VarInt::from_u64\(8 \* 1024 \* 1024\)\);\s*\ncfg\.initial_connection_receive_window\(VarInt::from_u64\(4 \* 1024 \* 1024\)\);\s*\ncfg\.max_connection_receive_window\(VarInt::from_u64\(16 \* 1024 \* 1024\)\);', '    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));\n    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));')
+          sub('src/quic.rs', r'cert\.signing_key\.serialize_der\(\)', 'cert.key_pair.serialize_der()')
+          sub('src/quic.rs', r'(?m)^(\s*)\}\)\n(\s*(?:Err\(_\) => break,|\})$)', r'\1});\n\2')
+          sub('src/quic.rs', r'(?m)^(\s*)\}\)\n(\s*)\}$', r'\1});\n\2}')
 
-          patch('src/wss_client.rs', [
-              ('            if let Err(e) = handle_non_mux_connection(stream, cfg2).await {\n                tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")\n            }\n        })\n    }', '            if let Err(e) = handle_non_mux_connection(stream, cfg2).await {\n                tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")\n            }\n        });\n    }'),
-              ('            if let Err(e) = handle_connection(stream, pool2).await {\n                tracing::debug!(%peer,error=%e,"WSS proxy connection closed")\n            }\n        })\n    }', '            if let Err(e) = handle_connection(stream, pool2).await {\n                tracing::debug!(%peer,error=%e,"WSS proxy connection closed")\n            }\n        });\n    }'),
-              ('#[derive(Debug)]\nstruct WssSessionPool {', 'struct WssSessionPool {'),
-          ])
+          # WSS: remove Debug from structs holding non-Debug transports/cipher, terminate statements.
+          sub('src/wss_client.rs', r'(?m)^#\[derive\(Debug\)\]\n(?=struct WssSessionState\b|struct WssSessionPool\b)', '')
+          sub('src/wss_client.rs', r'(?m)^(\s*)streams\.insert\(id, tx\)$', r'\1streams.insert(id, tx);')
+          sub('src/wss_client.rs', r'(?m)^([ \t]*session\.active\.fetch_sub\(1, Ordering::AcqRel\))$', r'\1;')
+          sub('src/wss_client.rs', r'(?m)^(\s*)\}\)\n(\s*\})$', r'\1});\n\2')
 
-          patch('src/main.rs', [
-              ('    let args = Args::parse_from(&raw_args);\n    let filter =', '''    let args = Args::parse_from(&raw_args);\n    if !(1..=64).contains(&args.mux_sessions) {\n        return Err(anyhow!("mux-sessions must be between 1 and 64"));\n    }\n    if let Some(v) = args.max_conn {\n        if !(1..=1_000_000).contains(&v) {\n            return Err(anyhow!("max-conn must be between 1 and 1000000"));\n        }\n    }\n    let filter =''')
-          ])
+          # Clap 4.5.20 does not expose value_parser(...).range(...); keep validation in main().
+          sub('src/main.rs', r'value_parser = clap::value_parser!\(usize\)\.range\(1\.\.=64\)', 'value_parser = clap::value_parser!(usize)')
+          sub('src/main.rs', r'value_parser = clap::value_parser!\(usize\)\.range\(1\.\.=1_000_000\)', 'value_parser = clap::value_parser!(usize)')
+          sub('src/main.rs', r'(?m)^    let args = Args::parse_from\(&raw_args\);\n    let filter =', '''    let args = Args::parse_from(&raw_args);
+    if !(1..=64).contains(&args.mux_sessions) {
+        return Err(anyhow!("mux-sessions must be between 1 and 64"));
+    }
+    if let Some(v) = args.max_conn {
+        if !(1..=1_000_000).contains(&v) {
+            return Err(anyhow!("max-conn must be between 1 and 1000000"));
+        }
+    }
+    let filter =''')
           PY
       - name: Format
         run: cargo fmt --all
