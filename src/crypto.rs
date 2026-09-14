@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use ring::digest::{digest, SHA256};
 
 /// GoWay v1.8.4-compatible XOR transform.
 /// Each TransformInPlace call starts at key offset zero. The SHA-256 digest
@@ -15,7 +15,8 @@ impl XorCipher {
         if key.is_empty() {
             return Self { key: Vec::new() };
         }
-        let digest = Sha256::digest(key.as_bytes());
+        let digest = digest(&SHA256, key.as_bytes());
+        let digest = digest.as_ref();
         let mut expanded = Vec::with_capacity(XOR_KEY_SIZE);
         while expanded.len() < XOR_KEY_SIZE {
             let take = (XOR_KEY_SIZE - expanded.len()).min(digest.len());
