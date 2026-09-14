@@ -2,46 +2,41 @@
 
 > Compatibility baseline: GoWay v1.8.4 at `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.
 
-## Current checkpoint — 2026-09-14
+## Current checkpoint — 2026-09-15
 
-**Implementation coverage: high; final release completion is not yet claimed.** The current blocker is executable high-concurrency validation: WS stress passes at 1, 100 and 500 streams but the 1000-stream burst test currently fails with `early eof`.
+**Implementation coverage: high; final release completion is not yet claimed.** The 1000-stream diagnostic results now separate transports: WS and QUIC pass at 1000 with 64 physical MUX sessions, while WSS still fails at flow 406 with `early eof`. The 1000 diagnostics remain non-blocking evidence gathering.
 
 ### Current validated revision
 
-- Last fully validated pre-stress run: Run #320, `34823392373`, head `323e8408a942b545a75f17f6d5594d391a93ccbf`.
+- Latest merged revision: `89615e5039207d2e51628e968e383677f6a11a8b` (PR #11 merge).
+- PR #11 adds non-blocking WSS and QUIC 1000-stream diagnostics using staged stress, 64 physical MUX sessions, and `ulimit -n 8192`.
+- PR #11 pre-merge CI Run #383: `34907505435` passed the full test job and all build jobs.
 - 39 unit tests passed; Rust format/check/test/release passed.
-- WS E2E passed: c1 `59.15`, c8 `175.87`, c32 `164.78` MiB/s.
-- WSS E2E passed: c1 `35.88`, c8 `128.99`, c32 `142.14` MiB/s.
-- QUIC E2E passed: c1 `153.08`, c8 `171.59`, c32 `192.27` MiB/s.
+- Standalone WS/WSS/QUIC TCP E2E passed.
 - Windows x64, Debian 12 x64 and ARMv7 Linux release artifacts passed.
 - GoWay comparison remains skipped because `WAY_READ_TOKEN` is not configured.
 
-### Latest stress result
+### Latest 1000-stream diagnostic evidence
 
-- Run #324: `34825498345`.
-- WS stress results:
-  - 1 stream: passed, 42 ms
-  - 100 streams: passed, 105 ms
-  - 500 streams: passed, 1161 ms
-  - 1000 streams: failed with generic `early eof`
-- WSS and QUIC stress steps were not reached because the WS stress step failed first.
-- The current harness does not identify the failing flow index or exact phase, so this result is a diagnostic blocker rather than proof of a 500-stream hard limit.
+- WS 1000: **passed** with 64 MUX sessions, staged pattern, 1000/1000 completed.
+- WSS 1000: **failed** at flow 406 with `SOCKS5 stage connect_reply_read timed out after 10s`, despite 64 MUX sessions and `ulimit -n 8192`.
+- QUIC 1000: **passed** with 64 MUX sessions, staged pattern, 1000/1000 completed in 571 ms.
+- The same Run #383 also passed WS/WSS/QUIC 1/100/500 blocking stress.
+- This is strong evidence that the 1000-stream issue is transport-specific for WSS rather than a universal MUX stream-capacity failure. It is not yet proof that WS/WSS/QUIC 1000 are release-ready because WS/QUIC need repeated evidence and WSS still fails.
 
-### Newly added stress coverage
+### Latest main CI
 
-- `src/bin/e2e_bench.rs` supports `RUSHWAY_E2E_STRESS=1`.
-- Stress payload is 64 KiB and exact concurrency levels are `1/100/500/1000`.
-- Each stream performs SOCKS5 CONNECT, sends the payload, validates the exact echo, and must complete.
-- Overall stress timeout is 180 seconds; individual flows retain the 30-second timeout.
-- CI runs dedicated stress coverage for WS, WSS and QUIC, although later transports are skipped when the first WS stress step fails.
+- Run #384: `34910162991`, merge commit `89615e5039207d2e51628e968e383677f6a11a8b`.
+- At this checkpoint the merge-triggered Run #384 is still in progress; its Rust format/check/test stages have passed and the GoWay job is skipped because the optional token is absent.
+- Do not treat Run #384 as fully validated until its remaining jobs finish.
 
 ### Immediate next action
 
-1. Enhance `e2e_bench.rs` diagnostics with flow index and failure phase.
-2. Add `RUSHWAY_E2E_STRESS_PATTERN=burst|staged`.
-3. Run WS 1000 burst and staged modes separately.
-4. After WS is understood, run WSS and QUIC staged stress.
-5. Do not create the final v0.0.3 tag/release until stress, lifecycle/error, UDP, GoWay and real-device gates are satisfied.
+1. Wait for Run #384 to finish and record its final result.
+2. Keep WS and QUIC 1000 diagnostics as executable evidence; do not promote them to blocking gates yet.
+3. Investigate the WSS-specific 1000 failure at flow 406 using transport/session diagnostics; do not change production behavior without evidence.
+4. After WSS is understood, run repeated 1000 rounds and then the lifecycle/error and TCP+UDP interoperability matrices.
+5. Keep the final v0.0.3 tag/release blocked until stress, lifecycle/error, UDP, GoWay and real-device gates are satisfied.
 
 ### Transport status
 
@@ -49,11 +44,14 @@
 |---|---|
 | Plain WS handshake/auth | Executably validated |
 | Plain WS MUX | Executably validated |
+| Plain WS 1000 diagnostic | Passed once at 64 MUX sessions; repeated acceptance pending |
 | Plain WS non-MUX | Implemented; lifecycle/error matrix still pending |
 | Plain WS UDP | Implemented; cross-transport executable matrix pending |
 | WSS MUX/non-MUX | WSS standalone TCP path executably validated |
+| WSS 1000 diagnostic | **Failing** at flow 406 under 64-session staged diagnostic |
 | WSS UDP | Implemented; executable UDP matrix pending |
 | QUIC/QUIC+TLS TCP | Standalone TCP path executably validated |
+| QUIC 1000 diagnostic | Passed once at 64 MUX sessions; repeated acceptance pending |
 | QUIC UDP | Implemented; executable interoperability matrix pending |
 | SOCKS5 TCP | Basic end-to-end path validated; lifecycle/error matrix pending |
 | SOCKS5 UDP | Implemented; executable matrix pending |
@@ -61,10 +59,11 @@
 
 ### Remaining verification gates
 
-- [x] Rust fmt/check/test/release on validated head.
+- [x] Rust fmt/check/test/release on validated revision.
 - [x] Standalone WS/WSS/QUIC TCP E2E.
-- [ ] WS 1000-stream burst and staged stress diagnosis/fix.
-- [ ] WSS/QUIC 1/100/500/1000 stream stress.
+- [ ] WS 1000 repeated acceptance stress.
+- [ ] WSS 1000 diagnosis/fix and repeated acceptance stress.
+- [ ] QUIC 1000 repeated acceptance stress.
 - [ ] SOCKS5/HTTP lifecycle, malformed input, target rejection and shutdown/error matrix.
 - [ ] WS/WSS/QUIC TCP+UDP interoperability matrix.
 - [ ] Additional repeated benchmark evidence across current head/stress revisions.
@@ -72,6 +71,10 @@
 - [ ] OpenWrt or real-device smoke.
 - [ ] Actual cloud GoWay v1.8.4 bidirectional WS/WSS/QUIC TCP+UDP interoperability.
 - [ ] Final v0.0.3 tag/release verification.
+
+### Known CI warnings / cleanup backlog
+
+Run #383 is green but reports existing compiler warnings, including unused imports/functions and unreachable expressions in `runtime.rs`, `mux_pool.rs`, `udp_relay.rs`, `quic.rs`, and `wss_client.rs`. These are cleanup items, not currently accepted as functional blockers; avoid broad cleanup until the transport/lifecycle gates are stabilized.
 
 ### AI relay rule
 
