@@ -17,55 +17,55 @@ jobs:
         with:
           toolchain: 1.85.0
           components: rustfmt
-      - name: Apply exact compiler repairs
+      - name: Apply deterministic compiler repairs
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          def replace(path, pairs):
-              p=Path(path); s=p.read_text()
-              for old,new in pairs:
-                  n=s.count(old); print(path,n,repr(old[:90]))
-                  if n: s=s.replace(old,new)
-              p.write_text(s)
-          replace('src/mux_pool.rs',[
-            ('#[derive(Debug)]\nstruct MuxSessionState {','struct MuxSessionState {'),
-            ('                self.active.fetch_sub(1, Ordering::AcqRel)\n            }','                self.active.fetch_sub(1, Ordering::AcqRel);\n            };'),
-            ('            self.active.fetch_sub(1, Ordering::AcqRel)\n        }','            self.active.fetch_sub(1, Ordering::AcqRel);\n        };'),
-            ('                    state.active.fetch_sub(1, Ordering::AcqRel)\n                }','                    state.active.fetch_sub(1, Ordering::AcqRel);\n                };'),
-            ('    enforce_target_policy(&cfg, &bind_hint).or_else(|_| Ok(()))?;','    let _ = enforce_target_policy(&cfg, &bind_hint);'),
-            ('            tracing::debug!(%peer,error=%e,"pooled proxy connection closed")\n            }\n        })','            tracing::debug!(%peer,error=%e,"pooled proxy connection closed")\n            }\n        });'),
-          ])
-          replace('src/nonmux.rs',[
-            ('        let mut ka = socket2::TcpKeepalive::new();\n        ka.with_time(Duration::from_secs(30));\n        let _ = sock.set_tcp_keepalive(&ka);','        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));\n        let _ = sock.set_tcp_keepalive(&ka);'),
-            ('            if let Err(error) = handle_client_connection(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX client connection closed")\n            }\n        })','            if let Err(error) = handle_client_connection(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX client connection closed")\n            }\n        });'),
-            ('            if let Err(error) = handle_server(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX transport closed")\n            }\n        })','            if let Err(error) = handle_server(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX transport closed")\n            }\n        });'),
-          ])
-          replace('src/runtime.rs',[
-            ('        return ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified();','        return match ip {\n            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),\n            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local(),\n        };'),
-            ('        let mut ka = socket2::TcpKeepalive::new();\n        ka.with_time(Duration::from_secs(30));\n        let _ = sock.set_tcp_keepalive(&ka);','        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));\n        let _ = sock.set_tcp_keepalive(&ka);'),
-            ('        let addr = resolve_socket(&target.host, target.port).await?;','        let addr = resolve_socket(&target.host, target.port).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;'),
-          ])
-          replace('src/quic.rs',[
-            ('    cfg.initial_stream_receive_window(VarInt::from_u64(2 * 1024 * 1024));\n    cfg.max_stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));\n    cfg.initial_connection_receive_window(VarInt::from_u64(4 * 1024 * 1024));\n    cfg.max_connection_receive_window(VarInt::from_u64(16 * 1024 * 1024));','    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));\n    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));'),
-            ('cert.signing_key.serialize_der()','cert.key_pair.serialize_der()'),
-            ('        })\n    }','        });\n    }'),
-            ('                                })\n                            }','                                });\n                            }'),
-            ('                        })\n                    }','                        });\n                    }'),
-          ])
-          replace('src/wss_client.rs',[
-            ('#[derive(Debug)]\nstruct WssSessionState {','struct WssSessionState {'),
-            ('#[derive(Debug)]\nstruct WssSessionPool {','struct WssSessionPool {'),
-            ('            streams.insert(id, tx)\n','            streams.insert(id, tx);\n'),
-            ('                session.active.fetch_sub(1, Ordering::AcqRel)\n            }','                session.active.fetch_sub(1, Ordering::AcqRel);\n            };'),
-            ('            tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")\n            }\n        })','            tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")\n            }\n        });'),
-            ('            tracing::debug!(%peer,error=%e,"WSS proxy connection closed")\n            }\n        })','            tracing::debug!(%peer,error=%e,"WSS proxy connection closed")\n            }\n        });'),
-          ])
-          replace('src/main.rs',[
-            ('value_parser = clap::value_parser!(usize).range(1..=64)','value_parser = clap::value_parser!(usize)'),
-            ('value_parser = clap::value_parser!(usize).range(1..=1_000_000)','value_parser = clap::value_parser!(usize)'),
-            ('    let args = Args::parse_from(&raw_args);\n    let filter =','    let args = Args::parse_from(&raw_args);\n    if !(1..=64).contains(&args.mux_sessions) {\n        return Err(anyhow!("mux-sessions must be between 1 and 64"));\n    }\n    if let Some(v) = args.max_conn {\n        if !(1..=1_000_000).contains(&v) {\n            return Err(anyhow!("max-conn must be between 1 and 1000000"));\n        }\n    }\n    let filter ='),
-          ])
+          import re
+
+          def rx(path, pattern, repl, flags=re.M):
+              p=Path(path); s=p.read_text(); out,n=re.subn(pattern,repl,s,flags=flags)
+              print(path, n, pattern[:100]); p.write_text(out)
+
+          # Expression statements / spawn handles.
+          rx('src/mux_pool.rs', r'(?m)^([ \t]*(?:self|state)\.active\.fetch_sub\(1, Ordering::AcqRel\))$', r'\1;')
+          rx('src/mux_pool.rs', r'(?m)^([ \t]*)enforce_target_policy\(&cfg, &bind_hint\)\.or_else\(\|_\| Ok\(\(\)\)\)\?;$', r'\1let _ = enforce_target_policy(&cfg, &bind_hint);')
+          rx('src/mux_pool.rs', r'(?m)^([ \t]*)\}\)$\n(?=\s*\}$)', r'\1});')
+          rx('src/nonmux.rs', r'(?m)^([ \t]*)let mut ka = socket2::TcpKeepalive::new\(\);\n\1ka\.with_time\(Duration::from_secs\(30\));\n\1let _ = sock\.set_tcp_keepalive\(&ka\);$', r'\1let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));\n\1let _ = sock.set_tcp_keepalive(&ka);')
+          rx('src/nonmux.rs', r'(?m)^([ \t]*)\}\)$\n(?=\s*\}$)', r'\1});')
+
+          rx('src/runtime.rs', r'(?m)^([ \t]*)return ip\.is_loopback\(\) \|\| ip\.is_private\(\) \|\| ip\.is_link_local\(\) \|\| ip\.is_unspecified\(\);$', r'''\1return match ip {
+\1    IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
+\1    IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local(),
+\1};''')
+          rx('src/runtime.rs', r'(?m)^([ \t]*)let mut ka = socket2::TcpKeepalive::new\(\);\n\1ka\.with_time\(Duration::from_secs\(30\)\);\n\1let _ = sock\.set_tcp_keepalive\(&ka\);$', r'\1let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));\n\1let _ = sock.set_tcp_keepalive(&ka);')
+          rx('src/runtime.rs', r'(?m)^([ \t]*)let addr = resolve_socket\(&target\.host, target\.port\)\.await\?;$', r'\1let addr = resolve_socket(&target.host, target.port).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;')
+          rx('src/runtime.rs', r'(?m)^([ \t]*)\}\)$\n(?=\s*\}$)', r'\1});')
+
+          rx('src/quic.rs', r'(?ms)^\s*cfg\.initial_stream_receive_window\(VarInt::from_u64\(2 \* 1024 \* 1024\)\);\s*\ncfg\.max_stream_receive_window\(VarInt::from_u64\(8 \* 1024 \* 1024\)\);\s*\ncfg\.initial_connection_receive_window\(VarInt::from_u64\(4 \* 1024 \* 1024\)\);\s*\ncfg\.max_connection_receive_window\(VarInt::from_u64\(16 \* 1024 \* 1024\)\);', '    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));\n    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));')
+          rx('src/quic.rs', r'cert\.signing_key\.serialize_der\(\)', 'cert.key_pair.serialize_der()')
+          rx('src/quic.rs', r'(?m)^([ \t]*)\}\)$\n(?=\s*\})', r'\1});')
+
+          # Do not derive Debug for secret-bearing or transport-erased session state.
+          rx('src/mux_pool.rs', r'(?m)^#\[derive\(Debug\)\]\n(?=struct MuxSessionState\b)', '')
+          rx('src/wss_client.rs', r'(?m)^#\[derive\(Debug\)\]\n(?=struct WssSessionState\b)', '')
+          rx('src/wss_client.rs', r'(?m)^([ \t]*)streams\.insert\(id, tx\)$', r'\1streams.insert(id, tx);')
+          rx('src/wss_client.rs', r'(?m)^([ \t]*session\.active\.fetch_sub\(1, Ordering::AcqRel\))$', r'\1;')
+          rx('src/wss_client.rs', r'(?m)^([ \t]*)\}\)$\n(?=\s*\}$)', r'\1});')
+
+          rx('src/main.rs', r'value_parser = clap::value_parser!\(usize\)\.range\(1\.\.=64\)', 'value_parser = clap::value_parser!(usize)')
+          rx('src/main.rs', r'value_parser = clap::value_parser!\(usize\)\.range\(1\.\.=1_000_000\)', 'value_parser = clap::value_parser!(usize)')
+          rx('src/main.rs', r'(?m)^    let args = Args::parse_from\(&raw_args\);\n    let filter =', '''    let args = Args::parse_from(&raw_args);
+    if !(1..=64).contains(&args.mux_sessions) {
+        return Err(anyhow!("mux-sessions must be between 1 and 64"));
+    }
+    if let Some(v) = args.max_conn {
+        if !(1..=1_000_000).contains(&v) {
+            return Err(anyhow!("max-conn must be between 1 and 1000000"));
+        }
+    }
+    let filter =''')
           PY
       - name: Format
         run: cargo fmt --all
