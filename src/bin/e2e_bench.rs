@@ -5,11 +5,12 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
 const TEST_KEY: &str = "rushway-e2e-test-key";
+const FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -47,6 +48,7 @@ fn spawn_rushway(
     port: u16,
     upstream: Option<String>,
     key: &str,
+    allow_local_targets: bool,
 ) -> io::Result<Child> {
     let mut cmd = Command::new(path);
     cmd.arg("-p")
@@ -55,6 +57,9 @@ fn spawn_rushway(
         .arg(key)
         .arg("--log")
         .arg("ERROR");
+    if allow_local_targets {
+        cmd.arg("--no-block-local");
+    }
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
     }
@@ -135,17 +140,21 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> io::Result<TcpStre
 }
 
 async fn one_flow(proxy_port: u16, target_port: u16, payload: Arc<[u8]>) -> io::Result<usize> {
-    let mut stream = socks5_connect(proxy_port, target_port).await?;
-    stream.write_all(&payload).await?;
-    let mut echoed = vec![0u8; payload.len()];
-    stream.read_exact(&mut echoed).await?;
-    if echoed.as_slice() != payload.as_ref() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "echo payload mismatch",
-        ));
-    }
-    Ok(payload.len())
+    timeout(FLOW_TIMEOUT, async {
+        let mut stream = socks5_connect(proxy_port, target_port).await?;
+        stream.write_all(&payload).await?;
+        let mut echoed = vec![0u8; payload.len()];
+        stream.read_exact(&mut echoed).await?;
+        if echoed.as_slice() != payload.as_ref() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "echo payload mismatch",
+            ));
+        }
+        Ok(payload.len())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "e2e flow timed out after 30s"))?
 }
 
 async fn run_case(
@@ -199,12 +208,13 @@ async fn main() -> io::Result<()> {
     let client_port = free_port().await?;
     let (target_port, echo_task) = start_echo().await?;
 
-    let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY)?;
+    let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY, true)?;
     let mut client = spawn_rushway(
         &rushway,
         client_port,
         Some(format!("ws://127.0.0.1:{}/", server_port)),
         TEST_KEY,
+        true,
     )?;
 
     let result = async {
