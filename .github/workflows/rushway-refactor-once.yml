@@ -23,56 +23,26 @@ jobs:
 
           mux = Path('src/mux_pool.rs')
           s = mux.read_text()
-          s, n = re.subn(
-              r'(?m)^            if !need_new \{\n                bail!\("all pooled MUX sessions are at stream capacity"\)\n            \};',
-              '''            if !need_new {
+          s, n = re.subn(r'(?m)^            if !need_new \{\n                bail!\("all pooled MUX sessions are at stream capacity"\)\n            \};', '''            if !need_new {
                 // RushWay uses backpressure instead of dropping a local connection
                 // when all physical MUX sessions are temporarily full.
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 continue;
-            }''',
-              s,
-              count=1,
-          )
+            }''', s, count=1)
           if n != 1:
               raise SystemExit(f'mux capacity guard replacements={n}')
-          s, n = re.subn(
-              r'let permit = match semaphore\.clone\(\)\.try_acquire_owned\(\) \{\n\s+Ok\(v\) => v,\n\s+Err\(_\) => \{\n\s+tracing::debug!\(%peer,"maximum client connections reached"\);\n\s+continue;\n\s+\}\n\s+\};',
-              'let permit = semaphore.clone().acquire_owned().await?;',
-              s,
-              count=1,
-          )
+          s, n = re.subn(r'let permit = match semaphore\.clone\(\)\.try_acquire_owned\(\) \{\n\s+Ok\(v\) => v,\n\s+Err\(_\) => \{\n\s+tracing::debug!\(%peer,"maximum client connections reached"\);\n\s+continue;\n\s+\}\n\s+\};', 'let permit = semaphore.clone().acquire_owned().await?;', s, count=1)
           if n != 1:
               raise SystemExit(f'client semaphore replacements={n}')
           mux.write_text(s)
 
           runtime = Path('src/runtime.rs')
           s = runtime.read_text()
-          s, n = re.subn(
-              r'let permit = match semaphore\.clone\(\)\.try_acquire_owned\(\) \{\n\s+Ok\(v\) => v,\n\s+Err\(_\) => \{\n\s+tracing::debug!\(%peer,"maximum concurrent connections reached"\);\n\s+continue;\n\s+\}\n\s+\};',
-              'let permit = semaphore.clone().acquire_owned().await?;',
-              s,
-              count=1,
-          )
+          s, n = re.subn(r'let permit = match semaphore\.clone\(\)\.try_acquire_owned\(\) \{\n\s+Ok\(v\) => v,\n\s+Err\(_\) => \{\n\s+tracing::debug!\(%peer,"maximum concurrent connections reached"\);\n\s+continue;\n\s+\}\n\s+\};', 'let permit = semaphore.clone().acquire_owned().await?;', s, count=1)
           if n != 1:
               raise SystemExit(f'server semaphore replacements={n}')
-          old = '''                let stream_limit_reached = {
-                    let guard = streams.lock().await;
-                    guard.len() >= 256
-                };
-
-                if stream_limit_reached {
-                    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
-                    continue;
-                }
-
-                let (tx, mut rx) = mpsc::channel(64);
-
-                streams
-                    .lock()
-                    .await
-                    .insert(stream_id, StreamEntry { tx: tx.clone() });'''
-          new = '''                let (tx, mut rx) = mpsc::channel(64);
+          pattern = re.compile(r'                let stream_limit_reached = \{.*?                streams\n                    \.lock\(\)\n                    \.await\n                    \.insert\(stream_id, StreamEntry \{ tx: tx\.clone\(\) \}\);', re.S)
+          replacement = '''                let (tx, mut rx) = mpsc::channel(64);
 
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
@@ -89,9 +59,9 @@ jobs:
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                     continue;
                 }'''
-          if old not in s:
-              raise SystemExit('stream admission block not found')
-          s = s.replace(old, new, 1)
+          s, n = pattern.subn(replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'stream admission replacements={n}')
           runtime.write_text(s)
           PY
       - name: Validate formatting and tests
