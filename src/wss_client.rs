@@ -585,7 +585,7 @@ impl WssSessionPool {
         Arc::new(Self {
             cfg,
             sessions: Mutex::new(Vec::new()),
-        });
+        })
     }
     async fn prewarm(self: &Arc<Self>) {
         for _ in 0..configured_session_count() {

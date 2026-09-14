@@ -32,8 +32,8 @@ fn transport_config() -> Arc<TransportConfig> {
     let mut cfg = TransportConfig::default();
     cfg.max_idle_timeout(Some(Duration::from_secs(60).try_into().expect("60s fits")));
     cfg.keep_alive_interval(Some(Duration::from_secs(15)));
-    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));
-    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));
+    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("8MiB fits QUIC VarInt"));
+    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("16MiB fits QUIC VarInt"));
     cfg.max_concurrent_uni_streams(0u32.into());
     Arc::new(cfg)
 }
@@ -243,7 +243,7 @@ impl QuicClientPool {
             server_name,
             connection: Arc::new(Mutex::new(None)),
             timeout_secs,
-        });
+        })
     }
     async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         for _ in 0..2 {
