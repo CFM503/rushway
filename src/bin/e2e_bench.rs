@@ -9,6 +9,7 @@ use tokio::time::sleep;
 
 const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const CONCURRENCIES: &[usize] = &[1, 8, 32];
+const TEST_KEY: &str = "rushway-e2e-test-key";
 
 async fn free_port() -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -41,25 +42,43 @@ fn child_path() -> io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-fn spawn_rushway(path: &std::path::Path, port: u16, upstream: Option<String>) -> io::Result<Child> {
+fn spawn_rushway(
+    path: &std::path::Path,
+    port: u16,
+    upstream: Option<String>,
+    key: &str,
+) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    cmd.arg("-p").arg(port.to_string());
+    cmd.arg("-p")
+        .arg(port.to_string())
+        .arg("-k")
+        .arg(key)
+        .arg("--log")
+        .arg("ERROR");
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
     }
-    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
 }
 
-async fn wait_for_port(port: u16) -> io::Result<()> {
+async fn wait_for_port(port: u16, child: &mut Child, role: &str) -> io::Result<()> {
     for _ in 0..100 {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(_) => return Ok(()),
-            Err(_) => sleep(Duration::from_millis(25)).await,
+            Err(_) => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "{role} RushWay child exited before opening port {port}: {status}"
+                    )));
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
         }
     }
+    let _ = child.try_wait()?;
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("port {} did not open", port),
+        format!("{role} RushWay port {port} did not open"),
     ))
 }
 
@@ -155,6 +174,19 @@ async fn run_case(
     Ok(mib / secs)
 }
 
+fn child_stderr(child: &mut Child) -> String {
+    child
+        .stderr
+        .take()
+        .map(|mut stderr| {
+            use std::io::Read;
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+        .unwrap_or_default()
+}
+
 fn kill_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -167,16 +199,17 @@ async fn main() -> io::Result<()> {
     let client_port = free_port().await?;
     let (target_port, echo_task) = start_echo().await?;
 
-    let mut server = spawn_rushway(&rushway, server_port, None)?;
+    let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY)?;
     let mut client = spawn_rushway(
         &rushway,
         client_port,
         Some(format!("ws://127.0.0.1:{}/", server_port)),
+        TEST_KEY,
     )?;
 
     let result = async {
-        wait_for_port(server_port).await?;
-        wait_for_port(client_port).await?;
+        wait_for_port(server_port, &mut server, "server").await?;
+        wait_for_port(client_port, &mut client, "client").await?;
         let mut payload = vec![0u8; PAYLOAD_SIZE];
         for (i, b) in payload.iter_mut().enumerate() {
             *b = ((i * 31 + 17) & 0xff) as u8;
@@ -201,6 +234,18 @@ async fn main() -> io::Result<()> {
         Ok::<(), io::Error>(())
     }
     .await;
+
+    if let Err(ref e) = result {
+        let server_log = child_stderr(&mut server);
+        let client_log = child_stderr(&mut client);
+        if !server_log.is_empty() {
+            eprintln!("e2e server stderr:\n{server_log}");
+        }
+        if !client_log.is_empty() {
+            eprintln!("e2e client stderr:\n{client_log}");
+        }
+        eprintln!("e2e benchmark failed: {e}");
+    }
 
     kill_child(&mut client);
     kill_child(&mut server);
