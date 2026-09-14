@@ -330,7 +330,8 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                         Err(_) => sleep(Duration::from_millis(20)).await,
                     }
                 }
-                let mut internal = internal.ok_or_else(|| anyhow!("private WS runtime did not start"))?;
+                let mut internal =
+                    internal.ok_or_else(|| anyhow!("private WS runtime did not start"))?;
                 let (request, key) = ws::build_client_handshake_request(
                     &format!("127.0.0.1:{internal_port}"),
                     "/",
