@@ -6,68 +6,76 @@
 
 ### Target
 - Repository: `CFM503/rushway`
-- GoWay baseline: v1.8.4, commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
-- Target version: `v0.0.3` test build; not yet a final release
-- Targets: Windows x64, Debian 12 x64, KWRT/OpenWrt ARMv7
+- Target version: `v0.0.3` test build; not a final release
+- GoWay baseline: v1.8.4, pinned commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
 - Branch: `main`
 
-### Local validated build
-Local commit `400c3de7267966f457e4437f9d57bd1dd00cd0b1` passed:
-- `cargo fmt -- --check`
-- `cargo check --all-targets`
-- `cargo test --all-targets --all-features` — 38 passed, 0 failed
-- `cargo build --release`
-- `target/release/rushway.exe --help`
+### Locally validated source
+Validated source commit: `400c3de7267966f457e4437f9d57bd1dd00cd0b1`
+- `cargo fmt -- --check` PASS
+- `cargo check --all-targets` PASS
+- `cargo test --all-targets --all-features` PASS — 38 passed, 0 failed
+- `cargo build --release` PASS
+- `target/release/rushway.exe --help` PASS
 
-### Direct source repairs in 400c3de
-1. `src/mux_pool.rs` — remove the stray semicolon after `Arc::new(Self { ... })` in `MuxSessionPool::new`.
-2. `src/wss_client.rs` — remove the stray semicolon after `Arc::new(Self { ... })` in `WssSessionPool::new`.
-3. `src/quic.rs` — wrap both QUIC receive-window `VarInt::from_u64` calls with `expect(...)`.
-4. `src/quic.rs` — remove the stray semicolon after `Arc::new(Self { ... })` in `QuicClientPool::new`.
+Direct source repairs in 400c3de:
+- `src/mux_pool.rs`: `MuxSessionPool::new()` constructor tail semicolon removed.
+- `src/wss_client.rs`: `WssSessionPool::new()` constructor tail semicolon removed.
+- `src/quic.rs`: both receive-window `VarInt::from_u64` calls use checked `expect(...)`.
+- `src/quic.rs`: `QuicClientPool::new()` constructor tail semicolon removed.
 
-### Packaging
-- `Cargo.toml` version is `0.0.3`.
+Packaging:
+- `Cargo.toml` version `0.0.3`.
 - `Cargo.lock` added.
-- `.gitignore` added with `target/` and `*.pdb`.
+- `.gitignore` added for `target/` and `*.pdb`.
 
 ### Local GoWay interoperability
 GoWay: `D:\SOFT\ROUTER\goflyway_windows_386\goway.exe`, `GOWAY v1.8.4`.
 
 Topology:
-- GoWay: `127.0.0.1:18880`, key `test123`.
-- RushWay: `127.0.0.1:11080`, upstream `ws://127.0.0.1:18880`.
+- GoWay server `127.0.0.1:18880`, key `test123`.
+- RushWay client `127.0.0.1:11080`, upstream `ws://127.0.0.1:18880`.
 
-Observed:
-- 4 physical MUX sessions became active on GoWay.
-- WebSocket/MUX physical establishment PASS.
-- SOCKS5 to public HTTPS FAIL at TLS (`curl` error 35).
-- SOCKS5 to local HTTP with `--no-block-local` hung / later closed.
-- No GoWay business connection was observed.
+Results:
+- 4 physical MUX sessions active: PASS.
+- SOCKS5 to public HTTPS: FAIL during TLS (`curl` error 35).
+- SOCKS5 to local HTTP with `--no-block-local`: hung / later closed.
+- No GoWay business connection observed.
 
-Conclusion: runtime SOCKS → MUX stream → GoWay business forwarding is not proven.
+Runtime SOCKS → MUX stream → GoWay business forwarding is therefore not proven.
 
-### Cloud CI incident — 2026-09-14
-The `400c3de` v0.0.3 test commit was pushed to `main`.
-The old CI contained a source-mutating repair step that ran `scripts/repair_compiler_issues.py` and could commit/push to `main`.
-That step reintroduced three constructor semicolons and pushed:
-`5d553ab455f5fe8a827255fb5a2771de88131a25` — `fix: repair compiler blockers`.
+### Cloud CI incident
+The old CI contained a source-mutating repair step. On the `400c3de` run it reintroduced three constructor semicolons and pushed `5d553ab455f5fe8a827255fb5a2771de88131a25` (`fix: repair compiler blockers`). The cloud `cargo check` then failed on those three constructors.
 
-The resulting cloud build failed `cargo check` on the same three constructor return types.
-This is a CI automation defect, not a failure of the locally validated 400c3de source.
+This was a CI automation defect, not a failure of 400c3de.
 
-### CI hardening
-The CI workflow has been changed to:
-- remove the source-mutating repair step;
-- use `contents: read` permission.
+### Cloud CI hardening and cleanup
+- `ci.yml` no longer mutates source or pushes code.
+- `ci.yml` uses `contents: read`.
+- `.github/workflows/compiler-diagnostic.yml` removed.
+- `.github/workflows/source-repair-once.yml` removed.
+- `scripts/repair_compiler_issues.py` removed.
+- `main` was restored to validated 400c3de source plus hardened CI in `38d64a2b3283344aec48f1536a21ac9ed18faa49`.
+- Latest cleanup commit removing the obsolete repair script is `cf32df03c7579109c15c97bc4745498a07ec31a0`.
 
-The current GoWay comparison job is still skipped because `WAY_READ_TOKEN` is not configured, so it is not yet a real cloud RushWay ↔ GoWay interoperability test.
+The current RushWay CI run for cleanup is pending. The obsolete repair workflows are no longer part of the current tree.
+
+The GoWay comparison job still skips actual GoWay v1.8.4 execution because `WAY_READ_TOKEN` is not configured. Therefore cloud CI is not yet a real RushWay ↔ GoWay interoperability test.
 
 ### Release gate
 Do not call v0.0.3 100% and do not create a final tag/release yet.
-Remaining proof includes clean cloud CI, actual GoWay v1.8.4 interoperability, SOCKS5/HTTP lifecycle/error matrix, WS/WSS/QUIC TCP+UDP interoperability, 1/100/500/1000 stream tests, benchmark evidence, Windows/Debian/ARMv7 smoke, and final release verification.
+Remaining proof:
+1. Clean cloud CI.
+2. Actual cloud GoWay v1.8.4 interoperability.
+3. SOCKS5/HTTP lifecycle and error matrix.
+4. WS/WSS/QUIC TCP+UDP interoperability.
+5. 1/100/500/1000 stream stress and mixed workloads.
+6. c1/c8/c32 benchmark evidence.
+7. Windows x64, Debian 12 x64 and ARMv7/OpenWrt smoke.
+8. Final v0.0.3 release/tag verification.
 
 ### Next action
-Restore `main` to the validated 400c3de source while retaining the hardened CI workflow; then remove obsolete source-repair workflow/script, run clean cloud CI, and establish a real GoWay interoperability job when the private-repo credential is available.
+Read the current CI result from the cleanup commit. Once clean, design/enable a true GoWay v1.8.4 interoperability job; do not use the missing secret as a false-positive pass. Then continue the runtime SOCKS/MUX investigation before final release.
 
 ## Three-file relay contract
 1. `AI_HANDOFF.md` — decisions, commits, blockers, next step.
