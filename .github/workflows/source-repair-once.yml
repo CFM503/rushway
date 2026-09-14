@@ -27,48 +27,43 @@ jobs:
               s = p.read_text()
               for old, new in replacements:
                   if old not in s:
-                      print(f'SKIP {path}: pattern not found: {old[:80]!r}')
+                      print(f'SKIP {path}: pattern not found: {old[:100]!r}')
                   else:
                       s = s.replace(old, new)
               p.write_text(s)
 
           patch('src/mux_pool.rs', [
-              ('#[derive(Debug)]\nstruct SessionState {', 'struct SessionState {'),
-              ('self.active.fetch_sub(1, Ordering::AcqRel)\n', 'self.active.fetch_sub(1, Ordering::AcqRel);\n'),
-              ('state.active.fetch_sub(1, Ordering::AcqRel)\n', 'state.active.fetch_sub(1, Ordering::AcqRel);\n'),
-              ('tokio::spawn(async move {\n            if let Err(e) = client_reader_loop', 'tokio::spawn(async move {\n            if let Err(e) = client_reader_loop'),
-              ('            reader_state.streams.lock().await.clear()\n        });', '            reader_state.streams.lock().await.clear();\n        });'),
-              ('    enforce_target_policy(&cfg, &bind_hint).or_else(|_| Ok(()))?;\n', '    let _ = enforce_target_policy(&cfg, &bind_hint);\n'),
-              ('        tokio::spawn(async move {\n            let result = handle_mux_stream', '        tokio::spawn(async move {\n            let result = handle_mux_stream'),
-              ('        });\n        Ok(())\n    })\n    .await?\n}', '        });\n        Ok(())\n    })\n    .await?\n};')
-          ])
-
-          patch('src/runtime.rs', [
-              ('        return ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified();', '''        return match ip {\n            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),\n            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local(),\n        };'''),
-              ('        let mut ka = socket2::TcpKeepalive::new();\n        ka.with_time(Duration::from_secs(30));', '        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));'),
-              ('        let addr = resolve_socket(&target.host, target.port).await?;', '        let addr = resolve_socket(&target.host, target.port).await.map_err(anyhow::Error::from)?;'),
-              ('        tokio::spawn(async move {\n', '        tokio::spawn(async move {\n'),
+              ('        tracing::debug!(%peer,error=%e,"pooled proxy connection closed")\n            }\n        })\n    }', '        tracing::debug!(%peer,error=%e,"pooled proxy connection closed")\n            }\n        });\n    }'),
           ])
 
           patch('src/nonmux.rs', [
-              ('        let mut ka = socket2::TcpKeepalive::new();\n        ka.with_time(Duration::from_secs(30));', '        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));'),
+              ('            if let Err(error) = handle_client_connection(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX client connection closed")\n            }\n        })\n    }', '            if let Err(error) = handle_client_connection(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX client connection closed")\n            }\n        });\n    }'),
+              ('            if let Err(error) = handle_server(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX transport closed")\n            }\n        })\n    }', '            if let Err(error) = handle_server(stream, cfg2).await {\n                tracing::debug!(%peer,%error,"non-MUX transport closed")\n            }\n        });\n    }'),
           ])
 
           patch('src/quic.rs', [
-              ('    cfg.initial_stream_receive_window(VarInt::from_u64(2 * 1024 * 1024));\n    cfg.max_stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));\n    cfg.initial_connection_receive_window(VarInt::from_u64(4 * 1024 * 1024));\n    cfg.max_connection_receive_window(VarInt::from_u64(16 * 1024 * 1024));', '    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));\n    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));'),
-              ('cert.signing_key.serialize_der()', 'cert.key_pair.serialize_der()'),
+              ('    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024));', '    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("QUIC stream window fits VarInt"));'),
+              ('    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024));', '    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("QUIC connection window fits VarInt"));'),
+              ('                                })\n                            }\n                            Err(_) => break,', '                                });\n                            }\n                            Err(_) => break,'),
+              ('                Err(_) => return,\n            }\n        })\n    }', '                Err(_) => return,\n            }\n        });\n    }'),
+              ('                        }\n                    }\n                })\n    }', '                        }\n                    }\n                });\n    }'),
+              ('                        })\n                    }\n                }\n                Err(_) => break,', '                        });\n                    }\n                }\n                Err(_) => break,'),
+          ])
+
+          patch('src/runtime.rs', [
+              ('let addr = resolve_socket(&target.host, target.port).await.map_err(anyhow::Error::from)?;', 'let addr = resolve_socket(&target.host, target.port).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;'),
+              ('                write_frame(&mut *w, &packet, 2, false).await?\n        }\n        Result::<()>::Ok(())', '                write_frame(&mut *w, &packet, 2, false).await?\n        }\n        Result::<()>::Ok(())'),
+              ('            }\n        })\n    }\n}', '            }\n        });\n    }\n}'),
           ])
 
           patch('src/wss_client.rs', [
-              ('#[derive(Debug)]\nstruct WssSessionState {', 'struct WssSessionState {'),
-              ('streams.insert(id, tx)\n', 'streams.insert(id, tx);\n'),
-              ('session.active.fetch_sub(1, Ordering::AcqRel)\n', 'session.active.fetch_sub(1, Ordering::AcqRel);\n'),
-              ('let ((_target, payload)) =', 'let (_target, payload) ='),
+              ('            if let Err(e) = handle_non_mux_connection(stream, cfg2).await {\n                tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")\n            }\n        })\n    }', '            if let Err(e) = handle_non_mux_connection(stream, cfg2).await {\n                tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")\n            }\n        });\n    }'),
+              ('            if let Err(e) = handle_connection(stream, pool2).await {\n                tracing::debug!(%peer,error=%e,"WSS proxy connection closed")\n            }\n        })\n    }', '            if let Err(e) = handle_connection(stream, pool2).await {\n                tracing::debug!(%peer,error=%e,"WSS proxy connection closed")\n            }\n        });\n    }'),
+              ('#[derive(Debug)]\nstruct WssSessionPool {', 'struct WssSessionPool {'),
           ])
 
           patch('src/main.rs', [
-              ('value_parser = clap::value_parser!(usize).range(1..=64)', 'value_parser = clap::value_parser!(usize)'),
-              ('value_parser = clap::value_parser!(usize).range(1..=1_000_000)', 'value_parser = clap::value_parser!(usize)'),
+              ('    let args = Args::parse_from(&raw_args);\n    let filter =', '''    let args = Args::parse_from(&raw_args);\n    if !(1..=64).contains(&args.mux_sessions) {\n        return Err(anyhow!("mux-sessions must be between 1 and 64"));\n    }\n    if let Some(v) = args.max_conn {\n        if !(1..=1_000_000).contains(&v) {\n            return Err(anyhow!("max-conn must be between 1 and 1000000"));\n        }\n    }\n    let filter =''')
           ])
           PY
       - name: Format
