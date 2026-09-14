@@ -44,6 +44,20 @@ fn child_path() -> io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
+fn transport_mode() -> &'static str {
+    match std::env::var("RUSHWAY_E2E_TRANSPORT").ok().as_deref() {
+        Some("quic") => "quic",
+        _ => "ws",
+    }
+}
+
+fn upstream_url(server_port: u16) -> String {
+    match transport_mode() {
+        "quic" => format!("quic://127.0.0.1:{server_port}"),
+        _ => format!("ws://127.0.0.1:{server_port}/"),
+    }
+}
+
 fn spawn_rushway(
     path: &std::path::Path,
     port: u16,
@@ -174,7 +188,6 @@ async fn run_case(
         )));
     }
 
-    // Count the full concurrent proxy flow, including SOCKS5 setup and upstream handshakes.
     let mut total = 0usize;
     for task in tasks {
         total += task.await.map_err(|e| io::Error::other(e.to_string()))??;
@@ -208,12 +221,13 @@ async fn main() -> io::Result<()> {
     let server_port = free_port().await?;
     let client_port = free_port().await?;
     let (target_port, echo_task) = start_echo().await?;
+    let mode = transport_mode();
 
     let mut server = spawn_rushway(&rushway, server_port, None, TEST_KEY, true)?;
     let mut client = spawn_rushway(
         &rushway,
         client_port,
-        Some(format!("ws://127.0.0.1:{}/", server_port)),
+        Some(upstream_url(server_port)),
         TEST_KEY,
         true,
     )?;
@@ -235,7 +249,8 @@ async fn main() -> io::Result<()> {
         }
 
         print!(
-            "rushway_e2e payload_mib={} roundtrip_echo=1",
+            "rushway_e2e transport={} payload_mib={} roundtrip_echo=1",
+            mode,
             payload.len() / (1024 * 1024)
         );
         for (concurrency, throughput) in results {
