@@ -41,6 +41,21 @@ jobs:
         env:
           RUSHWAY_E2E_TRANSPORT: quic
         run: cargo run --release --bin e2e_bench
+      - name: WS 1/100/500/1000 stream stress
+        env:
+          RUSHWAY_E2E_TRANSPORT: ws
+          RUSHWAY_E2E_STRESS: '1'
+        run: cargo run --release --bin e2e_bench
+      - name: WSS 1/100/500/1000 stream stress
+        env:
+          RUSHWAY_E2E_TRANSPORT: wss
+          RUSHWAY_E2E_STRESS: '1'
+        run: cargo run --release --bin e2e_bench
+      - name: QUIC 1/100/500/1000 stream stress
+        env:
+          RUSHWAY_E2E_TRANSPORT: quic
+          RUSHWAY_E2E_STRESS: '1'
+        run: cargo run --release --bin e2e_bench
       - name: Cross-proxy benchmark runner self-check
         run: cargo run --release --bin proxy_bench -- --implementation rushway --bin target/release/rushway
       - name: Repeated cross-proxy benchmark median
