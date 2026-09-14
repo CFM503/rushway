@@ -1,0 +1,79 @@
+name: RushWay CLI compatibility alignment
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  align:
+    if: startsWith(github.event.issue.title, 'RushWay CLI compatibility alignment')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          components: rustfmt
+      - name: Align RushWay CLI with pinned GoWay v1.8.4
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('src/main.rs')
+          s = p.read_text()
+          old = '    "version",\n    "cpuprofile",'
+          new = '    "version",\n    "help",\n    "cpuprofile",'
+          if old not in s:
+              raise SystemExit('expected legacy flag list anchor not found')
+          s = s.replace(old, new, 1)
+          old_test = '            "-version",\n        ]);'
+          new_test = '            "-version",\n            "-help",\n        ]);'
+          if old_test not in s:
+              raise SystemExit('expected legacy args test anchor not found')
+          s = s.replace(old_test, new_test, 1)
+          old_assert = '                "--log",\n                "ERROR",\n                "--version"\n            ]'
+          new_assert = '                "--log",\n                "ERROR",\n                "--version",\n                "--help"\n            ]'
+          if old_assert not in s:
+              raise SystemExit('expected legacy args assertion anchor not found')
+          s = s.replace(old_assert, new_assert, 1)
+          p.write_text(s)
+
+          h = Path('AI_HANDOFF.md')
+          text = h.read_text()
+          entry = '''\n\n## 2026-09-15 — GoWay CLI parameter compatibility alignment\n\n- Trigger: user requested that `rushway -help` expose/accept the same CLI parameter set as the pinned `CFM503/way` GoWay v1.8.4 CLI.\n- Reference: GoWay v1.8.4 commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.\n- Audit result: RushWay already exposes the GoWay operational flags (`-p`, `-up`, `-k`, `-fakehost`, `-mux`, `-no-mux`, `-mux-sessions`, `-W`, `-socket-buffer`, `-no-tcp-nodelay`, `-dns`, `-block-local`, `-no-block-local`, `-verify-ssl`, `-allow-open`, `-max-conn`, `-connection-timeout`, `-log`, `-log-file`, `-tui`, `-cpuprofile`, `-cpuprofile-duration`, `-version`) plus RushWay-native options.\n- Compatibility gap found: GoWay's standard `flag` parser accepts the multi-character `-help` spelling, while Clap's generated help entry is `--help`/`-h`; RushWay's legacy single-dash normalization did not include `help`.\n- Change: add `help` to `LEGACY_LONG_FLAGS`, so `rushway -help` normalizes to `--help`; extend the normalization regression test accordingly.\n- Astra review: keep GoWay as the CLI compatibility gate only; do not alter RushWay-native runtime architecture or protocol behavior for this CLI-only change.\n- Validation: `cargo fmt --all`, `cargo check --all-targets --all-features`, `cargo test --all-targets --all-features`, release `rushway -help`, `rushway --help`, and `rushway -version` checks.\n- Status: CLI compatibility alignment in progress; this cycle targets the concrete `-help` compatibility gap before returning to MUX concurrency diagnostics.\n- Remaining risk: exact help text/default rendering can still differ because RushWay uses Clap while GoWay uses Go's `flag` package; parameter presence and legacy spelling are the primary compatibility contract for this cycle.\n- Next action: verify the resulting CI commit and then resume MUX SYN/ACK lifecycle diagnostics for Run #364.\n'''
+          if 'GoWay CLI parameter compatibility alignment' not in text:
+              h.write_text(text + entry)
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check
+        run: cargo check --all-targets --all-features
+      - name: Test
+        run: cargo test --all-targets --all-features
+      - name: CLI compatibility smoke test
+        run: |
+          set -e
+          cargo run --release -- -help >/tmp/rushway-help.txt
+          cargo run --release -- --help >/tmp/rushway-help-long.txt
+          cargo run --release -- -version >/tmp/rushway-version.txt
+          grep -q -- '--help' /tmp/rushway-help.txt
+          grep -q -- '--log' /tmp/rushway-help.txt
+          grep -q -- '--cpuprofile' /tmp/rushway-help.txt
+      - name: Commit and remove one-shot workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs AI_HANDOFF.md .github/workflows/cli-align-once.yml
+          git commit -m 'Align RushWay CLI compatibility with GoWay'
+          git rm .github/workflows/cli-align-once.yml
+          git commit -m 'Remove one-shot CLI alignment workflow'
+          git push origin HEAD:main
+      - name: Close trigger issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close '${{ github.event.issue.number }}' --comment 'CLI compatibility alignment workflow completed.' || true
