@@ -70,7 +70,11 @@ impl MuxHeader {
                 available: buf.len().saturating_sub(MUX_HEADER_LEN),
             });
         }
-        Ok(Self { stream_id, command, payload_len })
+        Ok(Self {
+            stream_id,
+            command,
+            payload_len,
+        })
     }
 
     pub fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
@@ -78,7 +82,12 @@ impl MuxHeader {
     }
 }
 
-pub fn encode_header(out: &mut Vec<u8>, stream_id: u32, command: MuxCommand, payload_len: usize) -> Result<(), ProtocolError> {
+pub fn encode_header(
+    out: &mut Vec<u8>,
+    stream_id: u32,
+    command: MuxCommand,
+    payload_len: usize,
+) -> Result<(), ProtocolError> {
     if payload_len > MAX_MUX_PAYLOAD {
         return Err(ProtocolError::PayloadTooLarge(payload_len));
     }
@@ -89,7 +98,12 @@ pub fn encode_header(out: &mut Vec<u8>, stream_id: u32, command: MuxCommand, pay
     Ok(())
 }
 
-pub fn write_frame_parts(out: &mut Vec<u8>, stream_id: u32, command: MuxCommand, payload: &[u8]) -> Result<(), ProtocolError> {
+pub fn write_frame_parts(
+    out: &mut Vec<u8>,
+    stream_id: u32,
+    command: MuxCommand,
+    payload: &[u8],
+) -> Result<(), ProtocolError> {
     encode_header(out, stream_id, command, payload.len())?;
     out.extend_from_slice(payload);
     Ok(())
@@ -120,11 +134,19 @@ impl OwnedMuxFrame {
 }
 
 impl MuxFrame {
-    pub fn new(stream_id: u32, command: MuxCommand, payload: Vec<u8>) -> Result<Self, ProtocolError> {
+    pub fn new(
+        stream_id: u32,
+        command: MuxCommand,
+        payload: Vec<u8>,
+    ) -> Result<Self, ProtocolError> {
         if payload.len() > MAX_MUX_PAYLOAD {
             return Err(ProtocolError::PayloadTooLarge(payload.len()));
         }
-        Ok(Self { stream_id, command, payload })
+        Ok(Self {
+            stream_id,
+            command,
+            payload,
+        })
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
@@ -142,7 +164,11 @@ impl MuxFrame {
 
     pub fn decode_owned(buf: Vec<u8>) -> Result<OwnedMuxFrame, ProtocolError> {
         let header = MuxHeader::parse(&buf)?;
-        Ok(OwnedMuxFrame { stream_id: header.stream_id, command: header.command, storage: buf })
+        Ok(OwnedMuxFrame {
+            stream_id: header.stream_id,
+            command: header.command,
+            storage: buf,
+        })
     }
 }
 
@@ -198,8 +224,14 @@ impl fmt::Display for ProtocolError {
             Self::UnknownCommand(c) => write!(f, "unknown MUX command: 0x{c:02x}"),
             Self::PayloadTooLarge(n) => write!(f, "MUX payload exceeds uint16: {n} bytes"),
             Self::TargetTooLarge(n) => write!(f, "SYN target exceeds uint16: {n} bytes"),
-            Self::LengthMismatch { declared, available } => {
-                write!(f, "MUX payload length mismatch: declared {declared}, available {available}")
+            Self::LengthMismatch {
+                declared,
+                available,
+            } => {
+                write!(
+                    f,
+                    "MUX payload length mismatch: declared {declared}, available {available}"
+                )
             }
         }
     }
@@ -244,7 +276,12 @@ mod tests {
 
     #[test]
     fn all_commands_round_trip() {
-        for command in [MuxCommand::Syn, MuxCommand::Data, MuxCommand::Fin, MuxCommand::Rst] {
+        for command in [
+            MuxCommand::Syn,
+            MuxCommand::Data,
+            MuxCommand::Fin,
+            MuxCommand::Rst,
+        ] {
             let frame = MuxFrame::new(7, command, vec![]).unwrap();
             let mut bytes = Vec::new();
             frame.encode(&mut bytes).unwrap();
@@ -254,7 +291,10 @@ mod tests {
 
     #[test]
     fn syn_payload_round_trip_with_initial_data() {
-        let payload = SynPayload { target: b"example.com:443".to_vec(), initial_data: b"hello".to_vec() };
+        let payload = SynPayload {
+            target: b"example.com:443".to_vec(),
+            initial_data: b"hello".to_vec(),
+        };
         let encoded = payload.encode().unwrap();
         assert_eq!(&encoded[..2], &[0, 15]);
         assert_eq!(SynPayload::decode(&encoded).unwrap(), payload);
@@ -262,8 +302,17 @@ mod tests {
 
     #[test]
     fn malformed_frames_are_rejected() {
-        assert!(matches!(MuxFrame::decode(&[0; 6]), Err(ProtocolError::TruncatedHeader(6))));
-        assert!(matches!(MuxFrame::decode(&[0, 0, 0, 1, 0xff, 0, 0]), Err(ProtocolError::UnknownCommand(0xff))));
-        assert!(matches!(MuxFrame::decode(&[0, 0, 0, 1, MUX_DATA, 0, 2, 1]), Err(ProtocolError::LengthMismatch { .. })));
+        assert!(matches!(
+            MuxFrame::decode(&[0; 6]),
+            Err(ProtocolError::TruncatedHeader(6))
+        ));
+        assert!(matches!(
+            MuxFrame::decode(&[0, 0, 0, 1, 0xff, 0, 0]),
+            Err(ProtocolError::UnknownCommand(0xff))
+        ));
+        assert!(matches!(
+            MuxFrame::decode(&[0, 0, 0, 1, MUX_DATA, 0, 2, 1]),
+            Err(ProtocolError::LengthMismatch { .. })
+        ));
     }
 }

@@ -19,10 +19,24 @@ fn child_path() -> io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let path = exe
         .parent()
-        .map(|p| p.join(if cfg!(windows) { "rushway.exe" } else { "rushway" }))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot locate sibling rushway binary"))?;
+        .map(|p| {
+            p.join(if cfg!(windows) {
+                "rushway.exe"
+            } else {
+                "rushway"
+            })
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot locate sibling rushway binary",
+            )
+        })?;
     if !path.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing {}", path.display())));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing {}", path.display()),
+        ));
     }
     Ok(path)
 }
@@ -43,7 +57,10 @@ async fn wait_for_port(port: u16) -> io::Result<()> {
             Err(_) => sleep(Duration::from_millis(25)).await,
         }
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, format!("port {} did not open", port)))
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("port {} did not open", port),
+    ))
 }
 
 async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -51,7 +68,9 @@ async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
     let port = listener.local_addr()?.port();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((mut socket, _)) = listener.accept().await else { break };
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
@@ -75,7 +94,10 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> io::Result<TcpStre
     let mut method = [0u8; 2];
     stream.read_exact(&mut method).await?;
     if method != [5, 0] {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "SOCKS5 no-auth was rejected"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SOCKS5 no-auth was rejected",
+        ));
     }
 
     let port = target_port.to_be_bytes();
@@ -85,7 +107,10 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> io::Result<TcpStre
     let mut reply = [0u8; 10];
     stream.read_exact(&mut reply).await?;
     if reply[1] != 0 {
-        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("SOCKS5 connect failed: {}", reply[1])));
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("SOCKS5 connect failed: {}", reply[1]),
+        ));
     }
     Ok(stream)
 }
@@ -96,16 +121,28 @@ async fn one_flow(proxy_port: u16, target_port: u16, payload: Arc<[u8]>) -> io::
     let mut echoed = vec![0u8; payload.len()];
     stream.read_exact(&mut echoed).await?;
     if echoed.as_slice() != payload.as_ref() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "echo payload mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "echo payload mismatch",
+        ));
     }
     Ok(payload.len())
 }
 
-async fn run_case(proxy_port: u16, target_port: u16, concurrency: usize, payload: Arc<[u8]>) -> io::Result<f64> {
+async fn run_case(
+    proxy_port: u16,
+    target_port: u16,
+    concurrency: usize,
+    payload: Arc<[u8]>,
+) -> io::Result<f64> {
     let start = Instant::now();
     let mut tasks = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
-        tasks.push(tokio::spawn(one_flow(proxy_port, target_port, Arc::clone(&payload))));
+        tasks.push(tokio::spawn(one_flow(
+            proxy_port,
+            target_port,
+            Arc::clone(&payload),
+        )));
     }
 
     // Count the full concurrent proxy flow, including SOCKS5 setup and upstream handshakes.
@@ -131,7 +168,11 @@ async fn main() -> io::Result<()> {
     let (target_port, echo_task) = start_echo().await?;
 
     let mut server = spawn_rushway(&rushway, server_port, None)?;
-    let mut client = spawn_rushway(&rushway, client_port, Some(format!("ws://127.0.0.1:{}/", server_port)))?;
+    let mut client = spawn_rushway(
+        &rushway,
+        client_port,
+        Some(format!("ws://127.0.0.1:{}/", server_port)),
+    )?;
 
     let result = async {
         wait_for_port(server_port).await?;
@@ -144,7 +185,8 @@ async fn main() -> io::Result<()> {
 
         let mut results = Vec::with_capacity(CONCURRENCIES.len());
         for &concurrency in CONCURRENCIES {
-            let throughput = run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?;
+            let throughput =
+                run_case(client_port, target_port, concurrency, Arc::clone(&payload)).await?;
             results.push((concurrency, throughput));
         }
 

@@ -35,7 +35,11 @@ fn main() {
     let elapsed_owned = start.elapsed();
     let owned_ns = elapsed_owned.as_secs_f64() * 1e9 / ITERS as f64;
     let owned_mbps = owned as f64 / elapsed_owned.as_secs_f64() / 1024.0 / 1024.0;
-    let speedup = if owned_ns > 0.0 { copy_ns / owned_ns } else { 0.0 };
+    let speedup = if owned_ns > 0.0 {
+        copy_ns / owned_ns
+    } else {
+        0.0
+    };
 
     println!("rushway_mux_decode_copy iters={ITERS} payload={PAYLOAD} ns/op={copy_ns:.2} MB/s={copy_mbps:.2}");
     println!("rushway_mux_decode_owned_reused iters={ITERS} payload={PAYLOAD} ns/op={owned_ns:.2} MB/s={owned_mbps:.2}");

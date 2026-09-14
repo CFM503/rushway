@@ -153,9 +153,7 @@ async fn run_case(
 
     let mut total = 0usize;
     for task in tasks {
-        total += task
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))??;
+        total += task.await.map_err(|e| io::Error::other(e.to_string()))??;
     }
 
     let secs = start.elapsed().as_secs_f64();

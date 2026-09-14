@@ -6,8 +6,8 @@
 //! plain `ws://` path is unchanged while WSS integration is completed.
 
 use anyhow::{anyhow, Context, Result};
-use rustls::{ClientConfig, RootCertStore};
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -22,37 +22,41 @@ fn roots() -> RootCertStore {
 
 fn verified_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mut config = ClientConfig::builder()
-            .with_root_certificates(roots())
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Arc::new(config)
-    }).clone()
+    CONFIG
+        .get_or_init(|| {
+            let mut config = ClientConfig::builder()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(config)
+        })
+        .clone()
 }
 
 fn insecure_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mut config = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Arc::new(config)
-    }).clone()
+    CONFIG
+        .get_or_init(|| {
+            let mut config = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(config)
+        })
+        .clone()
 }
 
 /// Connect to an upstream TLS endpoint.
 ///
 /// `verify_ssl=false` matches GoWay's v1.8.4 default (`InsecureSkipVerify`).
 /// `verify_ssl=true` uses the platform-independent WebPKI root set.
-pub async fn connect(
-    stream: TcpStream,
-    host: &str,
-    verify_ssl: bool,
-) -> Result<RushTlsStream> {
-    let config = if verify_ssl { verified_config() } else { insecure_config() };
+pub async fn connect(stream: TcpStream, host: &str, verify_ssl: bool) -> Result<RushTlsStream> {
+    let config = if verify_ssl {
+        verified_config()
+    } else {
+        insecure_config()
+    };
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
     let connector = TlsConnector::from(config);

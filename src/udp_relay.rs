@@ -1,7 +1,10 @@
 use crate::crypto::XorCipher;
 use crate::proxy::{parse_socks5_udp_datagram, TargetAddr};
 use crate::runtime::{enforce_target_policy, RuntimeConfig};
-use crate::ws::{build_client_handshake_request, read_frame, read_http_headers, validate_client_handshake_response, write_frame};
+use crate::ws::{
+    build_client_handshake_request, read_frame, read_http_headers,
+    validate_client_handshake_response, write_frame,
+};
 use anyhow::{anyhow, bail, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -92,8 +95,12 @@ pub async fn handle_local_udp_proxy(
         write_frame(&mut *w, &hello, 2, true).await?
     };
     let mut frame_buf = Vec::with_capacity(64 * 1024);
-    let Some((opcode, mut ok)) =
-        read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await?
+    let Some((opcode, mut ok)) = read_frame(
+        &mut rd,
+        Option::<&mut WriteHalf<TcpStream>>::None,
+        &mut frame_buf,
+    )
+    .await?
     else {
         bail!("upstream closed during UDP handshake")
     };
@@ -122,19 +129,23 @@ pub async fn handle_local_udp_proxy(
         Result::<()>::Ok(())
     });
     loop {
-        let Some((opcode, mut packet)) =
-            read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut frame_buf).await?
+        let Some((opcode, mut packet)) = read_frame(
+            &mut rd,
+            Option::<&mut WriteHalf<TcpStream>>::None,
+            &mut frame_buf,
+        )
+        .await?
         else {
-            break
+            break;
         };
         if opcode != 2 {
-            continue
+            continue;
         }
         c.apply(&mut packet);
         let (target, payload) =
             parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
         if enforce_target_policy(&cfg, &target).is_err() {
-            continue
+            continue;
         }
         if let Some(peer) = *latest.lock().await {
             let _ = udp.send_to(payload, peer).await?;

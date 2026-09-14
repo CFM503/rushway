@@ -24,12 +24,16 @@ impl XorCipher {
         Self { key: expanded }
     }
 
-    pub fn is_enabled(&self) -> bool { !self.key.is_empty() }
+    pub fn is_enabled(&self) -> bool {
+        !self.key.is_empty()
+    }
 
     /// Applies one GoWay TransformInPlace operation. Offset is reset to zero
     /// for every call, matching the v1.8.4 implementation.
     pub fn apply(&self, data: &mut [u8]) {
-        if self.key.is_empty() { return; }
+        if self.key.is_empty() {
+            return;
+        }
         for (i, byte) in data.iter_mut().enumerate() {
             *byte ^= self.key[i % self.key.len()];
         }
