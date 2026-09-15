@@ -6,6 +6,7 @@ on:
     paths:
       - 'src/mux_pool.rs'
       - 'src/runtime.rs'
+      - 'src/bin/e2e_bench.rs'
       - '.github/workflows/mux-contention-diagnostic.yml'
 
 jobs:
@@ -56,11 +57,11 @@ jobs:
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_E2E_INCLUDE_1000: '1'
-          RUSHWAY_MUX_SESSIONS: '64'
+          RUSHWAY_E2E_MUX_SESSIONS: '64'
           RUSHWAY_E2E_DIAGNOSTIC: '1'
         run: |
           ulimit -n 8192
-          cargo run --release --bin e2e_bench -- --mux-sessions 64 2>&1 | tee mux-ws-diagnostic.log
+          cargo run --release --bin e2e_bench 2>&1 | tee mux-ws-diagnostic.log
         continue-on-error: true
       - name: Run WSS 1000 diagnostic
         shell: bash
@@ -69,11 +70,11 @@ jobs:
           RUSHWAY_E2E_STRESS: '1'
           RUSHWAY_E2E_STRESS_PATTERN: staged
           RUSHWAY_E2E_INCLUDE_1000: '1'
-          RUSHWAY_MUX_SESSIONS: '64'
+          RUSHWAY_E2E_MUX_SESSIONS: '64'
           RUSHWAY_E2E_DIAGNOSTIC: '1'
         run: |
           ulimit -n 8192
-          cargo run --release --bin e2e_bench -- --mux-sessions 64 2>&1 | tee mux-wss-diagnostic.log
+          cargo run --release --bin e2e_bench 2>&1 | tee mux-wss-diagnostic.log
         continue-on-error: true
       - name: Upload diagnostic logs
         uses: actions/upload-artifact@v4
