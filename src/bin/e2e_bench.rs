@@ -28,6 +28,13 @@ fn include_1000_stress() -> bool {
     )
 }
 
+fn configured_mux_sessions() -> Option<usize> {
+    std::env::var("RUSHWAY_MUX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=64).contains(v))
+}
+
 fn free_port() -> io::Result<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr().map(|a| a.port())
 }
@@ -54,6 +61,7 @@ fn spawn_rushway(path: &std::path::Path, port: u16, upstream: Option<String>, ke
     let mut cmd = Command::new(path);
     let log_level = if diagnostic_mode() { "DEBUG" } else { "ERROR" };
     cmd.arg("-p").arg(port.to_string()).arg("-k").arg(key).arg("--log").arg(log_level);
+    if let Some(sessions) = configured_mux_sessions() { cmd.arg("--mux-sessions").arg(sessions.to_string()); }
     if allow_local_targets { cmd.arg("--no-block-local"); }
     if wss_server { cmd.arg("--wss-server"); }
     if let Some(upstream) = upstream { cmd.arg("--up").arg(upstream); }

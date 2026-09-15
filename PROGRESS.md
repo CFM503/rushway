@@ -6,6 +6,15 @@
 
 **Implementation coverage: high; final release completion is not yet claimed.** The 1000-stream diagnostic results now separate transports: WS and QUIC pass at 1000 with 64 physical MUX sessions, while WSS still fails at flow 406 with `early eof`. The 1000 diagnostics remain non-blocking evidence gathering.
 
+### Native Session Manager alignment in progress
+
+- Branch: `astra/go-style-mux-session-manager`.
+- Plain-WS pooled MUX now binds the local proxy before upstream physical-session replenishment instead of synchronously prewarming the full configured pool.
+- Physical session creation remains serialized by `session_creation`; closed sessions are pruned during maintenance and acquisition.
+- Session selection snapshots active counts before choosing the least-loaded session.
+- No MUX wire-format, target-policy, or stream-limit change.
+- This is implemented but not yet accepted; executable CI evidence is required.
+
 ### Current validated revision
 
 - Latest merged revision: `89615e5039207d2e51628e968e383677f6a11a8b` (PR #11 merge).
@@ -27,16 +36,8 @@
 ### Latest main CI
 
 - Run #384: `34910162991`, merge commit `89615e5039207d2e51628e968e383677f6a11a8b`.
-- At this checkpoint the merge-triggered Run #384 is still in progress; its Rust format/check/test stages have passed and the GoWay job is skipped because the optional token is absent.
-- Do not treat Run #384 as fully validated until its remaining jobs finish.
-
-### Immediate next action
-
-1. Wait for Run #384 to finish and record its final result.
-2. Keep WS and QUIC 1000 diagnostics as executable evidence; do not promote them to blocking gates yet.
-3. Investigate the WSS-specific 1000 failure at flow 406 using transport/session diagnostics; do not change production behavior without evidence.
-4. After WSS is understood, run repeated 1000 rounds and then the lifecycle/error and TCP+UDP interoperability matrices.
-5. Keep the final v0.0.3 tag/release blocked until stress, lifecycle/error, UDP, GoWay and real-device gates are satisfied.
+- Its earlier core stages passed; the GoWay comparison is skipped when `WAY_READ_TOKEN` is absent.
+- Do not treat a skipped comparison as interoperability evidence.
 
 ### Transport status
 
@@ -48,7 +49,7 @@
 | Plain WS non-MUX | Implemented; lifecycle/error matrix still pending |
 | Plain WS UDP | Implemented; cross-transport executable matrix pending |
 | WSS MUX/non-MUX | WSS standalone TCP path executably validated |
-| WSS 1000 diagnostic | **Failing** at flow 406 under 64-session staged diagnostic |
+| WSS 1000 diagnostic | **Failing** at flow 406 under 64-session staged diagnostic on baseline; PR #18 startup fix has full CI success but repeatable 1000 evidence pending |
 | WSS UDP | Implemented; executable UDP matrix pending |
 | QUIC/QUIC+TLS TCP | Standalone TCP path executably validated |
 | QUIC 1000 diagnostic | Passed once at 64 MUX sessions; repeated acceptance pending |
@@ -70,7 +71,7 @@
 - [x] Windows x64 / Debian 12 x64 / ARMv7 Linux release builds.
 - [ ] OpenWrt or real-device smoke.
 - [ ] Actual cloud GoWay v1.8.4 bidirectional WS/WSS/QUIC TCP+UDP interoperability.
-- [ ] Final v0.0.3 tag/release verification.
+- [ ] Final v0.0.3 release/tag verification.
 
 ### Known CI warnings / cleanup backlog
 
