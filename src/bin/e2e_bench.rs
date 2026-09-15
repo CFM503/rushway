@@ -71,16 +71,20 @@ fn spawn_rushway(path: &std::path::Path, port: u16, upstream: Option<String>, ke
 }
 
 async fn wait_for_port(port: u16, child: &mut Child, role: &str) -> io::Result<()> {
-    for _ in 0..100 {
+    let started = Instant::now();
+    for _ in 0..400 {
         match TcpStream::connect(("127.0.0.1", port)).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                eprintln!("stress startup: role={role} port={port} ready_after_ms={}", started.elapsed().as_millis());
+                return Ok(())
+            },
             Err(_) => {
                 if let Some(status) = child.try_wait()? { return Err(io::Error::other(format!("{role} RushWay exited before opening port {port}: {status}"))); }
                 sleep(Duration::from_millis(25)).await;
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, format!("{role} RushWay port {port} did not open")))
+    Err(io::Error::new(io::ErrorKind::TimedOut, format!("{role} RushWay port {port} did not open after {}ms", started.elapsed().as_millis())))
 }
 
 async fn start_echo() -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
