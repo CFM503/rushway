@@ -26,29 +26,50 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 
-trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
-type BoxTransport = Box<dyn Transport>;
-type BoxReader = tokio::io::ReadHalf<BoxTransport>;
-type BoxWriter = tokio::io::WriteHalf<BoxTransport>;
+pub(crate) type BoxTransport = Box<dyn Transport>;
+pub(crate) type BoxReader = tokio::io::ReadHalf<BoxTransport>;
+pub(crate) type BoxWriter = tokio::io::WriteHalf<BoxTransport>;
 
 const DEFAULT_SESSION_COUNT: usize = 4;
 const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
 #[derive(Debug, Clone)]
-struct WssConfig {
-    proxy_host: String,
-    proxy_port: u16,
-    upstream: String,
-    key: Option<String>,
-    fakehost: Option<String>,
-    buffer_size: usize,
-    connection_timeout: u64,
-    verify_ssl: bool,
-    tcp_nodelay: bool,
-    tcp_keepalive: bool,
-    socket_buffer: usize,
+pub(crate) struct WssConfig {
+    pub(crate) proxy_host: String,
+    pub(crate) proxy_port: u16,
+    pub(crate) upstream: String,
+    pub(crate) key: Option<String>,
+    pub(crate) fakehost: Option<String>,
+    pub(crate) buffer_size: usize,
+    pub(crate) connection_timeout: u64,
+    pub(crate) verify_ssl: bool,
+    pub(crate) tcp_nodelay: bool,
+    pub(crate) tcp_keepalive: bool,
+    pub(crate) socket_buffer: usize,
+}
+impl WssConfig {
+    pub(crate) fn from_runtime_config(cfg: &RuntimeConfig, verify_ssl: bool) -> Result<Self> {
+        let upstream = cfg
+            .upstream
+            .clone()
+            .ok_or_else(|| anyhow!("WSS client requires upstream"))?;
+        Ok(Self {
+            proxy_host: cfg.proxy_host.clone(),
+            proxy_port: cfg.proxy_port,
+            upstream,
+            key: cfg.key.clone(),
+            fakehost: cfg.fakehost.clone(),
+            buffer_size: cfg.buffer_size,
+            connection_timeout: cfg.connection_timeout,
+            verify_ssl,
+            tcp_nodelay: cfg.tcp_nodelay,
+            tcp_keepalive: cfg.tcp_keepalive,
+            socket_buffer: cfg.socket_buffer,
+        })
+    }
 }
 fn cipher(key: &Option<String>) -> XorCipher {
     XorCipher::new(key.as_deref().unwrap_or(""))
@@ -186,7 +207,9 @@ async fn dial_cloudflare_fallback(
     bail!("all Cloudflare fallback edges failed for fakehost: {tls_name}")
 }
 
-async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+pub(crate) async fn connect_wss_upstream(
+    cfg: &WssConfig,
+) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
     let (addr, host, path) = parse_wss_url(&cfg.upstream)?;
     let (dns_host, dns_port) = split_authority(&addr)?;
     let resolved = dns::resolve_socket(&dns_host, dns_port).await?;
@@ -234,6 +257,12 @@ async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWrite
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
     Ok((rd, Arc::new(Mutex::new(wr))))
+}
+
+pub(crate) async fn open_upstream(
+    cfg: &WssConfig,
+) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+    connect_wss_upstream(cfg).await
 }
 
 async fn read_proxy_request(local: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
@@ -977,5 +1006,71 @@ mod tests {
         // IP host + no fakehost -> NOT eligible
         let no_fakehost = false;
         assert!(!(no_fakehost && is_ip));
+    }
+
+    #[tokio::test]
+    async fn mock_wss_server_fakehost_mux_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tls::standalone_server_acceptor().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = acceptor.accept(stream).await.unwrap();
+            let headers_bytes = read_http_headers(&mut tls_stream).await.unwrap();
+            let headers_str = std::str::from_utf8(&headers_bytes).unwrap();
+
+            assert!(headers_str.starts_with("GET /pyway HTTP/1.1\r\n"));
+            assert!(headers_str.contains("Host: colo.4467107.xyz\r\n"));
+            assert!(headers_str.contains("Origin: https://colo.4467107.xyz\r\n"));
+            assert!(headers_str.contains("Upgrade: websocket\r\n"));
+            assert!(!headers_str.contains("Host: 127.0.0.1"));
+
+            let key = crate::ws::validate_server_handshake(&headers_bytes).unwrap();
+            tls_stream
+                .write_all(&crate::ws::build_server_handshake_response(&key))
+                .await
+                .unwrap();
+
+            let mut buf = Vec::new();
+            let (opcode, mut payload) = read_frame(
+                &mut tls_stream,
+                Option::<&mut tokio::io::DuplexStream>::None,
+                &mut buf,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(opcode, 2);
+            let c = cipher(&Some("secretkey".into()));
+            c.apply(&mut payload);
+            assert_eq!(payload, b"MUX\n");
+
+            let mut ok_payload = b"OK\n".to_vec();
+            c.apply(&mut ok_payload);
+            write_frame(&mut tls_stream, &ok_payload, 2, false)
+                .await
+                .unwrap();
+        });
+
+        let cfg = WssConfig {
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 0,
+            upstream: format!("wss://127.0.0.1:{port}/pyway"),
+            key: Some("secretkey".into()),
+            fakehost: Some("colo.4467107.xyz".into()),
+            buffer_size: 128 * 1024,
+            connection_timeout: 10,
+            verify_ssl: false,
+            tcp_nodelay: true,
+            tcp_keepalive: true,
+            socket_buffer: 0,
+        };
+
+        let session = WssSessionState::connect(&cfg).await.unwrap();
+        assert_eq!(session.active.load(Ordering::Acquire), 0);
+        assert!(!session.closed.load(Ordering::Acquire));
+
+        server_task.await.unwrap();
     }
 }

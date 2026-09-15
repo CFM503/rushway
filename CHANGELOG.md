@@ -1,6 +1,20 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to this project will be documented in this file.
+
+## [v0.0.7] - 2026-09-15
+
+### Fixed
+- **Unified WSS Transport for MUX Physical Sessions**:
+  - Exported authoritative crate-level `connect_wss_upstream` transport helper in `src/wss_client.rs`.
+  - Clarified execution boundaries: verified that `wss://` with `-mux` routes through `WssSessionPool`, with all parallel physical sessions established via the Cloudflare-aware pipeline.
+  - Ensured `-fakehost` applies consistently to TLS SNI and HTTP `Host` for all MUX physical sessions.
+  - Ensured Cloudflare Edge fallback via DNS resolution of `fakehost` is available across each physical session dial.
+  - Fixed plain `ws://` origin scheme in `src/mux_pool.rs` to use `http://` instead of `https://`.
+- **Workflow Cleanup**:
+  - Removed completed one-shot workflows (`.github/workflows/cli-align-once.yml` and `.github/workflows/stress-gate-once.yml`).
+- **Regression Coverage**:
+  - Added in-process mock WSS server integration test verifying TLS SNI, HTTP `Host`, `Origin`, and encrypted `MUX\n` / `OK\n` handshake.
 
 ## [v0.0.6] - 2026-09-15
 

@@ -735,5 +735,53 @@ RushWay previously supported a basic `--fakehost` flag, but lacked:
 
 ### Validation
 - Unit tests: Verified WSS URL parsing, header construction, DNS answer parsing, and CLI normalization.
-- Next step: Commit to `main`, observe CI validation, tag `v0.0.6`, push tag, and verify GitHub Actions release workflow.
+- Release v0.0.6 completed with CI passing and release artifacts published.
+
+## 2026-09-15 — v0.0.7 Release: MUX Cloudflare WSS Transport Unification
+
+### Target & Version
+- Version: `v0.0.7`
+- Topic: Unification of MUX Physical WSS Transport & Pipeline Clarification
+- Branch: `main`
+
+### Background & Architectural Clarification
+Following the release of `v0.0.6`, review noted that `src/mux_pool.rs` contained an independent physical session connection implementation (`SessionState::connect`), raising concerns that `src/mux_pool.rs` might diverge from `src/wss_client.rs`.
+
+**Investigation & Proven Execution Path**:
+1. In `src/main.rs:444`, whenever `upstream.starts_with("wss://")`, execution is dispatched strictly to `wss_client::run_client_from_config` when `cfg.mux` is enabled.
+2. Inside `src/wss_client.rs`, `WssSessionPool` manages all physical sessions (up to `RUSHWAY_MUX_SESSIONS`, e.g. 8). Each physical session is established through `WssSessionState::connect`, which calls `open_upstream(cfg)`.
+3. `src/mux_pool.rs` was originally scoped strictly for plain unencrypted `ws://` MUX connections (`input.strip_prefix("ws://")`).
+4. To eliminate all ambiguity and provide an authoritative crate-wide WSS transport constructor, `src/wss_client.rs` now exports `pub(crate) async fn connect_wss_upstream`.
+5. `src/mux_pool.rs` has been documented and clarified: plain `ws://` origin is corrected to `http://`, and any attempt to feed `wss://` into `mux_pool.rs` produces an explicit error directing callers to `wss_client`.
+
+### Astra Review
+- **Pipeline Consistency**: Every MUX physical session (e.g. 8 sessions) runs through the identical Cloudflare-aware pipeline:
+  - Destination TCP: upstream IP (`172.64.229.105:443`)
+  - TLS SNI: `fakehost` (`colo.4467107.xyz`)
+  - HTTP `Host`: `fakehost` (`colo.4467107.xyz`)
+  - `Origin`: `https://colo.4467107.xyz`
+  - Path: `/pyway`
+  - Fallback: Cloudflare DNS A records iteration skipping primary IP.
+- **Workflow Hygiene**: Removed obsolete one-shot GitHub Actions workflows (`cli-align-once.yml`, `stress-gate-once.yml`), keeping only long-term `ci.yml` and `release.yml`.
+- **Concurrency & Defaults**: `max_connections` default remains strictly 1500 across `RuntimeConfig::default()` and `src/main.rs`.
+
+### Changes
+- `.github/workflows/`: Deleted `cli-align-once.yml` and `stress-gate-once.yml`.
+- `src/wss_client.rs`:
+  - Exported `pub(crate) trait Transport`, `BoxTransport`, `BoxReader`, `BoxWriter`.
+  - Exported `pub(crate) struct WssConfig` and `from_runtime_config`.
+  - Exported `pub(crate) async fn connect_wss_upstream`.
+  - Added in-process mock TLS WSS server test (`mock_wss_server_fakehost_mux_handshake`) verifying TLS SNI, HTTP Host, Origin, and MUX OK exchange.
+- `src/mux_pool.rs`:
+  - Added module documentation explaining `ws://` plain vs `wss://` TLS division.
+  - Fixed `Origin` scheme to `http://` for `ws://`.
+  - Added unit test checking `wss://` rejection and guidance.
+- `Cargo.toml`: Bumped version to `0.0.7`.
+- `CHANGELOG.md`: Added `[v0.0.7]` section.
+- `README.md`: Retained production Cloudflare command and clarified MUX transport behavior.
+
+### Validation
+- Unit & integration tests: Mock WSS server MUX handshake, URL parsing, DNS answer parsing, and CLI normalization.
+- Next action: Push commit to `main`, wait for CI, create tag `v0.0.7`, push tag, and verify GitHub Actions release.
+
 

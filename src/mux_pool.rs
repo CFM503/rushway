@@ -1,4 +1,7 @@
-//! Client-side physical MUX session pool.
+//! Client-side physical MUX session pool for plain WebSocket (`ws://`).
+//!
+//! Secure WebSocket (`wss://`) connections, including Cloudflare FakeHost and Edge
+//! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
 
 use crate::crypto::XorCipher;
 use crate::dns;
@@ -89,6 +92,9 @@ async fn send_mux_parts(
     send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut bytes).await
 }
 fn parse_upstream(input: &str) -> Result<(String, String)> {
+    if input.starts_with("wss://") {
+        bail!("pooled client in mux_pool requires ws:// upstream; use wss_client for wss://");
+    }
     let rest = input
         .strip_prefix("ws://")
         .ok_or_else(|| anyhow!("pooled client requires ws:// upstream"))?;
@@ -130,7 +136,7 @@ impl SessionState {
         .context("upstream connection timeout")??;
         apply_socket_options(&socket, cfg);
         let (mut rd, mut wr) = tokio::io::split(socket);
-        let origin = Some(format!("https://{}", actual_host));
+        let origin = Some(format!("http://{}", actual_host));
         let sec_fetch_site = if authority.eq_ignore_ascii_case(&actual_host) {
             "same-origin"
         } else {
@@ -689,5 +695,23 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 tracing::debug!(%peer,error=%e,"pooled proxy connection closed")
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ws_upstream_success() {
+        let (authority, path) = parse_upstream("ws://example.com:8080/ws").unwrap();
+        assert_eq!(authority, "example.com:8080");
+        assert_eq!(path, "/ws");
+    }
+
+    #[test]
+    fn parse_ws_upstream_rejects_wss_explicitly() {
+        let err = parse_upstream("wss://example.com:443/pyway").unwrap_err();
+        assert!(err.to_string().contains("use wss_client for wss://"));
     }
 }
