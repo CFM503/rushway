@@ -47,8 +47,8 @@ jobs:
           p.write_text(s)
           PY
           cargo fmt --all
-      - name: Build diagnostic binary
-        run: cargo build --release --bin e2e_bench
+      - name: Build diagnostic binaries
+        run: cargo build --release --bin rushway --bin e2e_bench
       - name: Run WS 1000 diagnostic
         shell: bash
         env:
