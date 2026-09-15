@@ -1,0 +1,48 @@
+name: apply stream lifecycle fix
+
+on:
+  push:
+    branches:
+      - astra/stream-lifecycle-cancellation
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'chore: stream lifecycle implementation' && github.event.head_commit.message != 'chore: remove stream lifecycle patcher'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch runtime
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('src/runtime.rs')
+          s = p.read_text()
+          s = s.replace('use tokio::sync::{mpsc, Mutex, Semaphore};', 'use tokio::sync::{mpsc, watch, Mutex, Semaphore};', 1)
+          s = s.replace('struct StreamEntry {\n    tx: mpsc::Sender<StreamCommand>,\n}', 'struct StreamEntry {\n    tx: mpsc::Sender<StreamCommand>,\n    cancel: watch::Sender<bool>,\n}', 1)
+          old = '''                let (tx, mut rx) = mpsc::channel(64);\n\n                // Atomically admit and register the logical stream. This removes\n                // the check-then-insert race during large concurrent SYN bursts.\n                let admitted = {\n                    let mut guard = streams.lock().await;\n                    if guard.len() >= 256 || guard.contains_key(&stream_id) {\n                        false\n                    } else {\n                        guard.insert(stream_id, StreamEntry { tx: tx.clone() });\n                        true\n                    }\n                };'''
+          new = '''                let (tx, mut rx) = mpsc::channel(64);\n                let (cancel_tx, cancel_rx) = watch::channel(false);\n\n                // Atomically admit and register the logical stream. This removes\n                // the check-then-insert race during large concurrent SYN bursts.\n                let admitted = {\n                    let mut guard = streams.lock().await;\n                    if guard.len() >= 256 || guard.contains_key(&stream_id) {\n                        false\n                    } else {\n                        guard.insert(\n                            stream_id,\n                            StreamEntry {\n                                tx: tx.clone(),\n                                cancel: cancel_tx.clone(),\n                            },\n                        );\n                        true\n                    }\n                };'''
+          if old not in s:
+              raise SystemExit('stream admission block not found')
+          s = s.replace(old, new, 1)
+          s = s.replace('''                let task = tokio::spawn(async move {\n                    let mut pending = Vec::new();\n\n                    let target_stream = loop {\n                        tokio::select! {\n                            dial = dial_target(''', '''                let task = tokio::spawn(async move {\n                    let mut pending = Vec::new();\n                    let mut cancel_rx = cancel_rx;\n\n                    let target_stream = loop {\n                        tokio::select! {\n                            _ = cancel_rx.changed() => {\n                                if *cancel_rx.borrow() {\n                                    streams_task.lock().await.remove(&stream_id);\n                                    return;\n                                }\n                            }\n                            dial = dial_target(''', 1)
+          s = s.replace('''                            command = rx.recv() => {\n                                match command {\n                                    Some(StreamCommand::Data(frame)) => {\n                                        pending.push(frame);\n                                    }\n                                    Some(StreamCommand::Fin)\n                                    | Some(StreamCommand::Reset)\n                                    | None => {\n                                        streams_task.lock().await.remove(&stream_id);\n                                        return;\n                                    }\n                                }\n                            }\n                        }\n                    };''', '''                            command = rx.recv() => {\n                                match command {\n                                    Some(StreamCommand::Data(frame)) => {\n                                        pending.push(frame);\n                                    }\n                                    Some(StreamCommand::Fin)\n                                    | Some(StreamCommand::Reset)\n                                    | None => {\n                                        streams_task.lock().await.remove(&stream_id);\n                                        return;\n                                    }\n                                }\n                            }\n                        }\n                    };\n\n                    if *cancel_rx.borrow() {\n                        streams_task.lock().await.remove(&stream_id);\n                        return;\n                    }''', 1)
+          s = s.replace('''                    while let Some(command) = rx.recv().await {\n                        match command {\n                            StreamCommand::Data(frame) => {\n                                if wr_target.write_all(frame.payload()).await.is_err() {\n                                    break;\n                                }\n                            }\n                            StreamCommand::Fin => {\n                                let _ = wr_target.shutdown().await;\n                                break;\n                            }\n                            StreamCommand::Reset => break,\n                        }\n                    }''', '''                    loop {\n                        tokio::select! {\n                            _ = cancel_rx.changed() => {\n                                if *cancel_rx.borrow() {\n                                    break;\n                                }\n                            }\n                            command = rx.recv() => {\n                                match command {\n                                    Some(StreamCommand::Data(frame)) => {\n                                        if wr_target.write_all(frame.payload()).await.is_err() {\n                                            break;\n                                        }\n                                    }\n                                    Some(StreamCommand::Fin) => {\n                                        let _ = wr_target.shutdown().await;\n                                        break;\n                                    }\n                                    Some(StreamCommand::Reset) | None => break,\n                                }\n                            }\n                        }\n                    }''', 1)
+          s = s.replace('''            MuxCommand::Data => {\n                let id = frame.stream_id;\n\n                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {\n                    if tx.send(StreamCommand::Data(frame)).await.is_err() {\n                        streams.lock().await.remove(&id);\n                    }\n                }\n            }''', '''            MuxCommand::Data => {\n                let id = frame.stream_id;\n\n                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {\n                    let _ = tx.send(StreamCommand::Data(frame)).await;\n                }\n            }''', 1)
+          s = s.replace('''            MuxCommand::Rst => {\n                let tx = streams.lock().await.remove(&frame.stream_id).map(|s| s.tx);\n\n                if let Some(tx) = tx {\n                    let _ = tx.send(StreamCommand::Reset).await;\n                }\n            }''', '''            MuxCommand::Rst => {\n                if let Some(cancel) = streams\n                    .lock()\n                    .await\n                    .get(&frame.stream_id)\n                    .map(|s| s.cancel.clone())\n                {\n                    let _ = cancel.send(true);\n                }\n            }''', 1)
+          p.write_text(s)
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/runtime.rs
+          git commit -m 'chore: stream lifecycle implementation'
+          git push origin HEAD
+      - name: Remove patcher
+        shell: bash
+        run: |
+          git rm .github/workflows/apply-stream-lifecycle-fix.yml
+          git commit -m 'chore: remove stream lifecycle patcher'
+          git push origin HEAD
