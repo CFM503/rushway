@@ -12,7 +12,8 @@ use crate::runtime::{apply_socket_options, RuntimeConfig};
 use crate::tls;
 use crate::ws::{
     build_client_handshake_request, read_frame, read_frame_owned, read_http_headers,
-    validate_client_handshake_response, write_frame,
+    read_http_headers_timeout, redact_handshake_request, validate_client_handshake_response,
+    write_frame,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
@@ -147,7 +148,11 @@ async fn connect_tls(
         TcpStream::connect(addr),
     )
     .await
-    .context("WSS upstream TCP timeout")??;
+    .context("WSS upstream TCP timeout")?
+    .map_err(|e| anyhow!("TCP connect failed: {e}"))?;
+
+    tracing::info!("[WSS] TCP connected");
+
     let policy = RuntimeConfig {
         proxy_host: "127.0.0.1".into(),
         proxy_port: 0,
@@ -165,7 +170,31 @@ async fn connect_tls(
         socket_buffer: cfg.socket_buffer,
     };
     apply_socket_options(&tcp, &policy);
-    tls::connect(tcp, tls_name, cfg.verify_ssl).await
+    let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl)
+        .await
+        .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
+
+    let (_, conn) = tls_stream.get_ref();
+    let alpn = conn
+        .alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let cipher = conn
+        .negotiated_cipher_suite()
+        .map(|c| format!("{:?}", c.suite()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let proto = conn
+        .protocol_version()
+        .map(|v| format!("{:?}", v))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    tracing::info!(
+        protocol = %proto,
+        cipher = %cipher,
+        alpn = %alpn,
+        "[WSS] TLS handshake completed"
+    );
+    Ok(tls_stream)
 }
 
 async fn dial_cloudflare_fallback(
@@ -252,10 +281,26 @@ pub(crate) async fn connect_wss_upstream(
     };
     let (request, key) =
         build_client_handshake_request(header_host, &path, Some(&origin), Some(sec_fetch_site));
-    wr.write_all(&request).await?;
-    wr.flush().await?;
-    let response = read_http_headers(&mut rd).await?;
+
+    tracing::debug!(
+        "[WSS] Outgoing WebSocket upgrade request:\n{}",
+        redact_handshake_request(&request)
+    );
+
+    tracing::info!("[WSS] Sending WebSocket upgrade");
+    wr.write_all(&request)
+        .await
+        .context("WebSocket request write failed")?;
+    wr.flush()
+        .await
+        .context("WebSocket request flush failed")?;
+
+    tracing::info!("[WSS] Waiting for WebSocket 101");
+    let handshake_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let response = read_http_headers_timeout(&mut rd, handshake_timeout).await?;
     validate_client_handshake_response(&response, &key)?;
+    tracing::info!("[WSS] WebSocket handshake completed");
+
     Ok((rd, Arc::new(Mutex::new(wr))))
 }
 
@@ -263,6 +308,15 @@ pub(crate) async fn open_upstream(
     cfg: &WssConfig,
 ) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
     connect_wss_upstream(cfg).await
+}
+
+/// Probe helper to test standalone WSS TCP -> TLS -> HTTP Upgrade -> 101 without entering MUX.
+#[allow(dead_code)]
+pub(crate) async fn probe_wss_handshake(cfg: &WssConfig) -> Result<String> {
+    let (mut rd, wr) = connect_wss_upstream(cfg).await?;
+    drop(rd);
+    drop(wr);
+    Ok("HTTP 101 Switching Protocols".to_string())
 }
 
 async fn read_proxy_request(local: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
@@ -542,23 +596,37 @@ impl WssSessionState {
         let c = cipher(&cfg.key);
         let mut hello = b"MUX\n".to_vec();
         c.apply(&mut hello);
+
+        tracing::info!("[WSS] Sending MUX handshake");
         {
             let mut w = writer.lock().await;
-            write_frame(&mut *w, &hello, 2, true).await?
+            write_frame(&mut *w, &hello, 2, true)
+                .await
+                .context("MUX handshake request write failed")?;
         };
         let mut frame_buf = Vec::with_capacity(64 * 1024);
-        let Some((opcode, mut ok)) =
-            read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
-        else {
+        let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+        let read_result = timeout(
+            mux_timeout,
+            read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf),
+        )
+        .await
+        .context("MUX OK timeout")??;
+
+        let Some((opcode, mut ok)) = read_result else {
             bail!("WSS upstream closed during MUX handshake")
         };
         if opcode != 2 {
-            bail!("invalid WSS MUX response opcode")
+            bail!("invalid WSS MUX response opcode: {opcode}")
         };
         c.apply(&mut ok);
         if ok != b"OK\n" {
-            bail!("WSS upstream rejected MUX handshake")
+            bail!(
+                "MUX rejected: {:?}",
+                String::from_utf8_lossy(&ok).trim()
+            )
         };
+        tracing::info!("[WSS] MUX handshake completed");
         let session = Arc::new(Self {
             writer,
             cipher: c.clone(),
@@ -704,13 +772,31 @@ impl WssSessionPool {
         }
         match WssSessionState::connect(&self.cfg).await {
             Ok(s) => self.sessions.lock().await.push(s),
-            Err(error) => tracing::debug!(%error,"WSS physical session creation failed; will retry"),
+            Err(error) => {
+                let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
+                let sni = self
+                    .cfg
+                    .fakehost
+                    .as_deref()
+                    .map(|s| s.split(':').next().unwrap_or(s))
+                    .unwrap_or(&host);
+                let header_host = self.cfg.fakehost.as_deref().unwrap_or(&host);
+                tracing::warn!(
+                    error = %error,
+                    upstream = %self.cfg.upstream,
+                    fakehost = ?self.cfg.fakehost,
+                    sni = %sni,
+                    host = %header_host,
+                    path = %path,
+                    "WSS physical session creation failed"
+                );
+            }
         }
     }
     async fn maintain(self: &Arc<Self>) {
         loop {
             self.replenish().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
     async fn acquire(
@@ -743,7 +829,26 @@ impl WssSessionPool {
             sessions.len() < limit
         };
         if can_create {
-            let session = WssSessionState::connect(&self.cfg).await?;
+            let session = WssSessionState::connect(&self.cfg).await.map_err(|e| {
+                let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
+                let sni = self
+                    .cfg
+                    .fakehost
+                    .as_deref()
+                    .map(|s| s.split(':').next().unwrap_or(s))
+                    .unwrap_or(&host);
+                let header_host = self.cfg.fakehost.as_deref().unwrap_or(&host);
+                tracing::warn!(
+                    error = %e,
+                    upstream = %self.cfg.upstream,
+                    fakehost = ?self.cfg.fakehost,
+                    sni = %sni,
+                    host = %header_host,
+                    path = %path,
+                    "WSS physical session creation on-demand failed"
+                );
+                e
+            })?;
             let opened = session.open_stream(target).await?;
             self.sessions.lock().await.push(session.clone());
             return Ok((session, opened.0, opened.1));
@@ -1071,6 +1176,50 @@ mod tests {
         assert_eq!(session.active.load(Ordering::Acquire), 0);
         assert!(!session.closed.load(Ordering::Acquire));
 
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_wss_standalone_handshake_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tls::standalone_server_acceptor().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = acceptor.accept(stream).await.unwrap();
+            let headers_bytes = read_http_headers(&mut tls_stream).await.unwrap();
+            let headers_str = std::str::from_utf8(&headers_bytes).unwrap();
+
+            assert!(headers_str.starts_with("GET /pyway HTTP/1.1\r\n"));
+            assert!(headers_str.contains("Host: dedi.4467107.xyz\r\n"));
+            assert!(headers_str.contains("Origin: https://dedi.4467107.xyz\r\n"));
+            assert!(headers_str.contains("Upgrade: websocket\r\n"));
+            assert!(!headers_str.contains("Host: 127.0.0.1"));
+
+            let key = crate::ws::validate_server_handshake(&headers_bytes).unwrap();
+            tls_stream
+                .write_all(&crate::ws::build_server_handshake_response(&key))
+                .await
+                .unwrap();
+        });
+
+        let cfg = WssConfig {
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 0,
+            upstream: format!("wss://127.0.0.1:{port}/pyway"),
+            key: Some("secretkey".into()),
+            fakehost: Some("dedi.4467107.xyz".into()),
+            buffer_size: 128 * 1024,
+            connection_timeout: 10,
+            verify_ssl: false,
+            tcp_nodelay: true,
+            tcp_keepalive: true,
+            socket_buffer: 0,
+        };
+
+        let res = probe_wss_handshake(&cfg).await.unwrap();
+        assert_eq!(res, "HTTP 101 Switching Protocols");
         server_task.await.unwrap();
     }
 }

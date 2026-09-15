@@ -782,6 +782,45 @@ Following the release of `v0.0.6`, review noted that `src/mux_pool.rs` contained
 
 ### Validation
 - Unit & integration tests: Mock WSS server MUX handshake, URL parsing, DNS answer parsing, and CLI normalization.
-- Next action: Push commit to `main`, wait for CI, create tag `v0.0.7`, push tag, and verify GitHub Actions release.
+- Release v0.0.7 completed with CI passing and release artifacts published.
+
+## 2026-09-15 — v0.0.8 Release: WSS Handshake Timeout & Detailed Diagnostics Alignment
+
+### Target & Version
+- Version: `v0.0.8`
+- Topic: WebSocket Handshake Timeout, Granular Stage Diagnostics & GoWay v1.8.x Request Alignment
+- Branch: `main`
+
+### Background & Diagnostic Objectives
+Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.4467107.xyz` revealed:
+1. TCP connect to `172.64.229.105:443` succeeds.
+2. TLS 1.3 handshake succeeds with SNI `dedi.4467107.xyz`, cipher `TLS13_AES_256_GCM_SHA384`, ALPN `http/1.1`.
+3. WebSocket Upgrade was sent, but client lacked response timeout and granular stage visibility, resulting in silent hangs or ambiguous retry messages.
+
+### Changes & Architecture Improvements
+1. **Response Timeout (`read_http_headers_timeout`)**:
+   - WebSocket HTTP 101 response reading is bound to `connection_timeout` (minimum 1s).
+   - On timeout or peer connection closure, logs structured diagnostics: distinguishes between 0 response bytes vs partial HTTP response bytes (with lossy UTF-8 formatting).
+2. **Explicit Non-101 HTTP Status Handling**:
+   - Status codes other than 101 (such as 403, 404, 400, 502) are logged immediately at `WARN` level with the first line and full headers, preventing them from being masked as generic network timeouts.
+3. **Granular Stage Logging**:
+   - `[WSS] TCP connected`
+   - `[WSS] TLS handshake completed` (logging protocol version, cipher suite, and ALPN)
+   - `[WSS] Sending WebSocket upgrade`
+   - `[WSS] Waiting for WebSocket 101`
+   - `[WSS] WebSocket handshake completed`
+   - `[WSS] Sending MUX handshake`
+   - `[WSS] MUX handshake completed`
+4. **Header Formatting & Redaction**:
+   - Aligned header casing with Chrome and GoWay (`sec-ch-ua` lowercase, `sec-ch-ua-mobile: ?0`, `sec-ch-ua-platform: "Windows"`).
+   - Added `redact_handshake_request` to log the full outgoing HTTP request in `DEBUG` level with `Sec-WebSocket-Key: [REDACTED]` to prevent credential or entropy leakage.
+5. **Session Pool Failure Escalation**:
+   - `WssSessionPool::replenish` and `acquire` log session creation failures at `WARN` level with structured fields (`error`, `upstream`, `fakehost`, `sni`, `host`, `path`).
+   - Retains secret key omission from all logs.
+   - Paced `maintain` loop to 500ms to avoid log spamming during connection errors.
+6. **Standalone WSS Probe Helper & Tests**:
+   - Added `probe_wss_handshake` to allow verifying TCP -> TLS -> HTTP Upgrade -> 101 in isolation.
+   - Added integration tests covering standalone probe, header redaction, zero-byte read diagnostics, and lowercase browser headers.
+
 
 

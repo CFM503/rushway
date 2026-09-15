@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.8] - 2026-09-15
+
+### Fixed
+- **WSS Handshake Timeout & Detailed Diagnostics**:
+  - Added strict configurable timeout for WebSocket upgrade response via `read_http_headers_timeout`, preventing indefinite hangs on HTTP 101.
+  - Added granular stage logging:
+    - `[WSS] TCP connected`
+    - `[WSS] TLS handshake completed` (including protocol, cipher, ALPN)
+    - `[WSS] Sending WebSocket upgrade`
+    - `[WSS] Waiting for WebSocket 101`
+    - `[WSS] WebSocket handshake completed`
+    - `[WSS] Sending MUX handshake`
+    - `[WSS] MUX handshake completed`
+  - Added partial response diagnostics: on handshake timeout or unexpected peer closure, logs whether 0 bytes were received or prints lossy UTF-8 partial HTTP response headers.
+  - Added explicit HTTP non-101 status logging (`HTTP 403`, `HTTP 404`, `HTTP 400`, `HTTP 502`, etc.) printing the first response line and headers.
+  - Upgraded physical session creation failures in `WssSessionPool` to `WARN` with full structured context (`error`, `upstream`, `fakehost`, `sni`, `host`, `path`) without leaking credentials.
+  - Added timeout on MUX handshake `OK\n` frame reading.
+  - Aligned client handshake request header formatting and casing (`sec-ch-ua` lowercase) with GoWay v1.8.x.
+  - Added `redact_handshake_request` to safely log outgoing HTTP request headers in `DEBUG` level with `Sec-WebSocket-Key: [REDACTED]`.
+  - Added `probe_wss_handshake` and standalone WSS handshake integration test.
+
 ## [v0.0.7] - 2026-09-15
 
 ### Fixed

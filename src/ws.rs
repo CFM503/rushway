@@ -69,19 +69,83 @@ fn token_contains(value: &str, token: &str) -> bool {
 }
 
 pub async fn read_http_headers<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+    read_http_headers_timeout(r, std::time::Duration::from_secs(60)).await
+}
+
+pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
+    r: &mut R,
+    timeout_duration: std::time::Duration,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
     let mut b = [0u8; 1];
-    while out.len() < MAX_HTTP_HEADER_SIZE {
-        r.read_exact(&mut b).await?;
-        out.push(b[0]);
-        if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
-            return Ok(out);
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            if out.is_empty() {
+                tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
+                bail!("WSS HTTP handshake response timeout; received 0 response bytes");
+            } else {
+                let partial = String::from_utf8_lossy(&out);
+                tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
+                bail!(
+                    "WSS HTTP handshake response timeout; partial response:\n{}",
+                    partial
+                );
+            }
         }
-        if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" {
-            return Ok(out);
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, r.read_exact(&mut b)).await {
+            Ok(Ok(_)) => {
+                out.push(b[0]);
+                if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
+                    return Ok(out);
+                }
+                if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" {
+                    return Ok(out);
+                }
+                if out.len() >= MAX_HTTP_HEADER_SIZE {
+                    bail!("header too large");
+                }
+            }
+            Ok(Err(e)) => {
+                if out.is_empty() {
+                    tracing::warn!(
+                        "[WSS] HTTP handshake connection closed by peer; received 0 response bytes ({})",
+                        e
+                    );
+                    bail!(
+                        "WSS HTTP handshake connection closed by peer; received 0 response bytes ({})",
+                        e
+                    );
+                } else {
+                    let partial = String::from_utf8_lossy(&out);
+                    tracing::warn!(
+                        "[WSS] HTTP handshake connection closed by peer; partial response:\n{}",
+                        partial
+                    );
+                    bail!(
+                        "WSS HTTP handshake connection closed by peer; partial response:\n{}",
+                        partial
+                    );
+                }
+            }
+            Err(_elapsed) => {
+                if out.is_empty() {
+                    tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
+                    bail!("WSS HTTP handshake response timeout; received 0 response bytes");
+                } else {
+                    let partial = String::from_utf8_lossy(&out);
+                    tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
+                    bail!(
+                        "WSS HTTP handshake response timeout; partial response:\n{}",
+                        partial
+                    );
+                }
+            }
         }
     }
-    bail!("header too large")
 }
 
 pub fn validate_server_handshake(request: &[u8]) -> Result<String> {
@@ -139,14 +203,28 @@ pub fn build_client_handshake_request(
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
     );
-    req.push_str("Pragma: no-cache\r\nCache-Control: no-cache\r\n");
-    req.push_str(&format!("User-Agent: {BROWSER_UA}\r\nAccept-Language: {BROWSER_ACCEPT_LANGUAGE}\r\nAccept-Encoding: {BROWSER_ACCEPT_ENCODING}\r\n"));
-    req.push_str(&format!("Sec-CH-UA: {BROWSER_SEC_CH_UA}\r\nSec-CH-UA-Mobile: ?0\r\nSec-CH-UA-Platform: \"Windows\"\r\n"));
     if let Some(origin) = origin {
         req.push_str(&format!("Origin: {origin}\r\n"));
     }
+    req.push_str("Pragma: no-cache\r\nCache-Control: no-cache\r\n");
+    req.push_str(&format!("User-Agent: {BROWSER_UA}\r\nAccept-Language: {BROWSER_ACCEPT_LANGUAGE}\r\nAccept-Encoding: {BROWSER_ACCEPT_ENCODING}\r\n"));
+    req.push_str(&format!("sec-ch-ua: {BROWSER_SEC_CH_UA}\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Windows\"\r\n"));
     req.push_str(&format!("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: {site}\r\n\r\n"));
     (req.into_bytes(), key)
+}
+
+pub fn redact_handshake_request(req: &[u8]) -> String {
+    let s = String::from_utf8_lossy(req);
+    let mut out = String::new();
+    for line in s.lines() {
+        if line.to_ascii_lowercase().starts_with("sec-websocket-key:") {
+            out.push_str("Sec-WebSocket-Key: [REDACTED]\r\n");
+        } else {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out
 }
 
 pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<()> {
@@ -166,9 +244,15 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
         bail!("malformed websocket handshake response: {first}");
     }
     if status != "101" {
+        tracing::warn!(
+            "[WSS] HTTP response status not 101: HTTP {}\nFirst line: {}\nHeaders:\n{}",
+            status,
+            first,
+            text.trim_end()
+        );
         match status {
             "200" => {
-                bail!("handshake failed: server returned 200 OK instead of 101 Switching Protocols")
+                bail!("handshake failed: server returned 200 OK instead of 101 Switching Protocols (upstream may not support WebSocket)")
             }
             "301" | "302" | "307" | "308" => bail!("handshake failed: HTTP {status} redirect"),
             "400" => bail!("handshake failed: HTTP 400 Bad Request"),
@@ -381,12 +465,37 @@ mod tests {
             "User-Agent:",
             "Accept-Language:",
             "Accept-Encoding:",
-            "Sec-CH-UA:",
-            "Sec-CH-UA-Mobile: ?0",
-            "Sec-CH-UA-Platform: \"Windows\"",
+            "sec-ch-ua:",
+            "sec-ch-ua-mobile: ?0",
+            "sec-ch-ua-platform: \"Windows\"",
         ] {
             assert!(text.contains(header), "missing {header}");
         }
+    }
+
+    #[test]
+    fn redact_handshake_request_redacts_key() {
+        let (request, key) = build_client_handshake_request(
+            "dedi.4467107.xyz",
+            "/pyway",
+            Some("https://dedi.4467107.xyz"),
+            Some("same-origin"),
+        );
+        let redacted = redact_handshake_request(&request);
+        assert!(!redacted.contains(&key));
+        assert!(redacted.contains("Sec-WebSocket-Key: [REDACTED]\r\n"));
+        assert!(redacted.contains("Host: dedi.4467107.xyz\r\n"));
+        assert!(redacted.contains("Origin: https://dedi.4467107.xyz\r\n"));
+    }
+
+    #[tokio::test]
+    async fn read_http_headers_timeout_zero_bytes_error() {
+        let (mut a, _b) = duplex(64);
+        drop(_b); // Closed immediately
+        let err = read_http_headers_timeout(&mut a, std::time::Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("received 0 response bytes"));
     }
 
     #[test]
