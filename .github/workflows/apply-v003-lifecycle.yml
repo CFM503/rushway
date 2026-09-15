@@ -1,0 +1,55 @@
+name: Apply v0.0.3 lifecycle fix
+
+on:
+  push:
+    branches: [fix/stream-lifecycle-v003]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/stream-lifecycle-v003
+          fetch-depth: 0
+      - name: Apply lifecycle fix and tests
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('src/runtime.rs')
+          s = p.read_text()
+          replacements = [
+              ('use tokio::sync::{mpsc, Mutex, Semaphore};', 'use tokio::sync::{mpsc, watch, Mutex, Semaphore};'),
+              ('struct StreamEntry {\n    tx: mpsc::Sender<StreamCommand>,\n}', 'struct StreamEntry {\n    tx: mpsc::Sender<StreamCommand>,\n    cancel: watch::Sender<bool>,\n}'),
+              ('                let (tx, mut rx) = mpsc::channel(64);', '                let (tx, mut rx) = mpsc::channel(64);\n                let (cancel, cancelled) = watch::channel(false);'),
+              ('                        guard.insert(stream_id, StreamEntry { tx: tx.clone() });', '                        guard.insert(\n                            stream_id,\n                            StreamEntry {\n                                tx: tx.clone(),\n                                cancel: cancel.clone(),\n                            },\n                        );'),
+              ('                let cfg_task = cfg.clone();\n\n                let task = tokio::spawn(async move {', '                let cfg_task = cfg.clone();\n\n                let task = tokio::spawn(async move {\n                    let mut cancelled = cancelled;'),
+              ('                            command = rx.recv() => {', '                            changed = cancelled.changed() => {\n                                match changed {\n                                    Ok(()) if *cancelled.borrow() => {\n                                        streams_task.lock().await.remove(&stream_id);\n                                        return;\n                                    }\n                                    Ok(()) => {}\n                                    Err(_) => {\n                                        streams_task.lock().await.remove(&stream_id);\n                                        return;\n                                    }\n                                }\n                            }\n\n                            command = rx.recv() => {'),
+              ('                    while let Ok(command) = rx.try_recv() {', '                    if *cancelled.borrow() {\n                        streams_task.lock().await.remove(&stream_id);\n                        return;\n                    }\n\n                    while let Ok(command) = rx.try_recv() {'),
+              ('            MuxCommand::Fin => {\n                if let Some(tx) = streams\n                    .lock()\n                    .await\n                    .get(&frame.stream_id)\n                    .map(|s| s.tx.clone())\n                {\n                    let _ = tx.send(StreamCommand::Fin).await;\n                }\n            }\n\n            MuxCommand::Rst => {\n                let tx = streams.lock().await.remove(&frame.stream_id).map(|s| s.tx);\n\n                if let Some(tx) = tx {\n                    let _ = tx.send(StreamCommand::Reset).await;\n                }\n            }', '            MuxCommand::Fin => {\n                if let Some((tx, cancel)) = streams\n                    .lock()\n                    .await\n                    .get(&frame.stream_id)\n                    .map(|s| (s.tx.clone(), s.cancel.clone()))\n                {\n                    let _ = tx.send(StreamCommand::Fin).await;\n                    let _ = cancel.send(true);\n                }\n            }\n\n            MuxCommand::Rst => {\n                if let Some((tx, cancel)) = streams\n                    .lock()\n                    .await\n                    .get(&frame.stream_id)\n                    .map(|s| (s.tx.clone(), s.cancel.clone()))\n                {\n                    let _ = tx.send(StreamCommand::Reset).await;\n                    let _ = cancel.send(true);\n                }\n            }'),
+          ]
+          for old, new in replacements:
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'replacement count {count}: {old[:100]!r}')
+              s = s.replace(old, new)
+          s += '''\n#[cfg(test)]\nmod lifecycle_tests {\n    use super::*;\n    use tokio::time::{timeout, Instant};\n\n    #[tokio::test]\n    async fn dialing_cancel_signal_wakes_immediately() {\n        let (cancel, mut cancelled) = watch::channel(false);\n        cancel.send(true).expect("receiver exists");\n        let result = timeout(Duration::from_millis(100), async move {\n            loop {\n                match cancelled.changed().await {\n                    Ok(()) if *cancelled.borrow() => break,\n                    Ok(()) => {}\n                    Err(_) => break,\n                }\n            }\n        })\n        .await;\n        assert!(result.is_ok(), "cancellation watcher did not wake in time");\n    }\n\n    #[tokio::test]\n    async fn cancellation_precedes_slow_dial() {\n        let (cancel, mut cancelled) = watch::channel(false);\n        cancel.send(true).expect("receiver exists");\n        let start = Instant::now();\n        let won = tokio::select! {\n            _ = std::future::pending::<Result<TcpStream>>() => false,\n            changed = cancelled.changed() => changed.is_ok() && *cancelled.borrow(),\n        };\n        assert!(won, "cancellation must win over a pending dial");\n        assert!(start.elapsed() < Duration::from_millis(100));\n    }\n}\n'''
+          p.write_text(s)
+          PY
+      - name: Verify and commit source fix
+        shell: bash
+        run: |
+          grep -n "watch::channel\|cancelled.changed\|cancel: watch::Sender" src/runtime.rs
+          cargo fmt --all
+          cargo check --all-targets --all-features
+          cargo test --all-targets --all-features lifecycle_tests
+          rm .github/workflows/apply-v003-lifecycle.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime.rs .github/workflows/apply-v003-lifecycle.yml
+          git commit -m "fix: make MUX stream cancellation explicit"
+          git push origin HEAD:fix/stream-lifecycle-v003
