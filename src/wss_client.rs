@@ -579,23 +579,36 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
 struct WssSessionPool {
     cfg: WssConfig,
     sessions: Mutex<Vec<Arc<WssSessionState>>>,
+    session_creation: Mutex<()>,
 }
 impl WssSessionPool {
     fn new(cfg: WssConfig) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             sessions: Mutex::new(Vec::new()),
+            session_creation: Mutex::new(()),
         })
     }
-    async fn prewarm(self: &Arc<Self>) {
-        for _ in 0..configured_session_count() {
-            match WssSessionState::connect(&self.cfg).await {
-                Ok(s) => self.sessions.lock().await.push(s),
-                Err(error) => {
-                    tracing::debug!(%error,"WSS physical session prewarm failed");
-                    break;
-                }
-            }
+    async fn replenish(self: &Arc<Self>) {
+        let target = configured_session_count();
+        let _guard = self.session_creation.lock().await;
+        let need_new = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
+            sessions.len() < target
+        };
+        if !need_new {
+            return;
+        }
+        match WssSessionState::connect(&self.cfg).await {
+            Ok(s) => self.sessions.lock().await.push(s),
+            Err(error) => tracing::debug!(%error,"WSS physical session creation failed; will retry"),
+        }
+    }
+    async fn maintain(self: &Arc<Self>) {
+        loop {
+            self.replenish().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     async fn acquire(
@@ -607,9 +620,12 @@ impl WssSessionPool {
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
             sessions.clone()
         };
-        let mut ordered = snapshot;
-        ordered.sort_by_key(|s| s.active.load(Ordering::Acquire));
-        for session in ordered {
+        let mut ordered = snapshot
+            .into_iter()
+            .map(|session| (session.active.load(Ordering::Acquire), session))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(active, _)| *active);
+        for (_active, session) in ordered {
             if !session.available() {
                 continue;
             }
@@ -618,8 +634,10 @@ impl WssSessionPool {
             }
         }
         let limit = configured_session_count();
+        let _guard = self.session_creation.lock().await;
         let can_create = {
-            let sessions = self.sessions.lock().await;
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
             sessions.len() < limit
         };
         if can_create {
@@ -753,8 +771,11 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
         socket_buffer: cfg.socket_buffer,
     };
     let pool = WssSessionPool::new(wc.clone());
-    pool.prewarm().await;
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    let pool_maintainer = pool.clone();
+    tokio::spawn(async move {
+        pool_maintainer.maintain().await;
+    });
     tracing::info!(
         "RushWay WSS client proxy listening on {}:{}",
         wc.proxy_host,
