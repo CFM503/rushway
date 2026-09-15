@@ -55,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build ARMv7 musl binary with cross-rs
-        uses: houseabsolute/actions-rust-cross@v0
+        uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
           target: armv7-unknown-linux-musleabihf
@@ -84,7 +84,7 @@ jobs:
       - name: Generate SHA256 checksums
         working-directory: release-assets
         run: sha256sum * > SHA256SUMS.txt
-      - name: Publish release and assets
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
