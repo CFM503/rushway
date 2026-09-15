@@ -1,0 +1,198 @@
+name: issue lifecycle fixer
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: contains(github.event.issue.title, 'Astra native: explicit Stream lifecycle ownership')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: astra/stream-lifecycle-cancellation
+          fetch-depth: 0
+      - name: Apply source fix and tests
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('src/runtime.rs')
+          s = p.read_text()
+          s = s.replace('use tokio::sync::{mpsc, Mutex, Semaphore};', 'use tokio::sync::{mpsc, watch, Mutex, Semaphore};')
+          s = s.replace('struct StreamEntry {\n    tx: mpsc::Sender<StreamCommand>,\n}', 'struct StreamEntry {\n    tx: mpsc::Sender<StreamCommand>,\n    cancel: watch::Sender<bool>,\n}')
+          s = s.replace('let (tx, mut rx) = mpsc::channel(64);', 'let (tx, mut rx) = mpsc::channel(64);\n                let (cancel, mut cancelled) = watch::channel(false);')
+          s = s.replace('guard.insert(stream_id, StreamEntry { tx: tx.clone() });', 'guard.insert(stream_id, StreamEntry { tx: tx.clone(), cancel: cancel.clone() });')
+          old = '''                            command = rx.recv() => {
+                                match command {
+                                    Some(StreamCommand::Data(frame)) => {
+                                        pending.push(frame);
+                                    }
+                                    Some(StreamCommand::Fin)
+                                    | Some(StreamCommand::Reset)
+                                    | None => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                }
+                            }
+'''
+          new = '''                            command = rx.recv() => {
+                                match command {
+                                    Some(StreamCommand::Data(frame)) => {
+                                        pending.push(frame);
+                                    }
+                                    Some(StreamCommand::Fin)
+                                    | Some(StreamCommand::Reset)
+                                    | None => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                }
+                            }
+
+                            changed = cancelled.changed() => {
+                                match changed {
+                                    Ok(()) if *cancelled.borrow() => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                }
+                            }
+'''
+          if old not in s:
+              raise SystemExit('DIALING block not found')
+          s = s.replace(old, new, 1)
+          old = '''            MuxCommand::Data => {
+                let id = frame.stream_id;
+
+                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {
+                    if tx.send(StreamCommand::Data(frame)).await.is_err() {
+                        streams.lock().await.remove(&id);
+                    }
+                }
+            }
+
+            MuxCommand::Fin => {
+                if let Some(tx) = streams
+                    .lock()
+                    .await
+                    .get(&frame.stream_id)
+                    .map(|s| s.tx.clone())
+                {
+                    let _ = tx.send(StreamCommand::Fin).await;
+                }
+            }
+
+            MuxCommand::Rst => {
+                let tx = streams.lock().await.remove(&frame.stream_id).map(|s| s.tx);
+
+                if let Some(tx) = tx {
+                    let _ = tx.send(StreamCommand::Reset).await;
+                }
+            }
+'''
+          new = '''            MuxCommand::Data => {
+                let id = frame.stream_id;
+
+                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {
+                    let _ = tx.send(StreamCommand::Data(frame)).await;
+                }
+            }
+
+            MuxCommand::Fin => {
+                if let Some(entry) = streams.lock().await.get(&frame.stream_id) {
+                    let _ = entry.tx.send(StreamCommand::Fin).await;
+                    let _ = entry.cancel.send(true);
+                }
+            }
+
+            MuxCommand::Rst => {
+                if let Some(entry) = streams.lock().await.get(&frame.stream_id) {
+                    let _ = entry.tx.send(StreamCommand::Reset).await;
+                    let _ = entry.cancel.send(true);
+                }
+            }
+'''
+          if old not in s:
+              raise SystemExit('dispatch block not found')
+          s = s.replace(old, new, 1)
+          marker = '\nasync fn resolve_udp_target(target: &TargetAddr) -> Result<SocketAddr> {'
+          tests = '''
+
+#[cfg(test)]
+mod stream_lifecycle_tests {
+    use super::*;
+    use tokio::time::{sleep, timeout};
+
+    #[tokio::test]
+    async fn dialing_cancel_signal_wakes_immediately() {
+        let (cancel, mut rx) = watch::channel(false);
+        let waiter = tokio::spawn(async move {
+            loop {
+                if *rx.borrow() {
+                    return true;
+                }
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+        });
+        sleep(Duration::from_millis(5)).await;
+        cancel.send(true).unwrap();
+        let observed = timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect('DIALING cancellation did not wake')
+            .expect('cancellation waiter panicked');
+        assert!(observed);
+    }
+
+    #[tokio::test]
+    async fn cancellation_precedes_slow_dial() {
+        let (cancel, mut rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                _ = sleep(Duration::from_secs(5)) => false,
+                changed = rx.changed() => changed.is_ok() && *rx.borrow(),
+            }
+        });
+        cancel.send(true).unwrap();
+        let result = timeout(Duration::from_millis(100), task)
+            .await
+            .expect('slow dial was not cancelled promptly')
+            .expect('cancellation task panicked');
+        assert!(result);
+    }
+}
+'''
+          if 'dialing_cancel_signal_wakes_immediately' not in s:
+              s = s.replace(marker, tests + marker)
+          p.write_text(s)
+      - name: Validate
+        run: |
+          rustfmt --edition 2021 src/runtime.rs
+          cargo test
+      - name: Commit source change and clean fixer files
+        shell: bash
+        run: |
+          git config user.name 'GitHub Actions'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/runtime.rs
+          git commit -m 'fix: make MUX stream lifecycle cancellation explicit'
+          git push origin HEAD:astra/stream-lifecycle-cancellation
+          git clone --depth 1 --branch main https://github.com/CFM503/rushway.git /tmp/main-clean
+          cd /tmp/main-clean
+          rm -f .github/workflows/issue-lifecycle-fix-once.yml
+          git config user.name 'GitHub Actions'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -u
+          git commit -m 'chore: remove one-shot lifecycle fixer'
+          git push origin main
