@@ -1,0 +1,178 @@
+name: Apply MUX 1000 contention fix
+
+on:
+  push:
+    branches: [fix/mux-1000-contention]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: "${{ !contains(github.event.head_commit.message, 'apply MUX 1000 fix') }}"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/mux-1000-contention
+          fetch-depth: 0
+      - name: Patch production sources
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one match, got {count}')
+              p.write_text(s.replace(old, new))
+
+          replace_once(
+              'src/wss_client.rs',
+              'let (tx, rx) = mpsc::channel(64);',
+              'let (tx, rx) = mpsc::channel(128);',
+          )
+          replace_once(
+              'src/wss_client.rs',
+              '''        let mut ordered = snapshot;
+        ordered.sort_by_key(|s| s.active.load(Ordering::Acquire));
+        for session in ordered {''',
+              '''        let mut ordered = snapshot
+            .into_iter()
+            .map(|session| (session.active.load(Ordering::Acquire), session))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(active, _)| *active);
+        for (_active, session) in ordered {''',
+          )
+          replace_once(
+              'src/wss_client.rs',
+              '''struct WssSessionPool {
+    cfg: WssConfig,
+    sessions: Mutex<Vec<Arc<WssSessionState>>>,
+}''',
+              '''struct WssSessionPool {
+    cfg: WssConfig,
+    sessions: Mutex<Vec<Arc<WssSessionState>>>,
+    session_creation: Mutex<()>,
+}''',
+          )
+          replace_once(
+              'src/wss_client.rs',
+              '''        Arc::new(Self {
+            cfg,
+            sessions: Mutex::new(Vec::new()),
+        })''',
+              '''        Arc::new(Self {
+            cfg,
+            sessions: Mutex::new(Vec::new()),
+            session_creation: Mutex::new(()),
+        })''',
+          )
+          replace_once(
+              'src/wss_client.rs',
+              '''    async fn prewarm(self: &Arc<Self>) {
+        for _ in 0..configured_session_count() {
+            match WssSessionState::connect(&self.cfg).await {
+                Ok(s) => self.sessions.lock().await.push(s),
+                Err(error) => {
+                    tracing::debug!(%error,"WSS physical session prewarm failed");
+                    break;
+                }
+            }
+        }
+    }''',
+              '''    async fn prewarm(self: &Arc<Self>) {
+        let limit = configured_session_count();
+        for _ in 0..limit {
+            let _creation_guard = self.session_creation.lock().await;
+            if self.sessions.lock().await.len() >= limit {
+                break;
+            }
+            match WssSessionState::connect(&self.cfg).await {
+                Ok(s) => self.sessions.lock().await.push(s),
+                Err(error) => {
+                    tracing::debug!(%error,"WSS physical session prewarm failed");
+                    break;
+                }
+            }
+        }
+    }''',
+          )
+          replace_once(
+              'src/wss_client.rs',
+              '''        let limit = configured_session_count();
+        let can_create = {
+            let sessions = self.sessions.lock().await;
+            sessions.len() < limit
+        };
+        if can_create {
+            let session = WssSessionState::connect(&self.cfg).await?;
+            let opened = session.open_stream(target).await?;
+            self.sessions.lock().await.push(session.clone());
+            return Ok((session, opened.0, opened.1));
+        }''',
+              '''        let limit = configured_session_count();
+        let _creation_guard = self.session_creation.lock().await;
+        let can_create = {
+            let sessions = self.sessions.lock().await;
+            sessions.len() < limit
+        };
+        if can_create {
+            let session = WssSessionState::connect(&self.cfg).await?;
+            let opened = session.open_stream(target).await?;
+            self.sessions.lock().await.push(session.clone());
+            return Ok((session, opened.0, opened.1));
+        }''',
+          )
+          replace_once(
+              'src/wss_client.rs',
+              '''    let pool = WssSessionPool::new(wc.clone());
+    pool.prewarm().await;
+    let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;''',
+              '''    let pool = WssSessionPool::new(wc.clone());
+    let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    let prewarm_pool = pool.clone();
+    tokio::spawn(async move {
+        prewarm_pool.prewarm().await;
+    });''',
+          )
+
+          replace_once(
+              'src/mux_pool.rs',
+              'let (tx, rx) = mpsc::channel(32);',
+              'let (tx, rx) = mpsc::channel(128);',
+          )
+          replace_once(
+              'src/runtime.rs',
+              'let (tx, mut rx) = mpsc::channel(64);',
+              'let (tx, mut rx) = mpsc::channel(128);',
+          )
+
+          # e2e_bench: remove dead helper flagged by clippy/rustc warnings.
+          p = Path('src/bin/e2e_bench.rs')
+          s = p.read_text()
+          old = '''fn free_port() -> io::Result<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr().map(|a| a.port())
+}
+
+'''
+          if s.count(old) != 1:
+              raise SystemExit('src/bin/e2e_bench.rs: free_port helper match mismatch')
+          p.write_text(s.replace(old, ''))
+          PY
+      - name: Format and test changed code
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo fmt --all -- --check
+          cargo check --all-targets --all-features
+          cargo test --all-targets --all-features
+      - name: Commit patched sources and remove bootstrap workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src .github/workflows/apply-mux-fix.yml
+          git rm .github/workflows/apply-mux-fix.yml
+          git commit -m "fix: apply MUX 1000 fix"
+          git push origin fix/mux-1000-contention
