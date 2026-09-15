@@ -150,8 +150,8 @@ mod stream_lifecycle_tests {
         cancel.send(true).unwrap();
         let observed = timeout(Duration::from_millis(100), waiter)
             .await
-            .expect('DIALING cancellation did not wake')
-            .expect('cancellation waiter panicked');
+            .expect("DIALING cancellation did not wake")
+            .expect("cancellation waiter panicked");
         assert!(observed);
     }
 
@@ -167,8 +167,8 @@ mod stream_lifecycle_tests {
         cancel.send(true).unwrap();
         let result = timeout(Duration::from_millis(100), task)
             .await
-            .expect('slow dial was not cancelled promptly')
-            .expect('cancellation task panicked');
+            .expect("slow dial was not cancelled promptly")
+            .expect("cancellation task panicked");
         assert!(result);
     }
 }
@@ -180,7 +180,7 @@ mod stream_lifecycle_tests {
         run: |
           rustfmt --edition 2021 src/runtime.rs
           cargo test
-      - name: Commit source change and clean fixer files
+      - name: Commit source change
         shell: bash
         run: |
           git config user.name 'GitHub Actions'
@@ -188,11 +188,3 @@ mod stream_lifecycle_tests {
           git add src/runtime.rs
           git commit -m 'fix: make MUX stream lifecycle cancellation explicit'
           git push origin HEAD:astra/stream-lifecycle-cancellation
-          git clone --depth 1 --branch main https://github.com/CFM503/rushway.git /tmp/main-clean
-          cd /tmp/main-clean
-          rm -f .github/workflows/issue-lifecycle-fix-once.yml
-          git config user.name 'GitHub Actions'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -u
-          git commit -m 'chore: remove one-shot lifecycle fixer'
-          git push origin main
