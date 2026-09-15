@@ -687,3 +687,53 @@ Merge `ai/500-stream-ci-gate`, let normal CI validate the branch, then resume pr
 
 ### Next action
 Wait for merge-triggered Run #384 to finish, then prioritize evidence-driven WSS/WS 1000 investigation and repeatability before moving to the lifecycle/error and TCP+UDP matrices.
+
+## 2026-09-15 — v0.0.6 Release: Cloudflare FakeHost / WSS / Edge Fallback Alignment
+
+### Target & Version
+- Version: `v0.0.6`
+- Topic: Cloudflare CDN / WSS / FakeHost Alignment with GoWay & Edge Fallback
+- Branch: `main`
+
+### Background & Assessment
+RushWay previously supported a basic `--fakehost` flag, but lacked:
+1. Complete separation of TCP destination address and TLS ServerName / HTTP Host identity across all WSS paths.
+2. Full GoWay alignment for the `Origin` header (`https://<fakehost>`) and `Sec-Fetch-Site`.
+3. Path retention (`/pyway`) and WebSocket handshake integrity when connecting to Cloudflare CDN endpoints.
+4. Cloudflare Edge fallback (`dialFallback`) behavior: when upstream host is an IP and fakehost is specified, connection failures to the primary Edge IP should fall back to resolving fakehost's DNS A records and dialing alternate Cloudflare edges.
+5. Standardized default `max_connections` at 1500 (aligning with v0.0.5/v0.0.6 requirements).
+
+### Astra Review
+- **Concurrency**: MUX physical sessions (`WssSessionPool`) all funnel through the unified `open_upstream` pipeline. Fallback connection attempts happen per physical session dial without blocking stream-level multiplexing.
+- **Protocol**: Preserved existing bidirectional MUX stream lifecycle and zero-payload DATA / FIN / RST mechanics. WebSocket handshake strictly adheres to RFC 6455 and GoWay browser profile header order.
+- **Security & Privacy**: FakeHost domain is strictly used for TLS SNI, HTTP `Host`, and `Origin`, preventing upstream IP leakage into HTTP headers. Sensitive auth keys are strictly omitted from logs.
+- **Target Policy**: Local/LAN IP filtering (`-block-local`) remains enforced.
+- **Compatibility**: Legacy CLI flags (`-fakehost`, `-mux`, `-block-local`, `-max-conn`, `-help`, etc.) remain fully supported.
+
+### Changes
+- `src/dns.rs`:
+  - Added `resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>>` querying remote DNS server (if configured) with automatic system DNS fallback.
+  - Added `parse_all_ipv4_from_response` collecting all IPv4 A records from DNS responses.
+  - Added unit test `parses_multiple_ipv4_answers`.
+- `src/wss_client.rs`:
+  - Refactored `open_upstream` to cleanly separate `connect_addr`, `tls_name` (SNI), and `header_host`.
+  - Aligned `Origin` header to `https://<tls_name>`.
+  - Added `connect_tls` helper and `dial_cloudflare_fallback`.
+  - Implemented multi-edge IPv4 fallback dialing skipping the failed primary IP.
+  - Added structured logs for WSS connection, SNI, Host, Path, and fallback attempts.
+  - Added comprehensive unit tests covering URL parsing, fakehost precedence, Origin formatting, header leakage prevention, and fallback criteria.
+- `src/runtime.rs`:
+  - Updated `RuntimeConfig::default()` `max_connections` from 1000 to 1500.
+- `src/main.rs`:
+  - Changed default connection limit override from 4096 to 1500.
+  - Updated CLI `--fakehost` and `--max-conn` help text.
+  - Added `-help` to legacy long flags.
+  - Added full Cloudflare FakeHost CLI test with 8 MUX sessions.
+- `Cargo.toml`: Version updated to `0.0.6`.
+- `README.md`: Added production Cloudflare WSS deployment guide and parameter explanation.
+- `CHANGELOG.md`: Created changelog document detailing v0.0.6 additions and updates.
+
+### Validation
+- Unit tests: Verified WSS URL parsing, header construction, DNS answer parsing, and CLI normalization.
+- Next step: Commit to `main`, observe CI validation, tag `v0.0.6`, push tag, and verify GitHub Actions release workflow.
+

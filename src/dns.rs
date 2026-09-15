@@ -90,6 +90,64 @@ pub(crate) async fn resolve_socket(host: &str, port: u16) -> Result<SocketAddr> 
     Ok(SocketAddr::new(resolve_host(host).await?, port))
 }
 
+pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Ok(vec![ip]);
+    }
+    if host.parse::<Ipv6Addr>().is_ok() {
+        return Ok(Vec::new());
+    }
+    let server = {
+        let guard = state().lock().await;
+        guard.server
+    };
+    let key = host.trim_end_matches('.').to_ascii_lowercase();
+    let remote_result = match server {
+        Some(server_ip) => query_remote_all_ipv4(&key, server_ip).await,
+        None => Err(anyhow!("remote DNS not configured")),
+    };
+    let ips = match remote_result {
+        Ok(list) if !list.is_empty() => list,
+        Err(err) => {
+            tracing::warn!(host=%host, error=%err, "remote DNS failed for fakehost; falling back to system DNS");
+            let mut result = Vec::new();
+            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((host, 0))).await {
+                for addr in iter {
+                    if let IpAddr::V4(v4) = addr.ip() {
+                        if !result.contains(&v4) {
+                            result.push(v4);
+                        }
+                    }
+                }
+            }
+            result
+        }
+        _ => {
+            let mut result = Vec::new();
+            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((host, 0))).await {
+                for addr in iter {
+                    if let IpAddr::V4(v4) = addr.ip() {
+                        if !result.contains(&v4) {
+                            result.push(v4);
+                        }
+                    }
+                }
+            }
+            result
+        }
+    };
+    let mut unique = Vec::new();
+    for ip in ips {
+        if !unique.contains(&ip) {
+            unique.push(ip);
+        }
+    }
+    if unique.is_empty() {
+        bail!("no IPv4 addresses resolved for {host}");
+    }
+    Ok(unique)
+}
+
 async fn resolve_remote(host: &str, server: IpAddr) -> Result<IpAddr> {
     let mut last_error = None;
     for qtype in [1u16, 28u16] {
@@ -128,6 +186,34 @@ async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<I
     let response = dns_tcp_query(server_addr, &request).await?;
     validate_transaction_id(&response, expected_id)?;
     Ok(parse_response(&response, qtype)?.0)
+}
+
+async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Addr>> {
+    let request = build_query(host, 1)?;
+    let expected_id = u16::from_be_bytes([request[0], request[1]]);
+    let server_addr = SocketAddr::new(server, DNS_PORT);
+    let socket = UdpSocket::bind(if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    socket.send_to(&request, server_addr).await?;
+    let mut buf = vec![0u8; MAX_PACKET];
+    let (size, _) = match timeout(RESOLVE_TIMEOUT, socket.recv_from(&mut buf)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => return Err(anyhow!("remote DNS UDP timeout")),
+    };
+    buf.truncate(size);
+    validate_transaction_id(&buf, expected_id)?;
+    let (ips, truncated) = parse_all_ipv4_from_response(&buf)?;
+    if !truncated && !ips.is_empty() {
+        return Ok(ips);
+    }
+    let response = dns_tcp_query(server_addr, &request).await?;
+    validate_transaction_id(&response, expected_id)?;
+    Ok(parse_all_ipv4_from_response(&response)?.0)
 }
 
 async fn dns_tcp_query(server: SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
@@ -243,6 +329,55 @@ fn parse_response(buf: &[u8], qtype: u16) -> Result<(Option<IpAddr>, bool)> {
     Ok((None, truncated))
 }
 
+fn parse_all_ipv4_from_response(buf: &[u8]) -> Result<(Vec<Ipv4Addr>, bool)> {
+    if buf.len() < 12 {
+        bail!("DNS response too short");
+    }
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    let truncated = flags & 0x0200 != 0;
+    let rcode = flags & 0x000f;
+    if rcode != 0 {
+        bail!("DNS response error code {rcode}");
+    }
+    let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let mut offset = 12usize;
+    for _ in 0..qd {
+        skip_name(buf, &mut offset)?;
+        if offset + 4 > buf.len() {
+            bail!("truncated DNS question");
+        }
+        offset += 4;
+    }
+    let mut ips = Vec::new();
+    for _ in 0..an {
+        skip_name(buf, &mut offset)?;
+        if offset + 10 > buf.len() {
+            bail!("truncated DNS answer header");
+        }
+        let rr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let class = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
+        let rd_len = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
+        offset += 10;
+        if offset + rd_len > buf.len() {
+            bail!("truncated DNS answer data");
+        }
+        if class == 1 && rr_type == 1 && rd_len == 4 {
+            let ip = Ipv4Addr::new(
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            );
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+        offset += rd_len;
+    }
+    Ok((ips, truncated))
+}
+
 fn skip_name(buf: &[u8], offset: &mut usize) -> Result<()> {
     let mut pos = *offset;
     let mut labels = 0usize;
@@ -304,5 +439,24 @@ mod tests {
         let (ip, truncated) = parse_response(&response, 1).unwrap();
         assert!(!truncated);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+    }
+    #[test]
+    fn parses_multiple_ipv4_answers() {
+        let response = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 104, 21,
+            50, 1, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 172,
+            67, 180, 2,
+        ];
+        let (ips, truncated) = parse_all_ipv4_from_response(&response).unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            ips,
+            vec![
+                Ipv4Addr::new(104, 21, 50, 1),
+                Ipv4Addr::new(172, 67, 180, 2)
+            ]
+        );
     }
 }

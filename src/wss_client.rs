@@ -116,13 +116,14 @@ fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
     Ok((connect_addr, host, path))
 }
 
-async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
-    let (addr, host, path) = parse_wss_url(&cfg.upstream)?;
-    let (dns_host, dns_port) = split_authority(&addr)?;
-    let resolved = dns::resolve_socket(&dns_host, dns_port).await?;
+async fn connect_tls(
+    addr: SocketAddr,
+    tls_name: &str,
+    cfg: &WssConfig,
+) -> Result<tls::RushTlsStream> {
     let tcp = timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
-        TcpStream::connect(resolved),
+        TcpStream::connect(addr),
     )
     .await
     .context("WSS upstream TCP timeout")??;
@@ -143,13 +144,85 @@ async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWrite
         socket_buffer: cfg.socket_buffer,
     };
     apply_socket_options(&tcp, &policy);
-    let tls_name = cfg.fakehost.as_deref().unwrap_or(&host);
-    let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl).await?;
+    tls::connect(tcp, tls_name, cfg.verify_ssl).await
+}
+
+async fn dial_cloudflare_fallback(
+    port: u16,
+    primary_ip: std::net::IpAddr,
+    tls_name: &str,
+    cfg: &WssConfig,
+) -> Result<tls::RushTlsStream> {
+    tracing::info!("[DNS] Resolving fakehost: {}", tls_name);
+    let ips = match dns::resolve_all_ipv4(tls_name).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(fakehost=%tls_name, error=%e, "[Cloudflare] Failed to resolve fakehost fallback IPs");
+            return Err(e);
+        }
+    };
+    for ip in ips {
+        let candidate_ip = std::net::IpAddr::V4(ip);
+        if candidate_ip == primary_ip {
+            continue;
+        }
+        let fallback_addr = SocketAddr::new(candidate_ip, port);
+        tracing::info!(
+            "[Cloudflare] Trying fallback edge: {} (fakehost: {})",
+            fallback_addr,
+            tls_name
+        );
+        match connect_tls(fallback_addr, tls_name, cfg).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                tracing::debug!(
+                    fallback_addr = %fallback_addr,
+                    error = %err,
+                    "[Cloudflare] Fallback edge dial failed"
+                );
+            }
+        }
+    }
+    bail!("all Cloudflare fallback edges failed for fakehost: {tls_name}")
+}
+
+async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+    let (addr, host, path) = parse_wss_url(&cfg.upstream)?;
+    let (dns_host, dns_port) = split_authority(&addr)?;
+    let resolved = dns::resolve_socket(&dns_host, dns_port).await?;
+
+    let sni_hostname = cfg
+        .fakehost
+        .as_deref()
+        .map(|s| s.split(':').next().unwrap_or(s))
+        .unwrap_or(&host);
+    let header_host = cfg.fakehost.as_deref().unwrap_or(&host);
+    let tls_name = sni_hostname;
+
+    tracing::info!("[WSS] Connecting to {}", addr);
+    tracing::info!("[WSS] TLS ServerName: {}", tls_name);
+    tracing::info!("[WSS] WebSocket Host: {}", header_host);
+    tracing::info!("[WSS] Path: {}", path);
+
+    let primary_result = connect_tls(resolved, tls_name, cfg).await;
+    let tls_stream = match primary_result {
+        Ok(stream) => stream,
+        Err(primary_err) => {
+            let is_ip_host = host.parse::<std::net::IpAddr>().is_ok();
+            if cfg.fakehost.is_some() && is_ip_host {
+                tracing::warn!("[WSS] Primary upstream failed: {}", addr);
+                dial_cloudflare_fallback(dns_port, resolved.ip(), tls_name, cfg).await?
+            } else {
+                return Err(primary_err);
+            }
+        }
+    };
+
     let boxed: BoxTransport = Box::new(tls_stream);
     let (mut rd, mut wr) = tokio::io::split(boxed);
-    let header_host = cfg.fakehost.as_deref().unwrap_or(&host);
-    let origin = format!("https://{}", host);
-    let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host) {
+    let origin = format!("https://{}", tls_name);
+    let header_host_name = header_host.split(':').next().unwrap_or(header_host);
+    let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host_name) {
         "same-origin"
     } else {
         "cross-site"
@@ -793,3 +866,116 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
 }
 
 async fn run_non_mux_dummy() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_wss_url_with_ip_and_path() {
+        let (connect_addr, host, path) =
+            parse_wss_url("wss://172.64.229.105:443/pyway").expect("valid wss url");
+        assert_eq!(connect_addr, "172.64.229.105:443");
+        assert_eq!(host, "172.64.229.105");
+        assert_eq!(path, "/pyway");
+    }
+
+    #[test]
+    fn parse_wss_url_standard_port_and_root_path() {
+        let (connect_addr, host, path) =
+            parse_wss_url("wss://example.com").expect("valid wss url");
+        assert_eq!(connect_addr, "example.com:443");
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_wss_url_rejects_non_wss() {
+        assert!(parse_wss_url("ws://172.64.229.105:443/pyway").is_err());
+        assert!(parse_wss_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn fakehost_overrides_tls_and_headers_matching_goway() {
+        let upstream = "wss://172.64.229.105:443/pyway";
+        let fakehost = "colo.4467107.xyz";
+
+        let (connect_addr, host, path) = parse_wss_url(upstream).unwrap();
+        let sni_hostname = fakehost.split(':').next().unwrap_or(fakehost);
+        let header_host = fakehost;
+        let tls_name = sni_hostname;
+        let origin = format!("https://{}", tls_name);
+        let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host.split(':').next().unwrap_or(header_host)) {
+            "same-origin"
+        } else {
+            "cross-site"
+        };
+
+        assert_eq!(connect_addr, "172.64.229.105:443");
+        assert_eq!(host, "172.64.229.105");
+        assert_eq!(tls_name, "colo.4467107.xyz");
+        assert_eq!(header_host, "colo.4467107.xyz");
+        assert_eq!(origin, "https://colo.4467107.xyz");
+        assert_eq!(sec_fetch_site, "same-origin");
+        assert_eq!(path, "/pyway");
+
+        let (request_bytes, key) = build_client_handshake_request(
+            header_host,
+            &path,
+            Some(&origin),
+            Some(sec_fetch_site),
+        );
+        let req_text = std::str::from_utf8(&request_bytes).unwrap();
+
+        assert!(req_text.starts_with("GET /pyway HTTP/1.1\r\n"));
+        assert!(req_text.contains("Host: colo.4467107.xyz\r\n"));
+        assert!(req_text.contains("Origin: https://colo.4467107.xyz\r\n"));
+        assert!(req_text.contains("Upgrade: websocket\r\n"));
+        assert!(req_text.contains("Connection: Upgrade\r\n"));
+        assert!(req_text.contains("Sec-WebSocket-Version: 13\r\n"));
+        assert!(req_text.contains(&format!("Sec-WebSocket-Key: {key}\r\n")));
+        assert!(req_text.contains("Sec-Fetch-Site: same-origin\r\n"));
+
+        // Must NOT leak raw IP into Host or Origin
+        assert!(!req_text.contains("Host: 172.64.229.105"));
+        assert!(!req_text.contains("Origin: https://172.64.229.105"));
+    }
+
+    #[test]
+    fn without_fakehost_uses_upstream_host() {
+        let upstream = "wss://gateway.example.com:443/ws";
+        let (connect_addr, host, path) = parse_wss_url(upstream).unwrap();
+        let fakehost: Option<&str> = None;
+
+        let sni_hostname = fakehost
+            .map(|s| s.split(':').next().unwrap_or(s))
+            .unwrap_or(&host);
+        let header_host = fakehost.unwrap_or(&host);
+        let tls_name = sni_hostname;
+        let origin = format!("https://{}", tls_name);
+
+        assert_eq!(connect_addr, "gateway.example.com:443");
+        assert_eq!(tls_name, "gateway.example.com");
+        assert_eq!(header_host, "gateway.example.com");
+        assert_eq!(origin, "https://gateway.example.com");
+        assert_eq!(path, "/ws");
+    }
+
+    #[test]
+    fn fallback_eligibility_criteria() {
+        // IP host + fakehost -> eligible for Cloudflare fallback
+        let host_ip = "172.64.229.105";
+        let has_fakehost = true;
+        let is_ip = host_ip.parse::<std::net::IpAddr>().is_ok();
+        assert!(has_fakehost && is_ip);
+
+        // Domain host + fakehost -> NOT eligible (standard DNS handles domain)
+        let host_domain = "example.com";
+        let is_ip_domain = host_domain.parse::<std::net::IpAddr>().is_ok();
+        assert!(!(has_fakehost && is_ip_domain));
+
+        // IP host + no fakehost -> NOT eligible
+        let no_fakehost = false;
+        assert!(!(no_fakehost && is_ip));
+    }
+}

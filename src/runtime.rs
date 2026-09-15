@@ -50,7 +50,7 @@ impl Default for RuntimeConfig {
             buffer_size: 128 * 1024,
             connection_timeout: 60,
             allow_open: false,
-            max_connections: 1000,
+            max_connections: 1500,
             block_local: true,
             tcp_nodelay: true,
             tcp_keepalive: true,

@@ -35,7 +35,10 @@ struct Args {
     upstream: Option<String>,
     #[arg(short = 'k')]
     key: Option<String>,
-    #[arg(long = "fakehost")]
+    #[arg(
+        long = "fakehost",
+        help = "Cloudflare/CDN hostname used for TLS SNI and HTTP Host; when upstream is an IP, failed connections may retry through DNS-resolved Cloudflare edges"
+    )]
     fakehost: Option<String>,
     #[arg(long = "mux", default_value_t = true)]
     mux: bool,
@@ -63,7 +66,11 @@ struct Args {
     block_local: bool,
     #[arg(long = "no-block-local", default_value_t = false)]
     no_block_local: bool,
-    #[arg(long = "max-conn", value_parser = clap::value_parser!(usize))]
+    #[arg(
+        long = "max-conn",
+        value_parser = clap::value_parser!(usize),
+        help = "Maximum concurrent client connections [default: 1500]"
+    )]
     max_conn: Option<usize>,
     #[arg(long = "connection-timeout")]
     connection_timeout: Option<u64>,
@@ -99,6 +106,7 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "log-file",
     "tui",
     "version",
+    "help",
     "cpuprofile",
     "cpuprofile-duration",
 ];
@@ -375,7 +383,7 @@ async fn main() -> Result<()> {
         RuntimeConfig::default()
     };
     if args.config.is_none() && args.max_conn.is_none() {
-        cfg.max_connections = 4096;
+        cfg.max_connections = 1500;
     }
     if args.tui {
         tracing::warn!("-tui accepted for GoWay CLI compatibility; RushWay currently uses log output without a TUI dashboard");
@@ -553,5 +561,57 @@ mod tests {
         assert_eq!(cfg.proxy_port, 1080);
         apply_listen_arg(&mut cfg, "9192").unwrap();
         assert_eq!(cfg.proxy_port, 9192);
+    }
+    #[test]
+    fn normalizes_legacy_help_flag() {
+        let got = normalize_legacy_args(["rushway", "-help"]);
+        assert_eq!(got, vec!["rushway", "--help"]);
+    }
+    #[test]
+    fn parses_cloudflare_fakehost_full_command() {
+        let raw = [
+            "rushway",
+            "-k",
+            "a6835181",
+            "-up",
+            "wss://172.64.229.105:443/pyway",
+            "-fakehost",
+            "colo.4467107.xyz",
+            "-p",
+            ":9195",
+            "-log",
+            "INFO",
+            "-W",
+            "1024",
+            "--socket-buffer",
+            "4096",
+            "-block-local",
+            "-tui",
+            "-dns",
+            "8.8.8.8",
+            "-mux-sessions",
+            "8",
+        ];
+        let normalized = normalize_legacy_args(raw);
+        let args = Args::parse_from(&normalized);
+        assert_eq!(args.key.as_deref(), Some("a6835181"));
+        assert_eq!(
+            args.upstream.as_deref(),
+            Some("wss://172.64.229.105:443/pyway")
+        );
+        assert_eq!(args.fakehost.as_deref(), Some("colo.4467107.xyz"));
+        assert_eq!(args.port.as_deref(), Some(":9195"));
+        assert_eq!(args.log_level, "INFO");
+        assert_eq!(args.buffer_kib, Some(1024));
+        assert_eq!(args.socket_buffer_kib, Some(4096));
+        assert!(args.block_local);
+        assert!(args.tui);
+        assert_eq!(args.dns.as_deref(), Some("8.8.8.8"));
+        assert_eq!(args.mux_sessions, 8);
+    }
+    #[test]
+    fn default_max_connections_is_1500() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.max_connections, 1500);
     }
 }
