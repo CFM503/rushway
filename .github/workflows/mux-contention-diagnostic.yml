@@ -1,24 +1,34 @@
 name: MUX contention diagnostic
 
 on:
-  push:
-    branches: [astra/mux-contention-diagnostic]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/mux_pool.rs'
+      - 'src/runtime.rs'
+      - 'src/wss_client.rs'
+      - 'src/bin/e2e_bench.rs'
+      - '.github/workflows/mux-contention-diagnostic.yml'
 
 permissions:
   contents: write
 
 jobs:
-  apply-production-fix:
-    if: "${{ !contains(github.event.head_commit.message, 'fix: apply MUX 1000 contention fixes') }}"
+  mux-contention-diagnostic:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
-          ref: astra/mux-contention-diagnostic
-      - name: Patch production sources
+      - name: Apply production MUX contention fixes once
+        id: apply_fix
         shell: bash
         run: |
+          if git log -1 --pretty=%B | grep -Fq 'fix: apply MUX 1000 contention fixes'; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           python3 - <<'PY'
           from pathlib import Path
 
@@ -139,10 +149,76 @@ jobs:
           replace_once('src/runtime.rs', 'let (tx, mut rx) = mpsc::channel(64);', 'let (tx, mut rx) = mpsc::channel(128);')
           PY
           cargo fmt --all
-      - name: Commit production fix
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/mux_pool.rs src/runtime.rs src/wss_client.rs
           git commit -m "fix: apply MUX 1000 contention fixes"
-          git push origin astra/mux-contention-diagnostic
+          git push origin HEAD:${GITHUB_HEAD_REF}
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Stop bootstrap run after source commit
+        if: steps.apply_fix.outputs.changed == 'true'
+        run: exit 0
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.apply_fix.outputs.changed != 'true'
+        with:
+          toolchain: 1.85.0
+          components: rustfmt
+      - name: Instrument MUX dispatch and writer contention
+        if: steps.apply_fix.outputs.changed != 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/mux_pool.rs')
+          s = p.read_text()
+          old = '''        if let Some(tx) = tx {\n            if tx.send(frame).await.is_err() {\n                if state.streams.lock().await.remove(&id).is_some() {\n                    state.active.fetch_sub(1, Ordering::AcqRel);\n                }\n            }\n        }'''
+          new = '''        if let Some(tx) = tx {\n            let started = std::time::Instant::now();\n            let send_result = tx.send(frame).await;\n            let elapsed = started.elapsed();\n            if elapsed >= Duration::from_millis(10) {\n                tracing::debug!(stream_id=id, elapsed_ms=elapsed.as_millis(), active=state.active.load(Ordering::Acquire), "MUX client stream dispatch blocked");\n            }\n            if send_result.is_err() {\n                if state.streams.lock().await.remove(&id).is_some() {\n                    state.active.fetch_sub(1, Ordering::AcqRel);\n                }\n            }\n        }'''
+          if old not in s: raise SystemExit('client dispatch pattern not found')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('src/runtime.rs')
+          s = p.read_text()
+          old = '''                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {\n                    if tx.send(StreamCommand::Data(frame)).await.is_err() {\n                        streams.lock().await.remove(&id);\n                    }\n                }'''
+          new = '''                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {\n                    let started = std::time::Instant::now();\n                    let send_result = tx.send(StreamCommand::Data(frame)).await;\n                    let elapsed = started.elapsed();\n                    if elapsed >= tokio::time::Duration::from_millis(10) {\n                        tracing::debug!(stream_id=id, elapsed_ms=elapsed.as_millis(), "MUX server stream dispatch blocked");\n                    }\n                    if send_result.is_err() {\n                        streams.lock().await.remove(&id);\n                    }\n                }'''
+          if old not in s: raise SystemExit('server dispatch pattern not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Build diagnostic binaries
+        if: steps.apply_fix.outputs.changed != 'true'
+        run: cargo build --release --bin rushway --bin e2e_bench
+      - name: Run WS 1000 diagnostic
+        if: steps.apply_fix.outputs.changed != 'true'
+        shell: bash
+        env:
+          RUSHWAY_E2E_TRANSPORT: ws
+          RUSHWAY_E2E_STRESS: '1'
+          RUSHWAY_E2E_STRESS_PATTERN: staged
+          RUSHWAY_E2E_INCLUDE_1000: '1'
+          RUSHWAY_E2E_MUX_SESSIONS: '64'
+          RUSHWAY_E2E_DIAGNOSTIC: '1'
+        run: |
+          ulimit -n 8192
+          cargo run --release --bin e2e_bench 2>&1 | tee mux-ws-diagnostic.log
+        continue-on-error: true
+      - name: Run WSS 1000 diagnostic
+        if: steps.apply_fix.outputs.changed != 'true'
+        shell: bash
+        env:
+          RUSHWAY_E2E_TRANSPORT: wss
+          RUSHWAY_E2E_STRESS: '1'
+          RUSHWAY_E2E_STRESS_PATTERN: staged
+          RUSHWAY_E2E_INCLUDE_1000: '1'
+          RUSHWAY_E2E_MUX_SESSIONS: '64'
+          RUSHWAY_E2E_DIAGNOSTIC: '1'
+        run: |
+          ulimit -n 8192
+          cargo run --release --bin e2e_bench 2>&1 | tee mux-wss-diagnostic.log
+        continue-on-error: true
+      - name: Upload diagnostic logs
+        if: steps.apply_fix.outputs.changed != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mux-contention-diagnostics
+          path: 'mux-*-diagnostic.log'
+          if-no-files-found: ignore
