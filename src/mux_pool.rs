@@ -302,15 +302,30 @@ impl MuxSessionPool {
             session_creation: Mutex::new(()),
         })
     }
-    async fn prewarm(self: &Arc<Self>) {
-        for _ in 0..configured_session_count() {
-            match SessionState::connect(&self.cfg).await {
-                Ok(s) => self.sessions.lock().await.push(s),
-                Err(e) => {
-                    tracing::debug!(error=%e,"MUX session prewarm failed");
-                    break;
-                }
+    async fn replenish(self: &Arc<Self>) {
+        let target = configured_session_count();
+        let _creation_guard = self.session_creation.lock().await;
+        let need_new = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
+            sessions.len() < target
+        };
+        if !need_new {
+            return;
+        }
+        match SessionState::connect(&self.cfg).await {
+            Ok(s) => {
+                self.sessions.lock().await.push(s);
             }
+            Err(error) => {
+                tracing::debug!(%error,"MUX physical session creation failed; will retry");
+            }
+        }
+    }
+    async fn maintain(self: &Arc<Self>) {
+        loop {
+            self.replenish().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     async fn acquire(
@@ -349,10 +364,21 @@ impl MuxSessionPool {
             }
             drop(sessions);
 
-            let s = SessionState::connect(&self.cfg).await?;
-            let r = s.open_stream(target).await?;
-            self.sessions.lock().await.push(s.clone());
-            return Ok((s, r.0, r.1));
+            match SessionState::connect(&self.cfg).await {
+                Ok(s) => match s.open_stream(target).await {
+                    Ok(r) => {
+                        self.sessions.lock().await.push(s.clone());
+                        return Ok((s, r.0, r.1));
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error,"new MUX physical session opened but stream admission failed");
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(%error,"MUX physical session creation failed during acquire");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -564,9 +590,7 @@ async fn handle_tcp_proxy(
             if is_socks5 {
                 local.write_all(&socks5_success_response()).await?
             } else {
-                local
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await?
+                local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?
             }
             local.shutdown().await.ok();
             session.close_stream(id).await;
@@ -580,9 +604,7 @@ async fn handle_tcp_proxy(
     if is_socks5 {
         local.write_all(&socks5_success_response()).await?
     } else {
-        local
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?
+        local.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?
     }
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
     if !first.payload().is_empty() {
@@ -657,11 +679,14 @@ async fn handle_tcp_proxy(
 
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     let pool = MuxSessionPool::new(cfg.clone());
-    pool.prewarm().await;
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let pool_maintainer = pool.clone();
+    tokio::spawn(async move {
+        pool_maintainer.maintain().await;
+    });
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     let session_count = configured_session_count();
-    tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,session_count,MAX_STREAMS_PER_SESSION);
+    tracing::info!("RushWay pooled client proxy listening on {}:{} (target {} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,session_count,MAX_STREAMS_PER_SESSION);
     loop {
         let (stream, peer) = listener.accept().await?;
         let permit = semaphore.clone().acquire_owned().await?;
