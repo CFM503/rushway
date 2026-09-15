@@ -1,0 +1,137 @@
+name: apply session manager refactor
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - '.github/workflows/apply-session-manager-refactor.yml'
+      - 'src/mux_pool.rs'
+      - 'AI_HANDOFF.md'
+      - 'PROGRESS.md'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'astra/go-style-mux-session-manager'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Apply patch
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('src/mux_pool.rs')
+          s = p.read_text()
+          if 'async fn replenish(self: &Arc<Self>)' not in s:
+              old = '''    async fn prewarm(self: &Arc<Self>) {
+        for _ in 0..configured_session_count() {
+            match SessionState::connect(&self.cfg).await {
+                Ok(s) => self.sessions.lock().await.push(s),
+                Err(e) => {
+                    tracing::debug!(error=%e,"MUX session prewarm failed");
+                    break;
+                }
+            }
+        }
+    }
+'''
+              new = '''    async fn replenish(self: &Arc<Self>) {
+        let target = configured_session_count();
+        let _guard = self.session_creation.lock().await;
+        let need_new = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
+            sessions.len() < target
+        };
+        if !need_new {
+            return;
+        }
+        match SessionState::connect(&self.cfg).await {
+            Ok(s) => self.sessions.lock().await.push(s),
+            Err(error) => {
+                tracing::debug!(error=%error,"MUX physical session creation failed; will retry")
+            }
+        }
+    }
+    async fn maintain(self: &Arc<Self>) {
+        loop {
+            self.replenish().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+'''
+              if old not in s: raise SystemExit('prewarm block not found')
+              s = s.replace(old, new, 1)
+
+          if 'let snapshot = sessions' not in s:
+              old = '''            if let Some(s) = sessions
+                .iter()
+                .filter(|s| s.available())
+                .min_by_key(|s| s.active.load(Ordering::Acquire))
+                .cloned()
+            {
+'''
+              new = '''            let snapshot = sessions
+                .iter()
+                .filter(|s| s.available())
+                .map(|s| (s.active.load(Ordering::Acquire), s.clone()))
+                .collect::<Vec<_>>();
+            if let Some((_active, s)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
+'''
+              if old not in s: raise SystemExit('session selection block not found')
+              s = s.replace(old, new, 1)
+
+          if 'pool_maintainer.maintain().await' not in s:
+              old = '''pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
+    let pool = MuxSessionPool::new(cfg.clone());
+    pool.prewarm().await;
+    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
+'''
+              new = '''pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
+    let pool = MuxSessionPool::new(cfg.clone());
+    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let pool_maintainer = pool.clone();
+    tokio::spawn(async move {
+        pool_maintainer.maintain().await;
+    });
+    let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
+'''
+              if old not in s: raise SystemExit('run_client startup block not found')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          handoff = Path('AI_HANDOFF.md')
+          h = handoff.read_text()
+          marker = '## 2026-09-15 — Astra Go-style Session Manager alignment\n'
+          if marker not in h:
+              h += '''\n\n## 2026-09-15 — Astra Go-style Session Manager alignment\n\n### Bug / architectural defect\n- Plain-WS pooled MUX client still synchronously prewarmed all configured physical sessions before binding the local proxy listener.\n- This left local readiness coupled to upstream DNS/TCP/WebSocket/MUX handshakes and made startup behavior differ from the corrected WSS pool.\n\n### Root cause / evidence\n- `src/mux_pool.rs::run_client()` called `pool.prewarm().await` before `TcpListener::bind(...)`.\n- The pool also ordered sessions from live `AtomicUsize` values; the new code snapshots active counts before selection.\n- Mature Go multiplexers such as HashiCorp yamux model a physical connection as a Session and logical connections as Streams, with explicit backpressure and lifecycle controls; smux likewise separates Session and Stream responsibilities and provides session-wide receive budgeting.\n\n### Astra review\n- Concurrency: physical session creation remains serialized; session selection uses a stable active-count snapshot.\n- Lifecycle: local readiness is no longer coupled to full upstream prewarm.\n- Resource ownership: closed physical sessions are pruned during maintenance and acquisition.\n- Protocol: no MUX wire format, command semantics, target policy, or stream limit changed.\n- Performance: maintenance adds one session at a time every 100 ms rather than blocking startup.\n\n### Change\n- `src/mux_pool.rs`: replace blocking `prewarm()` with `replenish()` + background `maintain()`.\n- `src/mux_pool.rs`: bind the client listener before starting maintenance.\n- `src/mux_pool.rs`: snapshot active counts before selecting the least-loaded session.\n\n### Commit\n- Branch: `astra/go-style-mux-session-manager`\n- Commit SHA: recorded after the source/documentation commit lands.\n\n### Validation\n- Pending the consolidated CI acceptance cycle on the resulting branch revision.\n- Acceptance target: Rust fmt/check/test/release, standalone WS/WSS/QUIC regressions, and the existing 1000-stream diagnostics once.\n\n### Status\n- **Implemented; awaiting executable validation.**\n\n### Remaining risk\n- Physical MUX reader per-stream channel backpressure/HOL remains a separate follow-up.\n- GoWay interoperability remains unverified unless the cloud comparison job actually executes with `WAY_READ_TOKEN`.\n\n### Next action\n- Run the consolidated CI acceptance cycle and make no completion claim beyond the observed evidence.\n'''
+              handoff.write_text(h)
+
+          progress = Path('PROGRESS.md')
+          text = progress.read_text()
+          marker = '## 2026-09-15 — Go-style MUX Session Manager refactor in progress\n'
+          if marker not in text:
+              text = marker + '\n- Branch: `astra/go-style-mux-session-manager`, based on the WSS startup fix branch.\n- Plain-WS pooled MUX binds the local proxy first, then replenishes physical sessions in the background.\n- Physical session creation is serialized and active-count ordering uses a stable snapshot.\n- No MUX wire-format change; executable validation pending.\n\n' + text
+              progress.write_text(text)
+
+      - name: Format
+        run: cargo fmt --all
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/mux_pool.rs AI_HANDOFF.md PROGRESS.md
+          if git diff --cached --quiet; then
+            echo 'Patch already applied'
+            exit 0
+          fi
+          git commit -m 'refactor: align MUX session manager with Go-style lifecycle'
+          git push origin HEAD:astra/go-style-mux-session-manager
