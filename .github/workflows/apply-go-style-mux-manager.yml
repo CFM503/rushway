@@ -1,6 +1,9 @@
 name: apply go-style mux manager
 
 on:
+  push:
+    branches:
+      - astra/go-style-mux-session-manager
   workflow_dispatch:
 
 permissions:
