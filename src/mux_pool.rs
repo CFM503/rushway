@@ -292,12 +292,14 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
 struct MuxSessionPool {
     cfg: RuntimeConfig,
     sessions: Mutex<Vec<Arc<SessionState>>>,
+    session_creation: Mutex<()>,
 }
 impl MuxSessionPool {
     fn new(cfg: RuntimeConfig) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             sessions: Mutex::new(Vec::new()),
+            session_creation: Mutex::new(()),
         })
     }
     async fn prewarm(self: &Arc<Self>) {
@@ -335,11 +337,18 @@ impl MuxSessionPool {
             let need_new = sessions.len() < n;
             drop(sessions);
             if !need_new {
-                // RushWay uses backpressure instead of dropping a local connection
-                // when all physical MUX sessions are temporarily full.
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 continue;
             }
+
+            let _creation_guard = self.session_creation.lock().await;
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
+            if sessions.len() >= n {
+                continue;
+            }
+            drop(sessions);
+
             let s = SessionState::connect(&self.cfg).await?;
             let r = s.open_stream(target).await?;
             self.sessions.lock().await.push(s.clone());
