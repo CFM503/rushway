@@ -52,7 +52,8 @@ fn upstream_url(port: u16) -> String { match transport_mode() { "quic" => format
 
 fn spawn_rushway(path: &std::path::Path, port: u16, upstream: Option<String>, key: &str, allow_local_targets: bool, wss_server: bool) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    cmd.arg("-p").arg(port.to_string()).arg("-k").arg(key).arg("--log").arg("ERROR");
+    let log_level = if diagnostic_mode() { "DEBUG" } else { "ERROR" };
+    cmd.arg("-p").arg(port.to_string()).arg("-k").arg(key).arg("--log").arg(log_level);
     if allow_local_targets { cmd.arg("--no-block-local"); }
     if wss_server { cmd.arg("--wss-server"); }
     if let Some(upstream) = upstream { cmd.arg("--up").arg(upstream); }
