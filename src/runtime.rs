@@ -18,7 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone)]
@@ -61,6 +61,7 @@ impl Default for RuntimeConfig {
 #[derive(Debug)]
 struct StreamEntry {
     tx: mpsc::Sender<StreamCommand>,
+    cancel: watch::Sender<bool>,
 }
 #[derive(Debug)]
 enum StreamCommand {
@@ -332,6 +333,7 @@ async fn handle_mux_parts(
                 }
 
                 let (tx, mut rx) = mpsc::channel(64);
+                let (cancel, cancelled) = watch::channel(false);
 
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
@@ -340,7 +342,13 @@ async fn handle_mux_parts(
                     if guard.len() >= 256 || guard.contains_key(&stream_id) {
                         false
                     } else {
-                        guard.insert(stream_id, StreamEntry { tx: tx.clone() });
+                        guard.insert(
+                            stream_id,
+                            StreamEntry {
+                                tx: tx.clone(),
+                                cancel: cancel.clone(),
+                            },
+                        );
                         true
                     }
                 };
@@ -371,6 +379,7 @@ async fn handle_mux_parts(
                 let cfg_task = cfg.clone();
 
                 let task = tokio::spawn(async move {
+                    let mut cancelled = cancelled;
                     let mut pending = Vec::new();
 
                     let target_stream = loop {
@@ -395,6 +404,20 @@ async fn handle_mux_parts(
                                 }
                             }
 
+                            changed = cancelled.changed() => {
+                                match changed {
+                                    Ok(()) if *cancelled.borrow() => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        streams_task.lock().await.remove(&stream_id);
+                                        return;
+                                    }
+                                }
+                            }
+
                             command = rx.recv() => {
                                 match command {
                                     Some(StreamCommand::Data(frame)) => {
@@ -410,6 +433,11 @@ async fn handle_mux_parts(
                             }
                         }
                     };
+
+                    if *cancelled.borrow() {
+                        streams_task.lock().await.remove(&stream_id);
+                        return;
+                    }
 
                     while let Ok(command) = rx.try_recv() {
                         match command {
@@ -486,21 +514,26 @@ async fn handle_mux_parts(
             }
 
             MuxCommand::Fin => {
-                if let Some(tx) = streams
+                if let Some((tx, cancel)) = streams
                     .lock()
                     .await
                     .get(&frame.stream_id)
-                    .map(|s| s.tx.clone())
+                    .map(|s| (s.tx.clone(), s.cancel.clone()))
                 {
                     let _ = tx.send(StreamCommand::Fin).await;
+                    let _ = cancel.send(true);
                 }
             }
 
             MuxCommand::Rst => {
-                let tx = streams.lock().await.remove(&frame.stream_id).map(|s| s.tx);
-
-                if let Some(tx) = tx {
+                if let Some((tx, cancel)) = streams
+                    .lock()
+                    .await
+                    .get(&frame.stream_id)
+                    .map(|s| (s.tx.clone(), s.cancel.clone()))
+                {
                     let _ = tx.send(StreamCommand::Reset).await;
+                    let _ = cancel.send(true);
                 }
             }
         }
@@ -645,5 +678,41 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 tracing::debug!(%peer,error=%e,"transport connection closed")
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use tokio::time::{timeout, Instant};
+
+    #[tokio::test]
+    async fn dialing_cancel_signal_wakes_immediately() {
+        let (cancel, mut cancelled) = watch::channel(false);
+        cancel.send(true).expect("receiver exists");
+        let result = timeout(Duration::from_millis(100), async move {
+            loop {
+                match cancelled.changed().await {
+                    Ok(()) if *cancelled.borrow() => break,
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "cancellation watcher did not wake in time");
+    }
+
+    #[tokio::test]
+    async fn cancellation_precedes_slow_dial() {
+        let (cancel, mut cancelled) = watch::channel(false);
+        cancel.send(true).expect("receiver exists");
+        let start = Instant::now();
+        let won = tokio::select! {
+            _ = std::future::pending::<Result<TcpStream>>() => false,
+            changed = cancelled.changed() => changed.is_ok() && *cancelled.borrow(),
+        };
+        assert!(won, "cancellation must win over a pending dial");
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 }
