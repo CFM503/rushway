@@ -1,10 +1,10 @@
 //! Plain WebSocket 1:1 relay compatibility path.
 
 use crate::crypto::XorCipher;
-use crate::dns::resolve_socket;
+use crate::dns::{resolve_all_ipv4, resolve_socket};
 use crate::proxy::{
-    parse_http_connect, parse_socks5_request, socks5_success_response, SocksCommand, TargetAddr,
-    SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION,
+    parse_authority_with_default, parse_target_authority, read_client_proxy_request,
+    socks5_success_response, ClientProxyRequest, SocksCommand,
 };
 use crate::runtime::{enforce_target_policy, RuntimeConfig};
 use crate::udp_relay::handle_local_udp_proxy;
@@ -12,7 +12,7 @@ use crate::ws::{
     build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers,
     validate_client_handshake_response, validate_server_handshake, write_frame,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use socket2::SockRef;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +38,45 @@ fn parse_ws_url(input: &str) -> Result<(String, String)> {
     };
     Ok((authority, path))
 }
+/// Plain-WS Cloudflare edge fallback. Mirrors goway.go `dialFallback`:
+/// IP upstream + `-fakehost` and primary unreachable -> try fakehost edges.
+async fn connect_ws_with_fallback(
+    cfg: &RuntimeConfig,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream> {
+    let primary = resolve_socket(target_host, target_port).await?;
+    let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let primary_res = timeout(conn_timeout, TcpStream::connect(primary)).await;
+    let failed = match primary_res {
+        Ok(Ok(socket)) => return Ok(socket),
+        Ok(Err(e)) => anyhow::anyhow!("TCP connect failed: {e}"),
+        Err(_) => anyhow::anyhow!("upstream connection timeout to {primary}"),
+    };
+    if target_host.parse::<std::net::IpAddr>().is_ok() && cfg.fakehost.is_some() {
+        let sni = cfg
+            .fakehost
+            .as_deref()
+            .map(|s| s.split(':').next().unwrap_or(s))
+            .unwrap();
+        tracing::warn!(%primary, error=%failed, "[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost");
+        for edge in resolve_all_ipv4(sni).await? {
+            let candidate =
+                std::net::SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
+            if candidate.ip() == primary.ip() {
+                continue;
+            }
+            tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+            match timeout(conn_timeout, TcpStream::connect(candidate)).await {
+                Ok(Ok(socket)) => return Ok(socket),
+                Ok(Err(e)) => tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed"),
+                Err(_) => tracing::debug!(%candidate, "[WS] Fallback edge dial timed out"),
+            }
+        }
+        bail!("primary {primary} unreachable and all Cloudflare fallback edges failed for fakehost: {sni}");
+    }
+    Err(failed)
+}
 fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
     let sock = SockRef::from(stream);
     let _ = sock.set_nodelay(cfg.tcp_nodelay);
@@ -51,63 +90,7 @@ fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
         let _ = sock.set_tcp_keepalive(&ka);
     }
 }
-async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
-    let first = stream.read_u8().await?;
-    if first == SOCKS5_VERSION {
-        let n = stream.read_u8().await? as usize;
-        let mut methods = vec![0u8; n];
-        stream.read_exact(&mut methods).await?;
-        if !methods.contains(&0) {
-            stream.write_all(&[5, 0xff]).await?;
-            bail!("SOCKS5 no-auth unavailable")
-        }
-        stream.write_all(&[5, 0]).await?;
-        let mut head = [0u8; 4];
-        stream.read_exact(&mut head).await?;
-        if head[1] != SOCKS5_CONNECT && head[1] != SOCKS5_UDP_ASSOCIATE {
-            stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-            bail!("unsupported SOCKS5 command")
-        }
-        let mut req = head.to_vec();
-        match head[3] {
-            1 => {
-                let mut b = [0u8; 6];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            3 => {
-                let mut n = [0u8; 1];
-                stream.read_exact(&mut n).await?;
-                req.extend_from_slice(&n);
-                let mut b = vec![0u8; n[0] as usize + 2];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            4 => {
-                let mut b = [0u8; 18];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            _ => {
-                stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-                bail!("unsupported SOCKS5 address type")
-            }
-        }
-        let parsed = parse_socks5_request(&req).map_err(|e| anyhow!(e.to_string()))?;
-        return Ok((parsed.command, parsed.target, true));
-    }
-    if first == b'C' {
-        let mut buf = vec![first];
-        let mut tail = read_http_headers(stream).await?;
-        buf.append(&mut tail);
-        return Ok((
-            SocksCommand::Connect,
-            parse_http_connect(&buf).map_err(|e| anyhow!(e.to_string()))?,
-            false,
-        ));
-    }
-    bail!("unsupported local proxy protocol")
-}
+
 async fn open_upstream(
     cfg: &RuntimeConfig,
 ) -> Result<(
@@ -119,28 +102,20 @@ async fn open_upstream(
         .as_deref()
         .ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (addr, path) = parse_ws_url(upstream)?;
-    let host = addr
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(addr.as_str())
-        .trim_matches(|c| c == '[' || c == ']')
-        .to_string();
-    let header_host = cfg.fakehost.as_deref().unwrap_or(&host).to_string();
-    let port = addr
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-        .unwrap_or(80);
-    let resolved = resolve_socket(&host, port).await?;
-    let tcp = timeout(
-        Duration::from_secs(cfg.connection_timeout.max(1)),
-        TcpStream::connect(resolved),
-    )
-    .await
-    .context("upstream connection timeout")??;
+    let target =
+        parse_authority_with_default(&addr, 80).map_err(|e| anyhow!(e.to_string()))?;
+    let header_host = cfg.fakehost.as_deref().unwrap_or(&target.host).to_string();
+    let sni_base = cfg
+        .fakehost
+        .as_deref()
+        .map(|s| s.split(':').next().unwrap_or(s))
+        .unwrap_or(&target.host);
+    let tcp = connect_ws_with_fallback(cfg, &target.host, target.port).await?;
     apply_socket_options(&tcp, cfg);
     let (mut rd, mut wr) = tokio::io::split(tcp);
-    let origin = format!("https://{}", host);
-    let sec_fetch_site = if header_host.eq_ignore_ascii_case(&host) {
+    let header_base = header_host.split(':').next().unwrap_or(&header_host);
+    let origin = format!("http://{}", sni_base);
+    let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
         "same-origin"
     } else {
         "cross-site"
@@ -156,13 +131,12 @@ async fn open_upstream(
 async fn relay_client(
     mut local: TcpStream,
     cfg: RuntimeConfig,
-    target: TargetAddr,
-    is_socks5: bool,
+    req: ClientProxyRequest,
 ) -> Result<()> {
-    enforce_target_policy(&cfg, &target)?;
+    enforce_target_policy(&cfg, &req.target)?;
     let (mut rd, writer) = open_upstream(&cfg).await?;
     let c = cipher(&cfg.key);
-    let mut hello = format!("{}:{}\n", target.host, target.port).into_bytes();
+    let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
     c.apply(&mut hello);
     {
         let mut w = writer.lock().await;
@@ -185,62 +159,74 @@ async fn relay_client(
     if ok != b"OK\n" {
         bail!("upstream rejected non-MUX target")
     };
-    if is_socks5 {
+    if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?
-    } else {
+    } else if req.is_connect {
         local
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?
     };
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
     let writer_up = writer.clone();
-    let upload_cipher = c.clone();
-    let upload = tokio::spawn(async move {
+    // GoWay v1.8.5 non-MUX TCP: only the target handshake ("host:port\n")
+    // and "OK\n" are XOR-encrypted. All subsequent data frames are plaintext.
+    if let Some(initial) = req.initial_payload {
+        let payload = initial;
+        let mut w = writer_up.lock().await;
+        write_frame(&mut *w, &payload, 2, true).await?;
+    }
+    let mut upload = tokio::spawn(async move {
         let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
-            let mut payload = buf[..n].to_vec();
-            upload_cipher.apply(&mut payload);
+            let payload = buf[..n].to_vec();
             let mut w = writer_up.lock().await;
             write_frame(&mut *w, &payload, 2, true).await?
         }
         Result::<()>::Ok(())
     });
-    let download_cipher = c;
-    loop {
-        let Some((opcode, mut payload)) = read_frame(
-            &mut rd,
-            Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
-            &mut frame_buf,
-        )
-        .await?
-        else {
-            break;
-        };
-        match opcode {
-            2 => {
-                download_cipher.apply(&mut payload);
-                local_wr.write_all(&payload).await?
+    tokio::select! {
+        _ = &mut upload => {}
+        _ = async {
+            loop {
+                let Some((opcode, payload)) = read_frame(
+                    &mut rd,
+                    Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
+                    &mut frame_buf,
+                )
+                .await?
+                else {
+                    break;
+                };
+                match opcode {
+                    2 => {
+                        // Non-MUX data frames are plaintext per GoWay server.
+                        if local_wr.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    8 => break,
+                    _ => {}
+                }
             }
-            8 => break,
-            _ => {}
-        }
+            Result::<()>::Ok(())
+        } => {}
     }
     upload.abort();
     Ok(())
 }
 async fn handle_client_connection(mut local: TcpStream, cfg: RuntimeConfig) -> Result<()> {
-    let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
-    if command == SocksCommand::UdpAssociate {
-        return handle_local_udp_proxy(local, cfg, target).await;
+    let req = read_client_proxy_request(&mut local).await?;
+    if req.command == SocksCommand::UdpAssociate {
+        return handle_local_udp_proxy(local, cfg, req.target).await;
     }
-    if command != SocksCommand::Connect {
+    if req.command != SocksCommand::Connect {
         bail!("non-MUX client supports CONNECT or UDP ASSOCIATE only")
     }
-    relay_client(local, cfg, target, is_socks5).await
+    relay_client(local, cfg, req).await
 }
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
@@ -321,16 +307,9 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         .map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?
         .trim()
         .to_string();
-    let (host, port_text) = target
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("invalid non-MUX target"))?;
-    let port = port_text
-        .parse::<u16>()
-        .map_err(|_| anyhow!("invalid non-MUX target port"))?;
-    if port == 0 {
-        bail!("invalid non-MUX target port")
-    };
-    let resolved = resolve_socket(host, port).await?;
+    let target_addr =
+        parse_target_authority(&target).map_err(|e| anyhow!(e.to_string()))?;
+    let resolved = resolve_socket(&target_addr.host, target_addr.port).await?;
     let target_stream = timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
         TcpStream::connect(resolved),
@@ -345,41 +324,48 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     };
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     let writer_down = writer.clone();
-    let download_cipher = c.clone();
     let buffer_size = cfg.buffer_size;
-    let download = tokio::spawn(async move {
+    let mut download = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
-            let mut payload = buf[..n].to_vec();
-            download_cipher.apply(&mut payload);
+            // Non-MUX data frames are plaintext per GoWay server.
+            let payload = buf[..n].to_vec();
             let mut w = writer_down.lock().await;
             write_frame(&mut *w, &payload, 2, false).await?
         }
         Result::<()>::Ok(())
     });
     loop {
-        let Some((opcode, mut payload)) = read_frame(
-            &mut rd,
-            Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
-            &mut frame_buf,
-        )
-        .await?
-        else {
-            break;
-        };
-        if opcode == 8 {
-            break;
+        tokio::select! {
+            _ = &mut download => {
+                break;
+            }
+            res = read_frame(
+                &mut rd,
+                Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
+                &mut frame_buf,
+            ) => {
+                let Some((opcode, payload)) = res? else {
+                    break;
+                };
+                if opcode == 8 {
+                    break;
+                }
+                if opcode != 2 {
+                    continue;
+                }
+                // Non-MUX data frames are plaintext per GoWay server.
+                if target_wr.write_all(&payload).await.is_err() {
+                    break;
+                }
+            }
         }
-        if opcode != 2 {
-            continue;
-        }
-        c.apply(&mut payload);
-        target_wr.write_all(&payload).await?
     }
+    let _ = target_wr.shutdown().await;
     download.abort();
     Ok(())
 }

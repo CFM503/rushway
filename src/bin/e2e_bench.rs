@@ -35,6 +35,7 @@ fn configured_mux_sessions() -> Option<usize> {
         .filter(|v| (1..=64).contains(v))
 }
 
+#[allow(dead_code)]
 fn free_port() -> io::Result<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr().map(|a| a.port())
 }

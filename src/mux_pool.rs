@@ -7,16 +7,15 @@ use crate::crypto::XorCipher;
 use crate::dns;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{
-    parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_failure_response,
-    socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE,
-    SOCKS5_VERSION,
+    parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
+    TargetAddr,
 };
 use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
 use crate::ws::{
     build_client_handshake_request, read_frame, read_frame_owned, read_http_headers,
     validate_client_handshake_response, write_frame,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
@@ -30,7 +29,7 @@ use tokio::time::{timeout, Duration};
 
 const DEFAULT_SESSION_COUNT: usize = 4;
 const MAX_SESSION_COUNT: usize = 64;
-const MAX_STREAMS_PER_SESSION: usize = 256;
+const MAX_STREAMS_PER_SESSION: usize = 2048;
 
 fn configured_session_count() -> usize {
     std::env::var("RUSHWAY_MUX_SESSIONS")
@@ -43,22 +42,79 @@ fn configured_cipher(key: &Option<String>) -> XorCipher {
     XorCipher::new(key.as_deref().unwrap_or(""))
 }
 
-fn split_authority(authority: &str) -> Result<(String, u16)> {
-    if authority.starts_with('[') {
-        let close = authority
-            .find(']')
-            .ok_or_else(|| anyhow!("invalid upstream IPv6 authority"))?;
-        let host = authority[1..close].to_string();
-        let port = authority
-            .get(close + 1..)
-            .and_then(|s| s.strip_prefix(':'))
-            .unwrap_or("80")
-            .parse::<u16>()?;
-        return Ok((host, port));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Ok((host.to_string(), port.parse::<u16>()?)),
-        None => Ok((authority.to_string(), 80)),
+/// GoWay-compatible Cloudflare edge fallback for plain `ws://`.
+/// If the upstream host is a literal IP and the primary TCP dial fails,
+/// resolve `fakehost` to IPv4 edges and try each non-primary edge.
+/// Mirrors `dialFallback` in goway.go.
+async fn connect_with_fallback(
+    cfg: &RuntimeConfig,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream> {
+    let primary = dns::resolve_socket(target_host, target_port).await?;
+    let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    match timeout(conn_timeout, TcpStream::connect(primary)).await {
+        Ok(Ok(socket)) => return Ok(socket),
+        Ok(Err(primary_err)) => {
+            let is_ip = target_host.parse::<std::net::IpAddr>().is_ok();
+            let sni = cfg
+                .fakehost
+                .as_deref()
+                .map(|s| s.split(':').next().unwrap_or(s));
+            if !(is_ip && sni.is_some()) {
+                return Err(primary_err.into());
+            }
+            let sni = sni.unwrap();
+            tracing::warn!(%primary, error=%primary_err, "[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost");
+            let edges = dns::resolve_all_ipv4(sni).await?;
+            for edge in edges {
+                if std::net::IpAddr::V4(edge) == primary.ip() {
+                    continue;
+                }
+                let candidate = SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
+                tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+                match timeout(conn_timeout, TcpStream::connect(candidate)).await {
+                    Ok(Ok(socket)) => return Ok(socket),
+                    Ok(Err(e)) => {
+                        tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed");
+                    }
+                    Err(_) => {
+                        tracing::debug!(%candidate, "[WS] Fallback edge dial timed out");
+                    }
+                }
+            }
+            Err(anyhow!("primary {primary} unreachable and all Cloudflare fallback edges failed for fakehost: {sni}"))
+        }
+        Err(_) => {
+            let is_ip = target_host.parse::<std::net::IpAddr>().is_ok();
+            let sni = cfg
+                .fakehost
+                .as_deref()
+                .map(|s| s.split(':').next().unwrap_or(s));
+            if !(is_ip && sni.is_some()) {
+                bail!("upstream connection timeout to {primary}");
+            }
+            let sni = sni.unwrap();
+            tracing::warn!(%primary, "[WS] Primary upstream timed out; trying Cloudflare fallback edges via fakehost");
+            let edges = dns::resolve_all_ipv4(sni).await?;
+            for edge in edges {
+                if std::net::IpAddr::V4(edge) == primary.ip() {
+                    continue;
+                }
+                let candidate = SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
+                tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+                match timeout(conn_timeout, TcpStream::connect(candidate)).await {
+                    Ok(Ok(socket)) => return Ok(socket),
+                    Ok(Err(e)) => {
+                        tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed");
+                    }
+                    Err(_) => {
+                        tracing::debug!(%candidate, "[WS] Fallback edge dial timed out");
+                    }
+                }
+            }
+            bail!("primary {primary} timed out and all Cloudflare fallback edges failed for fakehost: {sni}")
+        }
     }
 }
 
@@ -126,18 +182,21 @@ impl SessionState {
             .ok_or_else(|| anyhow!("client mode requires upstream"))?;
         let (authority, path) = parse_upstream(upstream)?;
         let actual_host = cfg.fakehost.clone().unwrap_or_else(|| authority.clone());
-        let (dns_host, dns_port) = split_authority(&authority)?;
-        let addr = dns::resolve_socket(&dns_host, dns_port).await?;
-        let socket = timeout(
-            Duration::from_secs(cfg.connection_timeout.max(1)),
-            TcpStream::connect(addr),
-        )
-        .await
-        .context("upstream connection timeout")??;
+        let target =
+            parse_authority_with_default(&authority, 80).map_err(|e| anyhow!(e.to_string()))?;
+        let socket = connect_with_fallback(cfg, &target.host, target.port).await?;
         apply_socket_options(&socket, cfg);
         let (mut rd, mut wr) = tokio::io::split(socket);
-        let origin = Some(format!("http://{}", actual_host));
-        let sec_fetch_site = if authority.eq_ignore_ascii_case(&actual_host) {
+        // GoWay performWSHandshake: SNI and Host both become fakehost when set,
+        // Origin is http(s)://SNI, Sec-Fetch-Site compares SNI vs Host base.
+        let sni_base = cfg
+            .fakehost
+            .as_deref()
+            .map(|s| s.split(':').next().unwrap_or(s))
+            .unwrap_or(&target.host);
+        let header_base = actual_host.split(':').next().unwrap_or(&actual_host);
+        let origin = Some(format!("http://{}", sni_base));
+        let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
             "same-origin"
         } else {
             "cross-site"
@@ -194,6 +253,24 @@ impl SessionState {
             reader_state.active.store(0, Ordering::Release);
             reader_state.streams.lock().await.clear()
         });
+        let heartbeat_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(25));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if heartbeat_state.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                if heartbeat_state.active.load(Ordering::Acquire) == 0 {
+                    let mut w = heartbeat_state.writer.lock().await;
+                    if write_frame(&mut *w, &[], 9, true).await.is_err() {
+                        heartbeat_state.closed.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        });
         Ok(state)
     }
     fn available(&self) -> bool {
@@ -203,14 +280,26 @@ impl SessionState {
     async fn open_stream(
         self: &Arc<Self>,
         target: &TargetAddr,
+        initial_data: Vec<u8>,
     ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>)> {
         if self.closed.load(Ordering::Acquire) {
             bail!("MUX session is closed")
         }
 
+        let target_bytes = format!("{}:{}", target.host, target.port).into_bytes();
+        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_bytes.len());
+        let (syn_initial, remaining_initial) = if initial_data.len() > max_syn_initial {
+            (
+                initial_data[..max_syn_initial].to_vec(),
+                &initial_data[max_syn_initial..],
+            )
+        } else {
+            (initial_data, &[][..])
+        };
+
         let syn_payload = SynPayload {
-            target: format!("{}:{}", target.host, target.port).into_bytes(),
-            initial_data: Vec::new(),
+            target: target_bytes,
+            initial_data: syn_initial,
         }
         .encode()
         .map_err(|e| anyhow!(e.to_string()))?;
@@ -235,7 +324,16 @@ impl SessionState {
             }
         }
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut id;
+        loop {
+            id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if id == 0 {
+                id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            }
+            if !streams.contains_key(&id) {
+                break;
+            }
+        }
         let (tx, rx) = mpsc::channel(32);
         streams.insert(id, tx);
         drop(streams);
@@ -255,6 +353,25 @@ impl SessionState {
             self.closed.store(true, Ordering::Release);
             return Err(e);
         }
+
+        if !remaining_initial.is_empty() {
+            if let Err(e) = send_mux_parts(
+                &self.writer,
+                &self.cipher,
+                id,
+                MuxCommand::Data,
+                remaining_initial,
+            )
+            .await
+            {
+                if self.streams.lock().await.remove(&id).is_some() {
+                    self.active.fetch_sub(1, Ordering::AcqRel);
+                }
+                self.closed.store(true, Ordering::Release);
+                return Err(e);
+            }
+        }
+
         Ok((id, rx))
     }
     async fn close_stream(&self, id: u32) {
@@ -299,6 +416,7 @@ struct MuxSessionPool {
     cfg: RuntimeConfig,
     sessions: Mutex<Vec<Arc<SessionState>>>,
     session_creation: Mutex<()>,
+    consecutive_failures: std::sync::atomic::AtomicU32,
 }
 impl MuxSessionPool {
     fn new(cfg: RuntimeConfig) -> Arc<Self> {
@@ -306,6 +424,7 @@ impl MuxSessionPool {
             cfg,
             sessions: Mutex::new(Vec::new()),
             session_creation: Mutex::new(()),
+            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
         })
     }
     async fn replenish(self: &Arc<Self>) {
@@ -317,24 +436,39 @@ impl MuxSessionPool {
             sessions.len() < target
         };
         if !need_new {
+            self.consecutive_failures
+                .store(0, Ordering::Release);
             return;
         }
         match SessionState::connect(&self.cfg).await {
-            Ok(s) => self.sessions.lock().await.push(s),
+            Ok(s) => {
+                self.sessions.lock().await.push(s);
+                self.consecutive_failures
+                    .store(0, Ordering::Release);
+            }
             Err(error) => {
-                tracing::debug!(error=%error,"MUX physical session creation failed; will retry")
+                let failures = self
+                    .consecutive_failures
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
+                tracing::warn!(error=%error, failures, "MUX physical session creation failed; will retry with backoff");
             }
         }
     }
     async fn maintain(self: &Arc<Self>) {
         loop {
             self.replenish().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Base 100ms; +500ms per consecutive failure, capped at ~5s.
+            // Prevents DNS/TCP hammering while the upstream is down.
+            let failures = self.consecutive_failures.load(Ordering::Acquire);
+            let backoff = (failures.saturating_mul(500)).min(5000);
+            tokio::time::sleep(Duration::from_millis(100 + backoff as u64)).await;
         }
     }
     async fn acquire(
         self: &Arc<Self>,
         target: &TargetAddr,
+        initial_data: Vec<u8>,
     ) -> Result<(Arc<SessionState>, u32, mpsc::Receiver<OwnedMuxFrame>)> {
         enforce_target_policy(&self.cfg, target)?;
         let n = configured_session_count();
@@ -348,7 +482,7 @@ impl MuxSessionPool {
                 .collect::<Vec<_>>();
             if let Some((_active, s)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
                 drop(sessions);
-                match s.open_stream(target).await {
+                match s.open_stream(target, initial_data.clone()).await {
                     Ok(r) => return Ok((s, r.0, r.1)),
                     Err(_) => continue,
                 }
@@ -369,58 +503,11 @@ impl MuxSessionPool {
             drop(sessions);
 
             let s = SessionState::connect(&self.cfg).await?;
-            let r = s.open_stream(target).await?;
+            let r = s.open_stream(target, initial_data.clone()).await?;
             self.sessions.lock().await.push(s.clone());
             return Ok((s, r.0, r.1));
         }
     }
-}
-async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
-    let first = stream.read_u8().await?;
-    if first != SOCKS5_VERSION {
-        if first == b'C' {
-            let mut buf = vec![first];
-            let mut tail = read_http_headers(stream).await?;
-            buf.append(&mut tail);
-            let target = parse_http_connect(&buf).map_err(|e| anyhow!(e.to_string()))?;
-            return Ok((SocksCommand::Connect, target, false));
-        }
-        bail!("unsupported proxy protocol")
-    }
-    let n = stream.read_u8().await? as usize;
-    let mut methods = vec![0u8; n];
-    stream.read_exact(&mut methods).await?;
-    if !methods.contains(&0) {
-        stream.write_all(&[5, 0xff]).await?;
-        bail!("SOCKS5 no-auth method unavailable")
-    }
-    stream.write_all(&[5, 0]).await?;
-    let mut head = [0u8; 4];
-    stream.read_exact(&mut head).await?;
-    if head[1] != SOCKS5_CONNECT && head[1] != SOCKS5_UDP_ASSOCIATE {
-        stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-        bail!("unsupported SOCKS5 command")
-    }
-    let mut rest = match head[3] {
-        1 => vec![0u8; 6],
-        3 => vec![0u8; 1],
-        4 => vec![0u8; 18],
-        _ => {
-            stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-            bail!("unsupported SOCKS5 address type")
-        }
-    };
-    stream.read_exact(&mut rest).await?;
-    let mut req = head.to_vec();
-    req.extend_from_slice(&rest);
-    if head[3] == 3 {
-        let n = rest[0] as usize;
-        let mut tail = vec![0u8; n + 2];
-        stream.read_exact(&mut tail).await?;
-        req.extend_from_slice(&tail)
-    }
-    let parsed = parse_socks5_request(&req).map_err(|e| anyhow!(e.to_string()))?;
-    Ok((parsed.command, parsed.target, true))
 }
 
 async fn handle_udp_proxy(
@@ -452,17 +539,19 @@ async fn handle_udp_proxy(
         .ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (authority, path) = parse_upstream(&upstream)?;
     let actual_host = cfg.fakehost.clone().unwrap_or_else(|| authority.clone());
-    let (dns_host, dns_port) = split_authority(&authority)?;
-    let addr = dns::resolve_socket(&dns_host, dns_port).await?;
-    let socket = timeout(
-        Duration::from_secs(cfg.connection_timeout.max(1)),
-        TcpStream::connect(addr),
-    )
-    .await??;
+    let target =
+        parse_authority_with_default(&authority, 80).map_err(|e| anyhow!(e.to_string()))?;
+    let socket = connect_with_fallback(&cfg, &target.host, target.port).await?;
     apply_socket_options(&socket, &cfg);
     let (mut rd, mut wr) = tokio::io::split(socket);
-    let origin = Some(format!("https://{}", actual_host));
-    let sec_fetch_site = if authority.eq_ignore_ascii_case(&actual_host) {
+    let sni_base = cfg
+        .fakehost
+        .as_deref()
+        .map(|s| s.split(':').next().unwrap_or(s))
+        .unwrap_or(&target.host);
+    let header_base = actual_host.split(':').next().unwrap_or(&actual_host);
+    let origin = Some(format!("http://{}", sni_base));
+    let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
         "same-origin"
     } else {
         "cross-site"
@@ -509,38 +598,44 @@ async fn handle_udp_proxy(
     let latest_send = latest.clone();
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let (n, peer) = udp_send.recv_from(&mut buf).await?;
+        while let Ok((n, peer)) = udp_send.recv_from(&mut buf).await {
             *latest_send.lock().await = Some(peer);
             let mut data = buf[..n].to_vec();
             c_send.apply(&mut data);
             let mut w = writer_send.lock().await;
-            write_frame(&mut *w, &data, 2, true).await?
+            if write_frame(&mut *w, &data, 2, true).await.is_err() {
+                break;
+            }
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
-    loop {
-        let Some((opcode, mut packet)) = read_frame(
-            &mut rd,
-            Option::<&mut WriteHalf<TcpStream>>::None,
-            &mut frame_buf,
-        )
-        .await?
-        else {
-            break;
-        };
-        if opcode != 2 {
-            continue;
-        }
-        cipher.apply(&mut packet);
-        let (_src, payload) =
-            parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
-        if let Some(peer) = *latest.lock().await {
-            let _ = udp.send_to(payload, peer).await?;
-        }
+    let mut dummy = [0u8; 1];
+    tokio::select! {
+        _ = control.read(&mut dummy) => {}
+        _ = async {
+            loop {
+                let Some((opcode, mut packet)) = read_frame(
+                    &mut rd,
+                    Option::<&mut WriteHalf<TcpStream>>::None,
+                    &mut frame_buf,
+                )
+                .await?
+                else {
+                    break;
+                };
+                if opcode != 2 {
+                    continue;
+                }
+                cipher.apply(&mut packet);
+                if let Some(peer) = *latest.lock().await {
+                    let _ = udp.send_to(&packet, peer).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        } => {}
     }
     upload.abort();
-    control.shutdown().await.ok();
+    let _ = control.shutdown().await;
     Ok(())
 }
 
@@ -549,64 +644,23 @@ async fn handle_tcp_proxy(
     cfg: RuntimeConfig,
     pool: Arc<MuxSessionPool>,
 ) -> Result<()> {
-    let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
-    if command == SocksCommand::UdpAssociate {
-        return handle_udp_proxy(local, cfg, target).await;
+    let req = read_client_proxy_request(&mut local).await?;
+    if req.command == SocksCommand::UdpAssociate {
+        return handle_udp_proxy(local, cfg, req.target).await;
     }
-    if command != SocksCommand::Connect {
+    if req.command != SocksCommand::Connect {
         bail!("MUX client supports CONNECT or UDP ASSOCIATE only")
     }
-    let (session, id, mut rx) = pool.acquire(&target).await?;
-    let first = timeout(Duration::from_secs(cfg.connection_timeout.max(1)), async {
-        loop {
-            match rx.recv().await {
-                Some(frame) if matches!(frame.command, MuxCommand::Syn) => continue,
-                other => break other,
-            }
-        }
-    })
-    .await
-    .context("MUX upstream response timeout")?
-    .ok_or_else(|| anyhow!("MUX upstream closed before CONNECT response"))?;
-    match first.command {
-        MuxCommand::Rst => {
-            session.close_stream(id).await;
-            if is_socks5 {
-                local.write_all(&socks5_failure_response()).await?
-            } else {
-                local.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?
-            }
-            local.shutdown().await.ok();
-            return Ok(());
-        }
-        MuxCommand::Fin => {
-            if is_socks5 {
-                local.write_all(&socks5_success_response()).await?
-            } else {
-                local
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await?
-            }
-            local.shutdown().await.ok();
-            session.close_stream(id).await;
-            return Ok(());
-        }
-        MuxCommand::Data => {}
-        MuxCommand::Syn => {
-            unreachable!()
-        }
-    }
-    if is_socks5 {
-        local.write_all(&socks5_success_response()).await?
-    } else {
+    let initial_data = req.initial_payload.unwrap_or_default();
+    let (session, id, mut rx) = pool.acquire(&req.target, initial_data).await?;
+    if req.is_socks5 {
+        local.write_all(&socks5_success_response()).await?;
+    } else if req.is_connect {
         local
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?
+            .await?;
     }
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    if !first.payload().is_empty() {
-        local_wr.write_all(first.payload()).await?
-    }
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
     let upload = tokio::spawn(async move {
@@ -648,9 +702,11 @@ async fn handle_tcp_proxy(
     while let Some(frame) = rx.recv().await {
         match frame.command {
             MuxCommand::Data => {
-                if let Err(e) = local_wr.write_all(frame.payload()).await {
-                    result = Err(e.into());
-                    break;
+                if !frame.payload().is_empty() {
+                    if let Err(e) = local_wr.write_all(frame.payload()).await {
+                        result = Err(e.into());
+                        break;
+                    }
                 }
             }
             MuxCommand::Fin => {

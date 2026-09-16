@@ -77,6 +77,7 @@ impl MuxHeader {
         })
     }
 
+    #[allow(dead_code)]
     pub fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
         &buf[MUX_HEADER_LEN..MUX_HEADER_LEN + self.payload_len]
     }
@@ -117,6 +118,7 @@ pub struct MuxFrame {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OwnedMuxFrame {
     pub stream_id: u32,
     pub command: MuxCommand,
@@ -128,11 +130,13 @@ impl OwnedMuxFrame {
         &self.storage[MUX_HEADER_LEN..]
     }
 
+    #[allow(dead_code)]
     pub fn into_storage(self) -> Vec<u8> {
         self.storage
     }
 }
 
+#[allow(dead_code)]
 impl MuxFrame {
     pub fn new(
         stream_id: u32,
@@ -153,6 +157,7 @@ impl MuxFrame {
         write_frame_parts(out, self.stream_id, self.command, &self.payload)
     }
 
+    #[allow(dead_code)]
     pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
         let header = MuxHeader::parse(buf)?;
         Ok(Self {
@@ -174,11 +179,13 @@ impl MuxFrame {
 
 /// SYN payload: uint16 target length, target bytes, optional initial data.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct SynPayload {
     pub target: Vec<u8>,
     pub initial_data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl SynPayload {
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         if self.target.len() > u16::MAX as usize {
@@ -209,9 +216,11 @@ impl SynPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     TruncatedHeader(usize),
+    #[allow(dead_code)]
     TruncatedSyn,
     UnknownCommand(u8),
     PayloadTooLarge(usize),
+    #[allow(dead_code)]
     TargetTooLarge(usize),
     LengthMismatch { declared: usize, available: usize },
 }

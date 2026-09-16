@@ -1,6 +1,7 @@
 use crate::crypto::XorCipher;
-use crate::proxy::{parse_socks5_udp_datagram, TargetAddr};
-use crate::runtime::{enforce_target_policy, RuntimeConfig};
+use crate::dns::{self, resolve_all_ipv4};
+use crate::proxy::{parse_authority_with_default, parse_socks5_udp_datagram, TargetAddr};
+use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
 use crate::ws::{
     build_client_handshake_request, read_frame, read_http_headers,
     validate_client_handshake_response, write_frame,
@@ -59,19 +60,55 @@ pub async fn handle_local_udp_proxy(
         .upstream
         .clone()
         .ok_or_else(|| anyhow!("client mode requires upstream"))?;
-    let (host, path) = parse_ws_url(&upstream)?;
-    let actual_host = cfg.fakehost.clone().unwrap_or_else(|| host.clone());
-    let socket = timeout(
-        Duration::from_secs(cfg.connection_timeout.max(1)),
-        TcpStream::connect(&host),
-    )
-    .await??;
-    if cfg.tcp_nodelay {
-        socket.set_nodelay(true).ok();
-    }
+    let (authority, path) = parse_ws_url(&upstream)?;
+    let actual_host = cfg.fakehost.clone().unwrap_or_else(|| authority.clone());
+    let target =
+        parse_authority_with_default(&authority, 80).map_err(|e| anyhow!(e.to_string()))?;
+    let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let primary = dns::resolve_socket(&target.host, target.port).await?;
+    let socket = match timeout(conn_timeout, TcpStream::connect(primary)).await {
+        Ok(Ok(s)) => s,
+        res => {
+            if target.host.parse::<std::net::IpAddr>().is_ok() && cfg.fakehost.is_some() {
+                let sni = cfg
+                    .fakehost
+                    .as_deref()
+                    .map(|s| s.split(':').next().unwrap_or(s))
+                    .unwrap();
+                tracing::warn!("[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost: {res:?}");
+                let mut fallback: Option<TcpStream> = None;
+                for edge in resolve_all_ipv4(sni).await? {
+                    let candidate =
+                        std::net::SocketAddr::new(std::net::IpAddr::V4(edge), target.port);
+                    if candidate.ip() == primary.ip() {
+                        continue;
+                    }
+                    tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+                    match timeout(conn_timeout, TcpStream::connect(candidate)).await {
+                        Ok(Ok(s)) => {
+                            fallback = Some(s);
+                            break;
+                        }
+                        Ok(Err(e)) => tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed"),
+                        Err(_) => tracing::debug!(%candidate, "[WS] Fallback edge dial timed out"),
+                    }
+                }
+                fallback.ok_or_else(|| anyhow!("primary {primary} unreachable and all fallback edges failed"))?
+            } else {
+                return Err(anyhow!("upstream connection failed to {primary}"));
+            }
+        }
+    };
+    apply_socket_options(&socket, &cfg);
     let (mut rd, mut wr) = tokio::io::split(socket);
-    let origin = Some(format!("https://{}", actual_host));
-    let sec_fetch_site = if host.eq_ignore_ascii_case(&actual_host) {
+    let sni_base = cfg
+        .fakehost
+        .as_deref()
+        .map(|s| s.split(':').next().unwrap_or(s))
+        .unwrap_or(&target.host);
+    let header_base = actual_host.split(':').next().unwrap_or(&actual_host);
+    let origin = Some(format!("http://{}", sni_base));
+    let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
         "same-origin"
     } else {
         "cross-site"
@@ -118,40 +155,48 @@ pub async fn handle_local_udp_proxy(
     let latest_send = latest.clone();
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let (n, peer) = udp_send.recv_from(&mut buf).await?;
+        while let Ok((n, peer)) = udp_send.recv_from(&mut buf).await {
             *latest_send.lock().await = Some(peer);
             let mut packet = buf[..n].to_vec();
             c_send.apply(&mut packet);
             let mut w = writer_send.lock().await;
-            write_frame(&mut *w, &packet, 2, true).await?
+            if write_frame(&mut *w, &packet, 2, true).await.is_err() {
+                break;
+            }
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
-    loop {
-        let Some((opcode, mut packet)) = read_frame(
-            &mut rd,
-            Option::<&mut WriteHalf<TcpStream>>::None,
-            &mut frame_buf,
-        )
-        .await?
-        else {
-            break;
-        };
-        if opcode != 2 {
-            continue;
-        }
-        c.apply(&mut packet);
-        let (target, payload) =
-            parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
-        if enforce_target_policy(&cfg, &target).is_err() {
-            continue;
-        }
-        if let Some(peer) = *latest.lock().await {
-            let _ = udp.send_to(payload, peer).await?;
-        }
+    let mut dummy = [0u8; 1];
+    tokio::select! {
+        _ = control.read(&mut dummy) => {}
+        _ = async {
+            loop {
+                let Some((opcode, mut packet)) = read_frame(
+                    &mut rd,
+                    Option::<&mut WriteHalf<TcpStream>>::None,
+                    &mut frame_buf,
+                )
+                .await?
+                else {
+                    break;
+                };
+                if opcode != 2 {
+                    continue;
+                }
+                c.apply(&mut packet);
+                let (target, _payload) =
+                    parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+                if enforce_target_policy(&cfg, &target).is_err() {
+                    continue;
+                }
+                if let Some(peer) = *latest.lock().await {
+                    let _ = udp.send_to(&packet, peer).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        } => {}
     }
     upload.abort();
-    control.shutdown().await.ok();
+    let _ = control.shutdown().await;
     Ok(())
 }

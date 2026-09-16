@@ -362,7 +362,13 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        let b0 = r.read_u8().await?;
+        let mut first = [0u8; 1];
+        match r.read(&mut first).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let b0 = first[0];
         let b1 = r.read_u8().await?;
         let fin = b0 & 0x80 != 0;
         let opcode = b0 & 0x0f;
@@ -387,9 +393,25 @@ where
         if masked {
             r.read_exact(&mut key).await?;
         }
+        // Grow incrementally in 64 KiB segments instead of a single
+        // `resize(len)`: a bogus 64 MB length prefix no longer causes an
+        // instant OOM — the peer must actually send the bytes (and hit the
+        // read timeout) to consume memory.
+        const READ_SEGMENT: usize = 64 * 1024;
         buf.clear();
-        buf.resize(len as usize, 0);
-        r.read_exact(buf).await?;
+        let total = len as usize;
+        buf.reserve(total.min(READ_SEGMENT));
+        let mut read: usize = 0;
+        while read < total {
+            let chunk = (total - read).min(READ_SEGMENT);
+            let start = buf.len();
+            buf.resize(start + chunk, 0);
+            if r.read_exact(&mut buf[start..]).await.is_err() {
+                buf.truncate(start);
+                return Err(anyhow!("websocket payload truncated"));
+            }
+            read += chunk;
+        }
         if masked {
             for (i, b) in buf.iter_mut().enumerate() {
                 *b ^= key[i & 3];
@@ -404,7 +426,7 @@ where
             8 => return Ok(None),
             9 => {
                 if let Some(w) = reply.as_deref_mut() {
-                    write_frame(w, buf, 0xA, false).await?;
+                    write_frame(w, buf, 0xA, !masked).await?;
                 }
             }
             10 => {}
@@ -582,5 +604,20 @@ mod tests {
         .unwrap();
         writer.await.unwrap().unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn clean_eof_returns_none() {
+        let (a, mut b) = duplex(1024);
+        drop(a); // Dropped without sending any frames
+        let mut buf = Vec::new();
+        let got = read_frame(
+            &mut b,
+            Option::<&mut tokio::io::DuplexStream>::None,
+            &mut buf,
+        )
+        .await
+        .unwrap();
+        assert!(got.is_none(), "clean connection close must yield Ok(None)");
     }
 }

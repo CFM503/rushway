@@ -3,10 +3,7 @@
 use crate::crypto::XorCipher;
 use crate::dns::resolve_socket;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
-use crate::proxy::{
-    parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_success_response,
-    SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE, SOCKS5_VERSION,
-};
+use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::ws::{
     build_server_handshake_response, read_frame, read_frame_owned, read_http_headers,
     validate_server_handshake, write_frame,
@@ -15,9 +12,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
@@ -76,16 +73,30 @@ fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
     cipher.apply(payload)
 }
 pub(crate) fn is_blocked_local_host(host: &str) -> bool {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    let clean = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if clean.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = clean.parse::<IpAddr>() {
         return match ip {
             IpAddr::V4(v4) => {
                 v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
             }
             IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4() {
+                    if v4.is_loopback()
+                        || v4.is_private()
+                        || v4.is_link_local()
+                        || v4.is_unspecified()
+                    {
+                        return true;
+                    }
+                }
                 v6.is_loopback()
                     || v6.is_unspecified()
                     || v6.is_unique_local()
                     || v6.is_unicast_link_local()
+                    || ((v6.segments()[0] & 0xff00) == 0xff00 && (v6.segments()[0] & 0x000f) <= 2)
             }
         };
     }
@@ -208,6 +219,7 @@ async fn target_to_mux(
         }
     }
 }
+#[allow(dead_code)]
 async fn server_stream_task(
     id: u32,
     target: TcpStream,
@@ -217,13 +229,14 @@ async fn server_stream_task(
     cipher: XorCipher,
 ) {
     let (rd, mut wr) = tokio::io::split(target);
-    let reader = tokio::spawn(target_to_mux(
+    let mut reader = tokio::spawn(target_to_mux(
         id,
         rd,
         writer.clone(),
         buffer_size,
         cipher.clone(),
     ));
+    let mut is_fin = false;
     while let Some(cmd) = rx.recv().await {
         match cmd {
             StreamCommand::Data(frame) => {
@@ -233,12 +246,26 @@ async fn server_stream_task(
             }
             StreamCommand::Fin => {
                 let _ = wr.shutdown().await;
+                is_fin = true;
                 break;
             }
             StreamCommand::Reset => break,
         }
     }
-    reader.abort()
+    if is_fin {
+        tokio::select! {
+            _ = &mut reader => {}
+            cmd = rx.recv() => {
+                if let Some(StreamCommand::Reset) = cmd {
+                    reader.abort();
+                } else {
+                    let _ = reader.await;
+                }
+            }
+        }
+    } else {
+        reader.abort();
+    }
 }
 async fn handle_mux_parts(
     mut rd: ReadHalf<TcpStream>,
@@ -306,25 +333,12 @@ async fn handle_mux_parts(
                     }
                 };
 
-                let (host, port_text) = match target_text.rsplit_once(':') {
-                    Some(v) => v,
-                    None => {
+                let target = match parse_target_authority(&target_text) {
+                    Ok(v) => v,
+                    Err(_) => {
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
                         continue;
                     }
-                };
-
-                let port = match port_text.parse::<u16>() {
-                    Ok(v) if v != 0 => v,
-                    _ => {
-                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
-                        continue;
-                    }
-                };
-
-                let target = TargetAddr {
-                    host: host.to_string(),
-                    port,
                 };
 
                 if enforce_target_policy(&cfg, &target).is_err() {
@@ -339,7 +353,7 @@ async fn handle_mux_parts(
                 // the check-then-insert race during large concurrent SYN bursts.
                 let admitted = {
                     let mut guard = streams.lock().await;
-                    if guard.len() >= 256 || guard.contains_key(&stream_id) {
+                    if guard.len() >= 2048 || guard.contains_key(&stream_id) {
                         false
                     } else {
                         guard.insert(
@@ -378,9 +392,26 @@ async fn handle_mux_parts(
                 let cipher_task = cipher.clone();
                 let cfg_task = cfg.clone();
 
+                // Bound pre-dial buffering: a malicious/buggy client could
+                // otherwise spray DATA frames while dial_target is in flight
+                // and grow `pending` without limit.
+                const MAX_PENDING_FRAMES: usize = 64;
+                const MAX_PENDING_BYTES: usize = 1024 * 1024;
+                async fn reject_pending_overflow(
+                    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+                    cipher: &XorCipher,
+                    streams: &Arc<Mutex<HashMap<u32, StreamEntry>>>,
+                    stream_id: u32,
+                ) {
+                    let _ =
+                        send_reset_encrypted(writer, cipher, stream_id).await;
+                    streams.lock().await.remove(&stream_id);
+                }
                 let task = tokio::spawn(async move {
                     let mut cancelled = cancelled;
                     let mut pending = Vec::new();
+                    let mut pending_bytes: usize = 0;
+                    let mut client_fin = false;
 
                     let target_stream = loop {
                         tokio::select! {
@@ -421,10 +452,25 @@ async fn handle_mux_parts(
                             command = rx.recv() => {
                                 match command {
                                     Some(StreamCommand::Data(frame)) => {
+                                        pending_bytes += frame.payload().len();
+                                        if pending.len() >= MAX_PENDING_FRAMES
+                                            || pending_bytes > MAX_PENDING_BYTES
+                                        {
+                                            reject_pending_overflow(
+                                                &writer_task,
+                                                &cipher_task,
+                                                &streams_task,
+                                                stream_id,
+                                            )
+                                            .await;
+                                            return;
+                                        }
                                         pending.push(frame);
                                     }
-                                    Some(StreamCommand::Fin)
-                                    | Some(StreamCommand::Reset)
+                                    Some(StreamCommand::Fin) => {
+                                        client_fin = true;
+                                    }
+                                    Some(StreamCommand::Reset)
                                     | None => {
                                         streams_task.lock().await.remove(&stream_id);
                                         return;
@@ -441,31 +487,32 @@ async fn handle_mux_parts(
 
                     while let Ok(command) = rx.try_recv() {
                         match command {
-                            StreamCommand::Data(frame) => pending.push(frame),
-                            StreamCommand::Fin | StreamCommand::Reset => {
+                            StreamCommand::Data(frame) => {
+                                pending_bytes += frame.payload().len();
+                                if pending.len() >= MAX_PENDING_FRAMES
+                                    || pending_bytes > MAX_PENDING_BYTES
+                                {
+                                    reject_pending_overflow(
+                                        &writer_task,
+                                        &cipher_task,
+                                        &streams_task,
+                                        stream_id,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                pending.push(frame);
+                            }
+                            StreamCommand::Fin => client_fin = true,
+                            StreamCommand::Reset => {
                                 streams_task.lock().await.remove(&stream_id);
                                 return;
                             }
                         }
                     }
-
-                    if send_mux_parts_encrypted(
-                        &writer_task,
-                        &cipher_task,
-                        stream_id,
-                        MuxCommand::Data,
-                        &[],
-                    )
-                    .await
-                    .is_err()
-                    {
-                        streams_task.lock().await.remove(&stream_id);
-                        return;
-                    }
-
                     let (rd_target, mut wr_target) = tokio::io::split(target_stream);
 
-                    let reader = tokio::spawn(target_to_mux(
+                    let mut reader = tokio::spawn(target_to_mux(
                         stream_id,
                         rd_target,
                         writer_task.clone(),
@@ -481,22 +528,41 @@ async fn handle_mux_parts(
                         }
                     }
 
-                    while let Some(command) = rx.recv().await {
-                        match command {
-                            StreamCommand::Data(frame) => {
-                                if wr_target.write_all(frame.payload()).await.is_err() {
+                    if client_fin {
+                        let _ = wr_target.shutdown().await;
+                    } else {
+                        while let Some(command) = rx.recv().await {
+                            match command {
+                                StreamCommand::Data(frame) => {
+                                    if wr_target.write_all(frame.payload()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                StreamCommand::Fin => {
+                                    let _ = wr_target.shutdown().await;
+                                    client_fin = true;
                                     break;
                                 }
+                                StreamCommand::Reset => break,
                             }
-                            StreamCommand::Fin => {
-                                let _ = wr_target.shutdown().await;
-                                break;
-                            }
-                            StreamCommand::Reset => break,
                         }
                     }
 
-                    reader.abort();
+                    if client_fin {
+                        tokio::select! {
+                            _ = &mut reader => {}
+                            cmd = rx.recv() => {
+                                if let Some(StreamCommand::Reset) = cmd {
+                                    reader.abort();
+                                } else {
+                                    let _ = reader.await;
+                                }
+                            }
+                        }
+                    } else {
+                        reader.abort();
+                    }
+
                     streams_task.lock().await.remove(&stream_id);
                 });
 
@@ -514,14 +580,13 @@ async fn handle_mux_parts(
             }
 
             MuxCommand::Fin => {
-                if let Some((tx, cancel)) = streams
+                if let Some(tx) = streams
                     .lock()
                     .await
                     .get(&frame.stream_id)
-                    .map(|s| (s.tx.clone(), s.cancel.clone()))
+                    .map(|s| s.tx.clone())
                 {
                     let _ = tx.send(StreamCommand::Fin).await;
-                    let _ = cancel.send(true);
                 }
             }
 
@@ -545,6 +610,80 @@ async fn handle_mux_parts(
 
     streams.lock().await.clear();
 
+    Ok(())
+}
+/// Plain non-MUX TCP relay, mirroring goway.go `handleServer`:
+/// only the target hello (`host:port\n`) and `OK\n` are XOR-encrypted,
+/// all subsequent data frames are plaintext.
+async fn handle_server_tcp_parts(
+    mut rd: ReadHalf<TcpStream>,
+    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    cfg: RuntimeConfig,
+    first: Vec<u8>,
+) -> Result<()> {
+    let cipher = configured_cipher(&cfg.key);
+    let mut target_frame = first;
+    transform_payload(&cipher, &mut target_frame);
+    let target_text = String::from_utf8(target_frame)
+        .map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
+    let target = parse_target_authority(target_text.trim())
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let resolved = resolve_socket(&target.host, target.port).await?;
+    let target_stream = timeout(
+        Duration::from_secs(cfg.connection_timeout.max(1)),
+        TcpStream::connect(resolved),
+    )
+    .await
+    .context("target connection timeout")??;
+    apply_socket_options(&target_stream, &cfg);
+    let mut ok = b"OK\n".to_vec();
+    transform_payload(&cipher, &mut ok);
+    {
+        let mut w = writer.lock().await;
+        write_frame(&mut *w, &ok, 2, false).await?;
+    }
+    let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
+    let writer_down = writer.clone();
+    let buffer_size = cfg.buffer_size;
+    let mut download = tokio::spawn(async move {
+        let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        loop {
+            let n = target_rd.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let payload = buf[..n].to_vec();
+            let mut w = writer_down.lock().await;
+            write_frame(&mut *w, &payload, 2, false).await?;
+        }
+        Result::<()>::Ok(())
+    });
+    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    loop {
+        tokio::select! {
+            _ = &mut download => break,
+            res = read_frame(
+                &mut rd,
+                Option::<&mut WriteHalf<TcpStream>>::None,
+                &mut frame_buf,
+            ) => {
+                let Some((opcode, payload)) = res? else {
+                    break;
+                };
+                if opcode == 8 {
+                    break;
+                }
+                if opcode != 2 {
+                    continue;
+                }
+                if target_wr.write_all(&payload).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = target_wr.shutdown().await;
+    download.abort();
     Ok(())
 }
 async fn resolve_udp_target(target: &TargetAddr) -> Result<SocketAddr> {
@@ -591,14 +730,15 @@ async fn handle_server_udp_parts(
     let cipher_send = cipher.clone();
     let send_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let (n, source) = udp_send.recv_from(&mut buf).await?;
+        while let Ok((n, source)) = udp_send.recv_from(&mut buf).await {
             let mut packet = udp_envelope(source, &buf[..n]);
             cipher_send.apply(&mut packet);
             let mut w = writer_send.lock().await;
-            write_frame(&mut *w, &packet, 2, false).await?
+            if write_frame(&mut *w, &packet, 2, false).await.is_err() {
+                break;
+            }
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     loop {
@@ -640,7 +780,15 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     );
     loop {
         let (stream, peer) = listener.accept().await?;
-        let permit = semaphore.clone().acquire_owned().await?;
+        // Fail fast at capacity instead of stalling the accept loop and
+        // letting the TCP backlog fill up.
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(%peer, "maximum server connections reached");
+                continue;
+            }
+        };
         let cfg2 = cfg.clone();
         apply_socket_options(&stream, &cfg2);
         tokio::spawn(async move {
@@ -671,7 +819,9 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 if plain == b"MUX\n" {
                     return handle_mux_parts(rd, writer, cfg2, first).await;
                 }
-                bail!("unknown transport handshake")
+                // Anything else is a plain non-MUX target ("host:port\n"),
+                // exactly like goway.go handleServer's fallthrough branch.
+                handle_server_tcp_parts(rd, writer, cfg2, first).await
             }
             .await;
             if let Err(e) = result {
@@ -714,5 +864,54 @@ mod lifecycle_tests {
         };
         assert!(won, "cancellation must win over a pending dial");
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_is_blocked_local_host_all_variants() {
+        let locals = [
+            "localhost",
+            "LocalHost",
+            "127.0.0.1",
+            "127.0.0.100",
+            "::1",
+            "[::1]",
+            "0.0.0.0",
+            "::",
+            "10.0.0.1",
+            "10.254.1.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.0.1",
+            "192.168.100.200",
+            "169.254.1.1",
+            "fe80::1",
+            "fc00::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+        ];
+        for a in locals {
+            assert!(
+                is_blocked_local_host(a),
+                "is_blocked_local_host({a}) should be true"
+            );
+        }
+
+        let non_locals = [
+            "1.1.1.1",
+            "8.8.8.8",
+            "172.15.255.255",
+            "172.32.0.1",
+            "203.0.113.1",
+            "google.com",
+            "example.com",
+            "::ffff:8.8.8.8",
+        ];
+        for a in non_locals {
+            assert!(
+                !is_blocked_local_host(a),
+                "is_blocked_local_host({a}) should be false"
+            );
+        }
     }
 }

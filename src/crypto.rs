@@ -25,6 +25,7 @@ impl XorCipher {
         Self { key: expanded }
     }
 
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         !self.key.is_empty()
     }

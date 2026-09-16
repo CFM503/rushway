@@ -29,6 +29,8 @@ use tracing_subscriber::EnvFilter;
 struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
+    #[arg(short = 'l', long = "local")]
+    local_host: Option<String>,
     #[arg(short = 'p')]
     port: Option<String>,
     #[arg(short = 'u', long = "up")]
@@ -104,6 +106,8 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "connection-timeout",
     "log",
     "log-file",
+    "local",
+    "wss-server",
     "tui",
     "version",
     "help",
@@ -396,6 +400,9 @@ async fn main() -> Result<()> {
     if args.cpu_profile.is_some() || args.cpu_profile_duration.is_some() {
         tracing::warn!("CPU profiling flags accepted for GoWay CLI compatibility; profiling output is not yet enabled");
     }
+    if let Some(v) = args.local_host {
+        cfg.proxy_host = v;
+    }
     if let Some(v) = args.port.as_deref() {
         apply_listen_arg(&mut cfg, v)?;
     }
@@ -561,6 +568,14 @@ mod tests {
         assert_eq!(cfg.proxy_port, 1080);
         apply_listen_arg(&mut cfg, "9192").unwrap();
         assert_eq!(cfg.proxy_port, 9192);
+    }
+    #[test]
+    fn parses_local_listen_flag() {
+        let raw = ["rushway", "-l", "0.0.0.0", "-p", "8100"];
+        let normalized = normalize_legacy_args(raw);
+        let args = Args::parse_from(&normalized);
+        assert_eq!(args.local_host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(args.port.as_deref(), Some("8100"));
     }
     #[test]
     fn normalizes_legacy_help_flag() {

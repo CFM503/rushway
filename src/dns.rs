@@ -47,14 +47,15 @@ pub(crate) async fn configure(server: Option<String>) -> Result<()> {
 }
 
 pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    let clean = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = clean.parse::<IpAddr>() {
         return Ok(ip);
     }
     let (server, cache) = {
         let guard = state().lock().await;
         (guard.server, guard.cache.clone())
     };
-    let key = host.trim_end_matches('.').to_ascii_lowercase();
+    let key = clean.trim_end_matches('.').to_ascii_lowercase();
     {
         let mut guard = cache.lock().await;
         if let Some((ip, expires)) = guard.get(&key).copied() {
@@ -72,7 +73,7 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
         Ok(ip) => ip,
         Err(remote_error) => {
             tracing::warn!(host=%host, error=%remote_error, "remote DNS failed; falling back to system DNS");
-            let mut addresses = timeout(RESOLVE_TIMEOUT, lookup_host((host, 0))).await??;
+            let mut addresses = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await??;
             addresses
                 .next()
                 .map(|addr| addr.ip())
@@ -90,18 +91,34 @@ pub(crate) async fn resolve_socket(host: &str, port: u16) -> Result<SocketAddr> 
     Ok(SocketAddr::new(resolve_host(host).await?, port))
 }
 
+type AllV4Cache = Mutex<HashMap<String, (Vec<Ipv4Addr>, Instant)>>;
+static ALL_V4_CACHE: OnceLock<AllV4Cache> = OnceLock::new();
+
+fn all_v4_cache() -> &'static AllV4Cache {
+    ALL_V4_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+    let clean = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = clean.parse::<Ipv4Addr>() {
         return Ok(vec![ip]);
     }
-    if host.parse::<Ipv6Addr>().is_ok() {
+    if clean.parse::<Ipv6Addr>().is_ok() {
         return Ok(Vec::new());
+    }
+    let key = clean.trim_end_matches('.').to_ascii_lowercase();
+    {
+        let guard = all_v4_cache().lock().await;
+        if let Some((ips, expires)) = guard.get(&key) {
+            if *expires > Instant::now() && !ips.is_empty() {
+                return Ok(ips.clone());
+            }
+        }
     }
     let server = {
         let guard = state().lock().await;
         guard.server
     };
-    let key = host.trim_end_matches('.').to_ascii_lowercase();
     let remote_result = match server {
         Some(server_ip) => query_remote_all_ipv4(&key, server_ip).await,
         None => Err(anyhow!("remote DNS not configured")),
@@ -111,7 +128,7 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         Err(err) => {
             tracing::warn!(host=%host, error=%err, "remote DNS failed for fakehost; falling back to system DNS");
             let mut result = Vec::new();
-            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((host, 0))).await {
+            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
                 for addr in iter {
                     if let IpAddr::V4(v4) = addr.ip() {
                         if !result.contains(&v4) {
@@ -124,7 +141,7 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         }
         _ => {
             let mut result = Vec::new();
-            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((host, 0))).await {
+            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
                 for addr in iter {
                     if let IpAddr::V4(v4) = addr.ip() {
                         if !result.contains(&v4) {
@@ -145,6 +162,10 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
     if unique.is_empty() {
         bail!("no IPv4 addresses resolved for {host}");
     }
+    all_v4_cache()
+        .lock()
+        .await
+        .insert(key, (unique.clone(), Instant::now() + CACHE_TTL));
     Ok(unique)
 }
 
@@ -458,5 +479,17 @@ mod tests {
                 Ipv4Addr::new(172, 67, 180, 2)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn parses_bracketed_ipv6_without_dns_query() {
+        let ip = resolve_host("[::1]").await.unwrap();
+        assert_eq!(ip, "::1".parse::<IpAddr>().unwrap());
+
+        let ip2 = resolve_host("[2001:db8::1]").await.unwrap();
+        assert_eq!(ip2, "2001:db8::1".parse::<IpAddr>().unwrap());
+
+        let v4_list = resolve_all_ipv4("[::1]").await.unwrap();
+        assert!(v4_list.is_empty());
     }
 }

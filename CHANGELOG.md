@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.9] - 2026-09-16
+
+### Fixed
+- **0-RTT MUX Deadlock Resolution (GoWay Server + RushWay Client)**:
+  - Eliminated blocking upstream first-frame wait in `src/mux_pool.rs` and `src/wss_client.rs`.
+  - Client sends immediate 0-RTT SOCKS5 success reply or `HTTP/1.1 200 Connection Established`.
+  - Removed non-standard empty `Data` frame dispatch from server dial path in `src/runtime.rs`.
+- **SOCKS5 UDP Datagram Preservation (RFC 1928 §7)**:
+  - Fixed UDP relay across all transports (`mux_pool.rs`, `wss_client.rs`, `udp_relay.rs`) to forward complete datagrams (`&packet`) preserving `[RSV][FRAG][ATYP][DST.ADDR][DST.PORT]` headers.
+- **SOCKS5 UDP Association Lifecycle Management (RFC 1928 §6)**:
+  - Added concurrent `control.read()` liveness monitoring via `tokio::select!` across all UDP relay paths.
+  - Automatically aborts background relay tasks and releases UDP port when client TCP control connection terminates.
+- **QUIC UDP Protocol Alignment with GoWay**:
+  - Removed invalid XOR cipher on QUIC UDP streams (QUIC transport is already TLS 1.3 encrypted).
+  - Aligned stream handshake to plaintext `"<key> UDP\n"` or `"UDP\n"`.
+  - Switched to length-prefixed raw datagram framing matching `goway.go:4970-5180`.
+- **Full Plain HTTP Proxy Support**:
+  - Added unified `read_client_proxy_request` supporting `GET`, `POST`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `PATCH`.
+  - Packed original HTTP request bytes into `SynPayload.initial_data` for true 0-RTT upstream dispatch without invalid `200 Connection Established` interception.
+- **Idle MUX Session Keepalive (WebSocket Ping Heartbeat)**:
+  - Added 25-second heartbeat task sending masked WebSocket `Ping` frames on idle sessions, preventing Cloudflare 100s idle drops and NAT connection timeouts.
+- **Collision-Free Stream ID Allocation**:
+  - Added non-zero allocation loop checking `!streams.contains_key(&id)` under stream table lock, preventing stream ID reuse or collision upon 32-bit integer overflow.
+- **TCP Half-Close Relay & Client FIN Liveness**:
+  - Maintained upstream-to-client reader task on `MuxCommand::Fin` in `src/runtime.rs` so HTTP responses are fully delivered when client half-closes its upload side.
+  - Decoupled `Fin` from cancellation watcher during stream connection dial.
+- **Hardened Localhost & IPv6 Bracket Target Filtering**:
+  - Stripped brackets `[` / `]` and added case-insensitive `"localhost"` check, IPv4-mapped IPv6 handling (`::ffff:127.0.0.1`), and multicast link-local detection in `src/runtime.rs`, matching GoWay's `isLocalTarget` exactly.
+  - Handled bracketed IPv6 literals in `src/dns.rs` (`resolve_host` and `resolve_all_ipv4`) without failing over to DNS queries.
+- **HTTP Proxy Pipelined Body Preservation**:
+  - Retained all buffered bytes (headers + body prefix) in `initial_payload` within `src/proxy.rs` so POST/PUT body payloads are never truncated.
+- **UDP Upstream DNS & Socket Options**:
+  - Wired custom `-dns` resolution and socket options in `src/udp_relay.rs`.
+- **Clean WebSocket EOF Handling & Symmetrical Pong Masking**:
+  - `read_frame` returns `Ok(None)` on clean socket EOF rather than raising `UnexpectedEof`, eliminating false error logging on connection disconnects.
+  - Symmetrically masks Pong replies (`!masked`) when responding as a client to satisfy RFC 6455 §5.1.
+- **Extended TLS / QUIC Signature Scheme Support**:
+  - Expanded `NoCertificateVerification` in `src/tls.rs` and `src/quic.rs` to support SHA-384 and SHA-512 algorithms (ECDSA P-384/P-521, RSA-PSS, RSA-PKCS1).
+- **Multi-Transport Target Authority Unification & IPv6 Hardening**:
+  - Added unified `parse_target_authority` and `parse_authority_with_default` in `src/proxy.rs` adhering to RFC 3986.
+  - Automatically strips brackets from IPv6 hostnames (`TargetAddr.host`), rejects port 0, and catches bare multi-colon IPv6 strings.
+  - Unified authority handling across all transports (`runtime.rs`, `quic.rs`, `nonmux.rs`, `wss_client.rs`, `udp_relay.rs`, `mux_pool.rs`).
+- **Session Hang & Resource Leak Prevention**:
+  - Added `tokio::select!` monitoring between upload tasks and download frame loops in non-MUX client mode (`src/nonmux.rs`, `src/wss_client.rs`).
+  - Added `tokio::select!` monitoring between backend read tasks and foreground loops in QUIC server mode (`src/quic.rs`) and plain WS server mode (`src/nonmux.rs`), preventing hung sessions when target backend or client disconnects.
+- **Non-MUX TCP Plaintext Alignment (GoWay Interop)**:
+  - GoWay `handleServer`/`handleClient` encrypt only the `host:port\n` / `OK\n` handshake; data frames are plaintext. RushWay wrongly XOR-applied every data frame, producing garbled relay against GoWay servers.
+  - Removed cipher application from all non-MUX data paths (`src/nonmux.rs` client + server, `src/wss_client.rs` non-MUX), keeping encryption for handshake only.
+  - Verified live: `RushWay -> GoWay` and `GoWay -> RushWay` both pass in MUX and non-MUX modes.
+- **Plain-WS Cloudflare Edge Fallback (`dialFallback` Parity)**:
+  - Ported GoWay `dialFallback` to plain `ws://`: when upstream is a literal IP, `-fakehost` is set, and the primary dial fails, resolve `fakehost` A records and try each non-primary edge (`src/mux_pool.rs`, `src/nonmux.rs`, `src/udp_relay.rs`).
+  - Aligned `Origin` (`http://<sni>`) and `Sec-Fetch-Site` (SNI-vs-Host comparison) with GoWay `performWSHandshake` on all plain-WS paths.
+- **WSS Stream Accounting Single-Ownership (P0)**:
+  - `wss_client.rs` reader no longer decrements `active` on terminal `FIN`/`RST`; cleanup happens once in `handle_connection` guarded by `remove().is_some()`, mirroring `mux_pool.rs`.
+- **Bounded Pre-Dial Buffering (P0)**:
+  - Capped pre-dial `pending` at 64 frames / 1 MiB in `src/runtime.rs`; overflow sends `RST` and drops the stream instead of unbounded growth.
+- **Runtime Server Non-MUX Branch (P0)**:
+  - `src/runtime.rs::run_server` now serves plain `host:port\n` targets via new `handle_server_tcp_parts` (GoWay `handleServer` fallthrough parity) instead of `bail!("unknown transport handshake")`; `Go non-mux -> RushWay` verified passing.
+- **Incremental WS Payload Reads (P0)**:
+  - `src/ws.rs::read_frame` grows the payload buffer in 64 KiB segments, so a bogus 64 MB length prefix no longer causes instant OOM.
+- **DNS All-v4 Cache & Pool Backoff (P1)**:
+  - `resolve_all_ipv4` results cached for 5 minutes (`src/dns.rs`).
+  - `MuxSessionPool`/`WssSessionPool` track consecutive failures; `maintain` sleeps base interval plus 500 ms per failure capped at ~5 s; MUX creation failures promoted to `WARN`.
+- **Fail-Fast Server Admission (P1)**:
+  - `src/runtime.rs::run_server` uses `try_acquire_owned` at capacity instead of stalling the accept loop.
+- **Dead Module Removal (P1)**:
+  - Deleted unreferenced `src/mux_config.rs` / `src/runtime_config.rs` (stale `MAX_MUX_STREAMS_PER_SESSION=256` vs authoritative 2048).
+
+### Added
+- **GoWay CLI `-l` / `--local` Flag Support**:
+  - Added `-l` / `--local` flag to `Args` and `LEGACY_LONG_FLAGS` in `src/main.rs`, mapping to `cfg.proxy_host`.
+
+### Changed
+- **Concurrency Scaling**:
+  - Scaled `MAX_STREAMS_PER_SESSION` from 256 to 2048 in `runtime.rs`, `mux_pool.rs`, and `wss_client.rs` to support full `--max-conn 1500` capacity without premature RST throttling.
+- **HTTP Proxy Header I/O Optimization**:
+  - Replaced byte-by-byte `read_exact` syscall loop with chunked buffered reading (up to 1024 bytes per read) in `src/proxy.rs`.
+- **Zero Warnings**:
+  - Cleaned all unused imports, dead code, and unreachable loop expressions across all crate targets.
+
 ## [v0.0.8] - 2026-09-15
 
 ### Fixed

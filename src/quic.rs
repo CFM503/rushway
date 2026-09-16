@@ -1,11 +1,10 @@
 //! GoWay v1.8.4-compatible QUIC transport.
 
-use crate::crypto::XorCipher;
 use crate::dns;
 use crate::proxy::{
-    parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_failure_response,
-    socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE,
-    SOCKS5_VERSION,
+    parse_authority_with_default, parse_socks5_udp_datagram, parse_target_authority,
+    read_client_proxy_request, socks5_failure_response, socks5_success_response,
+    ClientProxyRequest, SocksCommand, TargetAddr,
 };
 use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
 use anyhow::{anyhow, bail, Context, Result};
@@ -113,9 +112,14 @@ impl ServerCertVerifier for QuicNoCertificateVerification {
         vec![
             rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
             rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
             rustls::SignatureScheme::ED25519,
             rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
         ]
     }
 }
@@ -139,29 +143,12 @@ fn parse_upstream(input: &str) -> Result<String> {
         },
     )
 }
-fn split_authority(authority: &str) -> Result<(String, u16)> {
-    if authority.starts_with('[') {
-        let close = authority
-            .find(']')
-            .ok_or_else(|| anyhow!("invalid QUIC IPv6 authority"))?;
-        let host = authority[1..close].to_string();
-        let port = authority
-            .get(close + 1..)
-            .and_then(|v| v.strip_prefix(':'))
-            .unwrap_or("443")
-            .parse::<u16>()?;
-        return Ok((host, port));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Ok((host.to_string(), port.parse::<u16>()?)),
-        None => Ok((authority.to_string(), 443)),
-    }
-}
 async fn resolve_upstream(input: &str) -> Result<(std::net::SocketAddr, String)> {
     let authority = parse_upstream(input)?;
-    let (host, port) = split_authority(&authority)?;
-    let addr = dns::resolve_socket(&host, port).await?;
-    Ok((addr, host))
+    let target =
+        parse_authority_with_default(&authority, 443).map_err(|e| anyhow!(e.to_string()))?;
+    let addr = dns::resolve_socket(&target.host, target.port).await?;
+    Ok((addr, target.host))
 }
 async fn read_quic_line(recv: &mut RecvStream, limit: usize) -> Result<String> {
     let mut buf = Vec::with_capacity(128);
@@ -180,21 +167,6 @@ async fn read_quic_line(recv: &mut RecvStream, limit: usize) -> Result<String> {
         }
     }
     bail!("QUIC header too large")
-}
-fn authenticated_target(line: &str, key: &Option<String>) -> Result<String> {
-    if let Some(expected) = key {
-        let (got, target) = line
-            .split_once(' ')
-            .ok_or_else(|| anyhow!("QUIC authentication header missing key"))?;
-        if got != expected {
-            bail!("QUIC authentication failed")
-        }
-        return Ok(target.trim().to_string());
-    }
-    Ok(line.trim().to_string())
-}
-fn cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
 }
 async fn read_len_prefixed_udp(
     recv: &mut RecvStream,
@@ -269,63 +241,6 @@ impl QuicClientPool {
         bail!("QUIC pooled connection unavailable")
     }
 }
-async fn read_proxy_request(stream: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
-    let first = stream.read_u8().await?;
-    if first == SOCKS5_VERSION {
-        let n = stream.read_u8().await? as usize;
-        let mut methods = vec![0u8; n];
-        stream.read_exact(&mut methods).await?;
-        if !methods.contains(&0) {
-            stream.write_all(&[5, 0xff]).await?;
-            bail!("SOCKS5 no-auth unavailable")
-        }
-        stream.write_all(&[5, 0]).await?;
-        let mut head = [0u8; 4];
-        stream.read_exact(&mut head).await?;
-        if head[1] != SOCKS5_CONNECT && head[1] != SOCKS5_UDP_ASSOCIATE {
-            stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-            bail!("unsupported SOCKS5 command")
-        }
-        let mut req = head.to_vec();
-        match head[3] {
-            1 => {
-                let mut b = [0u8; 6];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            3 => {
-                let mut n = [0u8; 1];
-                stream.read_exact(&mut n).await?;
-                req.extend_from_slice(&n);
-                let mut b = vec![0u8; n[0] as usize + 2];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            4 => {
-                let mut b = [0u8; 18];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            _ => {
-                stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-                bail!("unsupported SOCKS5 address type")
-            }
-        }
-        let parsed = parse_socks5_request(&req).map_err(|e| anyhow!(e.to_string()))?;
-        return Ok((parsed.command, parsed.target, true));
-    }
-    if first == b'C' {
-        let mut buf = vec![first];
-        let mut tail = crate::ws::read_http_headers(stream).await?;
-        buf.append(&mut tail);
-        return Ok((
-            SocksCommand::Connect,
-            parse_http_connect(&buf).map_err(|e| anyhow!(e.to_string()))?,
-            false,
-        ));
-    }
-    bail!("unsupported local proxy protocol")
-}
 fn format_target(target: &TargetAddr) -> String {
     format!("{}:{}", target.host, target.port)
 }
@@ -333,14 +248,13 @@ async fn relay_quic(
     mut local: TcpStream,
     cfg: RuntimeConfig,
     pool: Arc<QuicClientPool>,
-    target: TargetAddr,
-    is_socks5: bool,
+    req: ClientProxyRequest,
 ) -> Result<()> {
-    enforce_target_policy(&cfg, &target)?;
+    enforce_target_policy(&cfg, &req.target)?;
     let (mut send, mut recv) = match pool.open_bi().await {
         Ok(v) => v,
         Err(error) => {
-            if is_socks5 {
+            if req.is_socks5 {
                 local.write_all(&socks5_failure_response()).await?
             } else {
                 local.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?
@@ -350,14 +264,14 @@ async fn relay_quic(
         }
     };
     let header = if let Some(key) = cfg.key.as_deref() {
-        format!("{} {}\n", key, format_target(&target))
+        format!("{} {}\n", key, format_target(&req.target))
     } else {
-        format!("{}\n", format_target(&target))
+        format!("{}\n", format_target(&req.target))
     };
     send.write_all(header.as_bytes()).await?;
     let response = read_quic_line(&mut recv, 8192).await?;
     if response != "OK" {
-        if is_socks5 {
+        if req.is_socks5 {
             local.write_all(&socks5_failure_response()).await?
         } else {
             local
@@ -369,12 +283,15 @@ async fn relay_quic(
         local.shutdown().await.ok();
         bail!("QUIC upstream rejected target: {}", response)
     }
-    if is_socks5 {
+    if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?
-    } else {
+    } else if req.is_connect {
         local
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?
+    }
+    if let Some(initial) = req.initial_payload {
+        send.write_all(&initial).await?;
     }
     let (lr, lw) = tokio::io::split(local);
     let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
@@ -421,10 +338,12 @@ async fn relay_quic_udp(
     resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
     control.write_all(&resp).await?;
     let (mut send, mut recv) = pool.open_bi().await?;
-    let c = cipher(&cfg.key);
-    let mut hello = b"UDP\n".to_vec();
-    c.apply(&mut hello);
-    send.write_all(&hello).await?;
+    let header = if let Some(key) = cfg.key.as_deref() {
+        format!("{} UDP\n", key)
+    } else {
+        "UDP\n".to_string()
+    };
+    send.write_all(header.as_bytes()).await?;
     let ok = read_quic_line(&mut recv, 8192).await?;
     if ok != "OK" {
         bail!("QUIC UDP upstream rejected: {}", ok)
@@ -435,30 +354,37 @@ async fn relay_quic_udp(
     let mut send_task = send;
     let upload = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
-        loop {
-            let (n, peer) = udp_send.recv_from(&mut buf).await?;
+        while let Ok((n, peer)) = udp_send.recv_from(&mut buf).await {
             *latest_send.lock().await = Some(peer);
-            write_len_prefixed_udp(&mut send_task, &buf[..n]).await?
+            if write_len_prefixed_udp(&mut send_task, &buf[..n]).await.is_err() {
+                break;
+            }
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
-    loop {
-        let Some(mut packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? else {
-            break;
-        };
-        c.apply(&mut packet);
-        let (target, payload) =
-            parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
-        if enforce_target_policy(&cfg, &target).is_err() {
-            continue;
-        }
-        if let Some(peer) = *latest.lock().await {
-            let _ = udp.send_to(payload, peer).await?;
-        }
+    let mut dummy = [0u8; 1];
+    tokio::select! {
+        _ = control.read(&mut dummy) => {}
+        _ = async {
+            loop {
+                let Some(packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? else {
+                    break;
+                };
+                let (target, _payload) =
+                    parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+                if enforce_target_policy(&cfg, &target).is_err() {
+                    continue;
+                }
+                if let Some(peer) = *latest.lock().await {
+                    let _ = udp.send_to(&packet, peer).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        } => {}
     }
     upload.abort();
-    control.shutdown().await.ok();
+    let _ = control.shutdown().await;
     Ok(())
 }
 
@@ -487,7 +413,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 continue;
             }
         };
-        let (request_command, target, is_socks5) = match read_proxy_request(&mut stream).await {
+        let req = match read_client_proxy_request(&mut stream).await {
             Ok(v) => v,
             Err(e) => {
                 drop(permit);
@@ -499,14 +425,14 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         let pool2 = pool.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match request_command {
+            match req.command {
                 SocksCommand::UdpAssociate => {
                     if let Err(e) = relay_quic_udp(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,error=%e,"QUIC UDP proxy closed")
                     }
                 }
                 SocksCommand::Connect => {
-                    if let Err(e) = relay_quic(stream, cfg2, pool2, target, is_socks5).await {
+                    if let Err(e) = relay_quic(stream, cfg2, pool2, req).await {
                         tracing::debug!(%peer,error=%e,"QUIC proxy connection closed")
                     }
                 }
@@ -559,29 +485,36 @@ async fn handle_server_stream(
     cfg: RuntimeConfig,
 ) -> Result<()> {
     let line = read_quic_line(&mut recv, 8192).await?;
-    if line.eq_ignore_ascii_case("UDP") || line.to_ascii_uppercase().starts_with("UDP ") {
+    let target_str = if let Some(key) = cfg.key.as_deref() {
+        let mut parts = line.splitn(2, ' ');
+        let k = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("");
+        if k != key {
+            send.write_all(b"ERR: AUTH_FAILED\n").await?;
+            let _ = send.finish();
+            bail!("QUIC authentication failed");
+        }
+        rest
+    } else {
+        line.as_str()
+    };
+    if target_str.eq_ignore_ascii_case("UDP") || target_str.to_ascii_uppercase().starts_with("UDP") {
         return handle_server_udp_stream(send, recv, cfg).await;
     }
-    let target = authenticated_target(&line, &cfg.key)?;
-    let (host, port_text) = target
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("invalid QUIC target"))?;
-    let port = port_text
-        .parse::<u16>()
-        .map_err(|_| anyhow!("invalid QUIC target port"))?;
-    if port == 0 {
-        bail!("invalid QUIC target port")
-    }
-    let target_addr = TargetAddr {
-        host: host.to_string(),
-        port,
+    let target_addr = match parse_target_authority(target_str) {
+        Ok(t) => t,
+        Err(_) => {
+            send.write_all(b"ERR: INVALID_TARGET\n").await?;
+            let _ = send.finish();
+            bail!("invalid QUIC target");
+        }
     };
     if cfg.upstream.is_some() && enforce_target_policy(&cfg, &target_addr).is_err() {
         send.write_all(b"ERR: DIAL_FAILED\n").await?;
         let _ = send.finish();
         return Ok(());
     }
-    let target_socket = dns::resolve_socket(host, port).await?;
+    let target_socket = dns::resolve_socket(&target_addr.host, target_addr.port).await?;
     let target_stream = match timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
         TcpStream::connect(target_socket),
@@ -599,7 +532,7 @@ async fn handle_server_stream(
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     send.write_all(b"OK\n").await?;
     let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size];
         loop {
             match target_rd.read(&mut buf).await {
@@ -616,12 +549,19 @@ async fn handle_server_stream(
     });
     let mut buf = vec![0u8; buffer_size];
     loop {
-        match recv.read(&mut buf).await? {
-            Some(0) | None => break,
-            Some(n) => target_wr.write_all(&buf[..n]).await?,
+        tokio::select! {
+            _ = &mut send_task => {
+                break;
+            }
+            res = recv.read(&mut buf) => {
+                match res? {
+                    Some(0) | None => break,
+                    Some(n) => target_wr.write_all(&buf[..n]).await?,
+                }
+            }
         }
     }
-    target_wr.shutdown().await?;
+    let _ = target_wr.shutdown().await;
     send_task.abort();
     Ok(())
 }
@@ -634,10 +574,9 @@ async fn handle_server_udp_stream(
     send.write_all(b"OK\n").await?;
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let udp_send = udp.clone();
-    let sender = tokio::spawn(async move {
+    let mut sender = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
-        loop {
-            let (n, src) = udp_send.recv_from(&mut buf).await?;
+        while let Ok((n, src)) = udp_send.recv_from(&mut buf).await {
             let mut packet = Vec::with_capacity(22 + n);
             packet.extend_from_slice(&[0, 0, 0]);
             match src.ip() {
@@ -656,19 +595,23 @@ async fn handle_server_udp_stream(
                 break;
             }
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
-    while let Some(mut packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? {
-        let c = cipher(&cfg.key);
-        c.apply(&mut packet);
-        let (target, payload) =
-            parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
-        if cfg.upstream.is_some() && enforce_target_policy(&cfg, &target).is_err() {
-            continue;
-        }
-        let addr = dns::resolve_socket(&target.host, target.port).await?;
-        let _ = udp.send_to(payload, addr).await;
+    tokio::select! {
+        _ = &mut sender => {}
+        _ = async {
+            while let Some(packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? {
+                let (target, payload) =
+                    parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+                if cfg.upstream.is_some() && enforce_target_policy(&cfg, &target).is_err() {
+                    continue;
+                }
+                let addr = dns::resolve_socket(&target.host, target.port).await?;
+                let _ = udp.send_to(payload, addr).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        } => {}
     }
     sender.abort();
     Ok(())

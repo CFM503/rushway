@@ -4,14 +4,13 @@ use crate::crypto::XorCipher;
 use crate::dns;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{
-    parse_http_connect, parse_socks5_request, parse_socks5_udp_datagram, socks5_failure_response,
-    socks5_success_response, SocksCommand, TargetAddr, SOCKS5_CONNECT, SOCKS5_UDP_ASSOCIATE,
-    SOCKS5_VERSION,
+    parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
+    TargetAddr,
 };
 use crate::runtime::{apply_socket_options, RuntimeConfig};
 use crate::tls;
 use crate::ws::{
-    build_client_handshake_request, read_frame, read_frame_owned, read_http_headers,
+    build_client_handshake_request, read_frame, read_frame_owned,
     read_http_headers_timeout, redact_handshake_request, validate_client_handshake_response,
     write_frame,
 };
@@ -35,7 +34,7 @@ pub(crate) type BoxWriter = tokio::io::WriteHalf<BoxTransport>;
 
 const DEFAULT_SESSION_COUNT: usize = 4;
 const MAX_SESSION_COUNT: usize = 64;
-const MAX_STREAMS_PER_SESSION: usize = 256;
+const MAX_STREAMS_PER_SESSION: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WssConfig {
@@ -52,6 +51,7 @@ pub(crate) struct WssConfig {
     pub(crate) socket_buffer: usize,
 }
 impl WssConfig {
+    #[allow(dead_code)]
     pub(crate) fn from_runtime_config(cfg: &RuntimeConfig, verify_ssl: bool) -> Result<Self> {
         let upstream = cfg
             .upstream
@@ -84,22 +84,9 @@ fn configured_session_count() -> usize {
 }
 
 fn split_authority(authority: &str) -> Result<(String, u16)> {
-    if authority.starts_with('[') {
-        let close = authority
-            .find(']')
-            .ok_or_else(|| anyhow!("invalid WSS IPv6 authority"))?;
-        let host = authority[1..close].to_string();
-        let port = authority
-            .get(close + 1..)
-            .and_then(|s| s.strip_prefix(':'))
-            .unwrap_or("443")
-            .parse::<u16>()?;
-        return Ok((host, port));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Ok((host.to_string(), port.parse::<u16>()?)),
-        None => Ok((authority.to_string(), 443)),
-    }
+    let target =
+        parse_authority_with_default(authority, 443).map_err(|e| anyhow!(e.to_string()))?;
+    Ok((target.host, target.port))
 }
 
 fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
@@ -113,29 +100,14 @@ fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
     if authority.is_empty() {
         bail!("empty WSS upstream authority")
     }
-    let host = if authority.starts_with('[') {
-        let close = authority
-            .find(']')
-            .ok_or_else(|| anyhow!("invalid IPv6 WSS authority"))?;
-        authority[1..close].to_string()
+    let target =
+        parse_authority_with_default(authority, 443).map_err(|e| anyhow!(e.to_string()))?;
+    let connect_addr = if target.host.contains(':') {
+        format!("[{}]:{}", target.host, target.port)
     } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_else(|| authority.to_string())
+        format!("{}:{}", target.host, target.port)
     };
-    let connect_addr = if authority.starts_with('[') {
-        if authority.contains("]:") {
-            authority.to_string()
-        } else {
-            format!("{}:443", authority)
-        }
-    } else if authority.matches(':').count() == 1 {
-        authority.to_string()
-    } else {
-        format!("{}:443", authority)
-    };
-    Ok((connect_addr, host, path))
+    Ok((connect_addr, target.host, path))
 }
 
 async fn connect_tls(
@@ -313,74 +285,10 @@ pub(crate) async fn open_upstream(
 /// Probe helper to test standalone WSS TCP -> TLS -> HTTP Upgrade -> 101 without entering MUX.
 #[allow(dead_code)]
 pub(crate) async fn probe_wss_handshake(cfg: &WssConfig) -> Result<String> {
-    let (mut rd, wr) = connect_wss_upstream(cfg).await?;
+    let (rd, wr) = connect_wss_upstream(cfg).await?;
     drop(rd);
     drop(wr);
     Ok("HTTP 101 Switching Protocols".to_string())
-}
-
-async fn read_proxy_request(local: &mut TcpStream) -> Result<(SocksCommand, TargetAddr, bool)> {
-    let first = local.read_u8().await?;
-    if first == SOCKS5_VERSION {
-        let n = local.read_u8().await? as usize;
-        let mut methods = vec![0u8; n];
-        local.read_exact(&mut methods).await?;
-        if !methods.contains(&0) {
-            local.write_all(&[5, 0xff]).await?;
-            bail!("SOCKS5 no-auth unavailable")
-        }
-        local.write_all(&[5, 0]).await?;
-        let mut head = [0u8; 4];
-        local.read_exact(&mut head).await?;
-        if head[1] != SOCKS5_CONNECT && head[1] != SOCKS5_UDP_ASSOCIATE {
-            local.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-            bail!("unsupported SOCKS5 command")
-        }
-        let mut req = head.to_vec();
-        match head[3] {
-            1 => {
-                let mut b = [0u8; 6];
-                local.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            3 => {
-                let mut n = [0u8; 1];
-                local.read_exact(&mut n).await?;
-                req.extend_from_slice(&n);
-                let mut b = vec![0u8; n[0] as usize + 2];
-                local.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            4 => {
-                let mut b = [0u8; 18];
-                local.read_exact(&mut b).await?;
-                req.extend_from_slice(&b)
-            }
-            _ => {
-                local.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-                bail!("unsupported SOCKS5 address type")
-            }
-        }
-        let parsed = parse_socks5_request(&req).map_err(|e| anyhow!(e.to_string()))?;
-        return Ok((parsed.command, parsed.target, true));
-    }
-    if first == b'C' {
-        let mut buf = vec![first];
-        let mut one = [0u8; 1];
-        while buf.len() < 8192 {
-            local.read_exact(&mut one).await?;
-            buf.push(one[0]);
-            if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
-                break;
-            }
-        }
-        return Ok((
-            SocksCommand::Connect,
-            parse_http_connect(&buf).map_err(|e| anyhow!(e.to_string()))?,
-            false,
-        ));
-    }
-    bail!("unsupported local proxy protocol")
 }
 
 async fn handle_udp_proxy(
@@ -433,48 +341,54 @@ async fn handle_udp_proxy(
     let latest_send = latest_client.clone();
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let (n, peer) = udp_send.recv_from(&mut buf).await?;
+        while let Ok((n, peer)) = udp_send.recv_from(&mut buf).await {
             *latest_send.lock().await = Some(peer);
             let mut packet = buf[..n].to_vec();
             cipher_send.apply(&mut packet);
             let mut w = writer_send.lock().await;
-            write_frame(&mut *w, &packet, 2, true).await?;
+            if write_frame(&mut *w, &packet, 2, true).await.is_err() {
+                break;
+            }
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
-    loop {
-        let Some((opcode, mut packet)) =
-            read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
-        else {
-            break;
-        };
-        if opcode != 2 {
-            continue;
-        }
-        c.apply(&mut packet);
-        let ((_target, payload)) =
-            parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
-        if let Some(peer) = *latest_client.lock().await {
-            let _ = udp.send_to(payload, peer).await?;
-        }
+    let mut dummy = [0u8; 1];
+    tokio::select! {
+        _ = control.read(&mut dummy) => {}
+        _ = async {
+            loop {
+                let Some((opcode, mut packet)) =
+                    read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
+                else {
+                    break;
+                };
+                if opcode != 2 {
+                    continue;
+                }
+                c.apply(&mut packet);
+                if let Some(peer) = *latest_client.lock().await {
+                    let _ = udp.send_to(&packet, peer).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        } => {}
     }
     upload.abort();
-    control.shutdown().await.ok();
+    let _ = control.shutdown().await;
     Ok(())
 }
 
 async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Result<()> {
-    let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
-    if command == SocksCommand::UdpAssociate {
-        return handle_udp_proxy(local, cfg, target).await;
+    let req = read_client_proxy_request(&mut local).await?;
+    if req.command == SocksCommand::UdpAssociate {
+        return handle_udp_proxy(local, cfg, req.target).await;
     }
-    if command != SocksCommand::Connect {
+    if req.command != SocksCommand::Connect {
         bail!("WSS non-MUX supports CONNECT or UDP ASSOCIATE only")
     };
     let (mut rd, writer) = open_upstream(&cfg).await?;
     let c = cipher(&cfg.key);
-    let mut hello = format!("{}:{}\n", target.host, target.port).into_bytes();
+    let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
     c.apply(&mut hello);
     {
         let mut w = writer.lock().await;
@@ -491,8 +405,8 @@ async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Resu
     };
     c.apply(&mut ok);
     if ok != b"OK\n" {
-        if is_socks5 {
-            local.write_all(&socks5_failure_response()).await?
+        if req.is_socks5 {
+            local.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?
         } else {
             local
                 .write_all(
@@ -503,45 +417,57 @@ async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Resu
         local.shutdown().await.ok();
         return Ok(());
     };
-    if is_socks5 {
+    if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?
-    } else {
+    } else if req.is_connect {
         local
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?
     };
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
     let writer_up = writer.clone();
-    let up_cipher = c.clone();
+    // GoWay non-MUX TCP: only handshake ("host:port\n"/"OK\n") is XOR-encrypted.
+    // Data frames are plaintext.
+    if let Some(initial) = req.initial_payload {
+        let payload = initial;
+        let mut w = writer_up.lock().await;
+        write_frame(&mut *w, &payload, 2, true).await?;
+    }
     let buffer_size = cfg.buffer_size;
-    let upload = tokio::spawn(async move {
+    let mut upload = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
-            let mut payload = buf[..n].to_vec();
-            up_cipher.apply(&mut payload);
+            let payload = buf[..n].to_vec();
             let mut w = writer_up.lock().await;
             write_frame(&mut *w, &payload, 2, true).await?
         }
-        Result::<()>::Ok(())
+        Ok::<(), anyhow::Error>(())
     });
-    loop {
-        let Some((opcode, mut payload)) =
-            read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
-        else {
-            break;
-        };
-        if opcode == 8 {
-            break;
-        }
-        if opcode != 2 {
-            continue;
-        }
-        c.apply(&mut payload);
-        local_wr.write_all(&payload).await?
+    tokio::select! {
+        _ = &mut upload => {}
+        _ = async {
+            loop {
+                let Some((opcode, payload)) =
+                    read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
+                else {
+                    break;
+                };
+                if opcode == 8 {
+                    break;
+                }
+                if opcode != 2 {
+                    continue;
+                }
+                if local_wr.write_all(&payload).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        } => {}
     }
     upload.abort();
     Ok(())
@@ -645,6 +571,24 @@ impl WssSessionState {
             streams.clear();
             reader_session.active.store(0, Ordering::Release)
         });
+        let heartbeat_session = session.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(25));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if heartbeat_session.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                if heartbeat_session.active.load(Ordering::Acquire) == 0 {
+                    let mut w = heartbeat_session.writer.lock().await;
+                    if write_frame(&mut *w, &[], 9, true).await.is_err() {
+                        heartbeat_session.closed.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        });
         Ok(session)
     }
     fn available(&self) -> bool {
@@ -664,23 +608,45 @@ impl WssSessionState {
     async fn open_stream(
         self: &Arc<Self>,
         target: &TargetAddr,
+        initial_data: Vec<u8>,
     ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>)> {
         if !self.try_reserve() {
             bail!("WSS physical session is full or closed")
         };
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
-        let (tx, rx) = mpsc::channel(64);
-        {
+        let (id, rx) = {
             let mut streams = self.streams.lock().await;
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 bail!("WSS physical session closed")
             }
-            streams.insert(id, tx);
-        }
+            let mut stream_id;
+            loop {
+                stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if stream_id == 0 {
+                    stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                }
+                if !streams.contains_key(&stream_id) {
+                    break;
+                }
+            }
+            let (tx, rx) = mpsc::channel(64);
+            streams.insert(stream_id, tx);
+            (stream_id, rx)
+        };
+        let target_bytes = format!("{}:{}", target.host, target.port).into_bytes();
+        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_bytes.len());
+        let (syn_initial, remaining_initial) = if initial_data.len() > max_syn_initial {
+            (
+                initial_data[..max_syn_initial].to_vec(),
+                &initial_data[max_syn_initial..],
+            )
+        } else {
+            (initial_data, &[][..])
+        };
+
         let syn_payload = SynPayload {
-            target: format!("{}:{}", target.host, target.port).into_bytes(),
-            initial_data: Vec::new(),
+            target: target_bytes,
+            initial_data: syn_initial,
         }
         .encode()
         .map_err(|e| anyhow!(e.to_string()))?;
@@ -690,6 +656,21 @@ impl WssSessionState {
             self.streams.lock().await.remove(&id);
             self.active.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
+        }
+        if !remaining_initial.is_empty() {
+            if let Err(error) = send_mux_parts(
+                &self.writer,
+                &self.cipher,
+                id,
+                MuxCommand::Data,
+                remaining_initial,
+            )
+            .await
+            {
+                self.streams.lock().await.remove(&id);
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(error);
+            }
         }
         Ok((id, rx))
     }
@@ -735,11 +716,14 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
         session.cipher.apply(&mut payload);
         let frame = MuxFrame::decode_owned(payload).map_err(|e| anyhow!(e.to_string()))?;
         let id = frame.stream_id;
-        let terminal = matches!(frame.command, MuxCommand::Fin | MuxCommand::Rst);
         let sender = { session.streams.lock().await.get(&id).cloned() };
         if let Some(tx) = sender {
-            if tx.send(frame).await.is_err() || terminal {
-                session.streams.lock().await.remove(&id);
+            // Terminal FIN/RST is forwarded; accounting is done once by the
+            // stream owner (see handle_connection cleanup below), mirroring
+            // mux_pool::client_reader_loop.
+            if tx.send(frame).await.is_err()
+                && session.streams.lock().await.remove(&id).is_some()
+            {
                 session.active.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -750,6 +734,7 @@ struct WssSessionPool {
     cfg: WssConfig,
     sessions: Mutex<Vec<Arc<WssSessionState>>>,
     session_creation: Mutex<()>,
+    consecutive_failures: AtomicU32,
 }
 impl WssSessionPool {
     fn new(cfg: WssConfig) -> Arc<Self> {
@@ -757,6 +742,7 @@ impl WssSessionPool {
             cfg,
             sessions: Mutex::new(Vec::new()),
             session_creation: Mutex::new(()),
+            consecutive_failures: AtomicU32::new(0),
         })
     }
     async fn replenish(self: &Arc<Self>) {
@@ -768,11 +754,21 @@ impl WssSessionPool {
             sessions.len() < target
         };
         if !need_new {
+            self.consecutive_failures
+                .store(0, Ordering::Release);
             return;
         }
         match WssSessionState::connect(&self.cfg).await {
-            Ok(s) => self.sessions.lock().await.push(s),
+            Ok(s) => {
+                self.sessions.lock().await.push(s);
+                self.consecutive_failures
+                    .store(0, Ordering::Release);
+            }
             Err(error) => {
+                let failures = self
+                    .consecutive_failures
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
                 let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
                 let sni = self
                     .cfg
@@ -788,7 +784,8 @@ impl WssSessionPool {
                     sni = %sni,
                     host = %header_host,
                     path = %path,
-                    "WSS physical session creation failed"
+                    failures,
+                    "WSS physical session creation failed; will retry with backoff"
                 );
             }
         }
@@ -796,12 +793,15 @@ impl WssSessionPool {
     async fn maintain(self: &Arc<Self>) {
         loop {
             self.replenish().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let failures = self.consecutive_failures.load(Ordering::Acquire);
+            let backoff = (failures.saturating_mul(500)).min(5000);
+            tokio::time::sleep(Duration::from_millis(500 + backoff as u64)).await;
         }
     }
     async fn acquire(
         self: &Arc<Self>,
         target: &TargetAddr,
+        initial_data: Vec<u8>,
     ) -> Result<(Arc<WssSessionState>, u32, mpsc::Receiver<OwnedMuxFrame>)> {
         let snapshot = {
             let mut sessions = self.sessions.lock().await;
@@ -817,7 +817,7 @@ impl WssSessionPool {
             if !session.available() {
                 continue;
             }
-            if let Ok((id, rx)) = session.open_stream(target).await {
+            if let Ok((id, rx)) = session.open_stream(target, initial_data.clone()).await {
                 return Ok((session, id, rx));
             }
         }
@@ -849,7 +849,7 @@ impl WssSessionPool {
                 );
                 e
             })?;
-            let opened = session.open_stream(target).await?;
+            let opened = session.open_stream(target, initial_data).await?;
             self.sessions.lock().await.push(session.clone());
             return Ok((session, opened.0, opened.1));
         }
@@ -858,67 +858,25 @@ impl WssSessionPool {
 }
 
 async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> Result<()> {
-    let (command, target, is_socks5) = read_proxy_request(&mut local).await?;
-    if command == SocksCommand::UdpAssociate {
-        return handle_udp_proxy(local, pool.cfg.clone(), target).await;
+    let req = read_client_proxy_request(&mut local).await?;
+    if req.command == SocksCommand::UdpAssociate {
+        return handle_udp_proxy(local, pool.cfg.clone(), req.target).await;
     }
-    if command != SocksCommand::Connect {
+    if req.command != SocksCommand::Connect {
         bail!("WSS path only supports CONNECT or UDP ASSOCIATE")
     };
-    let (session, stream_id, mut rx) = pool.acquire(&target).await?;
-    let first = timeout(
-        Duration::from_secs(pool.cfg.connection_timeout.max(1)),
-        async {
-            loop {
-                match rx.recv().await {
-                    Some(frame) if matches!(frame.command, MuxCommand::Syn) => continue,
-                    other => break other,
-                }
-            }
-        },
-    )
-    .await
-    .context("WSS upstream response timeout")?
-    .ok_or_else(|| anyhow!("WSS upstream closed before CONNECT response"))?;
-    match first.command {
-        MuxCommand::Rst => {
-            if is_socks5 {
-                local.write_all(&socks5_failure_response()).await?
-            } else {
-                local.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?
-            }
-            local.shutdown().await.ok();
-            return Ok(());
-        }
-        MuxCommand::Fin => {
-            if is_socks5 {
-                local.write_all(&socks5_success_response()).await?
-            } else {
-                local
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await?
-            }
-            local.shutdown().await.ok();
-            return Ok(());
-        }
-        MuxCommand::Data => {}
-        MuxCommand::Syn => {
-            unreachable!()
-        }
-    }
+    let initial_data = req.initial_payload.unwrap_or_default();
+    let (session, stream_id, mut rx) = pool.acquire(&req.target, initial_data).await?;
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
-    if is_socks5 {
-        local.write_all(&socks5_success_response()).await?
-    } else {
+    if req.is_socks5 {
+        local.write_all(&socks5_success_response()).await?;
+    } else if req.is_connect {
         local
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?
+            .await?;
     };
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    if !first.payload().is_empty() {
-        local_wr.write_all(first.payload()).await?
-    }
     let buffer_size = pool.cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size];
@@ -946,7 +904,11 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     });
     while let Some(frame) = rx.recv().await {
         match frame.command {
-            MuxCommand::Data => local_wr.write_all(frame.payload()).await?,
+            MuxCommand::Data => {
+                if !frame.payload().is_empty() {
+                    local_wr.write_all(frame.payload()).await?;
+                }
+            }
             MuxCommand::Fin => {
                 local_wr.shutdown().await?;
                 break;
@@ -956,6 +918,11 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         }
     }
     upload.abort();
+    // Conditional decrement: the reader may have already reaped the stream
+    // (send failure) or the session may have been torn down (active zeroed).
+    if session.streams.lock().await.remove(&stream_id).is_some() {
+        session.active.fetch_sub(1, Ordering::AcqRel);
+    }
     Ok(())
 }
 
@@ -999,11 +966,10 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
     }
 }
 
-async fn run_non_mux_dummy() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ws::read_http_headers;
 
     #[test]
     fn parse_wss_url_with_ip_and_path() {
