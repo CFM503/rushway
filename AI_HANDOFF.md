@@ -1447,3 +1447,19 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** PGO needs relay-path training data (graceful shutdown); B retry needs fair-condition validation; Firefox order is a ring subset.
 - **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-16 — v0.0.11 Release: Graceful Shutdown, Buffer Pool, Relay PGO Verdict
+
+- **Target & Version:** `0.0.11` — 7-loop graceful shutdown, global relay buffer pool, relay-traffic PGO measurement.
+- **Astra review:**
+  - Shutdown: accept loops converted to `select!` + `JoinSet` + 5 s drain; no permit/semaphore behavior change except `mux_pool` fail-fast (removes a latent stall).
+  - Pool: best-effort cache (early `?` returns drop instead of recycle — no accounting to corrupt); size cap bounds retained memory; no zeroing needed (full overwrite before use).
+  - PGO: negative result shipped as knowledge, not as binary; script documents both training methods and the kill-flush caveat.
+- **Change:** `Cargo.toml` 0.0.10 → 0.0.11; `CHANGELOG.md` new `[v0.0.11]` section; shutdown + pool code as above.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:**
+  - `cargo test --all-targets`: 72 + 6 passed; clippy: 4 pre-existing warnings, zero new.
+  - Live: Ctrl+Break → draining → exit 0; WS interop MUX/non-MUX PASS; relay-trained PGO within noise of normal (not shipped).
+- **Status:** released.
+- **Remaining risk:** Drain budget (5 s) is heuristic; pool only covers ≤ 1 MiB buffers; VPS-line numbers still open.
+- **Next action:** Push commit + tag; CI release builds follow.

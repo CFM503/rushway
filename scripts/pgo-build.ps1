@@ -3,20 +3,25 @@ $ErrorActionPreference = 'Stop'
 # PGO build pipeline for RushWay (Windows x64, MSVC).
 #
 #   Phase 1: build release binaries with profile instrumentation.
-#   Phase 2: training workload (must exit CLEANLY - killed processes never
-#            flush .profraw, so e2e_bench child runs are NOT usable as
-#            training data until RushWay gains graceful shutdown).
-#            Current default: `cargo test --all-targets`, which covers the
-#            cipher / WS framing / DNS / proxy hot leaf functions.
+#   Phase 2: training workload.
 #   Phase 3: merge profiles with llvm-profdata (needs `rustup component
 #            add llvm-tools`).
 #   Phase 4: rebuild release with `-Cprofile-use`.
 #
-# CAUTION (measured 2026-09-16): a unit-test-trained profile REGRESSED
-# steady-state relay throughput ~15-20% (c8/c32) because the profile marks
-# the async relay loops as cold. Do NOT ship a PGO binary trained only on
-# unit tests. Retrain on a cleanly-exiting relay workload (see above) and
-# compare `e2e_bench` medians before adopting.
+# TRAINING DATA WARNING (measured 2026-09-16, localhost 4 MiB echo):
+#   * Unit-test training REGRESSED steady-state relay throughput ~15-20%
+#     (c8/c32 medians): the profile marks async relay loops as cold.
+#   * Relay-traffic training (12 bulk rounds through real server/client,
+#     processes exited cleanly via Ctrl+Break graceful shutdown) landed
+#     WITHIN NOISE of the normal build (c8/c32 medians roughly -5%,
+#     overlapping run-to-run variance). No consistent gain on loopback.
+#   Do NOT ship a PGO binary without a VPS-line before/after win.
+#   Killed processes never flush .profraw: training drivers must let
+#   RushWay exit cleanly (Ctrl+C / Ctrl+Break graceful shutdown).
+#
+# Default training below uses `cargo test` (leaf coverage only). For relay
+# training, run real traffic between Phase 1 and Phase 3 instead (see
+# AI_HANDOFF.md 2026-09-16 Perf entries for the proven driver pattern).
 
 $Root = Join-Path $PSScriptRoot '..'
 $PgoData = Join-Path $Root 'target\pgo-data'

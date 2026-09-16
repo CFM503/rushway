@@ -7,7 +7,8 @@ use crate::proxy::{
     ClientProxyRequest, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
-    apply_socket_options, enforce_target_policy, relay_buffer_size, RuntimeConfig,
+    apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
+    wait_shutdown, RuntimeConfig,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -296,10 +297,10 @@ async fn relay_quic(
         send.write_all(&initial).await?;
     }
     let (lr, lw) = tokio::io::split(local);
-    let buffer_size = relay_buffer_size(cfg.buffer_size);
+    let buffer_size = cfg.buffer_size;
     let upload = tokio::spawn(async move {
         let mut r = lr;
-        let mut buf = vec![0u8; buffer_size];
+        let mut buf = relay_buf(buffer_size).await;
         loop {
             let n = r.read(&mut buf).await?;
             if n == 0 {
@@ -308,10 +309,11 @@ async fn relay_quic(
             }
             send.write_all(&buf[..n]).await?
         }
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
     let mut lw2 = lw;
-    let mut buf = vec![0u8; buffer_size];
+    let mut buf = relay_buf(buffer_size).await;
     loop {
         match recv.read(&mut buf).await? {
             Some(0) | None => break,
@@ -320,6 +322,7 @@ async fn relay_quic(
     }
     let _ = lw2.shutdown().await;
     upload.abort();
+    recycle_buf(buf).await;
     Ok(())
 }
 async fn relay_quic_udp(
@@ -406,41 +409,52 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         cfg.proxy_host,
         cfg.proxy_port
     );
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (mut stream, peer) = listener.accept().await?;
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum QUIC client connections reached");
-                continue;
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining QUIC client connections");
+                break;
             }
-        };
-        let req = match read_client_proxy_request(&mut stream).await {
-            Ok(v) => v,
-            Err(e) => {
-                drop(permit);
-                tracing::debug!(%peer,error=%e,"QUIC proxy request rejected");
-                continue;
-            }
-        };
-        let cfg2 = cfg.clone();
-        let pool2 = pool.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            match req.command {
-                SocksCommand::UdpAssociate => {
-                    if let Err(e) = relay_quic_udp(stream, cfg2, pool2).await {
-                        tracing::debug!(%peer,error=%e,"QUIC UDP proxy closed")
+            res = listener.accept() => {
+                let (mut stream, peer) = res?;
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer,"maximum QUIC client connections reached");
+                        continue;
                     }
-                }
-                SocksCommand::Connect => {
-                    if let Err(e) = relay_quic(stream, cfg2, pool2, req).await {
-                        tracing::debug!(%peer,error=%e,"QUIC proxy connection closed")
+                };
+                let req = match read_client_proxy_request(&mut stream).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        drop(permit);
+                        tracing::debug!(%peer,error=%e,"QUIC proxy request rejected");
+                        continue;
                     }
-                }
+                };
+                let cfg2 = cfg.clone();
+                let pool2 = pool.clone();
+                set.spawn(async move {
+                    let _permit = permit;
+                    match req.command {
+                        SocksCommand::UdpAssociate => {
+                            if let Err(e) = relay_quic_udp(stream, cfg2, pool2).await {
+                                tracing::debug!(%peer,error=%e,"QUIC UDP proxy closed")
+                            }
+                        }
+                        SocksCommand::Connect => {
+                            if let Err(e) = relay_quic(stream, cfg2, pool2, req).await {
+                                tracing::debug!(%peer,error=%e,"QUIC proxy connection closed")
+                            }
+                        }
+                    }
+                });
             }
-        });
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
@@ -448,36 +462,50 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     let endpoint = Endpoint::server(server_config()?, bind)?;
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!("RushWay QUIC server listening on {}", bind);
-    while let Some(incoming) = endpoint.accept().await {
-        let cfg2 = cfg.clone();
-        let sem = semaphore.clone();
-        tokio::spawn(async move {
-            let permit = match sem.clone().try_acquire_owned() {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            match incoming.await {
-                Ok(connection) => {
-                    let _permit = permit;
-                    loop {
-                        match connection.accept_bi().await {
-                            Ok((send, recv)) => {
-                                let cfg3 = cfg2.clone();
-                                tokio::spawn(async move {
-                                    if let Err(error) = handle_server_stream(send, recv, cfg3).await
-                                    {
-                                        tracing::debug!(%error,"QUIC stream closed")
-                                    }
-                                });
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-                Err(error) => tracing::debug!(%error,"QUIC connection handshake failed"),
+    let mut set = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining QUIC server connections");
+                break;
             }
-        });
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let cfg2 = cfg.clone();
+                let sem = semaphore.clone();
+                set.spawn(async move {
+                    let permit = match sem.clone().try_acquire_owned() {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    match incoming.await {
+                        Ok(connection) => {
+                            let _permit = permit;
+                            loop {
+                                match connection.accept_bi().await {
+                                    Ok((send, recv)) => {
+                                        let cfg3 = cfg2.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(error) = handle_server_stream(send, recv, cfg3).await
+                                            {
+                                                tracing::debug!(%error,"QUIC stream closed")
+                                            }
+                                        });
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        Err(error) => tracing::debug!(%error,"QUIC connection handshake failed"),
+                    }
+                });
+            }
+        }
     }
+    endpoint.close(0u32.into(), b"shutdown");
+    drain_join_set(&mut set).await;
     Ok(())
 }
 
@@ -533,9 +561,9 @@ async fn handle_server_stream(
     apply_socket_options(&target_stream, &cfg);
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     send.write_all(b"OK\n").await?;
-    let buffer_size = relay_buffer_size(cfg.buffer_size);
+    let buffer_size = cfg.buffer_size;
     let mut send_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; buffer_size];
+        let mut buf = relay_buf(buffer_size).await;
         loop {
             match target_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -547,9 +575,10 @@ async fn handle_server_stream(
             }
         }
         let _ = send.finish();
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
-    let mut buf = vec![0u8; buffer_size];
+    let mut buf = relay_buf(buffer_size).await;
     loop {
         tokio::select! {
             _ = &mut send_task => {
@@ -565,6 +594,7 @@ async fn handle_server_stream(
     }
     let _ = target_wr.shutdown().await;
     send_task.abort();
+    recycle_buf(buf).await;
     Ok(())
 }
 

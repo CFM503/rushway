@@ -320,48 +320,59 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
 
     let acceptor = tls::standalone_server_acceptor()?;
     tracing::info!("RushWay WSS server listening on {public_bind}");
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let mut tls_stream = acceptor.accept(stream).await?;
-                let request = ws::read_http_headers(&mut tls_stream).await?;
-                let key = ws::validate_server_handshake(&request)?;
-                tls_stream
-                    .write_all(&ws::build_server_handshake_response(&key))
-                    .await?;
+        tokio::select! {
+            _ = runtime::wait_shutdown() => {
+                tracing::info!("shutdown requested, draining WSS server connections");
+                break;
+            }
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                let acceptor = acceptor.clone();
+                set.spawn(async move {
+                    let result = async {
+                        let mut tls_stream = acceptor.accept(stream).await?;
+                        let request = ws::read_http_headers(&mut tls_stream).await?;
+                        let key = ws::validate_server_handshake(&request)?;
+                        tls_stream
+                            .write_all(&ws::build_server_handshake_response(&key))
+                            .await?;
 
-                let mut internal = None;
-                for _ in 0..100 {
-                    match TcpStream::connect(("127.0.0.1", internal_port)).await {
-                        Ok(stream) => {
-                            internal = Some(stream);
-                            break;
+                        let mut internal = None;
+                        for _ in 0..100 {
+                            match TcpStream::connect(("127.0.0.1", internal_port)).await {
+                                Ok(stream) => {
+                                    internal = Some(stream);
+                                    break;
+                                }
+                                Err(_) => sleep(Duration::from_millis(20)).await,
+                            }
                         }
-                        Err(_) => sleep(Duration::from_millis(20)).await,
+                        let mut internal = internal
+                            .ok_or_else(|| anyhow!("private WS runtime did not start"))?;
+                        let (request, key) = ws::build_client_handshake_request(
+                            &format!("127.0.0.1:{internal_port}"),
+                            "/",
+                            None,
+                            Some("same-origin"),
+                        );
+                        internal.write_all(&request).await?;
+                        let response = ws::read_http_headers(&mut internal).await?;
+                        ws::validate_client_handshake_response(&response, &key)?;
+                        copy_bidirectional(&mut tls_stream, &mut internal).await?;
+                        Ok::<(), anyhow::Error>(())
                     }
-                }
-                let mut internal =
-                    internal.ok_or_else(|| anyhow!("private WS runtime did not start"))?;
-                let (request, key) = ws::build_client_handshake_request(
-                    &format!("127.0.0.1:{internal_port}"),
-                    "/",
-                    None,
-                    Some("same-origin"),
-                );
-                internal.write_all(&request).await?;
-                let response = ws::read_http_headers(&mut internal).await?;
-                ws::validate_client_handshake_response(&response, &key)?;
-                copy_bidirectional(&mut tls_stream, &mut internal).await?;
-                Ok::<(), anyhow::Error>(())
+                    .await;
+                    if let Err(error) = result {
+                        tracing::debug!(%peer, %error, "WSS connection closed");
+                    }
+                });
             }
-            .await;
-            if let Err(error) = result {
-                tracing::debug!(%peer, %error, "WSS connection closed");
-            }
-        });
+        }
     }
+    runtime::drain_join_set(&mut set).await;
+    Ok(())
 }
 
 #[tokio::main]

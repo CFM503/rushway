@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.11] - 2026-09-16
+
+### Fixed
+- **Graceful Shutdown on Ctrl+C / Ctrl+Break**:
+  - All 7 accept loops (`runtime`/`nonmux` ×2/`mux_pool`/`wss_client` ×2/`quic` ×2/`main` WSS server) now stop accepting on signal, drain in-flight tasks with a 5 s budget (`SHUTDOWN_DRAIN_SECS`), then exit cleanly.
+  - `mux_pool` admission switched from blocking `acquire_owned` to fail-fast `try_acquire_owned` so shutdown is never stuck behind a permit wait.
+  - Verified live: Ctrl+Break → `draining` logged → exit code 0. Clean exit also flushes PGO profiles, enabling relay-traffic training.
+- **Global Relay Buffer Pool (GoWay `BufPool` Reuse Parity)**:
+  - New shared pool in `src/runtime.rs` (`relay_buf`/`recycle_buf`): buffers ≤ 1 MiB reused across relay tasks (max 128 retained); larger `-W` buffers fall back to allocate/free.
+  - Adopted at all 11 relay read sites (`runtime`/`mux_pool`/`wss_client`/`nonmux`/`quic`); pool hit/miss covered by `relay_buf_pool_reuses_allocations` test.
+  - Buffers are fully overwritten by `read` before use, so no zeroing is needed on either path.
+
+### Added
+- **Relay-Traffic PGO Training Result**:
+  - Extended `scripts/pgo-build.ps1` with the measured verdict: relay-trained profile lands within noise of the normal build on loopback (c8/c32 medians roughly -5%, overlapping variance) — PGO binary **not shipped**; `dist` keeps the normal release.
+  - Training driver pattern documented (real server/client bulk traffic + Ctrl+Break clean exit; killed processes never flush `.profraw`).
+
 ## [v0.0.10] - 2026-09-16
 
 ### Fixed

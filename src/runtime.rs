@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
@@ -110,6 +110,95 @@ pub(crate) fn is_blocked_local_host(host: &str) -> bool {
 pub(crate) fn relay_buffer_size(requested: usize) -> usize {
     requested.clamp(16 * 1024, 12 * 1024 * 1024)
 }
+
+/// Graceful-shutdown drain budget after Ctrl+C / Ctrl+Break: stop accepting
+/// new connections, then wait this long for in-flight tasks before aborting.
+pub(crate) const SHUTDOWN_DRAIN_SECS: u64 = 5;
+
+/// Relay read-buffer pool (GoWay `BufPool` parity for the reuse half).
+///
+/// Relay tasks hold one buffer for their whole lifetime and touch the pool
+/// only twice per task (get on start, put on exit), so a single global lock
+/// is uncontended. Only buffers at or below 1 MiB are pooled, bounding
+/// retained memory; larger `-W` buffers fall back to allocate/free (the
+/// allocator's page cache absorbs those). Buffers are always fully
+/// overwritten by `read` before the used prefix is consumed, so no
+/// zeroing is needed on either path.
+const POOLED_BUF_MAX_SIZE: usize = 1024 * 1024;
+const POOLED_BUF_MAX_COUNT: usize = 128;
+
+static RELAY_BUFS: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+
+fn relay_bufs() -> &'static Mutex<Vec<Vec<u8>>> {
+    RELAY_BUFS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Gets a zeroed relay buffer of exactly `relay_buffer_size(requested)`
+/// bytes, reusing a pooled one when available.
+pub(crate) async fn relay_buf(requested: usize) -> Vec<u8> {
+    let size = relay_buffer_size(requested);
+    if size <= POOLED_BUF_MAX_SIZE {
+        let mut pool = relay_bufs().lock().await;
+        if let Some(pos) = pool.iter().position(|b| b.len() == size) {
+            return pool.swap_remove(pos);
+        }
+    }
+    vec![0u8; size]
+}
+
+/// Returns a relay buffer to the pool (best-effort: over-capacity or
+/// oversized buffers are simply dropped).
+pub(crate) async fn recycle_buf(buf: Vec<u8>) {
+    if buf.len() > POOLED_BUF_MAX_SIZE {
+        return;
+    }
+    let mut pool = relay_bufs().lock().await;
+    if pool.len() < POOLED_BUF_MAX_COUNT {
+        pool.push(buf);
+    }
+}
+
+/// Resolves when the operator requests shutdown (Ctrl+C everywhere,
+/// Ctrl+Break on Windows — the latter is what console-less training
+/// drivers can deliver to a child process group).
+pub(crate) async fn wait_shutdown() {
+    #[cfg(windows)]
+    {
+        let mut brk = tokio::signal::windows::ctrl_break()
+            .expect("ctrl_break handler installed");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = brk.recv() => {}
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Drains a `JoinSet` after the accept loop exits: waits for in-flight
+/// tasks up to the drain budget, then aborts leftovers so the process can
+/// exit cleanly (flushing PGO profiles, releasing ports).
+pub(crate) async fn drain_join_set<T: Send + 'static>(
+    set: &mut tokio::task::JoinSet<T>,
+) {
+    let deadline = tokio::time::sleep(Duration::from_secs(SHUTDOWN_DRAIN_SECS));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                set.abort_all();
+                break;
+            }
+            next = set.join_next() => {
+                if next.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+}
 pub(crate) fn enforce_target_policy(cfg: &RuntimeConfig, target: &TargetAddr) -> Result<()> {
     if cfg.upstream.is_some() && cfg.block_local && is_blocked_local_host(&target.host) {
         bail!("local/LAN target blocked by client policy")
@@ -194,7 +283,7 @@ async fn target_to_mux(
     buffer_size: usize,
     cipher: XorCipher,
 ) {
-    let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
+    let mut buf = relay_buf(buffer_size).await;
     loop {
         match target.read(&mut buf).await {
             Ok(0) => {
@@ -215,6 +304,7 @@ async fn target_to_mux(
                     .await
                     .is_err()
                     {
+                        recycle_buf(buf).await;
                         return;
                     }
                     off = end;
@@ -226,6 +316,7 @@ async fn target_to_mux(
             }
         }
     }
+    recycle_buf(buf).await;
 }
 #[allow(dead_code)]
 async fn server_stream_task(
@@ -654,7 +745,7 @@ async fn handle_server_tcp_parts(
     let writer_down = writer.clone();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
-        let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
+        let mut buf = relay_buf(buffer_size).await;
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
@@ -664,6 +755,7 @@ async fn handle_server_tcp_parts(
             let mut w = writer_down.lock().await;
             write_frame(&mut *w, &payload, 2, false).await?;
         }
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
@@ -786,57 +878,68 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
         cfg.proxy_host,
         cfg.proxy_port
     );
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        // Fail fast at capacity instead of stalling the accept loop and
-        // letting the TCP backlog fill up.
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer, "maximum server connections reached");
-                continue;
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining server connections");
+                break;
             }
-        };
-        let cfg2 = cfg.clone();
-        apply_socket_options(&stream, &cfg2);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let result = async {
-                let (mut rd, mut wr) = tokio::io::split(stream);
-                let request = read_http_headers(&mut rd).await?;
-                let key = validate_server_handshake(&request)?;
-                wr.write_all(&build_server_handshake_response(&key)).await?;
-                wr.flush().await?;
-                let writer = Arc::new(Mutex::new(wr));
-                let mut buf = Vec::with_capacity(64 * 1024);
-                let Some((opcode, first)) =
-                    read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut buf)
-                        .await?
-                else {
-                    bail!("missing transport handshake")
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                // Fail fast at capacity instead of stalling the accept loop and
+                // letting the TCP backlog fill up.
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer, "maximum server connections reached");
+                        continue;
+                    }
                 };
-                if opcode != 2 {
-                    bail!("invalid transport handshake opcode")
-                };
-                let mut plain = first.clone();
-                let cipher = configured_cipher(&cfg2.key);
-                transform_payload(&cipher, &mut plain);
-                if plain == b"UDP\n" {
-                    return handle_server_udp_parts(rd, writer, cfg2, first).await;
-                }
-                if plain == b"MUX\n" {
-                    return handle_mux_parts(rd, writer, cfg2, first).await;
-                }
-                // Anything else is a plain non-MUX target ("host:port\n"),
-                // exactly like goway.go handleServer's fallthrough branch.
-                handle_server_tcp_parts(rd, writer, cfg2, first).await
+                let cfg2 = cfg.clone();
+                apply_socket_options(&stream, &cfg2);
+                set.spawn(async move {
+                    let _permit = permit;
+                    let result = async {
+                        let (mut rd, mut wr) = tokio::io::split(stream);
+                        let request = read_http_headers(&mut rd).await?;
+                        let key = validate_server_handshake(&request)?;
+                        wr.write_all(&build_server_handshake_response(&key)).await?;
+                        wr.flush().await?;
+                        let writer = Arc::new(Mutex::new(wr));
+                        let mut buf = Vec::with_capacity(64 * 1024);
+                        let Some((opcode, first)) =
+                            read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut buf)
+                                .await?
+                        else {
+                            bail!("missing transport handshake")
+                        };
+                        if opcode != 2 {
+                            bail!("invalid transport handshake opcode")
+                        };
+                        let mut plain = first.clone();
+                        let cipher = configured_cipher(&cfg2.key);
+                        transform_payload(&cipher, &mut plain);
+                        if plain == b"UDP\n" {
+                            return handle_server_udp_parts(rd, writer, cfg2, first).await;
+                        }
+                        if plain == b"MUX\n" {
+                            return handle_mux_parts(rd, writer, cfg2, first).await;
+                        }
+                        // Anything else is a plain non-MUX target ("host:port\n"),
+                        // exactly like goway.go handleServer's fallthrough branch.
+                        handle_server_tcp_parts(rd, writer, cfg2, first).await
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        tracing::debug!(%peer,error=%e,"transport connection closed")
+                    }
+                });
             }
-            .await;
-            if let Err(e) = result {
-                tracing::debug!(%peer,error=%e,"transport connection closed")
-            }
-        });
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -872,6 +975,23 @@ mod lifecycle_tests {
         };
         assert!(won, "cancellation must win over a pending dial");
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn relay_buf_pool_reuses_allocations() {
+        let a = relay_buf(128 * 1024).await;
+        assert_eq!(a.len(), 128 * 1024);
+        let ptr = a.as_ptr();
+        recycle_buf(a).await;
+        let b = relay_buf(128 * 1024).await;
+        assert_eq!(b.as_ptr(), ptr);
+        // Oversized buffers bypass the pool.
+        let big = relay_buf(4 * 1024 * 1024).await;
+        assert_eq!(big.len(), 4 * 1024 * 1024);
+        recycle_buf(big).await;
+        recycle_buf(b).await;
+        let c = relay_buf(128 * 1024).await;
+        assert_eq!(c.as_ptr(), ptr);
     }
 
     #[test]

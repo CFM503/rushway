@@ -7,7 +7,9 @@ use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
     TargetAddr,
 };
-use crate::runtime::{apply_socket_options, relay_buffer_size, RuntimeConfig};
+use crate::runtime::{
+    apply_socket_options, drain_join_set, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+};
 use crate::tls;
 use crate::ws::{
     build_client_handshake_request, read_frame, read_frame_owned,
@@ -435,7 +437,7 @@ async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Resu
     }
     let buffer_size = cfg.buffer_size;
     let mut upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
+        let mut buf = relay_buf(buffer_size).await;
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
@@ -445,6 +447,7 @@ async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Resu
             let mut w = writer_up.lock().await;
             write_frame(&mut *w, &payload, 2, true).await?
         }
+        recycle_buf(buf).await;
         Ok::<(), anyhow::Error>(())
     });
     tokio::select! {
@@ -497,15 +500,26 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         wc.proxy_host,
         wc.proxy_port
     );
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let cfg2 = wc.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_non_mux_connection(stream, cfg2).await {
-                tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining WSS non-MUX connections");
+                break;
             }
-        });
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                let cfg2 = wc.clone();
+                set.spawn(async move {
+                    if let Err(e) = handle_non_mux_connection(stream, cfg2).await {
+                        tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")
+                    }
+                });
+            }
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 
 struct WssSessionState {
@@ -877,9 +891,9 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             .await?;
     };
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    let buffer_size = relay_buffer_size(pool.cfg.buffer_size);
+    let buffer_size = pool.cfg.buffer_size;
     let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; buffer_size];
+        let mut buf = relay_buf(buffer_size).await;
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
@@ -900,6 +914,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 off = end
             }
         }
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
     while let Some(frame) = rx.recv().await {
@@ -955,15 +970,26 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
         wc.proxy_host,
         wc.proxy_port
     );
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let pool2 = pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, pool2).await {
-                tracing::debug!(%peer,error=%e,"WSS proxy connection closed")
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining WSS client connections");
+                break;
             }
-        });
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                let pool2 = pool.clone();
+                set.spawn(async move {
+                    if let Err(e) = handle_connection(stream, pool2).await {
+                        tracing::debug!(%peer,error=%e,"WSS proxy connection closed")
+                    }
+                });
+            }
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 
 #[cfg(test)]

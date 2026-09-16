@@ -1,4 +1,4 @@
-//! Client-side physical MUX session pool for plain WebSocket (`ws://`).
+﻿//! Client-side physical MUX session pool for plain WebSocket (`ws://`).
 //!
 //! Secure WebSocket (`wss://`) connections, including Cloudflare FakeHost and Edge
 //! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
@@ -11,7 +11,8 @@ use crate::proxy::{
     TargetAddr,
 };
 use crate::runtime::{
-    apply_socket_options, enforce_target_policy, relay_buffer_size, RuntimeConfig,
+    apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
+    wait_shutdown, RuntimeConfig,
 };
 use crate::ws::{
     build_client_handshake_request, read_frame, read_frame_owned, read_http_headers,
@@ -666,7 +667,7 @@ async fn handle_tcp_proxy(
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
     let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; relay_buffer_size(cfg.buffer_size)];
+        let mut buf = relay_buf(cfg.buffer_size).await;
         let mut frame_scratch = Vec::with_capacity(buf.len().min(u16::MAX as usize) + 7);
         loop {
             let n = local_rd.read(&mut buf).await?;
@@ -697,6 +698,7 @@ async fn handle_tcp_proxy(
                 off = end
             }
         }
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
     let mut result = Result::<()>::Ok(());
@@ -742,18 +744,37 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     let session_count = configured_session_count();
     tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,session_count,MAX_STREAMS_PER_SESSION);
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let permit = semaphore.clone().acquire_owned().await?;
-        let cfg2 = cfg.clone();
-        let pool2 = pool.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = handle_tcp_proxy(stream, cfg2, pool2).await {
-                tracing::debug!(%peer,error=%e,"pooled proxy connection closed")
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining pooled client connections");
+                break;
             }
-        });
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                // Fail fast at capacity so shutdown is never stuck behind
+                // a permit wait.
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer, "maximum client connections reached");
+                        continue;
+                    }
+                };
+                let cfg2 = cfg.clone();
+                let pool2 = pool.clone();
+                set.spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = handle_tcp_proxy(stream, cfg2, pool2).await {
+                        tracing::debug!(%peer,error=%e,"pooled proxy connection closed")
+                    }
+                });
+            }
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -6,7 +6,9 @@ use crate::proxy::{
     parse_authority_with_default, parse_target_authority, read_client_proxy_request,
     socks5_success_response, ClientProxyRequest, SocksCommand,
 };
-use crate::runtime::{enforce_target_policy, relay_buffer_size, RuntimeConfig};
+use crate::runtime::{
+    drain_join_set, enforce_target_policy, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+};
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
     build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers,
@@ -177,7 +179,7 @@ async fn relay_client(
         write_frame(&mut *w, &payload, 2, true).await?;
     }
     let mut upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; relay_buffer_size(cfg.buffer_size)];
+        let mut buf = relay_buf(cfg.buffer_size).await;
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
@@ -187,6 +189,7 @@ async fn relay_client(
             let mut w = writer_up.lock().await;
             write_frame(&mut *w, &payload, 2, true).await?
         }
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
     tokio::select! {
@@ -237,23 +240,34 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
         cfg.proxy_host,
         cfg.proxy_port
     );
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum client connections reached");
-                continue;
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining non-MUX client connections");
+                break;
             }
-        };
-        let cfg2 = cfg.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = handle_client_connection(stream, cfg2).await {
-                tracing::debug!(%peer,%error,"non-MUX client connection closed")
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer,"maximum client connections reached");
+                        continue;
+                    }
+                };
+                let cfg2 = cfg.clone();
+                set.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_client_connection(stream, cfg2).await {
+                        tracing::debug!(%peer,%error,"non-MUX client connection closed")
+                    }
+                });
             }
-        });
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
@@ -263,24 +277,35 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
         cfg.proxy_host,
         cfg.proxy_port
     );
+    let mut set = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(%peer,"maximum server connections reached");
-                continue;
+        tokio::select! {
+            _ = wait_shutdown() => {
+                tracing::info!("shutdown requested, draining non-MUX server connections");
+                break;
             }
-        };
-        let cfg2 = cfg.clone();
-        apply_socket_options(&stream, &cfg2);
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = handle_server(stream, cfg2).await {
-                tracing::debug!(%peer,%error,"non-MUX transport closed")
+            res = listener.accept() => {
+                let (stream, peer) = res?;
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer,"maximum server connections reached");
+                        continue;
+                    }
+                };
+                let cfg2 = cfg.clone();
+                apply_socket_options(&stream, &cfg2);
+                set.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_server(stream, cfg2).await {
+                        tracing::debug!(%peer,%error,"non-MUX transport closed")
+                    }
+                });
             }
-        });
+        }
     }
+    drain_join_set(&mut set).await;
+    Ok(())
 }
 async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -327,7 +352,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let writer_down = writer.clone();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
-        let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
+        let mut buf = relay_buf(buffer_size).await;
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
@@ -338,6 +363,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
             let mut w = writer_down.lock().await;
             write_frame(&mut *w, &payload, 2, false).await?
         }
+        recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
     loop {
