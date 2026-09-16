@@ -7,7 +7,7 @@ use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
     TargetAddr,
 };
-use crate::runtime::{apply_socket_options, RuntimeConfig};
+use crate::runtime::{apply_socket_options, relay_buffer_size, RuntimeConfig};
 use crate::tls;
 use crate::ws::{
     build_client_handshake_request, read_frame, read_frame_owned,
@@ -435,7 +435,7 @@ async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Resu
     }
     let buffer_size = cfg.buffer_size;
     let mut upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
@@ -877,7 +877,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             .await?;
     };
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    let buffer_size = pool.cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
+    let buffer_size = relay_buffer_size(pool.cfg.buffer_size);
     let upload = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size];
         loop {

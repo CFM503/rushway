@@ -6,7 +6,7 @@ use crate::proxy::{
     parse_authority_with_default, parse_target_authority, read_client_proxy_request,
     socks5_success_response, ClientProxyRequest, SocksCommand,
 };
-use crate::runtime::{enforce_target_policy, RuntimeConfig};
+use crate::runtime::{enforce_target_policy, relay_buffer_size, RuntimeConfig};
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
     build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers,
@@ -128,6 +128,7 @@ async fn open_upstream(
     validate_client_handshake_response(&response, &key)?;
     Ok((rd, Arc::new(Mutex::new(wr))))
 }
+
 async fn relay_client(
     mut local: TcpStream,
     cfg: RuntimeConfig,
@@ -176,7 +177,7 @@ async fn relay_client(
         write_frame(&mut *w, &payload, 2, true).await?;
     }
     let mut upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut buf = vec![0u8; relay_buffer_size(cfg.buffer_size)];
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
@@ -326,7 +327,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let writer_down = writer.clone();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
-        let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {

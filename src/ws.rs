@@ -5,7 +5,8 @@
 
 use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rand::RngCore;
+use rand::seq::SliceRandom;
+use rand::{Rng, RngCore};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -13,12 +14,116 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_WS_FRAME_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_HTTP_HEADER_SIZE: usize = 8192;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
-const BROWSER_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 const BROWSER_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
-const BROWSER_SEC_CH_UA: &str =
-    "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\"";
 const SMALL_FRAME_SIZE: usize = 512;
+
+/// Browser profile bundling UA, TLS cipher/curve preferences, and HTTP
+/// headers that must plausibly match each other. Mirrors GoWay's
+/// `browserProfiles` (Chrome 136 / Edge 136 / Firefox 138 / Android).
+/// A random profile is picked per handshake, like GoWay's
+/// `pickBrowserProfile`.
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserProfile {
+    pub ua: &'static str,
+    pub accept_lang: &'static str,
+    /// Chrome Client Hints; `None` for Firefox (which never sends sec-ch-ua).
+    pub sec_ch_ua: Option<&'static str>,
+    pub sec_ch_ua_mob: &'static str,
+    pub sec_ch_ua_plat: &'static str,
+    pub is_chromium: bool,
+    /// Mobile marker (currently only asserted in tests; kept for parity
+    /// with GoWay's profile table).
+    #[allow(dead_code)]
+    pub is_mobile: bool,
+    /// Which TLS cipher ordering to use (mirrors GoWay's per-profile lists).
+    pub tls_chromium_order: bool,
+}
+
+pub const BROWSER_PROFILES: [BrowserProfile; 7] = [
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        accept_lang: "en-US,en;q=0.9",
+        sec_ch_ua: Some("\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\""),
+        sec_ch_ua_mob: "?0",
+        sec_ch_ua_plat: "\"Windows\"",
+        is_chromium: true,
+        is_mobile: false,
+        tls_chromium_order: true,
+    },
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        accept_lang: "en-US,en;q=0.9",
+        sec_ch_ua: Some("\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\""),
+        sec_ch_ua_mob: "?0",
+        sec_ch_ua_plat: "\"macOS\"",
+        is_chromium: true,
+        is_mobile: false,
+        tls_chromium_order: true,
+    },
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        accept_lang: "zh-CN,zh;q=0.9,en;q=0.8",
+        sec_ch_ua: Some("\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\""),
+        sec_ch_ua_mob: "?0",
+        sec_ch_ua_plat: "\"Windows\"",
+        is_chromium: true,
+        is_mobile: false,
+        tls_chromium_order: true,
+    },
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+        accept_lang: "en-US,en;q=0.9",
+        sec_ch_ua: Some("\"Chromium\";v=\"136\", \"Microsoft Edge\";v=\"136\", \"Not.A/Brand\";v=\"99\""),
+        sec_ch_ua_mob: "?0",
+        sec_ch_ua_plat: "\"Windows\"",
+        is_chromium: true,
+        is_mobile: false,
+        tls_chromium_order: true,
+    },
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+        accept_lang: "en-US,en;q=0.5",
+        sec_ch_ua: None,
+        sec_ch_ua_mob: "",
+        sec_ch_ua_plat: "",
+        is_chromium: false,
+        is_mobile: false,
+        tls_chromium_order: false,
+    },
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
+        accept_lang: "en-US,en;q=0.5",
+        sec_ch_ua: None,
+        sec_ch_ua_mob: "",
+        sec_ch_ua_plat: "",
+        is_chromium: false,
+        is_mobile: false,
+        tls_chromium_order: false,
+    },
+    BrowserProfile {
+        ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+        accept_lang: "en-US,en;q=0.9",
+        sec_ch_ua: Some("\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\""),
+        sec_ch_ua_mob: "?1",
+        sec_ch_ua_plat: "\"Android\"",
+        is_chromium: true,
+        is_mobile: true,
+        tls_chromium_order: true,
+    },
+];
+
+/// Picks a random browser profile for one handshake (GoWay parity:
+/// GoWay draws independently for TLS and HTTP, so callers may draw here
+/// and pass the result to both layers for a correlated identity).
+pub fn pick_browser_profile() -> &'static BrowserProfile {
+    &BROWSER_PROFILES[pick_browser_profile_index()]
+}
+
+/// Index-based draw backing [`pick_browser_profile`]; the TLS layer draws
+/// its own index so each layer can order cipher suites consistently.
+pub fn pick_browser_profile_index() -> usize {
+    rand::thread_rng().gen_range(0..BROWSER_PROFILES.len())
+}
 
 thread_local! {
     static MASK_STATE: RefCell<u64> = const { RefCell::new(0) };
@@ -195,20 +300,57 @@ pub fn build_client_handshake_request(
     origin: Option<&str>,
     sec_fetch_site: Option<&str>,
 ) -> (Vec<u8>, String) {
+    build_client_handshake_request_with_profile(
+        host,
+        path,
+        origin,
+        sec_fetch_site,
+        pick_browser_profile(),
+    )
+}
+
+/// Builds the upgrade request with an explicit profile so callers can use
+/// one identity for both TLS and HTTP (GoWay draws them independently;
+/// correlating is strictly harder to fingerprint).
+pub fn build_client_handshake_request_with_profile(
+    host: &str,
+    path: &str,
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    profile: &BrowserProfile,
+) -> (Vec<u8>, String) {
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
     let key = STANDARD.encode(key_bytes);
     let path = if path.is_empty() { "/" } else { path };
     let site = sec_fetch_site.unwrap_or("cross-site");
+    // Fixed top, mirroring GoWay: Host / Connection / Upgrade stay first.
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
     );
+    // Shufflable middle section (GoWay Fisher-Yates shuffles these).
+    let mut middle: Vec<String> = Vec::with_capacity(9);
+    middle.push("Pragma: no-cache".to_string());
+    middle.push("Cache-Control: no-cache".to_string());
+    middle.push(format!("User-Agent: {}", profile.ua));
+    middle.push(format!("Accept-Language: {}", profile.accept_lang));
+    middle.push(format!("Accept-Encoding: {BROWSER_ACCEPT_ENCODING}"));
     if let Some(origin) = origin {
-        req.push_str(&format!("Origin: {origin}\r\n"));
+        middle.push(format!("Origin: {origin}"));
     }
-    req.push_str("Pragma: no-cache\r\nCache-Control: no-cache\r\n");
-    req.push_str(&format!("User-Agent: {BROWSER_UA}\r\nAccept-Language: {BROWSER_ACCEPT_LANGUAGE}\r\nAccept-Encoding: {BROWSER_ACCEPT_ENCODING}\r\n"));
-    req.push_str(&format!("sec-ch-ua: {BROWSER_SEC_CH_UA}\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Windows\"\r\n"));
+    if profile.is_chromium {
+        if let Some(sec_ch_ua) = profile.sec_ch_ua {
+            middle.push(format!("sec-ch-ua: {sec_ch_ua}"));
+            middle.push(format!("sec-ch-ua-mobile: {}", profile.sec_ch_ua_mob));
+            middle.push(format!("sec-ch-ua-platform: {}", profile.sec_ch_ua_plat));
+        }
+    }
+    middle.shuffle(&mut rand::thread_rng());
+    for line in &middle {
+        req.push_str(line);
+        req.push_str("\r\n");
+    }
+    // Fixed bottom, mirroring GoWay.
     req.push_str(&format!("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: {site}\r\n\r\n"));
     (req.into_bytes(), key)
 }
@@ -395,7 +537,7 @@ where
         }
         // Grow incrementally in 64 KiB segments instead of a single
         // `resize(len)`: a bogus 64 MB length prefix no longer causes an
-        // instant OOM — the peer must actually send the bytes (and hit the
+        // instant OOM —the peer must actually send the bytes (and hit the
         // read timeout) to consume memory.
         const READ_SEGMENT: usize = 64 * 1024;
         buf.clear();
@@ -474,11 +616,14 @@ mod tests {
 
     #[test]
     fn browser_headers_present() {
-        let (request, _) = build_client_handshake_request(
+        // Deterministic profile: Chromium headers must be present (order varies).
+        let profile = &BROWSER_PROFILES[0];
+        let (request, _) = build_client_handshake_request_with_profile(
             "example.com",
             "/ws",
             Some("https://example.com"),
             Some("same-origin"),
+            profile,
         );
         let text = std::str::from_utf8(&request).unwrap();
         for header in [
@@ -493,6 +638,49 @@ mod tests {
         ] {
             assert!(text.contains(header), "missing {header}");
         }
+    }
+
+    #[test]
+    fn all_profiles_build_valid_handshakes() {
+        for profile in &BROWSER_PROFILES {
+            let (request, key) = build_client_handshake_request_with_profile(
+                "example.com",
+                "/ws",
+                Some("https://example.com"),
+                Some("same-origin"),
+                profile,
+            );
+            // Every profile must pass server-side validation.
+            assert_eq!(validate_server_handshake(&request).unwrap(), key);
+            let text = std::str::from_utf8(&request).unwrap();
+            assert!(text.starts_with("GET /ws HTTP/1.1\r\n"));
+            assert!(text.contains("Upgrade: websocket\r\n"));
+            // Firefox never sends Client Hints; Chromium always does.
+            if profile.is_chromium {
+                assert!(text.contains("sec-ch-ua:"), "chromium profile missing sec-ch-ua");
+            } else {
+                assert!(
+                    !text.contains("sec-ch-ua:"),
+                    "firefox profile must not send sec-ch-ua"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_profile_signals_mobile() {
+        let mobile = BROWSER_PROFILES.iter().find(|p| p.is_mobile).unwrap();
+        assert_eq!(mobile.sec_ch_ua_mob, "?1");
+        let (request, _) = build_client_handshake_request_with_profile(
+            "example.com",
+            "/",
+            None,
+            Some("cross-site"),
+            mobile,
+        );
+        let text = std::str::from_utf8(&request).unwrap();
+        assert!(text.contains("sec-ch-ua-mobile: ?1\r\n"));
+        assert!(!text.contains("Origin:"));
     }
 
     #[test]

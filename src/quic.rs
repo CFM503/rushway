@@ -6,7 +6,9 @@ use crate::proxy::{
     read_client_proxy_request, socks5_failure_response, socks5_success_response,
     ClientProxyRequest, SocksCommand, TargetAddr,
 };
-use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
+use crate::runtime::{
+    apply_socket_options, enforce_target_policy, relay_buffer_size, RuntimeConfig,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
@@ -294,7 +296,7 @@ async fn relay_quic(
         send.write_all(&initial).await?;
     }
     let (lr, lw) = tokio::io::split(local);
-    let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
+    let buffer_size = relay_buffer_size(cfg.buffer_size);
     let upload = tokio::spawn(async move {
         let mut r = lr;
         let mut buf = vec![0u8; buffer_size];
@@ -531,7 +533,7 @@ async fn handle_server_stream(
     apply_socket_options(&target_stream, &cfg);
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     send.write_all(b"OK\n").await?;
-    let buffer_size = cfg.buffer_size.clamp(16 * 1024, 1024 * 1024);
+    let buffer_size = relay_buffer_size(cfg.buffer_size);
     let mut send_task = tokio::spawn(async move {
         let mut buf = vec![0u8; buffer_size];
         loop {

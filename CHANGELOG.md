@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.10] - 2026-09-16
+
+### Fixed
+- **Bulk 8-Byte XOR Transform**:
+  - `XorCipher::apply` now processes 8 bytes per iteration via native-endian `u64` words, mirroring GoWay `TransformInPlace`; byte `j` still maps to `key[j % 256KiB]`.
+  - Micro-benchmark (16 MiB × 20, `-O`): 1.58 → 3.48 GB/s (**2.2×** on the cipher kernel); A/B vs v0.0.9 tag: c8/c32 medians **+~35%**.
+- **GoWay-Aligned Relay Buffer Ceiling**:
+  - New shared `runtime::relay_buffer_size` honors `-W` up to 12 MiB (GoWay BufPool parity); 9 relay read sites across `runtime/mux_pool/wss_client/nonmux/quic` previously truncated at 1 MiB.
+  - 128 KiB default behavior unchanged; only high `-W` (e.g. `-W 1024/4096` + large `--socket-buffer`) now takes effect.
+  - Live check: 2 MiB bulk through MUX with `-W 4096` byte-identical end to end.
+- **Browser-Profile Rotation & TLS Fingerprint Parity**:
+  - New 7-profile table in `src/ws.rs` (Chrome 136 ×3 / Edge 136 / Firefox 138 ×2 / Android Chrome) mirroring GoWay; random profile per handshake; middle headers Fisher-Yates shuffled with fixed top/bottom; Firefox profiles omit `sec-ch-ua` like real Firefox.
+  - `src/tls.rs` orders ring cipher suites / key-exchange groups per profile (Chromium vs Firefox order, X25519-first), cached per (profile, verify) config; RSA/CBC and P-521 unavailable in ring are documented gaps.
+  - Exposed `connect_with_profile` / `build_client_handshake_request_with_profile` for future TLS+HTTP identity correlation (GoWay draws them independently).
+
+### Added
+- **PGO Build Pipeline** (`scripts/pgo-build.ps1`): instrument → train → `llvm-profdata merge` → `-Cprofile-use` rebuild (requires `rustup component add llvm-tools`).
+  - Measured outcome: unit-test-trained profile **regressed** steady-state relay throughput ~15-20% (c8/c32 medians) — training data marks async relay loops as cold. PGO binary **not shipped**.
+  - Correct training needs a cleanly-exiting relay workload (killed `e2e_bench` children never flush `.profraw`); blocked on graceful-shutdown support.
+
 ## [v0.0.9] - 2026-09-16
 
 ### Fixed
@@ -69,6 +89,21 @@ All notable changes to this project will be documented in this file.
   - `src/runtime.rs::run_server` uses `try_acquire_owned` at capacity instead of stalling the accept loop.
 - **Dead Module Removal (P1)**:
   - Deleted unreferenced `src/mux_config.rs` / `src/runtime_config.rs` (stale `MAX_MUX_STREAMS_PER_SESSION=256` vs authoritative 2048).
+- **Bulk 8-Byte XOR Transform (Perf Step 1)**:
+  - `XorCipher::apply` now processes 8 bytes per iteration via native-endian `u64` words, mirroring GoWay `TransformInPlace`; byte `j` still maps to `key[j % 256KiB]`.
+  - Micro-benchmark (16 MiB × 20, `-O`): 1.58 → 3.48 GB/s (**2.2×** on the cipher kernel).
+- **GoWay-Aligned Relay Buffer Ceiling (Perf Step 2)**:
+  - New shared `runtime::relay_buffer_size` honors `-W` up to 12 MiB (GoWay BufPool parity); 9 relay read sites across `runtime/mux_pool/wss_client/nonmux/quic` previously truncated at 1 MiB.
+  - 128 KiB default behavior unchanged; only high `-W` (e.g. `-W 1024/4096` + large `--socket-buffer`) now takes effect.
+  - Live check: 2 MiB bulk through MUX with `-W 4096` byte-identical end to end.
+- **PGO Build Pipeline (Perf Step 3)**:
+  - New `scripts/pgo-build.ps1`: instrument → train → `llvm-profdata merge` → `-Cprofile-use` rebuild (requires `rustup component add llvm-tools`).
+  - Measured outcome: unit-test-trained profile **regressed** steady-state relay throughput ~15-20% (c8/c32 medians) — training data marks async relay loops as cold. PGO binary **not shipped**; `dist` keeps the normal release build.
+  - Correct training needs a cleanly-exiting relay workload (killed `e2e_bench` children never flush `.profraw`); blocked on graceful-shutdown support.
+- **Browser-Profile Rotation & TLS Fingerprint Parity (A)**:
+  - New 7-profile table in `src/ws.rs` (Chrome 136 ×3 / Edge 136 / Firefox 138 ×2 / Android Chrome) mirroring GoWay; random profile per handshake; middle headers Fisher-Yates shuffled with fixed top/bottom; Firefox profiles omit `sec-ch-ua` like real Firefox.
+  - `src/tls.rs` orders ring cipher suites / key-exchange groups per profile (Chromium vs Firefox order, X25519-first), cached per (profile, verify) config; RSA/CBC and P-521 unavailable in ring are documented gaps.
+  - Exposed `connect_with_profile` / `build_client_handshake_request_with_profile` for future TLS+HTTP identity correlation (GoWay draws them independently).
 
 ### Added
 - **GoWay CLI `-l` / `--local` Flag Support**:

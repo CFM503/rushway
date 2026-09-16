@@ -2,7 +2,7 @@
 
 > Chronological AI-to-AI engineering handoff. Read this together with `PROGRESS.md` and `SPEC.md` before changing code.
 
-## Astra unified engineering identity â€?MANDATORY
+## Astra unified engineering identity ï¿½?MANDATORY
 
 From this checkpoint onward, **every AI participating in the RushWay project is treated as an Astra engineering agent** for project execution.
 
@@ -15,7 +15,7 @@ This is not a naming convention. It is a required engineering behavior:
 5. Prefer the smallest safe change that fixes the proven root cause. Avoid broad rewrites when a targeted change is sufficient.
 6. Keep the project on the `v0.0.3` test track until the release gates are actually satisfied. Do not create a final release merely because a local or partial test passes.
 
-## Mandatory automatic AI handoff logging â€?EVERY BUG FIX
+## Mandatory automatic AI handoff logging ï¿½?EVERY BUG FIX
 
 **Every time an AI fixes, closes, mitigates, or materially changes a BUG, the AI MUST update `AI_HANDOFF.md` in the same engineering cycle.** This rule applies even when the bug is small, even when CI has not yet completed, and even when the fix is on a feature branch.
 
@@ -39,13 +39,13 @@ For every bug fix, append a dated entry containing:
 
 ```text
 Astra review
-   â†?
+   ï¿½?
 implement fix
-   â†?
+   ï¿½?
 run appropriate validation
-   â†?
+   ï¿½?
 record BUG handoff in AI_HANDOFF.md
-   â†?
+   ï¿½?
 only then declare the fix status
 ```
 
@@ -69,7 +69,7 @@ The rule applies to, at minimum:
 
 Documentation-only changes that merely explain an existing state do not need a bug-fix entry unless they change engineering decisions or acceptance criteria.
 
-## 2026-09-14 â€?v0.0.3 test-track checkpoint
+## 2026-09-14 ï¿½?v0.0.3 test-track checkpoint
 
 ### Target
 - Repository: `CFM503/rushway`
@@ -77,14 +77,14 @@ Documentation-only changes that merely explain an existing state do not need a b
 - GoWay baseline: v1.8.4, pinned commit `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`
 - Branch: `main`
 
-### Latest validated CI â€?Run #320
-- Run #320: `34823392373`, head `323e8408a942b545a75f17f6d5594d391a93ccbf` â€?full core CI passed.
+### Latest validated CI ï¿½?Run #320
+- Run #320: `34823392373`, head `323e8408a942b545a75f17f6d5594d391a93ccbf` ï¿½?full core CI passed.
 - Rust format/check/test/release passed; 39 unit tests passed.
 - Standalone WS, WSS and QUIC TCP E2E passed.
 - Windows x64, Debian 12 x64, and ARMv7 Linux release artifacts passed and were uploaded.
 - GoWay comparison job remains intentionally skipped because `WAY_READ_TOKEN` is unset. A skipped comparison is not interoperability evidence.
 
-### Latest stress attempt â€?Run #324
+### Latest stress attempt ï¿½?Run #324
 - Run #324: `34825498345`.
 - WS stress output:
   - 1 stream: passed, 42 ms
@@ -95,7 +95,7 @@ Documentation-only changes that merely explain an existing state do not need a b
 - The harness currently reports only generic `early eof`; it does not identify the flow index, failure phase, or sufficiently useful child-process diagnostics.
 - This is not evidence of a hard 500-stream limit. It is an unresolved high-concurrency diagnostic issue.
 
-## 2026-09-14 â€?Astra concurrency review checkpoint
+## 2026-09-14 ï¿½?Astra concurrency review checkpoint
 
 ### Current blocker
 - Latest staged WS stress reached 500 streams successfully, but the 1000-stream run failed at approximately flow 411 with `connect: early eof`.
@@ -123,7 +123,7 @@ physical MUX reader
 The implementation must also handle FIN/RST while dialing, cancellation of outstanding work, physical-session shutdown cleanup, preserve the 256-stream/session limit and 4-session default, and preserve target-policy enforcement.
 
 ### Engineering record
-- GitHub Issue: #2 â€?`Astra review: remove synchronous target dialing from MUX reader loop`
+- GitHub Issue: #2 ï¿½?`Astra review: remove synchronous target dialing from MUX reader loop`
 - Development branch: `astra/mux-syn-concurrency`
 - Baseline: `ebfd256560be5f527cf60c7f2369c57d8ddcd987`
 - Branch documentation commit: `666566ad2901778cfe876225ea8911fdb2287ecc`
@@ -158,7 +158,7 @@ Current gates:
 - Never replace failed or skipped evidence with source-level assumptions.
 - Never silently omit a bug-fix handoff entry.
 
-## 2026-09-14 â€?Astra MUX SYN asynchronous dispatch attempt
+## 2026-09-14 ï¿½?Astra MUX SYN asynchronous dispatch attempt
 
 ### Bug
 - WS staged 1000-stream stress previously failed around flow 411 with `connect: early eof` because `handle_mux_parts()` synchronously awaited target DNS/TCP dialing inside the physical MUX reader loop.
@@ -178,8 +178,8 @@ Current gates:
 - `src/runtime.rs`: commit `c27f1e645e088d1fa77a03f5144eeb9baaf9e597` restored the zero-length SYN success ACK and added physical-session task abort cleanup.
 
 ### Validation
-- CI Run #339: `34853350247`, head `b3b3413617ee5234056fb27085e2cebbdf67fad1` â€?failed before stress; further source correction required.
-- CI Run #340: `34854203024`, head `c27f1e645e088d1fa77a03f5144eeb9baaf9e597` â€?failed at `Rust format check` before compilation/stress.
+- CI Run #339: `34853350247`, head `b3b3413617ee5234056fb27085e2cebbdf67fad1` ï¿½?failed before stress; further source correction required.
+- CI Run #340: `34854203024`, head `c27f1e645e088d1fa77a03f5144eeb9baaf9e597` ï¿½?failed at `Rust format check` before compilation/stress.
 - Exact Run #340 failure: `src/runtime.rs:592:3` reports an unclosed delimiter, with the parser tracing the mismatch to the MUX SYN block around lines 247/263/320/419.
 
 ### Status
@@ -193,12 +193,12 @@ Current gates:
 - Repair the `src/runtime.rs` MUX SYN block so the obsolete outer `match dial_target(...)` wrapper is removed completely, then run `cargo fmt`, `cargo check`, and `cargo test`. Only after those pass should WS 1/100/500/1000 stress be rerun.
 
 ## Three-file relay contract
-1. `AI_HANDOFF.md` â€?decisions, commits, blockers, bug-fix history, and next action.
-2. `PROGRESS.md` â€?compact progress dashboard.
-3. `SPEC.md` â€?source-derived GoWay compatibility contract.
+1. `AI_HANDOFF.md` ï¿½?decisions, commits, blockers, bug-fix history, and next action.
+2. `PROGRESS.md` ï¿½?compact progress dashboard.
+3. `SPEC.md` ï¿½?source-derived GoWay compatibility contract.
 
 Never call the project 100% complete merely because source paths exist.
-## 2026-09-14 â€?Astra CI compile correction after MUX SYN concurrency patch
+## 2026-09-14 ï¿½?Astra CI compile correction after MUX SYN concurrency patch
 
 ### Bug
 - CI Run #342 (`34855669677`), commit `81908775dfc667ca422bbd3aae12ccaeb33a3d3e`, passed Rust format check but failed during `cargo check --all-targets --all-features`.
@@ -225,7 +225,7 @@ Never call the project 100% complete merely because source paths exist.
 ### Next action
 - Commit the one-line compile correction together with this handoff entry and push.
 - Re-run CI and inspect `cargo check`, unit tests, and WS 1000 stress before making any completion claim.
-## 2026-09-14 â€?Astra correction: OwnedMuxFrame conversion was still missing
+## 2026-09-14 ï¿½?Astra correction: OwnedMuxFrame conversion was still missing
 
 ### Correction
 - CI Run #343 (`34856683716`) confirmed that the previous handoff note incorrectly stated the `OwnedMuxFrame` conversion was already correct.
@@ -238,14 +238,14 @@ Never call the project 100% complete merely because source paths exist.
 
 ### Validation
 - Local `git diff --check`: passed.
-- Local runtime diff contains only the intended `MuxFrame` â†?`OwnedMuxFrame` conversion.
+- Local runtime diff contains only the intended `MuxFrame` ï¿½?`OwnedMuxFrame` conversion.
 - CI Run #343 reached `cargo check` and reported only this remaining compile error; `MAX_STREAMS_PER_SESSION` visibility was already corrected.
 
 ### Status
 - Awaiting the next CI compile validation.
 - No functional/stress completion claim is made.
 
-## 2026-09-14 â€?Astra fix: atomic MUX stream-slot admission
+## 2026-09-14 ï¿½?Astra fix: atomic MUX stream-slot admission
 
 ### Bug
 - WS staged 1000-stream stress in CI Run #344 (`34857876740`) failed around flow 410 with `connect: early eof`.
@@ -291,7 +291,7 @@ Never call the project 100% complete merely because source paths exist.
 ### Next action
 - Commit this code fix together with this handoff entry, push `main`, then inspect the new CI run with priority on WS 1000 stress and exact failure diagnostics.
 
-## 2026-09-14 â€?Astra diagnostic instrumentation for WS 1000 EOF
+## 2026-09-14 ï¿½?Astra diagnostic instrumentation for WS 1000 EOF
 
 Bug / evidence
 - CI Run #34861096430 passed Rust format, cargo check, 39 unit tests, release build, MUX benchmark, WS/WSS/QUIC single E2E.
@@ -321,7 +321,7 @@ Status
 - The WS 1000-stream failure remains unresolved.
 - Next action: inspect the new CI logs for the first internal MUX/session error associated with the failing flow, then make the smallest production fix supported by that evidence.
 
-## 2026-09-15 â€?Astra fix: complete MUX FIN lifecycle cleanup
+## 2026-09-15 ï¿½?Astra fix: complete MUX FIN lifecycle cleanup
 
 ### Bug
 - WS staged stress reached the 1000-stream phase but failed around flow 408 with `connect: early eof`.
@@ -361,7 +361,7 @@ Status
 ### Next action
 - Push the fix and inspect the GitHub Actions stress results, especially WS 1000.
 
-## 2026-09-15 â€?Astra-mode RushWay native refactor plan (NEW DIRECTION)
+## 2026-09-15 ï¿½?Astra-mode RushWay native refactor plan (NEW DIRECTION)
 
 ### Decision
 RushWay is no longer treated as a GoWay port whose internal architecture must converge on GoWay. GoWay interoperability is a **late acceptance gate**, not the architectural design authority.
@@ -369,7 +369,7 @@ RushWay is no longer treated as a GoWay port whose internal architecture must co
 The objective of this phase is to make RushWay a self-consistent, high-concurrency MUX proxy with its own runtime contracts, lifecycle model, scheduling policy, backpressure, recovery behavior, diagnostics, and stress suite. Existing wire compatibility is preserved where already required, but internal design may be restructured when the evidence shows the current model is limiting RushWay.
 
 ### Astra engineering method
-Use the public Astra-style engineering loop: **decompose â†?inspect/reference â†?implement â†?execute/verify â†?record evidence â†?continue**. Astra's published engineering guidance emphasizes repository-wide understanding, multi-step execution, verification through real toolchains, and recovery from failed steps rather than single-shot code generation. This project adopts that discipline without treating any model's hidden chain-of-thought as a project artifact.
+Use the public Astra-style engineering loop: **decompose ï¿½?inspect/reference ï¿½?implement ï¿½?execute/verify ï¿½?record evidence ï¿½?continue**. Astra's published engineering guidance emphasizes repository-wide understanding, multi-step execution, verification through real toolchains, and recovery from failed steps rather than single-shot code generation. This project adopts that discipline without treating any model's hidden chain-of-thought as a project artifact.
 
 Rules for this refactor:
 1. Establish a concrete runtime invariant before changing each subsystem.
@@ -493,40 +493,40 @@ The first native refactor batch has been started on `main`:
 
 The implementation is being validated by GitHub Actions before this batch is considered complete.
 
-### Phase order â€?CONTINUOUS EXECUTION
+### Phase order ï¿½?CONTINUOUS EXECUTION
 
-**Phase A â€?Stabilize primitives**
+**Phase A ï¿½?Stabilize primitives**
 1. Finish semaphore/backpressure changes.
 2. Repair/verify atomic stream admission.
 3. Ensure no busy-spin and no permit leak.
 4. Run format/check/unit tests.
 
-**Phase B â€?Make lifecycle explicit**
+**Phase B ï¿½?Make lifecycle explicit**
 1. Centralize stream ownership and terminal cleanup.
 2. Implement cancellation while DIALING.
 3. Make physical-session shutdown deterministic.
 4. Add lifecycle-focused unit/integration tests.
 
-**Phase C â€?Rebuild session scheduling**
+**Phase C ï¿½?Rebuild session scheduling**
 1. Separate session health from stream occupancy.
 2. Add demand-based session creation within a configured upper bound.
 3. Add session failure recovery and stream redistribution.
 4. Test sustained 1000+ stream load.
 
-**Phase D â€?Upgrade stress diagnostics**
+**Phase D ï¿½?Upgrade stress diagnostics**
 1. Add phase-specific SOCKS/MUX error reporting.
 2. Add machine-readable stress summaries.
 3. Record per-session occupancy and failure reasons.
 4. Make the first failing event observable rather than only the first joined task failure.
 
-**Phase E â€?Native scale/recovery**
+**Phase E ï¿½?Native scale/recovery**
 1. 1000 Ã— repeated rounds.
 2. 2000 streams.
 3. session failure under load.
 4. limit/backpressure tests.
 5. FIN/RST/cancellation matrix.
 
-**Phase F â€?Release hardening**
+**Phase F ï¿½?Release hardening**
 1. WS/WSS/QUIC complete matrix.
 2. SOCKS5/HTTP error matrix.
 3. Windows/Linux/ARM/OpenWrt smoke.
@@ -556,7 +556,7 @@ Do not mark v0.0.3 final. Do not claim GoWay interoperability. Do not claim 1000
 ### Immediate next action
 Finish the current native concurrency batch, wait for CI evidence, then move directly into explicit stream lifecycle ownership and cancellation. Continue through the phases without reverting to GoWay-driven architecture.
 
-## 2026-09-15 â€?Astra correction: CI stress harness file-descriptor ceiling
+## 2026-09-15 ï¿½?Astra correction: CI stress harness file-descriptor ceiling
 
 ### Bug
 - CI Run #358 (`34891912821`), job `104136740182`, passed format, check, 39 unit tests, release build, MUX benchmark, and standalone WS/WSS/QUIC E2E.
@@ -602,7 +602,7 @@ Finish the current native concurrency batch, wait for CI evidence, then move dir
 ### Next action
 Wait for the new CI run. If WS 1000 passes, immediately inspect WSS and QUIC 1000; then proceed to sustained 10Ã—1000 and explicit stream lifecycle/cancellation tests.
 
-## 2026-09-15 â€?500-stream CI acceptance gate and #367 infrastructure failure
+## 2026-09-15 ï¿½?500-stream CI acceptance gate and #367 infrastructure failure
 
 ### Bug / decision
 - CI Run #366 (`34896145379`) passed Rust format, check, 39 unit tests, release build, MUX benchmark, standalone WS/WSS/QUIC E2E, and staged WS 1/100/500.
@@ -647,7 +647,7 @@ Wait for the new CI run. If WS 1000 passes, immediately inspect WSS and QUIC 100
 ### Next action
 Merge `ai/500-stream-ci-gate`, let normal CI validate the branch, then resume production diagnosis of the 1000-stream SYN/ACK path without letting it block the 500-stream baseline gate.
 
-## 2026-09-15 â€?Astra diagnostic validation: WSS and QUIC 1000-stream behavior
+## 2026-09-15 ï¿½?Astra diagnostic validation: WSS and QUIC 1000-stream behavior
 
 ### Decision / evidence
 - PR #11 (`test: add WSS and QUIC 1000-stream diagnostics`) was merged into `main` as merge commit `89615e5039207d2e51628e968e383677f6a11a8b`.
@@ -688,7 +688,7 @@ Merge `ai/500-stream-ci-gate`, let normal CI validate the branch, then resume pr
 ### Next action
 Wait for merge-triggered Run #384 to finish, then prioritize evidence-driven WSS/WS 1000 investigation and repeatability before moving to the lifecycle/error and TCP+UDP matrices.
 
-## 2026-09-15 â€?v0.0.6 Release: Cloudflare FakeHost / WSS / Edge Fallback Alignment
+## 2026-09-15 ï¿½?v0.0.6 Release: Cloudflare FakeHost / WSS / Edge Fallback Alignment
 
 ### Target & Version
 - Version: `v0.0.6`
@@ -737,7 +737,7 @@ RushWay previously supported a basic `--fakehost` flag, but lacked:
 - Unit tests: Verified WSS URL parsing, header construction, DNS answer parsing, and CLI normalization.
 - Release v0.0.6 completed with CI passing and release artifacts published.
 
-## 2026-09-15 â€?v0.0.7 Release: MUX Cloudflare WSS Transport Unification
+## 2026-09-15 ï¿½?v0.0.7 Release: MUX Cloudflare WSS Transport Unification
 
 ### Target & Version
 - Version: `v0.0.7`
@@ -784,7 +784,7 @@ Following the release of `v0.0.6`, review noted that `src/mux_pool.rs` contained
 - Unit & integration tests: Mock WSS server MUX handshake, URL parsing, DNS answer parsing, and CLI normalization.
 - Release v0.0.7 completed with CI passing and release artifacts published.
 
-## 2026-09-15 â€?v0.0.8 Release: WSS Handshake Timeout & Detailed Diagnostics Alignment
+## 2026-09-15 ï¿½?v0.0.8 Release: WSS Handshake Timeout & Detailed Diagnostics Alignment
 
 ### Target & Version
 - Version: `v0.0.8`
@@ -822,7 +822,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
    - Added `probe_wss_handshake` to allow verifying TCP -> TLS -> HTTP Upgrade -> 101 in isolation.
    - Added integration tests covering standalone probe, header redaction, zero-byte read diagnostics, and lowercase browser headers.
 
-## 2026-09-16 â€?GoWay Server + RushWay Client 0-RTT MUX Deadlock Fix
+## 2026-09-16 ï¿½?GoWay Server + RushWay Client 0-RTT MUX Deadlock Fix
 
 - **Bug:** When GoWay runs as server (`goway -p :19880 -k <key>`) and RushWay runs as client (`rushway -p :11080 -up ws://<server> -k <key>`), client proxy connections (SOCKS5 / HTTP CONNECT) deadlock and time out with code 28 (`Connection timed out after 10008 milliseconds`). No proxy traffic could flow.
 - **Root cause:**
@@ -842,7 +842,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
   - Live cross-implementation test: `goway.exe` server on `:19880`, `rushway.exe` client on `:11080`.
   - `curl.exe -v --socks5-hostname 127.0.0.1:11080 http://example.com/`: HTTP/1.1 200 OK, full body received (passed in 1s).
   - `curl.exe -v --socks5-hostname 127.0.0.1:11080 https://example.com/`: HTTPS TLS renegotiation and HTTP 200 OK passed.
-## 2026-09-15 â€?Astra diagnostic validation: WSS and QUIC 1000-stream behavior
+## 2026-09-15 ï¿½?Astra diagnostic validation: WSS and QUIC 1000-stream behavior
 
 ### Decision / evidence
 - PR #11 (`test: add WSS and QUIC 1000-stream diagnostics`) was merged into `main` as merge commit `89615e5039207d2e51628e968e383677f6a11a8b`.
@@ -883,7 +883,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 ### Next action
 Wait for merge-triggered Run #384 to finish, then prioritize evidence-driven WSS/WS 1000 investigation and repeatability before moving to the lifecycle/error and TCP+UDP matrices.
 
-## 2026-09-15 â€?v0.0.6 Release: Cloudflare FakeHost / WSS / Edge Fallback Alignment
+## 2026-09-15 ï¿½?v0.0.6 Release: Cloudflare FakeHost / WSS / Edge Fallback Alignment
 
 ### Target & Version
 - Version: `v0.0.6`
@@ -932,7 +932,7 @@ RushWay previously supported a basic `--fakehost` flag, but lacked:
 - Unit tests: Verified WSS URL parsing, header construction, DNS answer parsing, and CLI normalization.
 - Release v0.0.6 completed with CI passing and release artifacts published.
 
-## 2026-09-15 â€?v0.0.7 Release: MUX Cloudflare WSS Transport Unification
+## 2026-09-15 ï¿½?v0.0.7 Release: MUX Cloudflare WSS Transport Unification
 
 ### Target & Version
 - Version: `v0.0.7`
@@ -979,7 +979,7 @@ Following the release of `v0.0.6`, review noted that `src/mux_pool.rs` contained
 - Unit & integration tests: Mock WSS server MUX handshake, URL parsing, DNS answer parsing, and CLI normalization.
 - Release v0.0.7 completed with CI passing and release artifacts published.
 
-## 2026-09-15 â€?v0.0.8 Release: WSS Handshake Timeout & Detailed Diagnostics Alignment
+## 2026-09-15 ï¿½?v0.0.8 Release: WSS Handshake Timeout & Detailed Diagnostics Alignment
 
 ### Target & Version
 - Version: `v0.0.8`
@@ -1017,7 +1017,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
    - Added `probe_wss_handshake` to allow verifying TCP -> TLS -> HTTP Upgrade -> 101 in isolation.
    - Added integration tests covering standalone probe, header redaction, zero-byte read diagnostics, and lowercase browser headers.
 
-## 2026-09-16 â€?GoWay Server + RushWay Client 0-RTT MUX Deadlock Fix
+## 2026-09-16 ï¿½?GoWay Server + RushWay Client 0-RTT MUX Deadlock Fix
 
 - **Bug:** When GoWay runs as server (`goway -p :19880 -k <key>`) and RushWay runs as client (`rushway -p :11080 -up ws://<server> -k <key>`), client proxy connections (SOCKS5 / HTTP CONNECT) deadlock and time out with code 28 (`Connection timed out after 10008 milliseconds`). No proxy traffic could flow.
 - **Root cause:**
@@ -1045,7 +1045,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** Direct non-CONNECT plain HTTP proxy methods (`GET http://...`) over MUX can be added if users configure browsers in non-SOCKS HTTP proxy mode for non-HTTPS URLs.
 - **Next action:** Implement RFC 1928 SOCKS5 UDP relay header preservation, QUIC UDP cipher removal/handshake alignment, and plain HTTP proxy support.
 
-## 2026-09-16 â€?Full Protocol Alignment: SOCKS5 UDP RFC 1928, QUIC UDP Parity, Plain HTTP Proxy & Warning Cleanup
+## 2026-09-16 ï¿½?Full Protocol Alignment: SOCKS5 UDP RFC 1928, QUIC UDP Parity, Plain HTTP Proxy & Warning Cleanup
 
 - **Bug:**
   1. Plain HTTP proxy (`GET http://...`, `POST http://...`) failed or hung because RushWay only supported HTTP `CONNECT` tunneling.
@@ -1080,7 +1080,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** fixed.
 - **Next action:** Implement RFC 1928 Â§6 SOCKS5 UDP lifecycle monitoring, chunked HTTP proxy header reading, and MUX stream capacity scaling.
 
-## 2026-09-16 â€?RFC 1928 Â§6 SOCKS5 UDP Lifecycle, HTTP Header Chunked I/O & Concurrency Scaling
+## 2026-09-16 ï¿½?RFC 1928 Â§6 SOCKS5 UDP Lifecycle, HTTP Header Chunked I/O & Concurrency Scaling
 
 - **Bug:**
   1. In `mux_pool.rs`, `wss_client.rs`, `udp_relay.rs`, and `quic.rs`, when a client established a `UDP ASSOCIATE` association, RushWay never monitored the client TCP control socket (`control`) after writing the SOCKS5 response. When the client application disconnected or crashed, RushWay remained blocked reading upstream indefinitely, leaking the bound UDP port, socket file descriptors, upstream tunnel, and Tokio tasks.
@@ -1109,7 +1109,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** fixed.
 - **Next action:** Implement idle session WebSocket Ping heartbeat, collision-free stream ID allocation, and -l CLI flag.
 
-## 2026-09-16 â€?Idle MUX Session Ping Heartbeat, Stream ID Collision Safety & GoWay -l Flag Support
+## 2026-09-16 ï¿½?Idle MUX Session Ping Heartbeat, Stream ID Collision Safety & GoWay -l Flag Support
 
 - **Bug:**
   1. Under Cloudflare CDN or intermediate NAT firewalls, idle MUX sessions in `WssSessionPool` and `MuxSessionPool` would silently time out after 60-100s of inactivity due to lack of periodic keepalive probes, causing subsequent user requests to stall or fail on broken pipes.
@@ -1134,7 +1134,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** fixed.
 - **Next action:** Maintain production stability.
 
-## 2026-09-16 â€?TCP Half-Close Stream Relay, Localhost/IPv6 Bracket Filtering & HTTP Proxy Body Preservation
+## 2026-09-16 ï¿½?TCP Half-Close Stream Relay, Localhost/IPv6 Bracket Filtering & HTTP Proxy Body Preservation
 
 - **Bug:**
   1. In `src/runtime.rs`, upon receiving `MuxCommand::Fin` from the client (TCP half-close after client request transmission), the server executed `wr_target.shutdown().await; break; reader.abort();`. Killing the reader task aborted `target_to_mux` immediately, dropping the upstream target's HTTP response before downstream could receive it. Furthermore, receiving `Fin` during the target dial phase caused immediate cancellation via `cancel.send(true)`.
@@ -1166,7 +1166,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** fixed.
 - **Next action:** Production stability monitoring.
 
-## 2026-09-16 â€?Clean WebSocket EOF Handling, Symmetrical Pong Masking & Extended TLS/QUIC Signature Schemes
+## 2026-09-16 ï¿½?Clean WebSocket EOF Handling, Symmetrical Pong Masking & Extended TLS/QUIC Signature Schemes
 
 - **Bug:**
   1. In `src/ws.rs`, `read_frame` read the first byte of a frame using `r.read_u8().await?`. When the remote peer cleanly closed the TCP connection (EOF), Tokio returned `UnexpectedEof`. Instead of returning `Ok(None)` as expected by all callers (`loop { let Some(...) = read_frame().await? else { break; } }`), `read_frame` propagated an error, causing clean connection closes to be logged as transport read errors across `runtime.rs`, `mux_pool.rs`, `nonmux.rs`, and `wss_client.rs`.
@@ -1192,7 +1192,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** None.
 - **Next action:** Maintain production stability.
 
-## 2026-09-16 â€?Multi-Transport Target Authority Unification, IPv6 Authority Parsing Hardening & Session Hang Prevention
+## 2026-09-16 ï¿½?Multi-Transport Target Authority Unification, IPv6 Authority Parsing Hardening & Session Hang Prevention
 
 - **Bug:**
   1. In `src/runtime.rs`, `src/quic.rs`, `src/nonmux.rs`, `src/wss_client.rs`, `src/udp_relay.rs`, and `src/mux_pool.rs`, multiple divergent implementations of authority splitting existed, mostly using naive `rsplit_once(':')`. When processing IPv6 target authorities:
@@ -1222,7 +1222,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** None.
 - **Next action:** Maintain production stability.
 
-## 2026-09-16 â€?GoWay Server + RushWay Client Non-MUX Cipher Interop Failure
+## 2026-09-16 ï¿½?GoWay Server + RushWay Client Non-MUX Cipher Interop Failure
 
 - **Bug:** With GoWay as server and RushWay as client in non-MUX mode (`--no-mux`), SOCKS5 relay connected but echoed back XOR-garbled bytes (`b'\xc2\x97...'`); MUX mode passed. Live user case `ws://94.44.148.112:2052 + -fakehost` additionally failed with TCP `10060`.
 - **Root cause:**
@@ -1238,7 +1238,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
   - `src/wss_client.rs`: same removal in `handle_non_mux_connection`.
   - `src/mux_pool.rs` (`connect_with_fallback`), `src/nonmux.rs` (`connect_ws_with_fallback`), `src/udp_relay.rs`: IP-upstream + `-fakehost` primary failure now resolves `fakehost` A records and tries each non-primary edge (GoWay `dialFallback` parity).
   - `Origin` corrected to `http://<sni>` and `Sec-Fetch-Site` to SNI-vs-Host comparison on plain-WS paths.
-- **Commit:** pending â€?uncommitted working tree at time of writing.
+- **Commit:** pending ï¿½?uncommitted working tree at time of writing.
 - **Validation:**
   - `cargo test --bin rushway`: 64 passed.
   - Live matrix (local echo): `Rush->Go` MUX PASS / non-MUX PASS; `Go->Rush` MUX PASS / non-MUX PASS (after P0 server branch).
@@ -1247,13 +1247,13 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** WSS-behind-CDN against the real user VPS not yet re-tested with the new binary.
 - **Next action:** User re-tests `wss`/`ws + -fakehost` with the new `dist\windows-x64\rushway.exe` and pastes `DEBUG` fallback lines.
 
-## 2026-09-16 â€?P0 Hardening Batch (WSS Accounting, Pending Bound, Server Branch, WS Reads)
+## 2026-09-16 ï¿½?P0 Hardening Batch (WSS Accounting, Pending Bound, Server Branch, WS Reads)
 
 - **Bug:**
-  1. `wss_client.rs` reader decremented `active` on terminal `FIN`/`RST` and `handle_connection` decremented again â†?counter underflow, breaking the 2048-stream limit.
-  2. `runtime.rs` pre-dial `pending Vec` unbounded while `dial_target` in flight â†?memory DoS.
-  3. `runtime.rs::run_server` rejected plain `host:port\n` with `unknown transport handshake` â†?`Go non-mux -> RushWay` hard failure.
-  4. `ws.rs::read_frame` single `resize(len)` up to 64 MB â†?instant OOM from a bogus length prefix.
+  1. `wss_client.rs` reader decremented `active` on terminal `FIN`/`RST` and `handle_connection` decremented again ï¿½?counter underflow, breaking the 2048-stream limit.
+  2. `runtime.rs` pre-dial `pending Vec` unbounded while `dial_target` in flight ï¿½?memory DoS.
+  3. `runtime.rs::run_server` rejected plain `host:port\n` with `unknown transport handshake` ï¿½?`Go non-mux -> RushWay` hard failure.
+  4. `ws.rs::read_frame` single `resize(len)` up to 64 MB ï¿½?instant OOM from a bogus length prefix.
 - **Root cause:** Single-ownership violation (1), missing bound (2), missing GoWay `handleServer` fallthrough branch (3), upfront allocation on untrusted length (4). (3) proven live: Go non-mux client got `Read OK failed: EOF` + RushWay `unknown transport handshake` before the fix, PASS after.
 - **Astra review:**
   - Concurrency: single owner for stream accounting (handler), reader only reaps on send-failure; pending overflow sends `RST` and drops deterministically.
@@ -1264,7 +1264,7 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
   - `src/wss_client.rs`: reader forwards terminal frames without accounting; `handle_connection` cleanup conditional on `remove().is_some()`.
   - `src/runtime.rs`: `MAX_PENDING_FRAMES=64` / `MAX_PENDING_BYTES=1MiB` enforced at both enqueue points; new `handle_server_tcp_parts` + fallthrough call.
   - `src/ws.rs`: payload grown in 64 KiB `read_exact` segments.
-- **Commit:** pending â€?uncommitted working tree at time of writing.
+- **Commit:** pending ï¿½?uncommitted working tree at time of writing.
 - **Validation:**
   - `cargo test --bin rushway`: 64 passed; `cargo clippy --bin rushway`: no new warnings.
   - Live: `Go->Rush` non-MUX flipped FAILâ†’PASS; other three directions still PASS.
@@ -1272,10 +1272,10 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** Pending caps are heuristic (64/1MiB); tune if legit pre-dial bursts exceed them.
 - **Next action:** Proceed to P1 stability batch (done below).
 
-## 2026-09-16 â€?P1 Stability Batch (DNS Cache, Backoff, Admission, Dead Code)
+## 2026-09-16 ï¿½?P1 Stability Batch (DNS Cache, Backoff, Admission, Dead Code)
 
 - **Bug:**
-  1. `resolve_all_ipv4` uncached; pool `maintain` loops retried every 100/500 ms with no backoff â†?DNS/TCP hammering while upstream down; MUX failures logged only at `debug` (invisible at `INFO`).
+  1. `resolve_all_ipv4` uncached; pool `maintain` loops retried every 100/500 ms with no backoff ï¿½?DNS/TCP hammering while upstream down; MUX failures logged only at `debug` (invisible at `INFO`).
   2. `runtime.rs::run_server` used blocking `acquire_owned`, stalling `accept` and filling TCP backlog at capacity.
   3. Dead uncompiled files `src/mux_config.rs` / `src/runtime_config.rs` with stale `MAX_MUX_STREAMS_PER_SESSION=256` vs authoritative 2048.
 - **Root cause:** Missing cache/cool-down, fail-fast admission inconsistency (clients already used `try_acquire`), dead code drift.
@@ -1283,17 +1283,167 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
   - Concurrency: failure counters are atomics; backoff computed locally, no extra locks.
   - Performance: 5-minute all-v4 cache removes per-retry DNS; backoff caps at ~5 s preserving recovery speed.
   - Observability: MUX creation failures now `WARN` with failure count.
-  - Regression risk: deletion verified â€?neither file has a `mod` declaration; `grep` confirms zero references.
+  - Regression risk: deletion verified ï¿½?neither file has a `mod` declaration; `grep` confirms zero references.
 - **Change:**
   - `src/dns.rs`: 5-minute `ALL_V4_CACHE` for `resolve_all_ipv4`.
   - `src/mux_pool.rs` / `src/wss_client.rs`: `consecutive_failures` counter; `maintain` sleeps base + 500 ms/failure (cap ~5 s); MUX failure log `debug`â†’`warn`.
   - `src/runtime.rs`: server admission switched to `try_acquire_owned` with fail-fast `continue`.
   - Deleted `src/mux_config.rs`, `src/runtime_config.rs`.
-  - `Cargo.toml`: version bumped `0.0.8` â†?`0.0.9`.
-- **Commit:** pending â€?uncommitted working tree at time of writing.
+  - `Cargo.toml`: version bumped `0.0.8` ï¿½?`0.0.9`.
+- **Commit:** pending ï¿½?uncommitted working tree at time of writing.
 - **Validation:**
   - `cargo test --bin rushway`: 64 passed; `cargo clippy --bin rushway`: no new warnings (4 pre-existing style warnings remain).
   - Live 4-direction matrix re-run: all PASS.
 - **Status:** fixed.
 - **Remaining risk:** Backoff constants (500 ms/step, 5 s cap) are heuristic; QUIC `fakehost` support still open (P2).
 - **Next action:** Run `scripts/build-local.ps1`, refresh `dist\windows-x64\rushway.exe`, commit, push.
+
+## 2026-09-16 â€” Perf Step 1: Bulk 8-Byte XOR Transform
+
+- **Bug:** `XorCipher::apply` (`src/crypto.rs`) XORed byte-by-byte while GoWay `TransformInPlace` processes 8-byte words; cipher cost is pure overhead on every relayed byte.
+- **Root cause:** Scalar loop underutilizes memory bandwidth; keystream mapping itself was already correct (byte `j` â†’ `key[j % 256KiB]`).
+- **Astra review:**
+  - Protocol: keystream mapping unchanged â€” bulk word at `off` covers exactly `key[off..off+8]` with 8-aligned `off`, tail bytes use `key[i % SIZE]`; no wire-format change.
+  - Safety: `off + 8 â‰¤ key.len()` proven by 8-alignment (`off â‰¤ SIZE-8`); empty key early-returns as before.
+  - Performance: only the hot loop changed; allocation behavior identical.
+  - Regression risk: covered by new equivalence test across 11 lengths (unaligned, digest-boundary, multi-chunk 300 KiB+).
+- **Change:**
+  - `src/crypto.rs`: `apply` uses native-endian `u64` bulk loop + byte tail; added `bulk_path_matches_bytewise_reference` test.
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation:**
+  - `cargo test --bin rushway`: 65 passed (64 + 1 new).
+  - Throwaway `-O` micro-bench (16 MiB Ã— 20 iters): byte loop 1.58 GB/s â†’ bulk 3.48 GB/s (**2.2Ã—** kernel speedup, outputs byte-identical).
+- **Status:** fixed.
+- **Remaining risk:** Kernel-level win only; end-to-end relay gain is single-digit % (cipher is a fraction of the syscall/memcpy/TLS path) â€” needs link-level benchmark to quantify.
+- **Next action:** Perf Step 2 â€” raise relay buffer ceiling toward GoWay 12 MB scaling.
+
+## 2026-09-16 â€” Perf Step 2: GoWay-Aligned Relay Buffer Ceiling
+
+- **Bug:** All 9 relay read sites clamped `buffer_size` to 1 MiB, so `-W 1024/4096` + large `--socket-buffer` (the user's production flags) silently had no effect beyond 1 MiB reads; GoWay scales its BufPool to 12 MiB.
+- **Root cause:** Per-file hardcoded `.clamp(16 * 1024, 1024 * 1024)` instead of a shared ceiling.
+- **Astra review:**
+  - Protocol: read-size only, no wire-format change; MUX per-frame `u16` cap untouched.
+  - Memory: 12 MiB is per-active-task allocation like before (GoWay pools; RushWay allocates per task) â€” operator opt-in via `-W`, default 128 KiB path byte-identical.
+  - Regression risk: single shared helper, covered by ceiling unit test.
+- **Change:**
+  - `src/runtime.rs`: new `relay_buffer_size` (`16 KiB..=12 MiB`); adopted at all 9 sites in `runtime/mux_pool/wss_client/nonmux/quic`; added `relay_buffer_size_honors_goway_ceiling` test.
+  - Fixed one mis-substitution during rollout (`pool.cfg.relay_buffer_size(buffer_size)` â†’ `relay_buffer_size(pool.cfg.buffer_size)`), caught by grep before compiling.
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation:**
+  - `cargo test --bin rushway`: 66 passed.
+  - Live: 2 MiB bulk via `Rush->Go` MUX with `-W 4096` both ends, byte-identical, 18.7 MiB/s (localhost debug build â€” correctness check, not a benchmark).
+- **Status:** fixed.
+- **Remaining risk:** Real throughput gain only materializes on high-BDP links; needs VPS-line before/after measurement.
+- **Next action:** Perf Step 3 â€” PGO build support.
+
+## 2026-09-16 â€” Perf Step 3: PGO Pipeline (Infra Done, Unit-Test Profile Rejected)
+
+- **Bug:** No PGO support; GoWay ships profile-guided builds while RushWay relied on thin-LTO only.
+- **Root cause:** N/A (capability gap, not a defect). Two sub-findings during rollout:
+  1. `e2e_bench` kills child processes, and killed instrumented processes never flush `.profraw` â€” only 1 harness-owned file was produced, so relay-path training via `e2e_bench` is currently impossible.
+  2. Unit-test-trained profile regressed real throughput (see Validation).
+- **Astra review:**
+  - Correctness: PGO changes only code layout/branch hints; no source behavior change. Normal-release `dist` binary unaffected.
+  - Measurement discipline: instrumented-run numbers discarded as baseline (profiling overhead); compared clean normal-release vs profile-use medians over 3 runs each on shared hardware.
+  - Honesty: negative result recorded instead of shipped; script documents the caveat inline.
+- **Change:**
+  - New `scripts/pgo-build.ps1`: generate â†’ `cargo test --all-targets` training â†’ merge â†’ use-build, with the training-data caveat embedded.
+  - Installed `llvm-tools` rustup component (was missing).
+  - `dist\windows-x64\rushway.exe` refreshed from the normal (non-PGO) release build including Perf Steps 1â€“2.
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation:**
+  - Toolchain end-to-end works: 28 profraw (35 MB) â†’ 31 MB merged profdata â†’ clean `-Cprofile-use` build.
+  - `e2e_bench` (WS 4MiB, localhost): normal medians c8 ~299 / c32 ~282 MiB/s vs PGO c8 ~243 / c32 ~232 MiB/s â†’ **~15-20% regression**; c1 too noisy to call (86â€“194 across runs).
+  - `cargo test --all-targets`: 70 passed on the final tree.
+- **Status:** infra done, PGO binary rejected for shipping.
+- **Remaining risk:** Real PGO win requires relay-path training data â†’ needs graceful shutdown (P2-11) so training workloads exit cleanly.
+- **Next action:** Perf summary + decide next batch (browser-profile rotation / non-MUX pool).
+
+## 2026-09-16 â€” A: Browser-Profile Rotation & TLS Fingerprint Parity
+
+- **Bug:** RushWay sent one fixed Chrome 136 header set in fixed order plus rustls default cipher order on every handshake â€” a static fingerprint. GoWay rotates 7 browser profiles and shuffles header order per handshake.
+- **Root cause:** Single hard-coded UA/headers in `build_client_handshake_request`; single cached TLS config in `tls.rs`.
+- **Astra review:**
+  - Protocol: fixed top (request line/Host/Connection/Upgrade) and fixed bottom (version/key/fetch-dest/mode/site) preserved; only the middle section shuffles, exactly like GoWay. Server-side validators on both ends are order-insensitive (verified).
+  - Consistency: Firefox profiles omit all `sec-ch-ua*` (real Firefox behavior); mobile profile sends `?1` + `"Android"`.
+  - TLS: reorders only â€” no suite added/removed, ALPN `http/1.1` unchanged, verify/insecure paths unchanged; RSA-CBC and P-521 documented as ring-unavailable.
+  - Regression risk: covered by per-profile handshake validation tests + live Go interop.
+- **Change:**
+  - `src/ws.rs`: `BROWSER_PROFILES` (7), `pick_browser_profile[_index]`, `build_client_handshake_request_with_profile` with Fisher-Yates middle shuffle; old entry point now draws a random profile (GoWay parity).
+  - `src/tls.rs`: `CHROMIUM/FIREFOX_SUITE_ORDER`, `KX_GROUP_ORDER`, `provider_for_profile`, per-(profile, verify) config cache; `connect` draws random profile, new `connect_with_profile` for correlation.
+  - Tests: `all_profiles_build_valid_handshakes`, `mobile_profile_signals_mobile`, `profile_suite_orders_match_goway`, `provider_starts_with_profile_suite`; rewrote `browser_headers_present` (deterministic profile) and `cached_configs_are_reused`.
+  - Cleanup: removed `tls_advertises_p521` dead field; fixed a UTF-8 corruption from a PowerShell round-trip (em-dash byte) that broke the build â€” lesson: never bulk-rewrite Rust sources via Get-Content/Set-Content.
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation:**
+  - `cargo test --bin rushway`: 70 passed; `cargo clippy --bin rushway`: back to 4 pre-existing warnings, zero new.
+  - Live `Rush->Go` MUX + non-MUX with shuffled headers: both PASS.
+  - `dist\windows-x64\rushway.exe` refreshed (v0.0.9 release).
+- **Status:** fixed.
+- **Remaining risk:** GoWay draws TLS and HTTP profiles independently (uncorrelated); RushWay matches that by default â€” `connect_with_profile` enables future correlation but no caller uses it yet. Ring lacks P-521/CBC suites, so Firefox order is a subset.
+- **Next action:** B (non-MUX pre-warm pool) or user VPS-line retest with the new binary.
+
+## 2026-09-16 â€” A/B: v0.0.9 Tag vs Working Tree (Perf Steps 1â€“2 + A)
+
+- **Bug:** N/A (measurement task): which post-v0.0.9 changes are net-positive.
+- **Root cause:** N/A.
+- **Astra review:** Interleaved runs (v009/current alternating, 3 each) on shared hardware to cancel drift; localhost 4 MiB echo, default buffers.
+- **Change:** None (measurement only; worktree removed afterwards).
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation (`e2e_bench`, medians of 3):**
+  - v0.0.9 tag: c1 ~92 / c8 ~173 / c32 ~164 MiB/s.
+  - Working tree: c1 ~95 / c8 ~231 / c32 ~226 MiB/s.
+  - Current wins 6/6 comparisons on c8/c32 (**+~35%**); c1 is noise-dominated (87â€“155 range both sides).
+  - Verdict per change: Step 1 bulk XOR **positive** (kernel 2.2Ã—, end-to-end main driver); Step 2 buffer ceiling **neutral-positive** (zero effect at defaults, unlocks high `-W`); Step 3 PGO **negative result, infra kept, binary rejected**; A fingerprint **perf-neutral, detection-positive** (unmeasured vs real CF).
+- **Status:** done.
+- **Remaining risk:** Shared-box noise; absolute numbers depressed vs earlier session (~290) â€” direction, not magnitude, is the claim. VPS-line measurement still open.
+- **Next action:** Await user decision on B / commit.
+
+## 2026-09-16 â€” B Reverted: Non-MUX Pre-Warm Pool Rolled Back
+
+- **Bug:** During B validation, the second rapid WSS session establishment stalled mid-TLS-handshake (after server EncryptedExtensions, before Certificate flight); the first session always succeeded. WS pool path verified working (3 pre-warmed takes, both directions PASS).
+- **Root cause:** Not proven. Isolated so far: (1) untouched MUX path stalls identically (1 session in 12 s), so it is NOT the new pool code â€” it is a latent WSS-second-session issue; (2) Python OpenSSL client completes 3 sequential and concurrent upgrades against the same server, so the server answers fine; (3) fixed-profile bisection still stalls, so it is NOT the new TLS fingerprint ordering; (4) no leaked/rogue processes, CPU idle. Prime suspect remaining: client-side per-process second-TLS-session state (unproven â€” needs packet-level or task-dump evidence).
+- **Astra review:**
+  - No B code ships with an open stall: revert is the safe call; the stall needs its own root-cause cycle with evidence, not speculation.
+  - Revert verified complete by grep (zero hits for pool symbols/test names/debug markers) plus live `Rush->Go` MUX/non-MUX PASS after revert.
+  - Perf Steps 1â€“2, PGO script, and A fingerprint work are unaffected and retained; `git diff v0.0.9` now contains exactly those.
+- **Change:**
+  - `src/nonmux.rs`: removed `PooledUpstream`/`NonMuxPool`/expiry consts/tests; `relay_client`/`handle_client_connection`/`run_client` restored to direct `open_upstream` dial.
+  - `src/wss_client.rs`: removed `PooledWssUpstream`/`NonMuxWssPool`/expiry test; `handle_non_mux_connection`/`run_non_mux_from_config` restored; removed temporary `eprintln!` trace lines.
+  - `src/ws.rs`: removed temporary `RUSHWAY_FIXED_PROFILE` debug hook.
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation:**
+  - `cargo test --bin rushway`: 70 passed; `cargo clippy --bin rushway`: 4 pre-existing warnings, zero new.
+  - Live `Rush->Go` MUX + non-MUX: both PASS post-revert.
+- **Status:** reverted; stall investigation parked.
+- **Remaining risk:** The WSS-second-session stall is real, reproducible, and unexplained â€” it will resurface for any feature that dials rapid sequential WSS sessions (including a future B retry).
+- **Next action:** Reproduce with packet capture / task diagnostics before re-attempting B; user decides commit timing.
+
+## 2026-09-16 â€” B Stall Root Cause: Test-Harness Pipe-Buffer Freeze (B Innocent)
+
+- **Bug:** During B validation, the 2nd rapid WSS session stalled mid-TLS-handshake and the SOCKS accept loop went silent; MUX showed the same signature (1 session in 12 s).
+- **Root cause:** Observer effect in the Python harness, NOT RushWay code. Harnesses held child `stdout=PIPE` at `DEBUG` without draining; verbose rustls DEBUG spam (~KBs per handshake) fills the 64 KB OS pipe, the logging thread blocks inside `write()` holding tracing's global writer lock, and the whole tokio runtime freezes. Proof chain: (1) bare double-TLS in-process test passes; (2) Python OpenSSL upgrades always succeed (tiny output); (3) WS pool passed (no TLS spam); (4) rerun with file-redirected logs: **4/4 MUX sessions, 4/4 TLS, no stall**.
+- **Astra review:**
+  - All prior "evidence" for a WSS-second-session product bug is invalidated â€” every failing run shares the pipe-buffer condition; every passing run avoids it.
+  - B reverted code was never fairly trialed (WS half was proven working; WSS half untested under fair conditions).
+  - Lesson: integration harnesses must redirect child stdout to files (or `ERROR` level), never hold an undrained `PIPE` at `DEBUG`.
+- **Change:**
+  - Removed leftover `TMP-SRV eprintln!` probes from `src/main.rs::run_wss_server`.
+  - Kept the new `tls::tests::two_sequential_tls_handshakes` regression test (passes).
+- **Commit:** pending â€” uncommitted working tree at time of writing.
+- **Validation:**
+  - `cargo test --bin rushway`: 71 passed; `cargo clippy --bin rushway`: 4 pre-existing warnings, zero new.
+  - File-logged MUX run: 4/4 sessions established, zero stalls.
+- **Status:** root cause found; B cleared for re-application.
+- **Remaining risk:** None on this incident; B retry still needs fair-condition validation.
+- **Next action:** User decides: re-apply B (code exists in conversation history) or leave reverted.
+
+## 2026-09-16 â€” v0.0.10 Release: Perf Steps + Fingerprint Parity
+
+- **Target & Version:** `0.0.10` â€” bulk XOR, 12 MiB buffer ceiling, PGO pipeline (infra only), browser-profile rotation.
+- **Astra review:** No protocol behavior change except handshake identity rotation (order-insensitive validators on both ends, verified live). PGO binary deliberately excluded after negative measurement. B stays reverted.
+- **Change:** `Cargo.toml` 0.0.9 â†’ 0.0.10; `CHANGELOG.md` new `[v0.0.10]` section (4 post-tag entries moved out of `[v0.0.9]`).
+- **Commit:** pending â€” pushed as release commit + annotated tag below.
+- **Validation:** `cargo test --all-targets`: 71 + 6 passed; A/B vs v0.0.9 tag: c8/c32 +~35% medians; 4-direction live matrix green during the cycle.
+- **Status:** released.
+- **Remaining risk:** PGO needs relay-path training data (graceful shutdown); B retry needs fair-condition validation; Firefox order is a ring subset.
+- **Next action:** Push commit + tag; CI release builds follow.

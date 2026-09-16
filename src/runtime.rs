@@ -102,6 +102,14 @@ pub(crate) fn is_blocked_local_host(host: &str) -> bool {
     }
     false
 }
+/// GoWay-aligned relay read size: honors `-W` up to a 12 MiB ceiling
+/// (GoWay BufPool scales with the configured buffer up to 12 MiB + frame
+/// overhead). The 128 KiB default is unaffected; only high `-W` values
+/// (e.g. `-W 1024` + large `--socket-buffer`) now take effect instead of
+/// being truncated at 1 MiB.
+pub(crate) fn relay_buffer_size(requested: usize) -> usize {
+    requested.clamp(16 * 1024, 12 * 1024 * 1024)
+}
 pub(crate) fn enforce_target_policy(cfg: &RuntimeConfig, target: &TargetAddr) -> Result<()> {
     if cfg.upstream.is_some() && cfg.block_local && is_blocked_local_host(&target.host) {
         bail!("local/LAN target blocked by client policy")
@@ -186,7 +194,7 @@ async fn target_to_mux(
     buffer_size: usize,
     cipher: XorCipher,
 ) {
-    let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
+    let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
     loop {
         match target.read(&mut buf).await {
             Ok(0) => {
@@ -646,7 +654,7 @@ async fn handle_server_tcp_parts(
     let writer_down = writer.clone();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
-        let mut buf = vec![0u8; buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut buf = vec![0u8; relay_buffer_size(buffer_size)];
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
@@ -864,6 +872,18 @@ mod lifecycle_tests {
         };
         assert!(won, "cancellation must win over a pending dial");
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn relay_buffer_size_honors_goway_ceiling() {
+        // Defaults and small values pass through; high -W values that used
+        // to be truncated at 1 MiB now scale toward the 12 MiB ceiling.
+        assert_eq!(relay_buffer_size(128 * 1024), 128 * 1024);
+        assert_eq!(relay_buffer_size(0), 16 * 1024);
+        assert_eq!(relay_buffer_size(1024 * 1024), 1024 * 1024);
+        assert_eq!(relay_buffer_size(4 * 1024 * 1024), 4 * 1024 * 1024);
+        assert_eq!(relay_buffer_size(12 * 1024 * 1024), 12 * 1024 * 1024);
+        assert_eq!(relay_buffer_size(64 * 1024 * 1024), 12 * 1024 * 1024);
     }
 
     #[test]

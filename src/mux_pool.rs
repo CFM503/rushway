@@ -10,7 +10,9 @@ use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
     TargetAddr,
 };
-use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
+use crate::runtime::{
+    apply_socket_options, enforce_target_policy, relay_buffer_size, RuntimeConfig,
+};
 use crate::ws::{
     build_client_handshake_request, read_frame, read_frame_owned, read_http_headers,
     validate_client_handshake_response, write_frame,
@@ -664,7 +666,7 @@ async fn handle_tcp_proxy(
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
     let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; cfg.buffer_size.clamp(16 * 1024, 1024 * 1024)];
+        let mut buf = vec![0u8; relay_buffer_size(cfg.buffer_size)];
         let mut frame_scratch = Vec::with_capacity(buf.len().min(u16::MAX as usize) + 7);
         loop {
             let n = local_rd.read(&mut buf).await?;
