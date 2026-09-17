@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.16] - 2026-09-17
+
+### Added
+- **GoWay-Style Startup Banner**: unconditional `RushWay vX.Y.Z` dashboard header (mode/listen/upstream/mux/DNS/auth/buffer/max-conns), visible at any `--log` level.
+- **Non-MUX Pre-Warmed Upstream Pools (GoWay `ConnPool` Parity)**: `ws://` (`src/nonmux.rs`) and `wss://` (`src/wss_client.rs`) non-MUX clients keep 4 pre-handshaked transports (5 min max age, 30 s idle, 5 s refill, stop-on-first-failure). Single-use transports; pool is a pre-warmed dial cache. First attempt was reverted over a misdiagnosed stall (test-harness pipe-buffer freeze); re-applied with file-logged validation proving both WS and WSS pools hit in production paths.
+
 ## [v0.0.15] - 2026-09-17
 
 ### Fixed

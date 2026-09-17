@@ -17,6 +17,7 @@ use crate::ws::{
 use anyhow::{anyhow, bail, Result};
 use socket2::SockRef;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
@@ -131,13 +132,118 @@ async fn open_upstream(
     Ok((rd, Arc::new(Mutex::new(wr))))
 }
 
+/// Pre-warmed non-MUX upstream pool, mirroring GoWay `ConnPool`.
+///
+/// Each pooled transport has completed TCP and the WebSocket upgrade
+/// handshake but has NOT sent the target frame yet. Transports are
+/// single-use: a grabbed transport is relayed once and then closed, while
+/// a background task refills the pool (GoWay parity: the pool is a
+/// pre-warmed dial cache, not a reuse pool).
+struct PooledUpstream {
+    rd: tokio::io::ReadHalf<TcpStream>,
+    wr: Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>,
+    created: Instant,
+    last_used: Instant,
+}
+
+const NON_MUX_POOL_SIZE: usize = 4;
+const NON_MUX_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+const NON_MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const NON_MUX_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5);
+
+fn pooled_usable(created: Instant, last_used: Instant, now: Instant) -> bool {
+    now.duration_since(created) <= NON_MUX_MAX_AGE
+        && now.duration_since(last_used) <= NON_MUX_IDLE_TIMEOUT
+}
+
+struct NonMuxPool {
+    cfg: RuntimeConfig,
+    conns: Mutex<Vec<PooledUpstream>>,
+    creation: Mutex<()>,
+}
+
+impl NonMuxPool {
+    fn new(cfg: RuntimeConfig) -> Arc<Self> {
+        Arc::new(Self {
+            cfg,
+            conns: Mutex::new(Vec::new()),
+            creation: Mutex::new(()),
+        })
+    }
+
+    async fn dial_pooled(cfg: &RuntimeConfig) -> Result<PooledUpstream> {
+        let (rd, wr) = open_upstream(cfg).await?;
+        let now = Instant::now();
+        Ok(PooledUpstream {
+            rd,
+            wr,
+            created: now,
+            last_used: now,
+        })
+    }
+
+    /// Pops the freshest usable pre-warmed transport, or dials a fresh one
+    /// when the pool is empty (all failures propagate to the caller).
+    async fn get_or_dial(
+        self: &Arc<Self>,
+    ) -> Result<(
+        tokio::io::ReadHalf<TcpStream>,
+        Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>,
+    )> {
+        let pooled = {
+            let mut conns = self.conns.lock().await;
+            let now = Instant::now();
+            conns.retain(|c| pooled_usable(c.created, c.last_used, now));
+            conns.pop()
+        };
+        if let Some(mut c) = pooled {
+            c.last_used = Instant::now();
+            tracing::debug!("[non-MUX] using pre-warmed upstream connection");
+            return Ok((c.rd, c.wr));
+        }
+        let c = Self::dial_pooled(&self.cfg).await?;
+        Ok((c.rd, c.wr))
+    }
+
+    async fn replenish(self: &Arc<Self>) {
+        let _guard = self.creation.lock().await;
+        loop {
+            let need = {
+                let mut conns = self.conns.lock().await;
+                conns.retain(|c| pooled_usable(c.created, c.last_used, Instant::now()));
+                NON_MUX_POOL_SIZE.saturating_sub(conns.len())
+            };
+            if need == 0 {
+                return;
+            }
+            match Self::dial_pooled(&self.cfg).await {
+                Ok(c) => self.conns.lock().await.push(c),
+                // GoWay parity: stop refilling for this tick on first
+                // failure instead of hammering a downed upstream.
+                Err(error) => {
+                    tracing::debug!(error=%error, "[non-MUX] pre-warm dial failed; will retry next tick");
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn maintain(self: Arc<Self>) {
+        loop {
+            self.replenish().await;
+            tokio::time::sleep(NON_MUX_MAINTAIN_INTERVAL).await;
+        }
+    }
+}
+
 async fn relay_client(
     mut local: TcpStream,
     cfg: RuntimeConfig,
     req: ClientProxyRequest,
+    pool: Arc<NonMuxPool>,
 ) -> Result<()> {
     enforce_target_policy(&cfg, &req.target)?;
-    let (mut rd, writer) = open_upstream(&cfg).await?;
+    let (mut rd, writer) = pool.get_or_dial().await?;
     let c = cipher(&cfg.key);
     let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
     c.apply(&mut hello);
@@ -222,7 +328,11 @@ async fn relay_client(
     upload.abort();
     Ok(())
 }
-async fn handle_client_connection(mut local: TcpStream, cfg: RuntimeConfig) -> Result<()> {
+async fn handle_client_connection(
+    mut local: TcpStream,
+    cfg: RuntimeConfig,
+    pool: Arc<NonMuxPool>,
+) -> Result<()> {
     let req = read_client_proxy_request(&mut local).await?;
     if req.command == SocksCommand::UdpAssociate {
         return handle_local_udp_proxy(local, cfg, req.target).await;
@@ -230,15 +340,21 @@ async fn handle_client_connection(mut local: TcpStream, cfg: RuntimeConfig) -> R
     if req.command != SocksCommand::Connect {
         bail!("non-MUX client supports CONNECT or UDP ASSOCIATE only")
     }
-    relay_client(local, cfg, req).await
+    relay_client(local, cfg, req, pool).await
 }
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
+    let pool = NonMuxPool::new(cfg.clone());
+    let maintainer = pool.clone();
+    tokio::spawn(async move {
+        maintainer.maintain().await;
+    });
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
-        "RushWay non-MUX client proxy listening on {}:{}",
+        "RushWay non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
         cfg.proxy_host,
-        cfg.proxy_port
+        cfg.proxy_port,
+        NON_MUX_POOL_SIZE,
     );
     let mut set = tokio::task::JoinSet::new();
     loop {
@@ -257,9 +373,10 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                     }
                 };
                 let cfg2 = cfg.clone();
+                let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_client_connection(stream, cfg2).await {
+                    if let Err(error) = handle_client_connection(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,%error,"non-MUX client connection closed")
                     }
                 });
@@ -395,4 +512,28 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let _ = target_wr.shutdown().await;
     download.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pooled_transports_expire_by_age_and_idleness() {
+        let now = Instant::now();
+        // Fresh transport is usable.
+        assert!(pooled_usable(now, now, now));
+        // Idle past 30 s is reaped even when young.
+        assert!(!pooled_usable(
+            now,
+            now - NON_MUX_IDLE_TIMEOUT - Duration::from_secs(1),
+            now
+        ));
+        // Old transport is reaped even when recently used.
+        assert!(!pooled_usable(
+            now - NON_MUX_MAX_AGE - Duration::from_secs(1),
+            now,
+            now
+        ));
+    }
 }

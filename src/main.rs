@@ -376,6 +376,53 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
+/// Startup banner mirroring GoWay's dashboard header: always printed,
+/// even at `--log ERROR`, so the version and effective mode are visible.
+fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str) {
+    const CYAN: &str = "\x1b[36m";
+    const RESET: &str = "\x1b[0m";
+    let (mode, mux) = match cfg.upstream.as_deref() {
+        None => ("Server".to_string(), "Enabled (server)".to_string()),
+        Some(u) if u.starts_with("wss://") => (
+            "Client (WSS + SOCKS5/HTTP)".to_string(),
+            mux_summary(cfg.mux, mux_sessions),
+        ),
+        Some(u) if u.starts_with("quic") => (
+            "Client (QUIC + SOCKS5/HTTP)".to_string(),
+            mux_summary(cfg.mux, mux_sessions),
+        ),
+        Some(_) => (
+            "Client (WS + SOCKS5/HTTP)".to_string(),
+            mux_summary(cfg.mux, mux_sessions),
+        ),
+    };
+    let upstream = cfg.upstream.as_deref().unwrap_or("N/A (Server mode)");
+    let auth = if cfg.key.is_some() {
+        "Enabled (XOR)"
+    } else {
+        "Disabled (Open)"
+    };
+    println!("{CYAN}RushWay v{}{RESET}", env!("CARGO_PKG_VERSION"));
+    println!("{CYAN}------------------------------------------------------------{RESET}");
+    println!(" [+] Mode:        {mode}");
+    println!(" [+] Listen:      {}:{}", cfg.proxy_host, cfg.proxy_port);
+    println!(" [+] Upstream:    {upstream}");
+    println!(" [+] Mux:         {mux}");
+    println!(" [+] DNS:         {dns_display}");
+    println!(" [+] Auth:        {auth}");
+    println!(" [+] Buffer:      {} KB", cfg.buffer_size / 1024);
+    println!(" [+] Max Conns:   {}", cfg.max_connections);
+    println!("{CYAN}------------------------------------------------------------{RESET}");
+}
+
+fn mux_summary(enabled: bool, sessions: usize) -> String {
+    if enabled {
+        format!("Enabled (sessions: {sessions})")
+    } else {
+        "Disabled (1:1)".to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let raw_args = normalize_legacy_args(std::env::args());
@@ -454,10 +501,15 @@ async fn main() -> Result<()> {
     if let Some(v) = args.connection_timeout {
         cfg.connection_timeout = v;
     }
-    if let Some(v) = args.dns {
+    let dns_opt = args.dns.clone();
+    let dns_display = dns_opt
+        .clone()
+        .unwrap_or_else(|| "System default".to_string());
+    if let Some(v) = dns_opt {
         dns::configure(Some(v)).await?;
     }
     std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
+    print_banner(&cfg, args.mux_sessions, &dns_display);
 
     if let Some(upstream) = cfg.upstream.as_deref() {
         if upstream.starts_with("wss://") {

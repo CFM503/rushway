@@ -381,7 +381,108 @@ async fn handle_udp_proxy(
     Ok(())
 }
 
-async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Result<()> {
+/// Pre-warmed WSS non-MUX upstream pool (GoWay `ConnPool` parity).
+/// Transports complete TCP+TLS+WS-handshake and are single-use: grabbed
+/// once, relayed, then closed, with a background task refilling the pool.
+struct PooledWssUpstream {
+    rd: BoxReader,
+    wr: Arc<Mutex<BoxWriter>>,
+    created: std::time::Instant,
+    last_used: std::time::Instant,
+}
+
+const NON_MUX_WSS_POOL_SIZE: usize = 4;
+const NON_MUX_WSS_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+const NON_MUX_WSS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const NON_MUX_WSS_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5);
+
+fn pooled_wss_usable(
+    created: std::time::Instant,
+    last_used: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    now.duration_since(created) <= NON_MUX_WSS_MAX_AGE
+        && now.duration_since(last_used) <= NON_MUX_WSS_IDLE_TIMEOUT
+}
+
+struct NonMuxWssPool {
+    cfg: WssConfig,
+    conns: Mutex<Vec<PooledWssUpstream>>,
+    creation: Mutex<()>,
+}
+
+impl NonMuxWssPool {
+    fn new(cfg: WssConfig) -> Arc<Self> {
+        Arc::new(Self {
+            cfg,
+            conns: Mutex::new(Vec::new()),
+            creation: Mutex::new(()),
+        })
+    }
+
+    async fn dial_pooled(cfg: &WssConfig) -> Result<PooledWssUpstream> {
+        let (rd, wr) = open_upstream(cfg).await?;
+        let now = std::time::Instant::now();
+        Ok(PooledWssUpstream {
+            rd,
+            wr,
+            created: now,
+            last_used: now,
+        })
+    }
+
+    async fn get_or_dial(self: &Arc<Self>) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+        let pooled = {
+            let mut conns = self.conns.lock().await;
+            let now = std::time::Instant::now();
+            conns.retain(|c| pooled_wss_usable(c.created, c.last_used, now));
+            conns.pop()
+        };
+        if let Some(mut c) = pooled {
+            c.last_used = std::time::Instant::now();
+            tracing::debug!("[WSS non-MUX] using pre-warmed upstream connection");
+            return Ok((c.rd, c.wr));
+        }
+        let c = Self::dial_pooled(&self.cfg).await?;
+        Ok((c.rd, c.wr))
+    }
+
+    async fn replenish(self: &Arc<Self>) {
+        let _guard = self.creation.lock().await;
+        loop {
+            let need = {
+                let mut conns = self.conns.lock().await;
+                conns.retain(|c| {
+                    pooled_wss_usable(c.created, c.last_used, std::time::Instant::now())
+                });
+                NON_MUX_WSS_POOL_SIZE.saturating_sub(conns.len())
+            };
+            if need == 0 {
+                return;
+            }
+            match Self::dial_pooled(&self.cfg).await {
+                Ok(c) => self.conns.lock().await.push(c),
+                Err(error) => {
+                    tracing::debug!(error=%error, "[WSS non-MUX] pre-warm dial failed; will retry next tick");
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn maintain(self: Arc<Self>) {
+        loop {
+            self.replenish().await;
+            tokio::time::sleep(NON_MUX_WSS_MAINTAIN_INTERVAL).await;
+        }
+    }
+}
+
+async fn handle_non_mux_connection(
+    mut local: TcpStream,
+    cfg: WssConfig,
+    pool: Arc<NonMuxWssPool>,
+) -> Result<()> {
     let req = read_client_proxy_request(&mut local).await?;
     if req.command == SocksCommand::UdpAssociate {
         return handle_udp_proxy(local, cfg, req.target).await;
@@ -389,7 +490,7 @@ async fn handle_non_mux_connection(mut local: TcpStream, cfg: WssConfig) -> Resu
     if req.command != SocksCommand::Connect {
         bail!("WSS non-MUX supports CONNECT or UDP ASSOCIATE only")
     };
-    let (mut rd, writer) = open_upstream(&cfg).await?;
+    let (mut rd, writer) = pool.get_or_dial().await?;
     let c = cipher(&cfg.key);
     let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
     c.apply(&mut hello);
@@ -495,11 +596,17 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         tcp_keepalive: cfg.tcp_keepalive,
         socket_buffer: cfg.socket_buffer,
     };
+    let pool = NonMuxWssPool::new(wc.clone());
+    let maintainer = pool.clone();
+    tokio::spawn(async move {
+        maintainer.maintain().await;
+    });
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
     tracing::info!(
-        "RushWay WSS non-MUX client proxy listening on {}:{}",
+        "RushWay WSS non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
         wc.proxy_host,
-        wc.proxy_port
+        wc.proxy_port,
+        NON_MUX_WSS_POOL_SIZE,
     );
     let mut set = tokio::task::JoinSet::new();
     loop {
@@ -511,8 +618,9 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
             res = listener.accept() => {
                 let (stream, peer) = res?;
                 let cfg2 = wc.clone();
+                let pool2 = pool.clone();
                 set.spawn(async move {
-                    if let Err(e) = handle_non_mux_connection(stream, cfg2).await {
+                    if let Err(e) = handle_non_mux_connection(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")
                     }
                 });
@@ -1014,6 +1122,22 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
 mod tests {
     use super::*;
     use crate::ws::read_http_headers;
+
+    #[test]
+    fn pooled_wss_transports_expire_by_age_and_idleness() {
+        let now = std::time::Instant::now();
+        assert!(pooled_wss_usable(now, now, now));
+        assert!(!pooled_wss_usable(
+            now,
+            now - NON_MUX_WSS_IDLE_TIMEOUT - Duration::from_secs(1),
+            now
+        ));
+        assert!(!pooled_wss_usable(
+            now - NON_MUX_WSS_MAX_AGE - Duration::from_secs(1),
+            now,
+            now
+        ));
+    }
 
     #[test]
     fn parse_wss_url_with_ip_and_path() {

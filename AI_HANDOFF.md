@@ -1606,6 +1606,15 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** c1 protocol ceiling; QUIC congestion work ends here.
 - **Next action:** Push commit + tag; CI release builds follow.
 
+## 2026-09-17 — VPS Loopback Bench (Single-vCPU Debian 13)
+
+- **Setup:** User VPS `96.44.148.112` (NOTE: user initially gave `94.44.148.112` — wrong digits, cost an hour of debugging; real IP found via Tabby's live connection). 1 vCPU, 967 MB RAM, idle. Pristine v0.0.15 musl-static binaries uploaded to `/tmp/rw_bench`, removed afterwards (verified gone, no strays).
+- **Validation (`e2e_bench`, WS 4 MiB, 3 runs):** c1 ~21-24 / c8 ~26-35 / c32 ~40-55 MiB/s. Scaling c32 > c8 > c1 holds on one core — writer-task fix confirmed working where it matters.
+- **Astra review:** Absolute numbers (~1/6 of the dev PC) prove proxy CPU binds on small VPS hardware — the XOR/buffer/writer work is justified for this class, even though the user's 6 MiB/s line hides it end-to-end.
+- **Status:** done. VPS left clean; user must rotate the SSH password posted in chat.
+- **Remaining risk:** None from this task.
+- **Next action:** Await user direction.
+
 ## 2026-09-17 — Single-Pass Cipher+Mask + RwLock Stream Tables
 
 - **Bug:** Client uploads scanned every payload byte twice (cipher pass + mask pass); per-DATA-frame stream lookup took an exclusive `Mutex`.
@@ -1633,4 +1642,35 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Validation:** 76 unit tests; clippy zero new; 4-direction matrix green; same-window A/B neutral-to-positive with flakes on both sides.
 - **Status:** released.
 - **Remaining risk:** VPS-line confirmation open.
+- **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-17 — Startup Banner + B Retry (Pools Verified Fair)
+
+- **Bug:** (1) No version/mode visible at startup (`-tui` only warns); (2) non-MUX 1:1 connections pay full TCP+TLS+WS handshake per user connection.
+- **Root cause:** (1) Banner never implemented; (2) no pre-warm pool (B was reverted over the pipe-buffer misdiagnosis, code proven innocent afterwards).
+- **Astra review:**
+  - Banner: `println!` unconditionally (like GoWay), takes only `Copy` args to avoid partial-move issues (`local_host` is moved earlier).
+  - Pools: identical design to the reverted attempt (single-use, 4-deep, 5 min/30 s/5 s, stop-on-first-failure); `main.rs`/`run_client` shutdown refactors accommodated (JoinSet/select preserved).
+  - Validation discipline: ALL integration logs file-redirected this round — no undrained pipes.
+- **Change:**
+  - `src/main.rs`: `print_banner` + `mux_summary` (mode/listen/upstream/mux/DNS/auth/buffer/max-conns).
+  - `src/nonmux.rs` / `src/wss_client.rs`: `NonMuxPool` / `NonMuxWssPool` + expiry unit tests.
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - 78 unit tests pass; clippy 4 pre-existing warnings, zero new.
+  - Fair-condition pool tests (file logs): WS conn1+conn2 PASS with 3 pre-warmed takes; WSS conn1+conn2 PASS with 3 pre-warmed takes — the previously "impossible" WSS path.
+  - Standard 4-direction matrix: all PASS.
+- **Status:** done, unreleased.
+- **Remaining risk:** First-byte-latency gain unquantified on real links (needs `-no-mux` VPS measurement); pool depth (4) untuned.
+- **Next action:** User decides: release 0.0.16 or continue.
+
+## 2026-09-17 — v0.0.16 Release: Banner + Pools, Repo De-Binarized
+
+- **Target & Version:** `0.0.16` — startup banner, non-MUX pre-warmed pools (WS+WSS).
+- **Astra review:** Banner prints unconditionally like GoWay; pools fair-validated with file logs.
+- **Change:** `Cargo.toml` 0.0.15 → 0.0.16; `CHANGELOG.md` `[Unreleased]` → `[v0.0.16]`; repo hygiene: `git rm --cached` the 4 binaries under `dist/` (kept on disk), `.gitignore` now excludes `dist/`, `*.exe`, `*.tar.gz`, `*.zip` — release artifacts ship via CI/manual packages only.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:** 78 unit tests; clippy zero new; fair pool tests + 4-direction matrix green.
+- **Status:** released.
+- **Remaining risk:** Pool latency gain unquantified on real links.
 - **Next action:** Push commit + tag; CI release builds follow.
