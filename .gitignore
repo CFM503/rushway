@@ -1,2 +1,7 @@
 target/
 *.pdb
+# Release binaries are published via CI/GitHub Releases, never committed.
+dist/
+*.exe
+*.tar.gz
+*.zip
