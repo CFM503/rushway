@@ -16,7 +16,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone)]
@@ -391,7 +391,9 @@ async fn handle_mux_parts(
         .send(encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?)
         .await?;
 
-    let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Read-mostly under concurrency (one lookup per DATA frame), so a
+    // RwLock: concurrent lookups, exclusive insert/remove.
+    let streams: Arc<RwLock<HashMap<u32, StreamEntry>>> = Arc::new(RwLock::new(HashMap::new()));
     let mut stream_tasks = Vec::new();
     let mut frame_buf = Vec::with_capacity(64 * 1024);
 
@@ -456,7 +458,7 @@ async fn handle_mux_parts(
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
                 let admitted = {
-                    let mut guard = streams.lock().await;
+                    let mut guard = streams.write().await;
                     if guard.len() >= 2048 || guard.contains_key(&stream_id) {
                         false
                     } else {
@@ -504,12 +506,12 @@ async fn handle_mux_parts(
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
-                    streams: &Arc<Mutex<HashMap<u32, StreamEntry>>>,
+                    streams: &Arc<RwLock<HashMap<u32, StreamEntry>>>,
                     stream_id: u32,
                 ) {
                     let _ =
                         send_reset_encrypted(writer, cipher, stream_id).await;
-                    streams.lock().await.remove(&stream_id);
+                    streams.write().await.remove(&stream_id);
                 }
                 let task = tokio::spawn(async move {
                     let mut cancelled = cancelled;
@@ -533,7 +535,7 @@ async fn handle_mux_parts(
                                             stream_id,
                                         )
                                         .await;
-                                        streams_task.lock().await.remove(&stream_id);
+                                        streams_task.write().await.remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -542,12 +544,12 @@ async fn handle_mux_parts(
                             changed = cancelled.changed() => {
                                 match changed {
                                     Ok(()) if *cancelled.borrow() => {
-                                        streams_task.lock().await.remove(&stream_id);
+                                        streams_task.write().await.remove(&stream_id);
                                         return;
                                     }
                                     Ok(()) => {}
                                     Err(_) => {
-                                        streams_task.lock().await.remove(&stream_id);
+                                        streams_task.write().await.remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -576,7 +578,7 @@ async fn handle_mux_parts(
                                     }
                                     Some(StreamCommand::Reset)
                                     | None => {
-                                        streams_task.lock().await.remove(&stream_id);
+                                        streams_task.write().await.remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -585,7 +587,7 @@ async fn handle_mux_parts(
                     };
 
                     if *cancelled.borrow() {
-                        streams_task.lock().await.remove(&stream_id);
+                        streams_task.write().await.remove(&stream_id);
                         return;
                     }
 
@@ -609,7 +611,7 @@ async fn handle_mux_parts(
                             }
                             StreamCommand::Fin => client_fin = true,
                             StreamCommand::Reset => {
-                                streams_task.lock().await.remove(&stream_id);
+                                streams_task.write().await.remove(&stream_id);
                                 return;
                             }
                         }
@@ -627,7 +629,7 @@ async fn handle_mux_parts(
                     for frame in pending {
                         if wr_target.write_all(frame.payload()).await.is_err() {
                             reader.abort();
-                            streams_task.lock().await.remove(&stream_id);
+                            streams_task.write().await.remove(&stream_id);
                             return;
                         }
                     }
@@ -667,7 +669,7 @@ async fn handle_mux_parts(
                         reader.abort();
                     }
 
-                    streams_task.lock().await.remove(&stream_id);
+                    streams_task.write().await.remove(&stream_id);
                 });
 
                 stream_tasks.push(task);
@@ -676,16 +678,16 @@ async fn handle_mux_parts(
             MuxCommand::Data => {
                 let id = frame.stream_id;
 
-                if let Some(tx) = streams.lock().await.get(&id).map(|s| s.tx.clone()) {
+                if let Some(tx) = streams.read().await.get(&id).map(|s| s.tx.clone()) {
                     if tx.send(StreamCommand::Data(frame)).await.is_err() {
-                        streams.lock().await.remove(&id);
+                        streams.write().await.remove(&id);
                     }
                 }
             }
 
             MuxCommand::Fin => {
                 if let Some(tx) = streams
-                    .lock()
+                    .read()
                     .await
                     .get(&frame.stream_id)
                     .map(|s| s.tx.clone())
@@ -696,7 +698,7 @@ async fn handle_mux_parts(
 
             MuxCommand::Rst => {
                 if let Some((tx, cancel)) = streams
-                    .lock()
+                    .read()
                     .await
                     .get(&frame.stream_id)
                     .map(|s| (s.tx.clone(), s.cancel.clone()))
@@ -712,7 +714,7 @@ async fn handle_mux_parts(
         task.abort();
     }
 
-    streams.lock().await.clear();
+    streams.write().await.clear();
 
     Ok(())
 }

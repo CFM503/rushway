@@ -1605,3 +1605,32 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** c1 protocol ceiling; QUIC congestion work ends here.
 - **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-17 — Single-Pass Cipher+Mask + RwLock Stream Tables
+
+- **Bug:** Client uploads scanned every payload byte twice (cipher pass + mask pass); per-DATA-frame stream lookup took an exclusive `Mutex`.
+- **Root cause:** Staged transforms from the pre-fusion design; read-mostly map behind an exclusive lock.
+- **Astra review:**
+  - Fusion: mask period 4 divides the 8-byte word; keystream offsets stay region-relative (identical mapping to the two-pass version); empty-cipher (open proxy) and unmasked (server) paths preserved as branches.
+  - RwLock: read guards never held across `.await` sends that could block (lookup clones the `Sender` first); insert/remove/clear under write guards with the same atomicity as before.
+  - Regression risk: round-trip tests + 4-direction live matrix.
+- **Change:**
+  - `src/crypto.rs`: `keystream()` accessor; `src/mux_writer.rs`: fused loop; `src/mux_pool.rs` / `src/wss_client.rs` / `src/runtime.rs`: stream maps to `RwLock`, pool admission checks `writer.is_closed()`.
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - 76 unit tests pass; clippy zero new; 4-direction interop PASS.
+  - Same-window A/B vs v0.0.14 (noisy box with live user traffic): current c8 ~157-232 / c32 ~205-249 vs baseline c8 ~156-199 / c32 ~182-196 — neutral-to-marginal, c32 parity holds. `early eof` flakes on BOTH sides (1 each), confirming environmental, not a regression.
+- **Status:** done, unreleased.
+- **Remaining risk:** Gains below noise floor on loopback; VPS-line confirmation open.
+- **Next action:** User decides: commit or continue.
+
+## 2026-09-17 — v0.0.15 Release: Single-Pass Fusion + RwLock Tables
+
+- **Target & Version:** `0.0.15` — fused cipher+mask loop, RwLock stream tables.
+- **Astra review:** Offset semantics preserved; read guards never held across blocking sends; logged as neutral-to-marginal, not oversold.
+- **Change:** `Cargo.toml` 0.0.14 → 0.0.15; `CHANGELOG.md` `[Unreleased]` → `[v0.0.15]`.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:** 76 unit tests; clippy zero new; 4-direction matrix green; same-window A/B neutral-to-positive with flakes on both sides.
+- **Status:** released.
+- **Remaining risk:** VPS-line confirmation open.
+- **Next action:** Push commit + tag; CI release builds follow.

@@ -26,7 +26,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 pub(crate) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -526,7 +526,9 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
 struct WssSessionState {
     writer: Arc<MuxFrameWriter>,
     cipher: XorCipher,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
+    // Read-mostly under concurrency (one lookup per DATA frame), so a
+    // RwLock: concurrent lookups, exclusive insert/remove.
+    streams: Arc<RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
     next_id: AtomicU32,
     active: AtomicUsize,
     closed: AtomicBool,
@@ -577,7 +579,7 @@ impl WssSessionState {
         let session = Arc::new(Self {
             writer,
             cipher: c.clone(),
-            streams: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(RwLock::new(HashMap::new())),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -588,7 +590,7 @@ impl WssSessionState {
                 tracing::debug!(%error,"WSS physical session reader stopped")
             };
             reader_session.closed.store(true, Ordering::Release);
-            let mut streams = reader_session.streams.lock().await;
+            let mut streams = reader_session.streams.write().await;
             streams.clear();
             reader_session.active.store(0, Ordering::Release)
         });
@@ -642,7 +644,7 @@ impl WssSessionState {
             bail!("WSS physical session is full or closed")
         };
         let (id, rx) = {
-            let mut streams = self.streams.lock().await;
+            let mut streams = self.streams.write().await;
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 bail!("WSS physical session closed")
@@ -681,7 +683,7 @@ impl WssSessionState {
         let syn =
             MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
         if let Err(error) = send_mux(&self.writer, &self.cipher, &syn).await {
-            self.streams.lock().await.remove(&id);
+            self.streams.write().await.remove(&id);
             self.active.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
@@ -695,7 +697,7 @@ impl WssSessionState {
             )
             .await
             {
-                self.streams.lock().await.remove(&id);
+                self.streams.write().await.remove(&id);
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 return Err(error);
             }
@@ -746,13 +748,13 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
         session.cipher.apply(&mut payload);
         let frame = MuxFrame::decode_owned(payload).map_err(|e| anyhow!(e.to_string()))?;
         let id = frame.stream_id;
-        let sender = { session.streams.lock().await.get(&id).cloned() };
+        let sender = { session.streams.read().await.get(&id).cloned() };
         if let Some(tx) = sender {
             // Terminal FIN/RST is forwarded; accounting is done once by the
             // stream owner (see handle_connection cleanup below), mirroring
             // mux_pool::client_reader_loop.
             if tx.send(frame).await.is_err()
-                && session.streams.lock().await.remove(&id).is_some()
+                && session.streams.write().await.remove(&id).is_some()
             {
                 session.active.fetch_sub(1, Ordering::AcqRel);
             }
@@ -951,7 +953,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     upload.abort();
     // Conditional decrement: the reader may have already reaped the stream
     // (send failure) or the session may have been torn down (active zeroed).
-    if session.streams.lock().await.remove(&stream_id).is_some() {
+    if session.streams.write().await.remove(&stream_id).is_some() {
         session.active.fetch_sub(1, Ordering::AcqRel);
     }
     Ok(())

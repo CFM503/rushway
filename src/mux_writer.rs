@@ -8,7 +8,7 @@
 //! loop is pure I/O, and consecutive queued frames are coalesced into
 //! vectored writes.
 
-use crate::crypto::XorCipher;
+use crate::crypto::{XorCipher, XOR_KEY_SIZE};
 use crate::protocol::{write_frame_parts, MuxCommand};
 use crate::ws::{next_mask, ws_header_into};
 use anyhow::{anyhow, Result};
@@ -111,10 +111,40 @@ pub(crate) fn encode_mux_ws_frame(
         anyhow!(e.to_string())
     })?;
     debug_assert_eq!(out.len() - mux_start, mux_len);
-    cipher.apply(&mut out[mux_start..]);
-    if let Some(key) = mask_key {
-        for (i, byte) in out[mux_start..].iter_mut().enumerate() {
-            *byte ^= key[i & 3];
+    // Single pass over the payload: cipher keystream XOR WS mask.
+    // Offsets are region-relative (key byte `i` maps to
+    // `keystream[i % XOR_KEY_SIZE]`), exactly matching two sequential
+    // `TransformInPlace` + mask passes. Mask period 4 divides the 8-byte
+    // word, so bulk stays word-at-a-time.
+    let region = &mut out[mux_start..];
+    match mask_key {
+        None => cipher.apply(region),
+        Some(key) => {
+            let ks = cipher.keystream();
+            if ks.is_empty() {
+                for (i, byte) in region.iter_mut().enumerate() {
+                    *byte ^= key[i & 3];
+                }
+            } else {
+                let mask_u32 = u32::from_ne_bytes(key);
+                let mask64 =
+                    (mask_u32 as u64) | ((mask_u32 as u64) << 32);
+                let n = region.len();
+                let mut i = 0;
+                while i + 8 <= n {
+                    let off = i & (XOR_KEY_SIZE - 1);
+                    let kw =
+                        u64::from_ne_bytes(ks[off..off + 8].try_into().unwrap());
+                    let dw =
+                        u64::from_ne_bytes(region[i..i + 8].try_into().unwrap());
+                    region[i..i + 8].copy_from_slice(&(dw ^ kw ^ mask64).to_ne_bytes());
+                    i += 8;
+                }
+                while i < n {
+                    region[i] ^= ks[i & (XOR_KEY_SIZE - 1)] ^ key[i & 3];
+                    i += 1;
+                }
+            }
         }
     }
     Ok(())

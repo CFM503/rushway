@@ -30,6 +30,13 @@ impl XorCipher {
         !self.key.is_empty()
     }
 
+    /// Raw repeated keystream (`key[j]` == stream byte for data offset `j`).
+    /// Exposed for fused single-pass transforms (e.g. cipher + WS mask in
+    /// one loop); same-crate use only.
+    pub(crate) fn keystream(&self) -> &[u8] {
+        &self.key
+    }
+
     /// Applies one GoWay TransformInPlace operation. Offset is reset to zero
     /// for every call, matching the v1.8.4 implementation.
     ///

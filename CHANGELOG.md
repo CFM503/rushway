@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.15] - 2026-09-17
+
+### Fixed
+- **Single-Pass Cipher+Mask Fusion**:
+  - `encode_mux_ws_frame` now XORs the cipher keystream and WS mask in one word-at-a-time pass (`word ^ keystream ^ mask64`) instead of two full memory passes; offset semantics unchanged (region-relative, verified by round-trip tests).
+- **RwLock Stream Tables**:
+  - Per-session stream maps (`mux_pool`, `wss_client`, `runtime` server) switched from `Mutex` to `RwLock`: concurrent lookups per DATA frame, exclusive insert/remove. Pool admission also fails fast on dead writers.
+  - Measured same-window A/B vs v0.0.14: neutral-to-marginal (c32 ~205-249 vs ~182-196, c8 overlapping); kept for halved memory passes + no per-frame exclusive lock, not for claimed gain. Flow `early eof` flakes occur on both sides (environmental watch item).
+
 ## [v0.0.14] - 2026-09-17
 
 ### Fixed
