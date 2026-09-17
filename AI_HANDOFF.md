@@ -1580,3 +1580,28 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** c1 ceiling (~150 WS) still open; congestion tuning untouched.
 - **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-17 — QUIC BBR Attempt (Reverted) + c1 -W Sweep
+
+- **Bug:** N/A (experiments): (1) try BBR for the 3× QUIC gap; (2) map the WS c1 ceiling vs `-W`.
+- **Root cause:** N/A.
+- **Astra review:** Every claim below is measured, not reasoned. BBR reverted the same session it regressed; `-W` sweep is 5 rounds per setting with medians.
+- **Change:** `src/quic.rs`: one in-tree NOTE comment recording the BBR rejection (code itself reverted to Cubic).
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - BBR (`e2e_bench` QUIC release): c1 11-23 / c8 ~38-71 / c32 ~46-71 vs Cubic 62-75 / ~92 / ~89 — **clear regression + tripled variance**, reverted; post-revert run confirms recovery (63/79/84).
+  - c1 `-W` sweep (single MUX stream, 2 MB bulk, release, medians of 5): W128 77 / W512 78 / W1024 78 / **W4096 123 MiB/s** — flat until 1024, +~60% at 4096 (noisy box, outliers both sides).
+- **Status:** BBR rejected; c1 knob documented.
+- **Remaining risk:** c1 hard ceiling is the 64 KB MUX frame cap (protocol-locked with GoWay — cannot raise without forking the protocol); QUIC congestion work ends here.
+- **Next action:** User decides: commit the NOTE + logs, or continue elsewhere.
+
+## 2026-09-17 — v0.0.14 Release: BBR Verdict + c1 Guide
+
+- **Target & Version:** `0.0.14` — no behavior change vs v0.0.13 beyond the BBR NOTE; release carries the measured BBR rejection and single-stream tuning guide.
+- **Astra review:** Docs + one comment only; binaries rebuilt from the same tree re-verified (`--version` 0.0.14).
+- **Change:** `Cargo.toml` 0.0.13 → 0.0.14; `CHANGELOG.md` new `[v0.0.14]` section.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:** 76 unit tests; clippy zero new; BBR revert confirmed by post-revert bench.
+- **Status:** released.
+- **Remaining risk:** c1 protocol ceiling; QUIC congestion work ends here.
+- **Next action:** Push commit + tag; CI release builds follow.

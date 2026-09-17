@@ -83,6 +83,9 @@ fn transport_config() -> Arc<TransportConfig> {
     // Without path MTU discovery every datagram stays near 1200 bytes;
     // discovering larger MTUs cuts per-packet crypto/scheduling overhead.
     cfg.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
+    // NOTE (2026-09-17): BbrConfig was tried here and REVERTED — on
+    // loopback it halved throughput and tripled variance vs Cubic
+    // (c8 92→~55). Keep Cubic until VPS-line evidence says otherwise.
     Arc::new(cfg)
 }
 fn insecure_client_crypto() -> Result<RustlsClientConfig> {

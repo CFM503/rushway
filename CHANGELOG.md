@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.14] - 2026-09-17
+
+### Fixed
+- **QUIC BBR Rejected (Measured)**:
+  - Trialled `BbrConfig` congestion control; loopback throughput halved with tripled variance vs Cubic (c8 92→~55). Reverted same session; in-tree NOTE records the verdict. Cubic retained.
+- **Single-Stream Tuning Guide (Measured)**:
+  - c1 bulk vs `-W` (single MUX stream, 2 MB, release medians): 128/512/1024 → ~77-78 MiB/s, **4096 → ~123 MiB/s**. `-W 1024` remains the balanced default; raise to 4096 only when single-stream ceiling matters (hard ceiling is the protocol-locked 64 KB MUX frame).
+
 ## [v0.0.13] - 2026-09-17
 
 ### Fixed
