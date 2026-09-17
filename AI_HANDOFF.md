@@ -1463,3 +1463,17 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** Drain budget (5 s) is heuristic; pool only covers ≤ 1 MiB buffers; VPS-line numbers still open.
 - **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-16 — A/B: v0.0.10 Tag vs v0.0.11 Tree (Shutdown + Pool)
+
+- **Bug:** N/A (measurement task): is v0.0.11 (graceful shutdown + buffer pool) a positive or negative optimization vs v0.0.10.
+- **Astra review:** Interleaved worktree A/B (3 + 4 clean runs), localhost 4 MiB echo.
+- **Change:** None (measurement only; worktree removed afterwards).
+- **Validation (`e2e_bench` medians):**
+  - v0.0.10: c8 ~199 / c32 ~199 MiB/s.
+  - v0.0.11: c8 ~203 / c32 ~197 MiB/s.
+  - Verdict: **neutral** — within noise, as designed (shutdown only affects exit path; pooling saves allocator churn, which does not bind on loopback).
+  - One v0.0.11 run failed early with `10054 reset on flow 2`; 4 subsequent runs clean — treated as harness flake (history of such flakes), watch item, not a regression claim.
+- **Status:** done.
+- **Remaining risk:** Pool/shutdown payoff (p99, clean ops) needs high-concurrency/VPS-line evidence.
+- **Next action:** Await user direction.
