@@ -15,7 +15,6 @@ pub const MAX_WS_FRAME_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_HTTP_HEADER_SIZE: usize = 8192;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const BROWSER_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
-const SMALL_FRAME_SIZE: usize = 512;
 
 /// Browser profile bundling UA, TLS cipher/curve preferences, and HTTP
 /// headers that must plausibly match each other. Mirrors GoWay's
@@ -426,12 +425,11 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
     Ok(())
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    payload: &[u8],
-    opcode: u8,
-    mask: bool,
-) -> Result<()> {
+/// Encodes one complete WebSocket frame (header + optional mask + masked
+/// payload) into an owned byte buffer. The masking PRNG call happens here,
+/// on the caller's task, so a dedicated writer task can flush pre-encoded
+/// frames without touching thread-local RNG state.
+pub fn encode_ws_frame(payload: &[u8], opcode: u8, masked: bool) -> Result<Vec<u8>> {
     if payload.len() > MAX_WS_FRAME_SIZE {
         return Err(anyhow!("websocket frame too large"));
     }
@@ -448,7 +446,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         10
     };
     header[0] = 0x80 | (opcode & 0x0f);
-    let mask_bit = if mask { 0x80 } else { 0 };
+    let mask_bit = if masked { 0x80 } else { 0 };
     match header_len {
         2 => header[1] = mask_bit | payload.len() as u8,
         4 => {
@@ -462,34 +460,29 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         _ => unreachable!(),
     }
 
-    if !mask {
-        w.write_all(&header[..header_len]).await?;
-        w.write_all(payload).await?;
-        return Ok(());
-    }
-
-    let total = header_len + 4 + payload.len();
-    if total <= SMALL_FRAME_SIZE + 14 {
-        let mut frame = [0u8; SMALL_FRAME_SIZE + 14];
-        frame[..header_len].copy_from_slice(&header[..header_len]);
-        let key = next_mask();
-        frame[header_len..header_len + 4].copy_from_slice(&key);
-        frame[header_len + 4..total].copy_from_slice(payload);
-        for (i, byte) in frame[header_len + 4..total].iter_mut().enumerate() {
-            *byte ^= key[i & 3];
-        }
-        w.write_all(&frame[..total]).await?;
-        return Ok(());
-    }
-
+    let total = header_len + if masked { 4 + payload.len() } else { payload.len() };
     let mut frame = Vec::with_capacity(total);
     frame.extend_from_slice(&header[..header_len]);
+    if !masked {
+        frame.extend_from_slice(payload);
+        return Ok(frame);
+    }
     let key = next_mask();
     frame.extend_from_slice(&key);
     frame.extend_from_slice(payload);
     for (i, byte) in frame[header_len + 4..].iter_mut().enumerate() {
         *byte ^= key[i & 3];
     }
+    Ok(frame)
+}
+
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    payload: &[u8],
+    opcode: u8,
+    mask: bool,
+) -> Result<()> {
+    let frame = encode_ws_frame(payload, opcode, mask)?;
     w.write_all(&frame).await?;
     Ok(())
 }

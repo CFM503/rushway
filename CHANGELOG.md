@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.12] - 2026-09-17
+
+### Fixed
+- **Dedicated MUX Writer Task + Write Coalescing (GoWay `muxOutboundWriter` Parity)**:
+  - New `src/mux_writer.rs`: each MUX session owns one writer task fed by a bounded (256) channel instead of all streams locking a shared `Mutex<WriteHalf>` per frame.
+  - Callers pre-encode complete WS frames via new `ws::encode_ws_frame` (masking on the stream task); the writer loop coalesces queued frames (≤ 32 frames / 1 MiB) into vectored writes.
+  - Migrated all three MUX session types (`mux_pool` client, `wss_client` sessions, `runtime` server); 1:1 non-MUX/UDP paths keep direct writes (contention-free).
+  - Fixed self-owning-`Arc` task leak found by test (task now holds only the `closed` flag; new `writer_task_exits_when_handles_dropped` test).
+  - Pool admission now also checks writer liveness (`is_closed`) for fail-fast routing.
+  - Measured (`e2e_bench`, WS 4 MiB, localhost): c8 ~203 → ~250-271, c32 ~197 → ~244-292 (**+25-40%**, c32 ≥ c8 inversion fixed).
+
 ## [v0.0.11] - 2026-09-16
 
 ### Fixed

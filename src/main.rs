@@ -1,6 +1,7 @@
 mod crypto;
 mod dns;
 mod mux_pool;
+mod mux_writer;
 mod nonmux;
 mod protocol;
 mod proxy;

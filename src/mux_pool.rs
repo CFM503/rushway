@@ -5,6 +5,7 @@
 
 use crate::crypto::XorCipher;
 use crate::dns;
+use crate::mux_writer::MuxFrameWriter;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
@@ -15,8 +16,8 @@ use crate::runtime::{
     wait_shutdown, RuntimeConfig,
 };
 use crate::ws::{
-    build_client_handshake_request, read_frame, read_frame_owned, read_http_headers,
-    validate_client_handshake_response, write_frame,
+    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_owned,
+    read_http_headers, validate_client_handshake_response, write_frame,
 };
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
@@ -122,7 +123,7 @@ async fn connect_with_fallback(
 }
 
 async fn send_mux_parts_reuse(
-    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     stream_id: u32,
     command: MuxCommand,
@@ -137,11 +138,11 @@ async fn send_mux_parts_reuse(
     );
     write_frame_parts(scratch, stream_id, command, payload).map_err(|e| anyhow!(e.to_string()))?;
     cipher.apply(scratch);
-    let mut w = writer.lock().await;
-    write_frame(&mut *w, scratch, 2, true).await
+    let frame = encode_ws_frame(scratch, 2, true).map_err(|e| anyhow!(e.to_string()))?;
+    writer.send(frame).await
 }
 async fn send_mux_parts(
-    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     stream_id: u32,
     command: MuxCommand,
@@ -170,7 +171,7 @@ fn parse_upstream(input: &str) -> Result<(String, String)> {
 }
 
 struct SessionState {
-    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: Arc<MuxFrameWriter>,
     cipher: XorCipher,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
     next_id: AtomicU32,
@@ -214,14 +215,13 @@ impl SessionState {
         wr.flush().await?;
         let response = read_http_headers(&mut rd).await?;
         validate_client_handshake_response(&response, &key)?;
-        let writer = Arc::new(Mutex::new(wr));
+        let (writer, _writer_task) = MuxFrameWriter::spawn(wr);
         let cipher = configured_cipher(&cfg.key);
         let mut hello = b"MUX\n".to_vec();
         cipher.apply(&mut hello);
-        {
-            let mut w = writer.lock().await;
-            write_frame(&mut *w, &hello, 2, true).await?
-        };
+        writer
+            .send(encode_ws_frame(&hello, 2, true).map_err(|e| anyhow!(e.to_string()))?)
+            .await?;
         let mut frame_buf = Vec::with_capacity(64 * 1024);
         let Some((opcode, mut ok)) = read_frame(
             &mut rd,
@@ -266,8 +266,14 @@ impl SessionState {
                     break;
                 }
                 if heartbeat_state.active.load(Ordering::Acquire) == 0 {
-                    let mut w = heartbeat_state.writer.lock().await;
-                    if write_frame(&mut *w, &[], 9, true).await.is_err() {
+                    let ping = match encode_ws_frame(&[], 9, true) {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            heartbeat_state.closed.store(true, Ordering::Release);
+                            break;
+                        }
+                    };
+                    if heartbeat_state.writer.send(ping).await.is_err() {
                         heartbeat_state.closed.store(true, Ordering::Release);
                         break;
                     }
@@ -278,6 +284,7 @@ impl SessionState {
     }
     fn available(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
+            && !self.writer.is_closed()
             && self.active.load(Ordering::Acquire) < MAX_STREAMS_PER_SESSION
     }
     async fn open_stream(

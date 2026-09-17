@@ -2,11 +2,12 @@
 
 use crate::crypto::XorCipher;
 use crate::dns::resolve_socket;
+use crate::mux_writer::MuxFrameWriter;
 use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::ws::{
-    build_server_handshake_response, read_frame, read_frame_owned, read_http_headers,
-    validate_server_handshake, write_frame,
+    build_server_handshake_response, encode_ws_frame, read_frame, read_frame_owned,
+    read_http_headers, validate_server_handshake, write_frame,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
@@ -238,7 +239,7 @@ async fn dial_target(
     Ok(stream)
 }
 async fn send_frame_encrypted(
-    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     frame: &MuxFrame,
 ) -> Result<()> {
@@ -247,11 +248,11 @@ async fn send_frame_encrypted(
         .encode(&mut bytes)
         .map_err(|e| anyhow!(e.to_string()))?;
     cipher.apply(&mut bytes);
-    let mut w = writer.lock().await;
-    write_frame(&mut *w, &bytes, 2, false).await
+    let frame = encode_ws_frame(&bytes, 2, false).map_err(|e| anyhow!(e.to_string()))?;
+    writer.send(frame).await
 }
 async fn send_mux_parts_encrypted(
-    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     stream_id: u32,
     command: MuxCommand,
@@ -261,11 +262,11 @@ async fn send_mux_parts_encrypted(
     write_frame_parts(&mut bytes, stream_id, command, payload)
         .map_err(|e| anyhow!(e.to_string()))?;
     cipher.apply(&mut bytes);
-    let mut w = writer.lock().await;
-    write_frame(&mut *w, &bytes, 2, false).await
+    let frame = encode_ws_frame(&bytes, 2, false).map_err(|e| anyhow!(e.to_string()))?;
+    writer.send(frame).await
 }
 async fn send_reset_encrypted(
-    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     id: u32,
 ) -> Result<()> {
@@ -279,7 +280,7 @@ async fn send_reset_encrypted(
 async fn target_to_mux(
     id: u32,
     mut target: ReadHalf<TcpStream>,
-    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
     cipher: XorCipher,
 ) {
@@ -323,7 +324,7 @@ async fn server_stream_task(
     id: u32,
     target: TcpStream,
     mut rx: mpsc::Receiver<StreamCommand>,
-    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
     cipher: XorCipher,
 ) {
@@ -368,7 +369,7 @@ async fn server_stream_task(
 }
 async fn handle_mux_parts(
     mut rd: ReadHalf<TcpStream>,
-    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    wr: WriteHalf<TcpStream>,
     cfg: RuntimeConfig,
     first_payload: Vec<u8>,
 ) -> Result<()> {
@@ -379,12 +380,14 @@ async fn handle_mux_parts(
         bail!("invalid MUX handshake")
     }
 
+    // Hand the write half to the dedicated writer task; all MUX frames on
+    // this session go through its serialized, coalescing queue.
+    let (writer, _writer_task) = MuxFrameWriter::spawn(wr);
     let mut ok = b"OK\n".to_vec();
     transform_payload(&cipher, &mut ok);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &ok, 2, false).await?
-    };
+    writer
+        .send(encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?)
+        .await?;
 
     let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut stream_tasks = Vec::new();
@@ -497,7 +500,7 @@ async fn handle_mux_parts(
                 const MAX_PENDING_FRAMES: usize = 64;
                 const MAX_PENDING_BYTES: usize = 1024 * 1024;
                 async fn reject_pending_overflow(
-                    writer: &Arc<Mutex<WriteHalf<TcpStream>>>,
+                    writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
                     streams: &Arc<Mutex<HashMap<u32, StreamEntry>>>,
                     stream_id: u32,
@@ -924,7 +927,10 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                             return handle_server_udp_parts(rd, writer, cfg2, first).await;
                         }
                         if plain == b"MUX\n" {
-                            return handle_mux_parts(rd, writer, cfg2, first).await;
+                            let wr = Arc::try_unwrap(writer)
+                                .map_err(|_| anyhow!("upstream writer unexpectedly shared"))?
+                                .into_inner();
+                            return handle_mux_parts(rd, wr, cfg2, first).await;
                         }
                         // Anything else is a plain non-MUX target ("host:port\n"),
                         // exactly like goway.go handleServer's fallthrough branch.
