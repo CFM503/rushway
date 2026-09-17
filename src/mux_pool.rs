@@ -6,7 +6,7 @@
 use crate::crypto::XorCipher;
 use crate::dns;
 use crate::mux_writer::MuxFrameWriter;
-use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
+use crate::protocol::{MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
     TargetAddr,
@@ -130,16 +130,9 @@ async fn send_mux_parts_reuse(
     payload: &[u8],
     scratch: &mut Vec<u8>,
 ) -> Result<()> {
-    scratch.clear();
-    scratch.reserve(
-        7 + payload
-            .len()
-            .saturating_sub(scratch.capacity().saturating_sub(7)),
-    );
-    write_frame_parts(scratch, stream_id, command, payload).map_err(|e| anyhow!(e.to_string()))?;
-    cipher.apply(scratch);
-    let frame = encode_ws_frame(scratch, 2, true).map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(frame).await
+    crate::mux_writer::encode_mux_ws_frame(scratch, stream_id, command, payload, cipher, true)
+        .map_err(|e| anyhow!(e.to_string()))?;
+    writer.send(std::mem::take(scratch)).await
 }
 async fn send_mux_parts(
     writer: &Arc<MuxFrameWriter>,

@@ -128,7 +128,7 @@ thread_local! {
     static MASK_STATE: RefCell<u64> = const { RefCell::new(0) };
 }
 
-fn next_mask() -> [u8; 4] {
+pub(crate) fn next_mask() -> [u8; 4] {
     MASK_STATE.with(|state| {
         let mut value = state.borrow_mut();
         if *value == 0 {
@@ -425,6 +425,39 @@ pub fn validate_client_handshake_response(response: &[u8], key: &str) -> Result<
     Ok(())
 }
 
+/// Writes a WebSocket frame header for `payload_len` bytes into `header`,
+/// returning the header length (2/4/10). Shared by [`encode_ws_frame`] and
+/// the fused MUX encoder so the layout logic lives in one place.
+pub(crate) fn ws_header_into(
+    header: &mut [u8; 14],
+    payload_len: usize,
+    opcode: u8,
+    masked: bool,
+) -> usize {
+    let header_len = if payload_len <= 125 {
+        2
+    } else if payload_len <= u16::MAX as usize {
+        4
+    } else {
+        10
+    };
+    header[0] = 0x80 | (opcode & 0x0f);
+    let mask_bit = if masked { 0x80 } else { 0 };
+    match header_len {
+        2 => header[1] = mask_bit | payload_len as u8,
+        4 => {
+            header[1] = mask_bit | 126;
+            header[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        }
+        10 => {
+            header[1] = mask_bit | 127;
+            header[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
+        }
+        _ => unreachable!(),
+    }
+    header_len
+}
+
 /// Encodes one complete WebSocket frame (header + optional mask + masked
 /// payload) into an owned byte buffer. The masking PRNG call happens here,
 /// on the caller's task, so a dedicated writer task can flush pre-encoded
@@ -438,27 +471,7 @@ pub fn encode_ws_frame(payload: &[u8], opcode: u8, masked: bool) -> Result<Vec<u
     }
 
     let mut header = [0u8; 14];
-    let header_len = if payload.len() <= 125 {
-        2
-    } else if payload.len() <= u16::MAX as usize {
-        4
-    } else {
-        10
-    };
-    header[0] = 0x80 | (opcode & 0x0f);
-    let mask_bit = if masked { 0x80 } else { 0 };
-    match header_len {
-        2 => header[1] = mask_bit | payload.len() as u8,
-        4 => {
-            header[1] = mask_bit | 126;
-            header[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        }
-        10 => {
-            header[1] = mask_bit | 127;
-            header[2..10].copy_from_slice(&(payload.len() as u64).to_be_bytes());
-        }
-        _ => unreachable!(),
-    }
+    let header_len = ws_header_into(&mut header, payload.len(), opcode, masked);
 
     let total = header_len + if masked { 4 + payload.len() } else { payload.len() };
     let mut frame = Vec::with_capacity(total);

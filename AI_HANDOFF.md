@@ -1533,3 +1533,50 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** Heuristic caps; VPS-line confirmation open.
 - **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-17 — Fused MUX+WS Encoding (Copy Elimination)
+
+- **Bug:** Every MUX chunk paid 2 allocations + 1 full extra copy (MUX `Vec` → cipher → WS `Vec`).
+- **Root cause:** Separate encode stages in `send_mux_parts*` across three files.
+- **Astra review:**
+  - Layout: single authority `ws_header_into`; cipher covers exactly the MUX region; mask applied in place after key slot reservation.
+  - Correctness: new `fused_encoding_matches_two_step_path` test (length equality — mask keys are random — plus full WS→XOR→MUX round-trip across sizes).
+  - Two test bugs caught during rollout (random-mask byte equality; 70000 > u16 MUX limit) — both in the test, not the code.
+- **Change:**
+  - `src/mux_writer.rs`: `encode_mux_ws_frame`; `src/ws.rs`: `ws_header_into` + `next_mask` visibility; all MUX upload paths fused; dead `write_frame_parts` imports removed.
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - 76 unit tests pass; clippy zero new; 4-direction live interop PASS.
+  - `e2e_bench` (6 runs): c8/c32 within pre-change band, c32 ≥ c8 holds; verdict **neutral-to-marginal** — kept for strictly-less-work, not oversold. One `flow 13 early eof` in 6 runs logged as harness flake watch item.
+- **Status:** done, unreleased.
+- **Remaining risk:** Batch/queue heuristics unchanged; QUIC bulk still ~4× behind WS (measured c8 64) and untouched.
+- **Next action:** User decides: commit, or continue (QUIC path / c1 ceiling).
+
+## 2026-09-17 — QUIC Socket Buffers + MTU Discovery (up to 2×)
+
+- **Bug:** QUIC bulk ~4× behind WS (c1 46 / c8 64 / c32 43) with the same c32 < c8 inversion; transport windows were already generous (8/16 MiB), implicating UDP socket buffers (OS defaults) and disabled MTU discovery.
+- **Root cause:** `Endpoint::client`/`server` constructors used OS-default socket buffers; `TransportConfig` had no MTU discovery (datagrams stuck near 1200 bytes).
+- **Astra review:**
+  - Sockets: custom `socket2` UDP sockets, 8 MiB buffers default (honors `--socket-buffer`), best-effort clamping; dual-stack explicitly enabled for IPv6 binds.
+  - Self-inflicted outage caught pre-merge: first version omitted `IPV6_V6ONLY=0`, breaking IPv4-mapped targets (`AddrNotAvailable` on `[::ffff:127.0.0.1]`) — quinn used to do this internally. Fixed + live-verified before proceeding.
+  - Protocol: stream/conn windows, ALPN, auth all untouched; congestion controller untouched.
+- **Change:**
+  - `src/quic.rs`: `bound_udp_socket`, `quic_socket_buffer_bytes`, `mtu_discovery_config` in `transport_config`; client/server endpoint construction via `Endpoint::new` with `TokioRuntime`.
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - 76 unit tests pass; clippy zero new; QUIC SOCKS echo green.
+  - `e2e_bench` QUIC release (2 runs): c1 62-75, c8 ~92, c32 ~89 vs baseline 46/64/43 (**up to 2×**, inversion fixed).
+- **Status:** done, unreleased.
+- **Remaining risk:** Absolute QUIC bulk still ~3× behind WS — congestion/flow-control tuning untouched; VPS-line confirmation open.
+- **Next action:** User decides: commit (with fused-encoding batch?) or continue (c1 ceiling).
+
+## 2026-09-17 — v0.0.13 Release: Fused Encoding + QUIC Buffers
+
+- **Target & Version:** `0.0.13` — fused MUX+WS encoding, QUIC socket buffers + MTU discovery.
+- **Astra review:** No wire-format changes; dual-stack outage caught and fixed pre-merge; PGO-style overclaim avoided (fused path logged as neutral).
+- **Change:** `Cargo.toml` 0.0.12 → 0.0.13; `CHANGELOG.md` `[Unreleased]` → `[v0.0.13]`.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:** 76 unit tests; clippy zero new; 4-direction WS matrix green; QUIC echo green; QUIC bulk up to 2×.
+- **Status:** released.
+- **Remaining risk:** c1 ceiling (~150 WS) still open; congestion tuning untouched.
+- **Next action:** Push commit + tag; CI release builds follow.

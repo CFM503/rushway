@@ -29,6 +29,49 @@ use tokio::time::timeout;
 
 const ALPN: &[&[u8]] = &[b"goway-quic", b"h3"];
 const MAX_QUIC_UDP_PACKET: usize = u16::MAX as usize;
+/// Default UDP socket buffer for QUIC endpoints when `--socket-buffer` is
+/// unset. OS defaults (tens of KB) starve bulk transfer; quinn itself
+/// documents enlarged buffers as required for throughput.
+const DEFAULT_QUIC_SOCKET_BUFFER: usize = 8 * 1024 * 1024;
+
+fn quic_socket_buffer_bytes(cfg: &RuntimeConfig) -> usize {
+    if cfg.socket_buffer > 0 {
+        cfg.socket_buffer.saturating_mul(1024)
+    } else {
+        DEFAULT_QUIC_SOCKET_BUFFER
+    }
+}
+
+/// Builds a bound UDP socket with enlarged send/receive buffers for a QUIC
+/// endpoint. Best-effort: the OS may clamp silently, which only reduces the
+/// gain instead of failing the bind.
+fn bound_udp_socket(bind: std::net::SocketAddr, buf_bytes: usize) -> Result<std::net::UdpSocket> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .context("QUIC UDP socket creation failed")?;
+    sock.set_nonblocking(true)
+        .context("QUIC UDP nonblocking failed")?;
+    // Dual-stack is mandatory for wildcard IPv6 binds: without it,
+    // IPv4-mapped destinations (::ffff:127.0.0.1) fail with
+    // AddrNotAvailable. Quinn enables this internally; doing it manually
+    // is the price of custom socket buffers.
+    if bind.is_ipv6() {
+        sock.set_only_v6(false)
+            .context("QUIC dual-stack setup failed")?;
+    }
+    if sock.set_send_buffer_size(buf_bytes).is_err() {
+        tracing::debug!(bytes = buf_bytes, "QUIC UDP send buffer request denied");
+    }
+    if sock.set_recv_buffer_size(buf_bytes).is_err() {
+        tracing::debug!(bytes = buf_bytes, "QUIC UDP receive buffer request denied");
+    }
+    sock.bind(&bind.into())
+        .context("QUIC UDP bind failed")?;
+    Ok(sock.into())
+}
 
 fn transport_config() -> Arc<TransportConfig> {
     let mut cfg = TransportConfig::default();
@@ -37,6 +80,9 @@ fn transport_config() -> Arc<TransportConfig> {
     cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("8MiB fits QUIC VarInt"));
     cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("16MiB fits QUIC VarInt"));
     cfg.max_concurrent_uni_streams(0u32.into());
+    // Without path MTU discovery every datagram stays near 1200 bytes;
+    // discovering larger MTUs cuts per-packet crypto/scheduling overhead.
+    cfg.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
     Arc::new(cfg)
 }
 fn insecure_client_crypto() -> Result<RustlsClientConfig> {
@@ -399,8 +445,16 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("QUIC client requires upstream"))?;
     let (server_addr, server_name) = resolve_upstream(&upstream).await?;
-    let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
+    let socket_buf = quic_socket_buffer_bytes(&cfg);
+    let std_socket = bound_udp_socket("[::]:0".parse().unwrap(), socket_buf)?;
+    let mut endpoint = Endpoint::new(
+        Default::default(),
+        None,
+        std_socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     endpoint.set_default_client_config(client_config(verify_ssl)?);
+    tracing::debug!(bytes = socket_buf, "QUIC client UDP socket buffers requested");
     let pool = QuicClientPool::new(endpoint, server_addr, server_name, cfg.connection_timeout);
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
@@ -459,7 +513,15 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     let bind: std::net::SocketAddr = format!("{}:{}", cfg.proxy_host, cfg.proxy_port).parse()?;
-    let endpoint = Endpoint::server(server_config()?, bind)?;
+    let socket_buf = quic_socket_buffer_bytes(&cfg);
+    let std_socket = bound_udp_socket(bind, socket_buf)?;
+    let endpoint = Endpoint::new(
+        Default::default(),
+        Some(server_config()?),
+        std_socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    tracing::debug!(bytes = socket_buf, "QUIC server UDP socket buffers requested");
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!("RushWay QUIC server listening on {}", bind);
     let mut set = tokio::task::JoinSet::new();

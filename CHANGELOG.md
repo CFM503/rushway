@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.13] - 2026-09-17
+
+### Fixed
+- **Fused MUX+WS Frame Encoding**:
+  - New `mux_writer::encode_mux_ws_frame` builds `[WS header][mask?][MUX header|payload]` in one buffer (one allocation, bytes written once) instead of MUX-`Vec` → cipher → WS-`Vec` + full copy; `ws::ws_header_into` extracted as the single layout authority.
+  - Adopted in all MUX upload paths (`mux_pool`, `wss_client`, `runtime` server).
+  - Measured (`e2e_bench`, localhost): within noise of the writer-task baseline (c8 ~240-271, c32 ~234-292 both before/after); kept for strictly-less-work + simpler path, not for claimed gain. One `flow 13 early eof` in 6 runs treated as harness flake (watch item).
+- **QUIC Socket Buffers + MTU Discovery**:
+  - QUIC endpoints now bind custom UDP sockets with enlarged buffers (8 MiB default, honors `--socket-buffer`) instead of OS defaults, and enable path MTU discovery (previously every datagram stayed near 1200 bytes).
+  - Fixed self-inflicted dual-stack outage found during rollout (custom socket lacked `IPV6_V6ONLY=0`, breaking IPv4-mapped targets with `AddrNotAvailable`).
+  - Measured (`e2e_bench`, QUIC 4 MiB, localhost): c1 46 → 62-75, c8 64 → ~92, c32 43 → ~89 (**up to 2×**, c32 ≥ c8 inversion fixed).
+
 ## [v0.0.12] - 2026-09-17
 
 ### Fixed

@@ -8,6 +8,9 @@
 //! loop is pure I/O, and consecutive queued frames are coalesced into
 //! vectored writes.
 
+use crate::crypto::XorCipher;
+use crate::protocol::{write_frame_parts, MuxCommand};
+use crate::ws::{next_mask, ws_header_into};
 use anyhow::{anyhow, Result};
 use std::future::poll_fn;
 use std::io::IoSlice;
@@ -68,6 +71,53 @@ impl MuxFrameWriter {
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+}
+
+/// Encodes one MUX frame already wrapped in its WebSocket frame, in a
+/// single buffer with a single allocation: `[WS header][mask?][MUX header |
+/// payload]`.
+///
+/// Previously this took two allocations and a full extra copy (MUX `Vec`
+/// then WS `Vec`). Layout: the WS header describes the MUX frame length
+/// (`7 + payload.len()`), the cipher covers exactly the MUX region, and
+/// the WS mask (client side) covers it as well.
+pub(crate) fn encode_mux_ws_frame(
+    out: &mut Vec<u8>,
+    stream_id: u32,
+    command: MuxCommand,
+    payload: &[u8],
+    cipher: &XorCipher,
+    masked: bool,
+) -> Result<()> {
+    let mux_len = 7 + payload.len();
+    let mut ws_header = [0u8; 14];
+    let ws_header_len = ws_header_into(&mut ws_header, mux_len, 0x2, masked);
+    let mask_len = if masked { 4 } else { 0 };
+    out.clear();
+    out.reserve(ws_header_len + mask_len + mux_len);
+    out.extend_from_slice(&ws_header[..ws_header_len]);
+    let mask_key = if masked {
+        let key = next_mask();
+        out.extend_from_slice(&key);
+        Some(key)
+    } else {
+        None
+    };
+    let mux_start = out.len();
+    write_frame_parts(out, stream_id, command, payload).map_err(|e| {
+        // Keep `out` reusable on error: only the WS header (and key) were
+        // written before the MUX payload, so truncate back to empty.
+        out.clear();
+        anyhow!(e.to_string())
+    })?;
+    debug_assert_eq!(out.len() - mux_start, mux_len);
+    cipher.apply(&mut out[mux_start..]);
+    if let Some(key) = mask_key {
+        for (i, byte) in out[mux_start..].iter_mut().enumerate() {
+            *byte ^= key[i & 3];
+        }
+    }
+    Ok(())
 }
 
 async fn writer_loop<W>(mut w: W, mut rx: mpsc::Receiver<Vec<u8>>)
@@ -145,8 +195,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MuxFrame;
     use crate::ws::{encode_ws_frame, read_frame};
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn fused_encoding_matches_two_step_path() {
+        let cipher = XorCipher::new("fuse-key");
+        for (command, payload_len) in [
+            (MuxCommand::Syn, 0),
+            (MuxCommand::Data, 7),
+            (MuxCommand::Data, 60000),
+            (MuxCommand::Fin, 0),
+        ] {
+            let payload = vec![0xABu8; payload_len];
+            for masked in [false, true] {
+                // Fused single-buffer path.
+                let mut fused = Vec::new();
+                encode_mux_ws_frame(&mut fused, 0x01020304, command, &payload, &cipher, masked)
+                    .unwrap();
+                // Lengths must match the legacy path exactly (mask keys
+                // are random per frame, so bytes themselves differ).
+                let mut mux = Vec::new();
+                write_frame_parts(&mut mux, 0x01020304, command, &payload).unwrap();
+                cipher.apply(&mut mux);
+                let legacy = encode_ws_frame(&mux, 2, masked).unwrap();
+                assert_eq!(
+                    fused.len(),
+                    legacy.len(),
+                    "length mismatch for {command:?}/{masked}"
+                );
+                // Round-trip: WS decode, XOR off, MUX decode.
+                let (mut a, mut b) = duplex(128 * 1024);
+                a.write_all(&fused).await.unwrap();
+                drop(a);
+                let mut buf = Vec::new();
+                let (opcode, mut got) =
+                    read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(opcode, 2);
+                cipher.apply(&mut got);
+                let frame = MuxFrame::decode(&got).unwrap();
+                assert_eq!(frame.stream_id, 0x01020304);
+                assert_eq!(frame.command, command);
+                assert_eq!(frame.payload, payload);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn writer_task_exits_when_handles_dropped() {

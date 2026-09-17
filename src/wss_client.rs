@@ -3,7 +3,7 @@
 use crate::crypto::XorCipher;
 use crate::dns;
 use crate::mux_writer::MuxFrameWriter;
-use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
+use crate::protocol::{MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
     TargetAddr,
@@ -709,12 +709,16 @@ async fn send_mux(
     frame: &MuxFrame,
 ) -> Result<()> {
     let mut data = Vec::with_capacity(7 + frame.payload.len());
-    frame
-        .encode(&mut data)
-        .map_err(|e| anyhow!(e.to_string()))?;
-    cipher.apply(&mut data);
-    let frame = encode_ws_frame(&data, 2, true).map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(frame).await
+    crate::mux_writer::encode_mux_ws_frame(
+        &mut data,
+        frame.stream_id,
+        frame.command,
+        &frame.payload,
+        cipher,
+        true,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+    writer.send(data).await
 }
 async fn send_mux_parts(
     writer: &Arc<MuxFrameWriter>,
@@ -724,11 +728,9 @@ async fn send_mux_parts(
     payload: &[u8],
 ) -> Result<()> {
     let mut data = Vec::with_capacity(7 + payload.len());
-    write_frame_parts(&mut data, stream_id, command, payload)
+    crate::mux_writer::encode_mux_ws_frame(&mut data, stream_id, command, payload, cipher, true)
         .map_err(|e| anyhow!(e.to_string()))?;
-    cipher.apply(&mut data);
-    let frame = encode_ws_frame(&data, 2, true).map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(frame).await
+    writer.send(data).await
 }
 async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
     let mut frame_buf = Vec::with_capacity(64 * 1024);

@@ -3,7 +3,7 @@
 use crate::crypto::XorCipher;
 use crate::dns::resolve_socket;
 use crate::mux_writer::MuxFrameWriter;
-use crate::protocol::{write_frame_parts, MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
+use crate::protocol::{MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame, read_frame_owned,
@@ -244,12 +244,16 @@ async fn send_frame_encrypted(
     frame: &MuxFrame,
 ) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + frame.payload.len());
-    frame
-        .encode(&mut bytes)
-        .map_err(|e| anyhow!(e.to_string()))?;
-    cipher.apply(&mut bytes);
-    let frame = encode_ws_frame(&bytes, 2, false).map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(frame).await
+    crate::mux_writer::encode_mux_ws_frame(
+        &mut bytes,
+        frame.stream_id,
+        frame.command,
+        &frame.payload,
+        cipher,
+        false,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+    writer.send(bytes).await
 }
 async fn send_mux_parts_encrypted(
     writer: &Arc<MuxFrameWriter>,
@@ -259,11 +263,9 @@ async fn send_mux_parts_encrypted(
     payload: &[u8],
 ) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + payload.len());
-    write_frame_parts(&mut bytes, stream_id, command, payload)
+    crate::mux_writer::encode_mux_ws_frame(&mut bytes, stream_id, command, payload, cipher, false)
         .map_err(|e| anyhow!(e.to_string()))?;
-    cipher.apply(&mut bytes);
-    let frame = encode_ws_frame(&bytes, 2, false).map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(frame).await
+    writer.send(bytes).await
 }
 async fn send_reset_encrypted(
     writer: &Arc<MuxFrameWriter>,
