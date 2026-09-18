@@ -458,17 +458,22 @@ pub(crate) fn ws_header_into(
     header_len
 }
 
+fn check_frame_args(payload_len: usize, opcode: u8) -> Result<()> {
+    if payload_len > MAX_WS_FRAME_SIZE {
+        return Err(anyhow!("websocket frame too large"));
+    }
+    if opcode >= 0x8 && payload_len > 125 {
+        return Err(anyhow!("control frame payload exceeds 125 bytes"));
+    }
+    Ok(())
+}
+
 /// Encodes one complete WebSocket frame (header + optional mask + masked
 /// payload) into an owned byte buffer. The masking PRNG call happens here,
 /// on the caller's task, so a dedicated writer task can flush pre-encoded
 /// frames without touching thread-local RNG state.
 pub fn encode_ws_frame(payload: &[u8], opcode: u8, masked: bool) -> Result<Vec<u8>> {
-    if payload.len() > MAX_WS_FRAME_SIZE {
-        return Err(anyhow!("websocket frame too large"));
-    }
-    if opcode >= 0x8 && payload.len() > 125 {
-        return Err(anyhow!("control frame payload exceeds 125 bytes"));
-    }
+    check_frame_args(payload.len(), opcode)?;
 
     let mut header = [0u8; 14];
     let header_len = ws_header_into(&mut header, payload.len(), opcode, masked);
@@ -500,6 +505,81 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Writes a frame from an already-owned payload buffer: masks it in place
+/// and emits header (+ key) + payload with a single vectored write.
+/// Saves one full allocation + copy versus [`write_frame`] (which copies
+/// into a fresh frame buffer). Used by the 1:1 non-MUX relay paths.
+pub async fn write_frame_owned<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    mut payload: Vec<u8>,
+    opcode: u8,
+    masked: bool,
+) -> Result<()> {
+    check_frame_args(payload.len(), opcode)?;
+    let mut header = [0u8; 14];
+    let header_len = ws_header_into(&mut header, payload.len(), opcode, masked);
+    let mut key = [0u8; 4];
+    if masked {
+        key = next_mask();
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= key[i & 3];
+        }
+    }
+    use std::future::poll_fn;
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    // (part, off) progress across partial vectored writes, where the parts
+    // are [header][key][payload]. Empty leading parts are skipped so the
+    // slice list is never all-empty before completion.
+    let key_len = if masked { 4 } else { 0 };
+    let lens = [header_len, key_len, payload.len()];
+    let mut part = 0u8;
+    let mut off = 0usize;
+    while part < 3 {
+        while part < 3 && lens[part as usize] == off {
+            part += 1;
+            off = 0;
+        }
+        if part >= 3 {
+            break;
+        }
+        let mut slices = Vec::with_capacity(3 - part as usize);
+        match part {
+            0 => {
+                slices.push(IoSlice::new(&header[off..header_len]));
+                if masked {
+                    slices.push(IoSlice::new(&key));
+                }
+                slices.push(IoSlice::new(&payload));
+            }
+            1 => {
+                slices.push(IoSlice::new(&key[off..key_len]));
+                slices.push(IoSlice::new(&payload));
+            }
+            _ => {
+                slices.push(IoSlice::new(&payload[off..]));
+            }
+        }
+        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices)).await?;
+        if n == 0 {
+            return Err(anyhow!("vectored frame write returned zero"));
+        }
+        let mut remaining = n;
+        while remaining > 0 && part < 3 {
+            let available = lens[part as usize] - off;
+            if remaining < available {
+                off += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                part += 1;
+                off = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn read_frame<R, W>(
     r: &mut R,
     mut reply: Option<&mut W>,
@@ -510,22 +590,39 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        let mut first = [0u8; 1];
-        match r.read(&mut first).await {
+        // Header batched into at most 3 reads (was up to 5): the 2-byte
+        // base, then extended-length + mask key in one go. Matters most
+        // for small-frame traffic (tens of thousands of frames/s).
+        let mut head = [0u8; 2];
+        match r.read(&mut head).await {
             Ok(0) => return Ok(None),
+            Ok(1) => {
+                r.read_exact(&mut head[1..2]).await?;
+            }
             Ok(_) => {}
             Err(e) => return Err(e.into()),
         }
-        let b0 = first[0];
-        let b1 = r.read_u8().await?;
+        let b0 = head[0];
+        let b1 = head[1];
         let fin = b0 & 0x80 != 0;
         let opcode = b0 & 0x0f;
         let masked = b1 & 0x80 != 0;
-        let mut len = (b1 & 0x7f) as u64;
-        if len == 126 {
-            len = r.read_u16().await? as u64;
-        } else if len == 127 {
-            len = r.read_u64().await?;
+        let len_marker = b1 & 0x7f;
+        let ext_len = match len_marker {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        let mut rest = [0u8; 12];
+        let rest_len = ext_len + if masked { 4 } else { 0 };
+        if rest_len > 0 {
+            r.read_exact(&mut rest[..rest_len]).await?;
+        }
+        let mut len = len_marker as u64;
+        if ext_len == 2 {
+            len = u16::from_be_bytes(rest[..2].try_into().unwrap()) as u64;
+        } else if ext_len == 8 {
+            len = u64::from_be_bytes(rest[..8].try_into().unwrap());
         }
         if len > MAX_WS_FRAME_SIZE as u64 {
             return Err(anyhow!("frame too large"));
@@ -539,7 +636,7 @@ where
         }
         let mut key = [0u8; 4];
         if masked {
-            r.read_exact(&mut key).await?;
+            key.copy_from_slice(&rest[ext_len..ext_len + 4]);
         }
         // Grow incrementally in 64 KiB segments instead of a single
         // `resize(len)`: a bogus 64 MB length prefix no longer causes an
@@ -762,6 +859,29 @@ mod tests {
         assert_eq!(got.0, 2);
         assert_eq!(got.1, vec![11u8; 70000]);
         assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_write_matches_encode_wire_format() {
+        for (len, masked) in [(0usize, true), (13, true), (125, true), (126, true), (70000, true), (70000, false)] {
+            let (mut a, mut b) = duplex(1024 * 1024);
+            let data = vec![0x5Au8; len];
+            let writer =
+                tokio::spawn(async move { write_frame_owned(&mut a, data, 2, masked).await });
+            let mut buf = Vec::new();
+            let got = read_frame(
+                &mut b,
+                Option::<&mut tokio::io::DuplexStream>::None,
+                &mut buf,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            writer.await.unwrap().unwrap();
+            assert_eq!(got.0, 2);
+            assert_eq!(got.1, vec![0x5Au8; len]);
+            assert!(buf.is_empty());
+        }
     }
 
     #[tokio::test]

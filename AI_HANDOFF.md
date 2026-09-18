@@ -1674,3 +1674,33 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** Pool latency gain unquantified on real links.
 - **Next action:** Push commit + tag; CI release builds follow.
+
+## 2026-09-18 — Batched Header Reads + Zero-Copy Non-MUX Writes
+
+- **Bug:** Read path paid up to 5 syscalls per frame (1-byte + u8/u16/u64 + mask reads); non-MUX write paths paid an extra allocation + copy + syscall per chunk (`to_vec` + `encode` copy + 2× `write_all`).
+- **Root cause:** Piecemeal header parsing predating the writer work; non-MUX paths never got the owned-buffer treatment.
+- **Astra review:**
+  - Header batching preserves clean-EOF semantics (first byte via `read`, never `read_exact`) and validation order/outcomes; mask bytes are consumed before validation exactly as before (connection torn down on error either way).
+  - `write_frame_owned` masks caller-owned buffers in place (safe: scratch is fully overwritten by the next read) and advances (part, off) across partial vectored writes with zero-length-part skipping.
+  - Regression risk: new wire-equivalence round-trip test across header sizes (0/13/125/126/70k, masked/unmasked); non-MUX paths re-verified live.
+- **Change:**
+  - `src/ws.rs`: 3-read header parse, `check_frame_args` shared validator, `write_frame_owned`.
+  - `src/nonmux.rs` (2 sites) + `src/wss_client.rs` (1 site): `write_frame` → `write_frame_owned` (the `to_vec` stays — ownership is required — but the second copy and second syscall are gone).
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - 79 unit tests pass; clippy zero new; MUX/non-MUX interop + 2 MiB bulk PASS.
+  - Gain claim kept honest: bulk big-frame effect ~0 (measured nothing on loopback); value concentrates in small-frame traffic, not directly benchable here.
+- **Status:** done, unreleased.
+- **Remaining risk:** Partial-vectored-write path (multi-syscall fallback) exercised only by unit mock, not live — logic reviewed, low risk.
+- **Next action:** User decides: commit or continue.
+
+## 2026-09-18 — v0.0.17 Release: Batched Reads + Zero-Copy Writes
+
+- **Target & Version:** `0.0.17` — 3-read WS headers, `write_frame_owned` on non-MUX paths.
+- **Astra review:** EOF semantics and validation outcomes preserved; gains claimed only for small-frame traffic.
+- **Change:** `Cargo.toml` 0.0.16 → 0.0.17; `CHANGELOG.md` `[Unreleased]` → `[v0.0.17]`.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:** 79 unit tests; clippy zero new; interop + bulk green.
+- **Status:** released.
+- **Remaining risk:** Small-frame gain unmeasured directly; partial-write fallback mock-only.
+- **Next action:** Push commit + tag; build 3 manual packages.

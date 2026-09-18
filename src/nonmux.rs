@@ -12,7 +12,7 @@ use crate::runtime::{
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
     build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers,
-    validate_client_handshake_response, validate_server_handshake, write_frame,
+    validate_client_handshake_response, validate_server_handshake, write_frame, write_frame_owned,
 };
 use anyhow::{anyhow, bail, Result};
 use socket2::SockRef;
@@ -293,7 +293,7 @@ async fn relay_client(
             }
             let payload = buf[..n].to_vec();
             let mut w = writer_up.lock().await;
-            write_frame(&mut *w, &payload, 2, true).await?
+            write_frame_owned(&mut *w, payload, 2, true).await?
         }
         recycle_buf(buf).await;
         Result::<()>::Ok(())
@@ -478,7 +478,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
             // Non-MUX data frames are plaintext per GoWay server.
             let payload = buf[..n].to_vec();
             let mut w = writer_down.lock().await;
-            write_frame(&mut *w, &payload, 2, false).await?
+            write_frame_owned(&mut *w, payload, 2, false).await?
         }
         recycle_buf(buf).await;
         Result::<()>::Ok(())

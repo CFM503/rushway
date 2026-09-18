@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.17] - 2026-09-18
+
+### Fixed
+- **Batched WS Header Reads**: `read_frame` parses the header in at most 3 reads (2-byte base, then extended-length + mask key in one go) instead of up to 5; matters most for small-frame traffic (tens of thousands of frames/s).
+- **Zero-Copy Non-MUX Frame Writes**: new `ws::write_frame_owned` masks the caller's buffer in place and emits header (+ key) + payload with a single vectored write — one fewer allocation + copy + syscall per chunk on all 1:1 non-MUX relay paths (`nonmux` client/server, `wss_client`).
+
 ## [v0.0.16] - 2026-09-17
 
 ### Added

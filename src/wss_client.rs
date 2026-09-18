@@ -15,7 +15,7 @@ use crate::tls;
 use crate::ws::{
     build_client_handshake_request, encode_ws_frame, read_frame, read_frame_owned,
     read_http_headers_timeout, redact_handshake_request, validate_client_handshake_response,
-    write_frame,
+    write_frame, write_frame_owned,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
@@ -547,7 +547,7 @@ async fn handle_non_mux_connection(
             }
             let payload = buf[..n].to_vec();
             let mut w = writer_up.lock().await;
-            write_frame(&mut *w, &payload, 2, true).await?
+            write_frame_owned(&mut *w, payload, 2, true).await?
         }
         recycle_buf(buf).await;
         Ok::<(), anyhow::Error>(())
