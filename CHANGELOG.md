@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.19] - 2026-09-18
+
+### Added
+- **MUX Sender-Side `-obfs` Padding (GoWay Parity)**: `encode_mux_ws_frame` appends a random `[0, OBFS_PAD_MAX]` tail to DATA frames inside the WS payload length (MUX declared length unchanged); control frames stay exact. Plumbed through `mux_pool` (client), `wss_client` (`self.obfs`/`session.obfs`), and `runtime` server (`cfg.obfs`); `--obfs` CLI + config-file key already existed and are now honored end to end.
+
+### Fixed
+- **Obfs Pad Framing Desync (critical)**: first implementation appended pad *after* the WS header was computed, so peers left pad bytes in the stream and the next header parsed as garbage — reproduced as `ws.rs:692 unreachable!()` panic on a live obfs↔obfs transfer. Pad is now sized up-front and covered by the WS length; pad bytes are masked/ciphered with the rest.
+- **Reserved-Opcode Panic Hardening**: `read_frame`'s `_ => unreachable!()` (reachable via reserved opcodes 0xB–0xF after any desync, or from a hostile peer) now returns an error instead of panicking the worker.
+
 ## [v0.0.18] - 2026-09-18
 
 ### Fixed

@@ -73,14 +73,23 @@ impl MuxFrameWriter {
     }
 }
 
+/// Max random padding appended to MUX DATA frames when obfuscation is on
+/// (GoWay `-obfs` parity: same 1400-byte cap).
+pub(crate) const OBFS_PAD_MAX: usize = 1400;
+
 /// Encodes one MUX frame already wrapped in its WebSocket frame, in a
 /// single buffer with a single allocation: `[WS header][mask?][MUX header |
-/// payload]`.
+/// payload][pad?]`.
 ///
 /// Previously this took two allocations and a full extra copy (MUX `Vec`
 /// then WS `Vec`). Layout: the WS header describes the MUX frame length
-/// (`7 + payload.len()`), the cipher covers exactly the MUX region, and
-/// the WS mask (client side) covers it as well.
+/// (`7 + payload.len()`, plus obfs pad when enabled), and the
+/// cipher + WS mask (client side) cover the whole region including pad.
+///
+/// When `obfs` is set, DATA frames carry `[0, OBFS_PAD_MAX]` random pad
+/// bytes inside the WS payload past the declared MUX length. Receivers
+/// (old and new, Go and Rust) slice by the declared length, so padding is
+/// transparently ignored — unilateral deployment is safe.
 pub(crate) fn encode_mux_ws_frame(
     out: &mut Vec<u8>,
     stream_id: u32,
@@ -88,13 +97,26 @@ pub(crate) fn encode_mux_ws_frame(
     payload: &[u8],
     cipher: &XorCipher,
     masked: bool,
+    obfs: bool,
 ) -> Result<()> {
     let mux_len = 7 + payload.len();
+    // Unilateral obfuscation: random pad past the declared MUX length.
+    // Computed up-front so the WS header covers it — otherwise the peer
+    // would leave pad bytes in the stream and desync the next frame.
+    // Receivers slice by the declared MUX length, so the tail is ignored
+    // by old and new peers alike. DATA only — control frames stay exact.
+    use rand::RngCore;
+    let pad_len = if obfs && command == MuxCommand::Data {
+        (rand::thread_rng().next_u32() as usize) % (OBFS_PAD_MAX + 1)
+    } else {
+        0
+    };
+    let total = mux_len + pad_len;
     let mut ws_header = [0u8; 14];
-    let ws_header_len = ws_header_into(&mut ws_header, mux_len, 0x2, masked);
+    let ws_header_len = ws_header_into(&mut ws_header, total, 0x2, masked);
     let mask_len = if masked { 4 } else { 0 };
     out.clear();
-    out.reserve(ws_header_len + mask_len + mux_len);
+    out.reserve(ws_header_len + mask_len + total);
     out.extend_from_slice(&ws_header[..ws_header_len]);
     let mask_key = if masked {
         let key = next_mask();
@@ -111,6 +133,13 @@ pub(crate) fn encode_mux_ws_frame(
         anyhow!(e.to_string())
     })?;
     debug_assert_eq!(out.len() - mux_start, mux_len);
+    // Pad lands inside the WS payload and gets masked/ciphered with the
+    // rest; the receiver slices by the declared MUX length and ignores it.
+    if pad_len > 0 {
+        let start = out.len();
+        out.resize(start + pad_len, 0);
+        rand::thread_rng().fill_bytes(&mut out[start..]);
+    }
     // Single pass over the payload: cipher keystream XOR WS mask.
     // Offsets are region-relative (key byte `i` maps to
     // `keystream[i % XOR_KEY_SIZE]`), exactly matching two sequential
@@ -240,9 +269,9 @@ mod tests {
         ] {
             let payload = vec![0xABu8; payload_len];
             for masked in [false, true] {
-                // Fused single-buffer path.
+                // Fused single-buffer path (obfs off: exact lengths).
                 let mut fused = Vec::new();
-                encode_mux_ws_frame(&mut fused, 0x01020304, command, &payload, &cipher, masked)
+                encode_mux_ws_frame(&mut fused, 0x01020304, command, &payload, &cipher, masked, false)
                     .unwrap();
                 // Lengths must match the legacy path exactly (mask keys
                 // are random per frame, so bytes themselves differ).
@@ -273,6 +302,70 @@ mod tests {
                 assert_eq!(frame.payload, payload);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn obfs_pads_data_only_within_cap() {
+        let cipher = XorCipher::new("obfs-key");
+        let payload = vec![0xCDu8; 100];
+        // Control frames are never padded.
+        for command in [MuxCommand::Syn, MuxCommand::Fin, MuxCommand::Rst] {
+            let mut out = Vec::new();
+            encode_mux_ws_frame(&mut out, 1, command, &payload, &cipher, true, true).unwrap();
+            assert_eq!(out.len(), mux_ws_len(100, true), "control must stay exact");
+        }
+        // DATA frames gain [0, OBFS_PAD_MAX] random tail past the declared
+        // length; the declared prefix always decodes.
+        let mut seen_pad = false;
+        for _ in 0..16 {
+            let mut out = Vec::new();
+            encode_mux_ws_frame(&mut out, 9, MuxCommand::Data, &payload, &cipher, true, true)
+                .unwrap();
+            let base = mux_ws_len(100, true);
+            assert!((base..=base + OBFS_PAD_MAX).contains(&out.len()));
+            if out.len() > base {
+                seen_pad = true;
+            }
+            // Strip the WS layer using the header's own length field
+            // (pad is inside the WS payload now): unmask, decrypt, then
+            // verify the MUX header still declares exactly 100 bytes.
+            assert_eq!(out[0] & 0x0F, 0x2);
+            let (ws_len, header_len) = match out[1] & 0x7F {
+                126 => (
+                    u16::from_be_bytes(out[2..4].try_into().unwrap()) as usize,
+                    4,
+                ),
+                127 => (
+                    u64::from_be_bytes(out[2..10].try_into().unwrap()) as usize,
+                    10,
+                ),
+                n => (n as usize, 2),
+            };
+            assert!(ws_len >= 107 && ws_len <= 107 + OBFS_PAD_MAX);
+            let mask: [u8; 4] = out[header_len..header_len + 4].try_into().unwrap();
+            let mut mux_frame = out[header_len + 4..header_len + 4 + ws_len].to_vec();
+            for (i, byte) in mux_frame.iter_mut().enumerate() {
+                *byte ^= mask[i & 3];
+            }
+            cipher.apply(&mut mux_frame);
+            let frame = MuxFrame::decode(&mux_frame).unwrap();
+            assert_eq!(frame.stream_id, 9);
+            assert_eq!(frame.payload, payload);
+        }
+        assert!(seen_pad, "16 padded frames all came out unpadded (p ~= 0)");
+    }
+
+    /// Wire length of an unpadded MUX+WS frame (mirrors the encoder).
+    fn mux_ws_len(payload_len: usize, masked: bool) -> usize {
+        let mux_len = 7 + payload_len;
+        let ws_header_len = if mux_len <= 125 {
+            2
+        } else if mux_len <= u16::MAX as usize {
+            4
+        } else {
+            10
+        };
+        ws_header_len + if masked { 4 } else { 0 } + mux_len
     }
 
     #[tokio::test]

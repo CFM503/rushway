@@ -689,7 +689,9 @@ where
                 }
             }
             10 => {}
-            _ => unreachable!(),
+            // Reserved opcodes (0x3-0x7, 0xB-0xF): a buggy or hostile peer
+            // must cause an error, never a panic (cf. obfs desync probe).
+            _ => return Err(anyhow!("reserved websocket opcode {}", opcode)),
         }
     }
 }

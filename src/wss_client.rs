@@ -52,6 +52,7 @@ pub(crate) struct WssConfig {
     pub(crate) tcp_nodelay: bool,
     pub(crate) tcp_keepalive: bool,
     pub(crate) socket_buffer: usize,
+    pub(crate) obfs: bool,
 }
 impl WssConfig {
     #[allow(dead_code)]
@@ -72,6 +73,7 @@ impl WssConfig {
             tcp_nodelay: cfg.tcp_nodelay,
             tcp_keepalive: cfg.tcp_keepalive,
             socket_buffer: cfg.socket_buffer,
+            obfs: cfg.obfs,
         })
     }
 }
@@ -143,6 +145,7 @@ async fn connect_tls(
         tcp_nodelay: cfg.tcp_nodelay,
         tcp_keepalive: cfg.tcp_keepalive,
         socket_buffer: cfg.socket_buffer,
+        obfs: false,
     };
     apply_socket_options(&tcp, &policy);
     let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl)
@@ -594,6 +597,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         tcp_nodelay: cfg.tcp_nodelay,
         tcp_keepalive: cfg.tcp_keepalive,
         socket_buffer: cfg.socket_buffer,
+        obfs: cfg.obfs,
     };
     let pool = NonMuxWssPool::new(wc.clone());
     let maintainer = pool.clone();
@@ -633,6 +637,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
 struct WssSessionState {
     writer: Arc<MuxFrameWriter>,
     cipher: XorCipher,
+    obfs: bool,
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
     streams: Arc<RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
@@ -686,6 +691,7 @@ impl WssSessionState {
         let session = Arc::new(Self {
             writer,
             cipher: c.clone(),
+            obfs: cfg.obfs,
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
@@ -789,7 +795,7 @@ impl WssSessionState {
         .map_err(|e| anyhow!(e.to_string()))?;
         let syn =
             MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
-        if let Err(error) = send_mux(&self.writer, &self.cipher, &syn).await {
+        if let Err(error) = send_mux(&self.writer, &self.cipher, &syn, self.obfs).await {
             self.streams.write().await.remove(&id);
             self.active.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
@@ -801,6 +807,7 @@ impl WssSessionState {
                 id,
                 MuxCommand::Data,
                 remaining_initial,
+                self.obfs,
             )
             .await
             {
@@ -816,6 +823,7 @@ async fn send_mux(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     frame: &MuxFrame,
+    obfs: bool,
 ) -> Result<()> {
     let mut data = Vec::with_capacity(7 + frame.payload.len());
     crate::mux_writer::encode_mux_ws_frame(
@@ -825,6 +833,7 @@ async fn send_mux(
         &frame.payload,
         cipher,
         true,
+        obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
     writer.send(data).await
@@ -835,10 +844,13 @@ async fn send_mux_parts(
     stream_id: u32,
     command: MuxCommand,
     payload: &[u8],
+    obfs: bool,
 ) -> Result<()> {
     let mut data = Vec::with_capacity(7 + payload.len());
-    crate::mux_writer::encode_mux_ws_frame(&mut data, stream_id, command, payload, cipher, true)
-        .map_err(|e| anyhow!(e.to_string()))?;
+    crate::mux_writer::encode_mux_ws_frame(
+        &mut data, stream_id, command, payload, cipher, true, obfs,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
     writer.send(data).await
 }
 async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
@@ -1008,6 +1020,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     let (session, stream_id, mut rx) = pool.acquire(&req.target, initial_data).await?;
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
+    let obfs = session.obfs;
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else if req.is_connect {
@@ -1022,7 +1035,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
-                let _ = send_mux_parts(&writer, &cipher, stream_id, MuxCommand::Fin, &[]).await;
+                let _ = send_mux_parts(&writer, &cipher, stream_id, MuxCommand::Fin, &[], obfs).await;
                 break;
             }
             let mut off = 0;
@@ -1034,6 +1047,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                     stream_id,
                     MuxCommand::Data,
                     &buf[off..end],
+                    obfs,
                 )
                 .await?;
                 off = end
@@ -1083,6 +1097,7 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
         tcp_nodelay: cfg.tcp_nodelay,
         tcp_keepalive: cfg.tcp_keepalive,
         socket_buffer: cfg.socket_buffer,
+        obfs: cfg.obfs,
     };
     let pool = WssSessionPool::new(wc.clone());
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
@@ -1303,6 +1318,7 @@ mod tests {
             tcp_nodelay: true,
             tcp_keepalive: true,
             socket_buffer: 0,
+            obfs: false,
         };
 
         let session = WssSessionState::connect(&cfg).await.unwrap();
@@ -1349,6 +1365,7 @@ mod tests {
             tcp_nodelay: true,
             tcp_keepalive: true,
             socket_buffer: 0,
+            obfs: false,
         };
 
         let res = probe_wss_handshake(&cfg).await.unwrap();

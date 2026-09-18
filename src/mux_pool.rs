@@ -129,8 +129,9 @@ async fn send_mux_parts_reuse(
     command: MuxCommand,
     payload: &[u8],
     scratch: &mut Vec<u8>,
+    obfs: bool,
 ) -> Result<()> {
-    crate::mux_writer::encode_mux_ws_frame(scratch, stream_id, command, payload, cipher, true)
+    crate::mux_writer::encode_mux_ws_frame(scratch, stream_id, command, payload, cipher, true, obfs)
         .map_err(|e| anyhow!(e.to_string()))?;
     writer.send(std::mem::take(scratch)).await
 }
@@ -140,9 +141,10 @@ async fn send_mux_parts(
     stream_id: u32,
     command: MuxCommand,
     payload: &[u8],
+    obfs: bool,
 ) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + payload.len());
-    send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut bytes).await
+    send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut bytes, obfs).await
 }
 fn parse_upstream(input: &str) -> Result<(String, String)> {
     if input.starts_with("wss://") {
@@ -166,6 +168,7 @@ fn parse_upstream(input: &str) -> Result<(String, String)> {
 struct SessionState {
     writer: Arc<MuxFrameWriter>,
     cipher: XorCipher,
+    obfs: bool,
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
     streams: Arc<RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
@@ -237,6 +240,7 @@ impl SessionState {
         let state = Arc::new(Self {
             writer: writer.clone(),
             cipher: cipher.clone(),
+            obfs: cfg.obfs,
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
@@ -349,6 +353,7 @@ impl SessionState {
             id,
             MuxCommand::Syn,
             &syn_payload,
+            self.obfs,
         )
         .await
         {
@@ -366,6 +371,7 @@ impl SessionState {
                 id,
                 MuxCommand::Data,
                 remaining_initial,
+                self.obfs,
             )
             .await
             {
@@ -668,6 +674,7 @@ async fn handle_tcp_proxy(
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
+    let obfs = session.obfs;
     let upload = tokio::spawn(async move {
         let mut buf = relay_buf(cfg.buffer_size).await;
         let mut frame_scratch = Vec::with_capacity(buf.len().min(u16::MAX as usize) + 7);
@@ -681,6 +688,7 @@ async fn handle_tcp_proxy(
                     MuxCommand::Fin,
                     &[],
                     &mut frame_scratch,
+                    obfs,
                 )
                 .await;
                 break;
@@ -695,6 +703,7 @@ async fn handle_tcp_proxy(
                     MuxCommand::Data,
                     &buf[off..end],
                     &mut frame_scratch,
+                    obfs,
                 )
                 .await?;
                 off = end
@@ -729,7 +738,7 @@ async fn handle_tcp_proxy(
     }
     upload.abort();
     if remote_fin {
-        let _ = send_mux_parts(&session.writer, &session.cipher, id, MuxCommand::Fin, &[]).await;
+        let _ = send_mux_parts(&session.writer, &session.cipher, id, MuxCommand::Fin, &[], session.obfs).await;
     }
 
     session.close_stream(id).await;

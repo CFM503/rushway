@@ -64,7 +64,10 @@ impl MuxHeader {
         let stream_id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
         let command = MuxCommand::try_from(buf[4])?;
         let payload_len = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
-        if buf.len() != MUX_HEADER_LEN + payload_len {
+        // Trailing bytes past the declared payload are obfuscation padding
+        // (GoWay `-obfs`): slice by the declared length and ignore the tail.
+        // Only a short buffer is an error.
+        if buf.len() < MUX_HEADER_LEN + payload_len {
             return Err(ProtocolError::LengthMismatch {
                 declared: payload_len,
                 available: buf.len().saturating_sub(MUX_HEADER_LEN),
@@ -123,11 +126,15 @@ pub struct OwnedMuxFrame {
     pub stream_id: u32,
     pub command: MuxCommand,
     storage: Vec<u8>,
+    payload_len: usize,
 }
 
 impl OwnedMuxFrame {
+    /// Payload bounded by the declared MUX length. Storage may hold extra
+    /// trailing bytes (GoWay `-obfs` padding); those must never leak into
+    /// the relayed stream.
     pub fn payload(&self) -> &[u8] {
-        &self.storage[MUX_HEADER_LEN..]
+        &self.storage[MUX_HEADER_LEN..MUX_HEADER_LEN + self.payload_len]
     }
 
     #[allow(dead_code)]
@@ -172,6 +179,7 @@ impl MuxFrame {
         Ok(OwnedMuxFrame {
             stream_id: header.stream_id,
             command: header.command,
+            payload_len: header.payload_len,
             storage: buf,
         })
     }
@@ -323,5 +331,21 @@ mod tests {
             MuxFrame::decode(&[0, 0, 0, 1, MUX_DATA, 0, 2, 1]),
             Err(ProtocolError::LengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn trailing_obfs_padding_is_ignored() {
+        // Declared payload is 2 bytes ("hi"); 1400 random pad bytes follow
+        // (GoWay `-obfs` unilateral padding must not break decoding).
+        let mut encoded = vec![0, 0, 0, 1, MUX_DATA, 0, 2, b'h', b'i'];
+        encoded.extend_from_slice(&[0x5Au8; 1400]);
+        let frame = MuxFrame::decode(&encoded).unwrap();
+        assert_eq!(frame.stream_id, 1);
+        assert_eq!(frame.command, MuxCommand::Data);
+        assert_eq!(frame.payload, b"hi");
+        // The zero-copy owned path must bound by the declared length too —
+        // this was the live data-leak (pad bytes forwarded into streams).
+        let owned = MuxFrame::decode_owned(encoded).unwrap();
+        assert_eq!(owned.payload(), b"hi");
     }
 }

@@ -35,6 +35,8 @@ pub struct RuntimeConfig {
     pub tcp_nodelay: bool,
     pub tcp_keepalive: bool,
     pub socket_buffer: usize,
+    /// Pad MUX DATA frames with random lengths (GoWay `-obfs` parity).
+    pub obfs: bool,
 }
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -50,11 +52,12 @@ impl Default for RuntimeConfig {
             allow_open: false,
             max_connections: 1500,
             block_local: true,
-            tcp_nodelay: true,
-            tcp_keepalive: true,
-            socket_buffer: 0,
-        }
+        tcp_nodelay: true,
+        tcp_keepalive: true,
+        socket_buffer: 0,
+        obfs: false,
     }
+}
 }
 #[derive(Debug)]
 struct StreamEntry {
@@ -242,6 +245,7 @@ async fn send_frame_encrypted(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     frame: &MuxFrame,
+    obfs: bool,
 ) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + frame.payload.len());
     crate::mux_writer::encode_mux_ws_frame(
@@ -251,6 +255,7 @@ async fn send_frame_encrypted(
         &frame.payload,
         cipher,
         false,
+        obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
     writer.send(bytes).await
@@ -261,21 +266,26 @@ async fn send_mux_parts_encrypted(
     stream_id: u32,
     command: MuxCommand,
     payload: &[u8],
+    obfs: bool,
 ) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + payload.len());
-    crate::mux_writer::encode_mux_ws_frame(&mut bytes, stream_id, command, payload, cipher, false)
-        .map_err(|e| anyhow!(e.to_string()))?;
+    crate::mux_writer::encode_mux_ws_frame(
+        &mut bytes, stream_id, command, payload, cipher, false, obfs,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
     writer.send(bytes).await
 }
 async fn send_reset_encrypted(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     id: u32,
+    obfs: bool,
 ) -> Result<()> {
     send_frame_encrypted(
         writer,
         cipher,
         &MuxFrame::new(id, MuxCommand::Rst, Vec::new()).map_err(|e| anyhow!(e.to_string()))?,
+        obfs,
     )
     .await
 }
@@ -285,12 +295,13 @@ async fn target_to_mux(
     writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
     cipher: XorCipher,
+    obfs: bool,
 ) {
     let mut buf = relay_buf(buffer_size).await;
     loop {
         match target.read(&mut buf).await {
             Ok(0) => {
-                let _ = send_mux_parts_encrypted(&writer, &cipher, id, MuxCommand::Fin, &[]).await;
+                let _ = send_mux_parts_encrypted(&writer, &cipher, id, MuxCommand::Fin, &[], obfs).await;
                 break;
             }
             Ok(n) => {
@@ -303,6 +314,7 @@ async fn target_to_mux(
                         id,
                         MuxCommand::Data,
                         &buf[off..end],
+                        obfs,
                     )
                     .await
                     .is_err()
@@ -310,11 +322,11 @@ async fn target_to_mux(
                         recycle_buf(buf).await;
                         return;
                     }
-                    off = end;
+                    off = end
                 }
             }
             Err(_) => {
-                let _ = send_reset_encrypted(&writer, &cipher, id).await;
+                let _ = send_reset_encrypted(&writer, &cipher, id, obfs).await;
                 break;
             }
         }
@@ -329,6 +341,7 @@ async fn server_stream_task(
     writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
     cipher: XorCipher,
+    obfs: bool,
 ) {
     let (rd, mut wr) = tokio::io::split(target);
     let mut reader = tokio::spawn(target_to_mux(
@@ -337,6 +350,7 @@ async fn server_stream_task(
         writer.clone(),
         buffer_size,
         cipher.clone(),
+        obfs,
     ));
     let mut is_fin = false;
     while let Some(cmd) = rx.recv().await {
@@ -426,7 +440,7 @@ async fn handle_mux_parts(
                 let syn = match SynPayload::decode(frame.payload()) {
                     Ok(v) => v,
                     Err(_) => {
-                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
                 };
@@ -434,7 +448,7 @@ async fn handle_mux_parts(
                 let target_text = match String::from_utf8(syn.target) {
                     Ok(v) => v,
                     Err(_) => {
-                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
                 };
@@ -442,13 +456,13 @@ async fn handle_mux_parts(
                 let target = match parse_target_authority(&target_text) {
                     Ok(v) => v,
                     Err(_) => {
-                        let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+                        let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
                 };
 
                 if enforce_target_policy(&cfg, &target).is_err() {
-                    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+                    let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                     continue;
                 }
 
@@ -473,7 +487,7 @@ async fn handle_mux_parts(
                     }
                 };
                 if !admitted {
-                    let _ = send_reset_encrypted(&writer, &cipher, stream_id).await;
+                    let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                     continue;
                 }
 
@@ -508,9 +522,10 @@ async fn handle_mux_parts(
                     cipher: &XorCipher,
                     streams: &Arc<RwLock<HashMap<u32, StreamEntry>>>,
                     stream_id: u32,
+                    obfs: bool,
                 ) {
                     let _ =
-                        send_reset_encrypted(writer, cipher, stream_id).await;
+                        send_reset_encrypted(writer, cipher, stream_id, obfs).await;
                     streams.write().await.remove(&stream_id);
                 }
                 let task = tokio::spawn(async move {
@@ -533,6 +548,7 @@ async fn handle_mux_parts(
                                             &writer_task,
                                             &cipher_task,
                                             stream_id,
+                                            cfg_task.obfs,
                                         )
                                         .await;
                                         streams_task.write().await.remove(&stream_id);
@@ -567,6 +583,7 @@ async fn handle_mux_parts(
                                                 &cipher_task,
                                                 &streams_task,
                                                 stream_id,
+                                                cfg_task.obfs,
                                             )
                                             .await;
                                             return;
@@ -603,6 +620,7 @@ async fn handle_mux_parts(
                                         &cipher_task,
                                         &streams_task,
                                         stream_id,
+                                        cfg_task.obfs,
                                     )
                                     .await;
                                     return;
@@ -624,6 +642,7 @@ async fn handle_mux_parts(
                         writer_task.clone(),
                         cfg_task.buffer_size,
                         cipher_task.clone(),
+                        cfg_task.obfs,
                     ));
 
                     for frame in pending {

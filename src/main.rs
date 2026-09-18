@@ -49,6 +49,12 @@ struct Args {
     no_mux: bool,
     #[arg(long = "mux-sessions", default_value_t = 4, value_parser = clap::value_parser!(usize))]
     mux_sessions: usize,
+    #[arg(
+        long = "obfs",
+        default_value_t = false,
+        help = "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting (GoWay parity)"
+    )]
+    obfs: bool,
     #[arg(long = "allow-open", default_value_t = false)]
     allow_open: bool,
     #[arg(long = "verify-ssl", default_value_t = false)]
@@ -95,6 +101,7 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "mux",
     "no-mux",
     "mux-sessions",
+    "obfs",
     "allow-open",
     "verify-ssl",
     "socket-buffer",
@@ -255,6 +262,9 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
     {
         cfg.allow_open = x
     }
+    if let Some(x) = v.get("obfs").and_then(|x| x.as_bool()) {
+        cfg.obfs = x
+    }
     if let Some(x) = v
         .get("max_connections")
         .or_else(|| v.get("maxConnections"))
@@ -408,6 +418,10 @@ fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str) {
     println!(" [+] Listen:      {}:{}", cfg.proxy_host, cfg.proxy_port);
     println!(" [+] Upstream:    {upstream}");
     println!(" [+] Mux:         {mux}");
+    println!(
+        " [+] Obfs:        {}",
+        if cfg.obfs { "Enabled" } else { "Disabled" }
+    );
     println!(" [+] DNS:         {dns_display}");
     println!(" [+] Auth:        {auth}");
     println!(" [+] Buffer:      {} KB", cfg.buffer_size / 1024);
@@ -489,6 +503,9 @@ async fn main() -> Result<()> {
     }
     if args.allow_open {
         cfg.allow_open = true;
+    }
+    if args.obfs {
+        cfg.obfs = true;
     }
     if let Some(v) = args.max_conn {
         cfg.max_connections = v;

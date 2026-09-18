@@ -1724,6 +1724,20 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Remaining risk:** Partial-vectored-write path mock-only (as before).
 - **Next action:** User decides: commit or continue.
 
+## 2026-09-18 â€” Writer Batch Sensitivity: BATCH_MAX_FRAMES 8/32/128
+
+- **Bug:** N/A (measurement task): does the coalescing cap matter?
+- **Astra review:** Same-window interleaved runs; box heavily loaded by live user traffic throughout, so absolute numbers are depressed vs morning â€” only relative order counts.
+- **Change:** None (all values reverted; tree clean).
+- **Validation (`e2e_bench`, WS 4 MiB, 2 runs each):**
+  - 8: c8 ~183 / c32 ~192-218.
+  - 128: c8 ~172-215 / c32 ~211-230.
+  - 32: c8 ~170-195 / c32 ~178-239.
+  - Verdict: **indistinguishable** â€” the drain rarely finds deep queues at these frame rates (64 KB frames â‰ˆ 3000/s), so the cap never binds. Keep 32.
+- **Status:** done (negative result, no code change).
+- **Remaining risk:** None new.
+- **Next action:** Await user direction (entry uncommitted).
+
 ## 2026-09-18 â€” v0.0.18 Release: Batched Reads + Borrowed Writes
 
 - **Target & Version:** `0.0.18` â€” 3-read WS headers, zero-alloc non-MUX frame writes.
@@ -1734,3 +1748,33 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** Small-frame gain unmeasured directly.
 - **Next action:** Push commit + tag; build 3 manual packages.
+
+## 2026-09-18 â€” GoWay #1 Fair DRR Writer + #3 Unilateral Obfs Padding
+
+- **Bug:** (1) Single-FIFO MUX writer buries interactive streams behind bulk (video-stall pattern); (2) fixed packet lengths fingerprintable by size.
+- **Root cause:** (1) No per-stream scheduling; (2) no length obfuscation.
+- **Astra review:**
+  - Fairness: priority lane (ping/SYN/FIN/RST) + DRR (64 KB quantum, 256 KB deficit cap); locks never across network IO; `w.pos = idx + 1` strict rotation (a stick-to-same-stream bug was caught by hand-tracing before merge); queue cap raised 8 â†’ 64 total with backpressure preserved.
+  - Obfs: random pad inside WS payload, MUX header length unchanged â€” old Go/RushWay receivers slice by declared length and ignore the tail (verified); RushWay's strict `!=` length check was relaxed to `<` (plus a real data-leak found and fixed: `OwnedMuxFrame::payload()` was unbounded and forwarded pad bytes into streams).
+  - Test discipline: racy test assumption (writer blocked on first write) fixed to drain-first deterministic pattern; a stale-binary false failure was diagnosed via `cargo clean -p` (cargo fingerprint missed a rapid revert cycle).
+- **Change:**
+  - `way/goway/goway.go`: `muxOutboundFrame` gains `streamID`/`cmd`; writer rewritten (DRR + priority + cond); `SendFrame` (client+server) pads DATA when `-obfs`; `RemoveStream` drops queued frames; new `-obfs` flag + `Obfs` config.
+  - `rushway/src/protocol.rs`: trailing-pad tolerance + regression test (proven to fail on old code).
+  - Tests: `TestMuxOutboundWriterFairness` (2 sub-tests), `TestMuxObfsPadding` (3 sub-tests) â€” all pass; full `go test` 77 s green; rushway 80 green.
+  - Live (file logs): Go-obfsâ†”Go-obfs, Go-obfsâ†’RushWay, Go-plainâ†’RushWay bulk all PASS; fairness A/B (4 bulk + interactive probes) PASS both versions (localhost too fast to separate â€” ordering guarantee is the deliverable).
+- **Commit:** pending â€” NOT committed in either repo at time of writing.
+- **Validation:** As above. Timing jitter deferred (would fight the fairness latency win); control-frame padding deferred (rare, low signal).
+- **Status:** done, uncommitted in `way` repo; rushway side only needed the tolerance fix.
+- **Remaining risk:** Bulk-vs-interactive end-to-end latency gap needs slow-link proof; jitter phase open.
+- **Next action:** User decides: commit Go changes, then #2 UDP batching.
+## 2026-09-18 ¡ª RushWay Sender-Side -obfs + Pad-Framing Panic Fix
+
+- **Bug:** (1) RushWay ignored --obfs on send (only decode tolerance existed); (2) first send-side implementation desynced peers -> \ws.rs:692 unreachable!()\ panic on live obfs transfer.
+- **Root cause:** (1) \encode_mux_ws_frame\ had no pad path; call sites passed no obfs flag. (2) Pad appended after WS header computed, outside the declared WS length; peer left pad bytes in-stream, next header parsed as garbage opcode.
+- **Astra review:** Pad inside WS payload + MUX declared length unchanged = matches Go \SendFrame\ design and old-peer tolerance; pad masked/ciphered with body (middlebox-safe); control frames never padded; \OwnedMuxFrame::payload()\ already bounded so tails can't leak into streams; reserved-opcode arm converted error (DoS hardening); no lock/ownership changes (pure param plumbing).
+- **Change:** \src/mux_writer.rs\ (up-front pad sizing, header covers pad, unit-test WS-strip fixed to parse real header lengths); \src/protocol.rs\ (no change needed ¡ª tolerance already in); \src/mux_pool.rs\, \src/wss_client.rs\, \src/runtime.rs\ (obfs param threading; fixed an edit-dropped \}\ orphan in \	arget_to_mux\ before compile); \src/ws.rs\ (reserved opcode -> Err); \CHANGELOG.md\ [Unreleased].
+- **Commit:** pending ¡ª NOT committed at time of writing.
+- **Validation:** \cargo check --all-targets\ clean; \cargo test\ 81/81 (incl. \obfs_pads_data_only_within_cap\); loopback e2e (python http target via SOCKS, \--no-block-local\ since loopback is block-listed by default): obfs-obfs, plainSrv-obfsCli, obfsSrv-plainCli all 200 + full body, zero panics on stderr. Pre-existing clippy \ -D warnings\ failures (10) confirmed identical on clean HEAD ¡ª not introduced here.
+- **Status:** done, uncommitted.
+- **Remaining risk:** Bulk-vs-interactive fairness still single-FIFO on RushWay side (Go DRR done, RushWay port open); jitter phase open.
+- **Next action:** RushWay write-side DRR fair scheduling port.
