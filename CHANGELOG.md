@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.18] - 2026-09-18
+
+### Fixed
+- **Batched WS Header Reads**: `read_frame` parses the header in at most 3 reads (2-byte base, then extended-length + mask key in one go) instead of up to 5; matters most for small-frame traffic (tens of thousands of frames/s).
+- **Borrowed Non-MUX Frame Writes**: new `ws::write_frame_borrowed` masks reusable scratch in place and emits via a single vectored write — zero allocation on all 1:1 non-MUX relay paths (the interim `write_frame_owned` was superseded and removed).
+
 ## [v0.0.17] - 2026-09-18
 
 ### Fixed

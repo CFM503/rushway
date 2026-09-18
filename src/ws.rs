@@ -505,33 +505,47 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Writes a frame from an already-owned payload buffer: masks it in place
-/// and emits header (+ key) + payload with a single vectored write.
-/// Saves one full allocation + copy versus [`write_frame`] (which copies
-/// into a fresh frame buffer). Used by the 1:1 non-MUX relay paths.
-pub async fn write_frame_owned<W: AsyncWrite + Unpin>(
+/// Writes a frame borrowing its payload from reusable scratch: masks the
+/// scratch region in place and emits with a single vectored write, with
+/// zero allocation. The caller must fully overwrite the region on the next
+/// read (plain `read` into `[..]` satisfies this); only the used prefix is
+/// ever consumed downstream.
+pub async fn write_frame_borrowed<W: AsyncWrite + Unpin>(
     w: &mut W,
-    mut payload: Vec<u8>,
+    scratch: &mut [u8],
     opcode: u8,
     masked: bool,
 ) -> Result<()> {
-    check_frame_args(payload.len(), opcode)?;
+    check_frame_args(scratch.len(), opcode)?;
     let mut header = [0u8; 14];
-    let header_len = ws_header_into(&mut header, payload.len(), opcode, masked);
-    let mut key = [0u8; 4];
-    if masked {
-        key = next_mask();
-        for (i, byte) in payload.iter_mut().enumerate() {
+    let header_len = ws_header_into(&mut header, scratch.len(), opcode, masked);
+    let key_opt = if masked {
+        let key = next_mask();
+        for (i, byte) in scratch.iter_mut().enumerate() {
             *byte ^= key[i & 3];
         }
-    }
+        Some(key)
+    } else {
+        None
+    };
+    write_frame_parts_vectored(w, &header, header_len, key_opt, scratch).await
+}
+
+async fn write_frame_parts_vectored<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    header: &[u8; 14],
+    header_len: usize,
+    key: Option<[u8; 4]>,
+    payload: &[u8],
+) -> Result<()> {
     use std::future::poll_fn;
     use std::io::IoSlice;
     use std::pin::Pin;
     // (part, off) progress across partial vectored writes, where the parts
     // are [header][key][payload]. Empty leading parts are skipped so the
     // slice list is never all-empty before completion.
-    let key_len = if masked { 4 } else { 0 };
+    let key_slice: &[u8] = key.as_ref().map(|k| &k[..]).unwrap_or(&[]);
+    let key_len = key_slice.len();
     let lens = [header_len, key_len, payload.len()];
     let mut part = 0u8;
     let mut off = 0usize;
@@ -547,14 +561,14 @@ pub async fn write_frame_owned<W: AsyncWrite + Unpin>(
         match part {
             0 => {
                 slices.push(IoSlice::new(&header[off..header_len]));
-                if masked {
-                    slices.push(IoSlice::new(&key));
+                if !key_slice.is_empty() {
+                    slices.push(IoSlice::new(key_slice));
                 }
-                slices.push(IoSlice::new(&payload));
+                slices.push(IoSlice::new(payload));
             }
             1 => {
-                slices.push(IoSlice::new(&key[off..key_len]));
-                slices.push(IoSlice::new(&payload));
+                slices.push(IoSlice::new(&key_slice[off..]));
+                slices.push(IoSlice::new(payload));
             }
             _ => {
                 slices.push(IoSlice::new(&payload[off..]));
@@ -862,12 +876,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_write_matches_encode_wire_format() {
-        for (len, masked) in [(0usize, true), (13, true), (125, true), (126, true), (70000, true), (70000, false)] {
-            let (mut a, mut b) = duplex(1024 * 1024);
-            let data = vec![0x5Au8; len];
-            let writer =
-                tokio::spawn(async move { write_frame_owned(&mut a, data, 2, masked).await });
+    async fn borrowed_write_reuses_scratch_safely() {
+        let (mut a, mut b) = duplex(1024 * 1024);
+        // One scratch buffer reused across frames of different sizes:
+        // each frame must decode cleanly with no cross-frame leakage.
+        let mut scratch = vec![0u8; 70000];
+        for (len, byte) in [(70000usize, 0x11u8), (13, 0x22), (50000, 0x33)] {
+            for i in 0..len {
+                scratch[i] = byte;
+            }
+            write_frame_borrowed(&mut a, &mut scratch[..len], 2, true)
+                .await
+                .unwrap();
             let mut buf = Vec::new();
             let got = read_frame(
                 &mut b,
@@ -877,9 +897,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            writer.await.unwrap().unwrap();
             assert_eq!(got.0, 2);
-            assert_eq!(got.1, vec![0x5Au8; len]);
+            assert_eq!(got.1, vec![byte; len]);
             assert!(buf.is_empty());
         }
     }

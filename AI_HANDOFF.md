@@ -1704,3 +1704,33 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released.
 - **Remaining risk:** Small-frame gain unmeasured directly; partial-write fallback mock-only.
 - **Next action:** Push commit + tag; build 3 manual packages.
+
+## 2026-09-18 — Batched Header Reads + Borrowed Non-MUX Writes
+
+- **Bug:** Read path paid up to 5 syscalls per frame; non-MUX write paths paid an extra allocation + copy + syscall per chunk.
+- **Root cause:** Piecemeal header parsing predating the writer work; `to_vec` + second copy in 1:1 paths.
+- **Astra review:**
+  - Header batching preserves clean-EOF semantics (first byte via `read`, never `read_exact`) and validation outcomes; shared `check_frame_args` validator.
+  - Borrowed writes mask scratch in place (safe: fully overwritten by the next read; only the used prefix is consumed); vectored-write progress shared via `write_frame_parts_vectored`.
+  - Interim `write_frame_owned` removed once superseded (with its test — borrowed test covers the behavior).
+- **Change:**
+  - `src/ws.rs`: 3-read header parse, `write_frame_borrowed`, `borrowed_write_reuses_scratch_safely` test (same buffer, varying sizes).
+  - `src/nonmux.rs` (2 sites) + `src/wss_client.rs` (1 site): `write_frame_owned` → `write_frame_borrowed`.
+- **Commit:** pending — uncommitted working tree at time of writing.
+- **Validation:**
+  - 79 unit tests pass; clippy zero new; MUX/non-MUX interop + 2 MiB bulk PASS.
+  - Gain claim kept honest: bulk big-frame effect ~0; value concentrates in small-frame traffic, not directly benchable here.
+- **Status:** done, unreleased.
+- **Remaining risk:** Partial-vectored-write path mock-only (as before).
+- **Next action:** User decides: commit or continue.
+
+## 2026-09-18 — v0.0.18 Release: Batched Reads + Borrowed Writes
+
+- **Target & Version:** `0.0.18` — 3-read WS headers, zero-alloc non-MUX frame writes.
+- **Astra review:** EOF semantics and validation outcomes preserved; gains claimed only for small-frame traffic.
+- **Change:** `Cargo.toml` 0.0.17 → 0.0.18; `CHANGELOG.md` `[Unreleased]` → `[v0.0.18]`.
+- **Commit:** pending — pushed as release commit + annotated tag below.
+- **Validation:** 79 unit tests; clippy zero new; interop + bulk green.
+- **Status:** released.
+- **Remaining risk:** Small-frame gain unmeasured directly.
+- **Next action:** Push commit + tag; build 3 manual packages.
