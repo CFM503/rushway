@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.21] - 2026-09-20
+
+### Fixed
+- **SYN-Yields-DATA Loss (critical, burst-only)**: the self-ordering rule initially applied to ALL controls, so a SYN queued behind its own stream's DATA yielded — the peer then dropped that DATA as unknown-stream (no error anywhere: no Rst, no dispatch-miss, no panic). Manifested as 1–25% of flows vanishing under tight burst (full request sent, zero echo). Only FIN/RST yield now; SYN always leads. Proven by per-id frequency analysis (lost SYNs were always the burst tail) + `drr_syn_never_yields_to_own_data`.
+- **Tail Stall When No Further Arrivals**: the emit loop broke at the first unaffordable `next()`; at flow tails (no future arrivals to add credit) the remainder stranded forever. Now retries while non-empty (each call accrues a quantum; frames far below the cap, so termination is guaranteed).
+- **Close-Time Frame Abandonment**: channel close dropped scheduler leftovers (56 frames caught live). Now drains on close with a bounded spin guard.
+- **Feed 64→256**: absorbs tight bursts without sender blocking (validated 5×100-burst green); total bound 512 frames worst-case.
+
+### Added
+- **Burst Regression Tests**: `concurrent_bulk_all_frames_delivered` (8×71 live-task frames), `drr_syn_never_yields_to_own_data`.
+
 ## [v0.0.20] - 2026-09-20
 
 ### Added

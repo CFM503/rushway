@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const WRITER_QUEUE: usize = 256;
-const FEED_CAP: usize = 64;
+const FEED_CAP: usize = 256;
 const BATCH_MAX_FRAMES: usize = 32;
 const BATCH_MAX_BYTES: usize = 1024 * 1024;
 /// Per-stream byte credit added each deficit round (GoWay parity).
@@ -41,13 +41,15 @@ const DRR_MAX_DEFICIT: usize = 256 * 1024;
 /// scheduled per `stream_id` (GoWay `muxOutboundWriter` parity).
 ///
 /// `stream_id` is `Some` for MUX control frames (SYN/FIN/RST) so the
-/// scheduler can keep a stream's control behind its own queued DATA —
-/// otherwise a FIN would overtake its stream's data, the peer would close
-/// early, and the tail would be dropped. System frames (hello/ping) carry
-/// `None` and always jump the queue.
+/// scheduler can keep a stream-closing control behind its own queued DATA.
+/// `yield_to_data` is set ONLY for FIN/RST: a SYN must always lead (it
+/// creates the server-side stream — yielding it behind its own DATA makes
+/// the peer drop that DATA as unknown-stream, a live-caught burst bug).
+/// System frames (hello/ping) carry `None` and always jump the queue.
 pub(crate) struct OutboundFrame {
     stream_id: Option<u32>,
     priority: bool,
+    yield_to_data: bool,
     bytes: Vec<u8>,
 }
 
@@ -88,6 +90,7 @@ impl MuxFrameWriter {
         self.send_frame(OutboundFrame {
             stream_id: None,
             priority: true,
+            yield_to_data: false,
             bytes: frame,
         })
         .await
@@ -97,9 +100,15 @@ impl MuxFrameWriter {
     /// lane; DATA frames are DRR-scheduled per stream. Same failure and
     /// backpressure contract as [`MuxFrameWriter::send`].
     pub async fn send_mux(&self, stream_id: u32, command: MuxCommand, frame: Vec<u8>) -> Result<()> {
+        // Only stream-CLOSING controls yield to their own queued DATA.
+        // SYN must lead (it creates the peer-side stream); DATA never
+        // takes the priority lane at all.
+        let yield_to_data =
+            command == MuxCommand::Fin || command == MuxCommand::Rst;
         self.send_frame(OutboundFrame {
             stream_id: Some(stream_id),
             priority: command != MuxCommand::Data,
+            yield_to_data,
             bytes: frame,
         })
         .await
@@ -133,7 +142,7 @@ struct StreamQueue {
 /// queue depth is bounded at [`WRITER_QUEUE`] frames total (priority + all
 /// streams), preserving the old backpressure contract.
 struct Scheduler {
-    priority: VecDeque<(Option<u32>, Vec<u8>)>,
+    priority: VecDeque<(Option<u32>, bool, Vec<u8>)>,
     streams: HashMap<u32, StreamQueue>,
     rotation: Vec<u32>,
     pos: usize,
@@ -165,14 +174,15 @@ impl Scheduler {
         // stream. MUX frames top out near 67KB — far below the cap.
         debug_assert!(frame.bytes.len() <= DRR_MAX_DEFICIT);
         if frame.priority {
-            self.priority.push_back((frame.stream_id, frame.bytes));
+            self.priority
+                .push_back((frame.stream_id, frame.yield_to_data, frame.bytes));
             self.total += 1;
             return;
         }
         let Some(stream_id) = frame.stream_id else {
             // Unreachable: only send_mux (always Some) reaches here with
             // priority == false. Guard anyway to never strand a frame.
-            self.priority.push_back((None, frame.bytes));
+            self.priority.push_back((None, false, frame.bytes));
             self.total += 1;
             return;
         };
@@ -189,18 +199,21 @@ impl Scheduler {
 
     /// Pops the next frame to emit: priority lane first, then one DRR step.
     ///
-    /// Intra-stream order wins over cross-stream priority: a control frame
-    /// for a stream with queued DATA yields to that DATA (it stays queued).
-    /// Otherwise a FIN/RST would overtake its own stream's tail, the peer
-    /// would close early, and the tail would be dropped. System frames
-    /// (`None`) and controls for streams with empty queues jump immediately.
+    /// Intra-stream order wins over cross-stream priority, but ONLY for
+    /// stream-closing controls (FIN/RST): those yield while their own
+    /// stream still has queued DATA (it stays queued), otherwise the peer
+    /// would close early and drop the tail. SYN never yields — it creates
+    /// the peer-side stream, so yielding it makes the peer drop its own
+    /// DATA as unknown-stream. System frames (`None`) and controls for
+    /// streams with empty queues jump immediately.
     fn next(&mut self) -> Option<Vec<u8>> {
-        if let Some(&(sid, _)) = self.priority.front() {
-            let blocked = sid.is_some_and(|id| {
-                self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
-            });
+        if let Some(&(sid, yield_to_data, _)) = self.priority.front() {
+            let blocked = yield_to_data
+                && sid.is_some_and(|id| {
+                    self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
+                });
             if !blocked {
-                let (_, frame) = self.priority.pop_front().unwrap();
+                let (_, _, frame) = self.priority.pop_front().unwrap();
                 self.total -= 1;
                 return Some(frame);
             }
@@ -385,6 +398,13 @@ where
         }
         // Emit one DRR-ordered batch (priority lane first, then one frame
         // per affordable stream); vectored write preserved.
+        //
+        // A `None` here only means "nothing affordable THIS round" — each
+        // next() call adds a quantum to every stream, so retrying while the
+        // scheduler is non-empty always reaches an emission within a few
+        // rounds (frames are far below the deficit cap). Breaking at the
+        // first None instead would strand the tail whenever no further
+        // arrivals come to wake us (caught live: 4MiB tail stall).
         batch.clear();
         let mut bytes = 0usize;
         while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES {
@@ -393,7 +413,8 @@ where
                     bytes += frame.len();
                     batch.push(frame);
                 }
-                None => break,
+                None if sched.is_empty() => break,
+                None => continue,
             }
         }
         if batch.is_empty() {
@@ -407,7 +428,32 @@ where
                     sched.push(frame);
                     continue;
                 }
-                None => break,
+                // Feed closed: drain everything still scheduled before
+                // exiting — abandoning queued frames here would silently
+                // drop tails (caught live: 56 stranded frames at close).
+                // Terminates: every next() either emits (total--) or
+                // accrues deficit, and frames are far below the deficit
+                // cap, so emission is always reached within a few calls.
+                // The iteration bound is pure paranoia against a hang at
+                // teardown (a hang there is worse than a drop).
+                None => {
+                    let mut spins = 0usize;
+                    let max_spins = sched.len() * 8 + 32;
+                    while !sched.is_empty() && spins < max_spins {
+                        spins += 1;
+                        if let Some(frame) = sched.next() {
+                            batch.push(frame);
+                            if batch.len() >= BATCH_MAX_FRAMES {
+                                let _ = write_batch(&mut w, &batch).await;
+                                batch.clear();
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        let _ = write_batch(&mut w, &batch).await;
+                    }
+                    break;
+                }
             }
         }
         if write_batch(&mut w, &batch).await.is_err() {
@@ -637,6 +683,18 @@ mod tests {
     }
 
     fn drr_frame(stream_id: u32, priority: bool, len: usize, tag: u8) -> OutboundFrame {
+        drr_frame_yield(stream_id, priority, priority, len, tag)
+    }
+
+    /// priority + yield_to_data set independently (mirrors send_mux: only
+    /// FIN/RST yield; SYN never does even though it is priority).
+    fn drr_frame_yield(
+        stream_id: u32,
+        priority: bool,
+        yield_to_data: bool,
+        len: usize,
+        tag: u8,
+    ) -> OutboundFrame {
         let mut bytes = vec![tag; len];
         if !bytes.is_empty() {
             bytes[0] = tag;
@@ -644,6 +702,7 @@ mod tests {
         OutboundFrame {
             stream_id: Some(stream_id),
             priority,
+            yield_to_data,
             bytes,
         }
     }
@@ -652,6 +711,7 @@ mod tests {
         OutboundFrame {
             stream_id: None,
             priority: true,
+            yield_to_data: false,
             bytes: vec![tag; len],
         }
     }
@@ -715,6 +775,81 @@ mod tests {
         // of its own stream: D1 always comes before FIN. Intra-stream order
         // is what correctness needs; cross-stream order stays fair.
         assert_eq!(order, vec![3, 5, 1, 2]);
+    }
+
+    #[test]
+    fn drr_syn_never_yields_to_own_data() {
+        // SYN creates the peer-side stream: it must lead even when its own
+        // DATA is already queued. Yielding it (like FIN/RST) makes the peer
+        // drop that DATA as unknown-stream — live-caught with full 64KB
+        // flows vanishing under burst while zero probes fired.
+        let mut sched = Scheduler::new();
+        sched.push(drr_frame(1, false, 100, 1));
+        sched.push(drr_frame_yield(1, true, false, 7, 2));
+        sched.push(drr_frame(1, false, 100, 1));
+        let mut order = Vec::new();
+        while !sched.is_empty() {
+            if let Some(frame) = sched.next() {
+                order.push(frame[0]);
+            }
+        }
+        assert_eq!(order, vec![2, 1, 1]);
+    }
+
+    /// Regression: 8 bulk streams racing one writer must deliver every
+    /// frame, including the close-time drain (a prior revision stranded
+    /// queued frames when the feed closed, and an earlier one wedged the
+    /// tail when no further arrivals came).
+    #[tokio::test]
+    async fn concurrent_bulk_all_frames_delivered() {
+        use crate::crypto::XorCipher;
+        use crate::ws::read_frame;
+        use tokio::io::duplex;
+        let (a, mut b) = duplex(256 * 1024 * 1024);
+        let (writer, handle) = MuxFrameWriter::spawn(a);
+        let cipher = XorCipher::new("repro");
+        let mut tasks = Vec::new();
+        for sid in 1..=8u32 {
+            let w = writer.clone();
+            let c = cipher.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..70 {
+                    let mut enc = Vec::new();
+                    encode_mux_ws_frame(&mut enc, sid, MuxCommand::Data, &[sid as u8; 65535], &c, true, false).unwrap();
+                    w.send_mux(sid, MuxCommand::Data, enc).await.unwrap();
+                }
+                let mut enc = Vec::new();
+                encode_mux_ws_frame(&mut enc, sid, MuxCommand::Fin, &[], &c, true, false).unwrap();
+                w.send_mux(sid, MuxCommand::Fin, enc).await.unwrap();
+            }));
+        }
+        drop(writer);
+        let reader = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut count = 0usize;
+            while count < 8 * 71 {
+                let (op, mut payload) = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(op, 2);
+                cipher.apply(&mut payload);
+                let _ = MuxFrame::decode(&payload).unwrap();
+                count += 1;
+            }
+            count
+        });
+        let (_senders, received) = tokio::join!(
+            async {
+                for t in tasks {
+                    t.await.unwrap();
+                }
+            },
+            tokio::time::timeout(std::time::Duration::from_secs(30), reader),
+        );
+        let n = received.expect("writer stalled: reader timed out").unwrap();
+        assert_eq!(n, 8 * 71);
+        handle.await.unwrap();
     }
 
     #[tokio::test]

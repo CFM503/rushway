@@ -1767,26 +1767,38 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** done, uncommitted in `way` repo; rushway side only needed the tolerance fix.
 - **Remaining risk:** Bulk-vs-interactive end-to-end latency gap needs slow-link proof; jitter phase open.
 - **Next action:** User decides: commit Go changes, then #2 UDP batching.
-## 2026-09-18 ¡ª RushWay Sender-Side -obfs + Pad-Framing Panic Fix
+## 2026-09-18 â€” RushWay Sender-Side -obfs + Pad-Framing Panic Fix
 
 - **Bug:** (1) RushWay ignored --obfs on send (only decode tolerance existed); (2) first send-side implementation desynced peers -> \ws.rs:692 unreachable!()\ panic on live obfs transfer.
 - **Root cause:** (1) \encode_mux_ws_frame\ had no pad path; call sites passed no obfs flag. (2) Pad appended after WS header computed, outside the declared WS length; peer left pad bytes in-stream, next header parsed as garbage opcode.
 - **Astra review:** Pad inside WS payload + MUX declared length unchanged = matches Go \SendFrame\ design and old-peer tolerance; pad masked/ciphered with body (middlebox-safe); control frames never padded; \OwnedMuxFrame::payload()\ already bounded so tails can't leak into streams; reserved-opcode arm converted error (DoS hardening); no lock/ownership changes (pure param plumbing).
-- **Change:** \src/mux_writer.rs\ (up-front pad sizing, header covers pad, unit-test WS-strip fixed to parse real header lengths); \src/protocol.rs\ (no change needed ¡ª tolerance already in); \src/mux_pool.rs\, \src/wss_client.rs\, \src/runtime.rs\ (obfs param threading; fixed an edit-dropped \}\ orphan in \	arget_to_mux\ before compile); \src/ws.rs\ (reserved opcode -> Err); \CHANGELOG.md\ [Unreleased].
-- **Commit:** pending ¡ª NOT committed at time of writing.
-- **Validation:** \cargo check --all-targets\ clean; \cargo test\ 81/81 (incl. \obfs_pads_data_only_within_cap\); loopback e2e (python http target via SOCKS, \--no-block-local\ since loopback is block-listed by default): obfs-obfs, plainSrv-obfsCli, obfsSrv-plainCli all 200 + full body, zero panics on stderr. Pre-existing clippy \ -D warnings\ failures (10) confirmed identical on clean HEAD ¡ª not introduced here.
+- **Change:** \src/mux_writer.rs\ (up-front pad sizing, header covers pad, unit-test WS-strip fixed to parse real header lengths); \src/protocol.rs\ (no change needed â€” tolerance already in); \src/mux_pool.rs\, \src/wss_client.rs\, \src/runtime.rs\ (obfs param threading; fixed an edit-dropped \}\ orphan in \	arget_to_mux\ before compile); \src/ws.rs\ (reserved opcode -> Err); \CHANGELOG.md\ [Unreleased].
+- **Commit:** pending â€” NOT committed at time of writing.
+- **Validation:** \cargo check --all-targets\ clean; \cargo test\ 81/81 (incl. \obfs_pads_data_only_within_cap\); loopback e2e (python http target via SOCKS, \--no-block-local\ since loopback is block-listed by default): obfs-obfs, plainSrv-obfsCli, obfsSrv-plainCli all 200 + full body, zero panics on stderr. Pre-existing clippy \ -D warnings\ failures (10) confirmed identical on clean HEAD â€” not introduced here.
 - **Status:** done, uncommitted.
 - **Remaining risk:** Bulk-vs-interactive fairness still single-FIFO on RushWay side (Go DRR done, RushWay port open); jitter phase open.
 - **Next action:** RushWay write-side DRR fair scheduling port.
 
-## 2026-09-20 ¡ª RushWay DRR Port + FIN-Overtakes-DATA Loss (both sides fixed)
+## 2026-09-20 â€” RushWay DRR Port + FIN-Overtakes-DATA Loss (both sides fixed)
 
 - **Bug:** (1) RushWay single-FIFO writer buries interactive streams (Go had DRR since v1.8.6); (2) first DRR port let FIN jump its own stream's queued DATA -> peer closes early -> tail dropped (loopback \curl 000\ with full response emitted); (3) priority-branch early return skipped \	otal += 1\ -> writer exited early, hello never sent.
 - **Root cause:** (2) Priority lane evaluated before DRR with no intra-stream guard; batching window (up to 32) made the inversion deterministic, while Go's one-frame cadence won the race on fast links. Proven: client received \[Fin, Data]\ for a server-sent \[Data, Fin]\. (3) Counter only incremented on the DATA path.
 - **Astra review:** Fix keeps cross-stream priority (fairness goal intact) and adds self-ordering only; termination still guaranteed (frames <= 67KB << 256KB deficit cap, deficits persist, park+retry can't deadlock since recv() also drains the feed); backpressure preserved (64 feed + 256 internal vs old 256; overshoot bounded); per-stream FIFO keeps in-order delivery; no lock/ownership changes.
 - **Change:** \src/mux_writer.rs\ (OutboundFrame envelope, Scheduler, DRR writer_loop, 4 unit tests incl. \drr_control_never_overtakes_own_data\); \send_mux\ threading in \mux_pool.rs\/\untime.rs\/\wss_client.rs\; \CHANGELOG.md\ [Unreleased]. GoWay fixed identically in v1.8.8 (test failed pre-fix with \[FIN DATA DATA]\).
-- **Commit:** pending ¡ª NOT committed at time of writing (both repos: goway v1.8.8 pushed, rushway DRR uncommitted).
+- **Commit:** pending â€” NOT committed at time of writing (both repos: goway v1.8.8 pushed, rushway DRR uncommitted).
 - **Validation:** \cargo test\ 85+7 green; loopback obfs e2e 200 (multi-request, zero panic); 6-way rushway-0.0.19<->goway-1.8.7 interop green pre-DRR; Go<->Go + Go<->RushWay green post-fix.
 - **Status:** done, uncommitted.
 - **Remaining risk:** 64KB MUX frame cap is a joint protocol lock (needs v2 to lift); last-frame DRR latency wart exists in Go only.
 - **Next action:** User decides: commit rushway DRR (suggest v0.0.20).
+
+## 2026-09-20 â€” SYN-Yields-DATA Loss + Burst Stall Trilogy (DRR follow-ups)
+
+- **Bug:** (1) Self-ordering applied to ALL controls: a SYN queued behind its own DATA yielded, peer dropped that DATA as unknown-stream (full 64KB flows vanishing under burst, zero logs everywhere); (2) emit loop broke at first unaffordable next(): flow tails stranded with no future arrivals; (3) channel close abandoned scheduler leftovers (56 frames caught live).
+- **Root cause:** (1) SYN creates the peer-side stream and must lead; only FIN/RST may yield. Proven by per-id frequency analysis (lost SYNs were always the burst tail, ids 19-26) + server dispatch-miss for full 65535+1 DATA pairs arriving before their SYN. (2)(3) Found via close-drain instrumentation + deficit math review.
+- **Astra review:** yield_to_data flag set only for Fin/Rst at send_mux; SYN/system always jump. Termination preserved (frames far below deficit cap; close-drain bounded). Feed 64â†’256 absorbs tight bursts (validated 5x100-burst green); backpressure contract kept (bounded total).
+- **Change:** `src/mux_writer.rs` only (yield_to_data envelope, Scheduler priority rule, emit retry-while-nonempty, close drain, regression tests `drr_syn_never_yields_to_own_data` + `concurrent_bulk_all_frames_delivered`). GoWay fixed identically (SYN exempted from yield + `SynNeverYieldsToOwnData`).
+- **Commit:** tag v0.0.21 (commit 9865ba4 plus this handoff amend).
+- **Validation:** `cargo test` 87+7 green; 5x100-burst 100/100 (72-163ms); bench c1/c8/c32 pass; 3-way obfs interop green post-fix. Go full suite green.
+- **Status:** released as v0.0.21.
+- **Remaining risk:** burst validation is loopback-only; slow-link fairness proof still open (DRR's real deliverable).
+- **Next action:** RushWay perf program: UDP batching, QUIC parity (goway frozen at v1.8.10 except critical interop bugs).
