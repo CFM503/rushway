@@ -1778,3 +1778,15 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** done, uncommitted.
 - **Remaining risk:** Bulk-vs-interactive fairness still single-FIFO on RushWay side (Go DRR done, RushWay port open); jitter phase open.
 - **Next action:** RushWay write-side DRR fair scheduling port.
+
+## 2026-09-20 ¡ª RushWay DRR Port + FIN-Overtakes-DATA Loss (both sides fixed)
+
+- **Bug:** (1) RushWay single-FIFO writer buries interactive streams (Go had DRR since v1.8.6); (2) first DRR port let FIN jump its own stream's queued DATA -> peer closes early -> tail dropped (loopback \curl 000\ with full response emitted); (3) priority-branch early return skipped \	otal += 1\ -> writer exited early, hello never sent.
+- **Root cause:** (2) Priority lane evaluated before DRR with no intra-stream guard; batching window (up to 32) made the inversion deterministic, while Go's one-frame cadence won the race on fast links. Proven: client received \[Fin, Data]\ for a server-sent \[Data, Fin]\. (3) Counter only incremented on the DATA path.
+- **Astra review:** Fix keeps cross-stream priority (fairness goal intact) and adds self-ordering only; termination still guaranteed (frames <= 67KB << 256KB deficit cap, deficits persist, park+retry can't deadlock since recv() also drains the feed); backpressure preserved (64 feed + 256 internal vs old 256; overshoot bounded); per-stream FIFO keeps in-order delivery; no lock/ownership changes.
+- **Change:** \src/mux_writer.rs\ (OutboundFrame envelope, Scheduler, DRR writer_loop, 4 unit tests incl. \drr_control_never_overtakes_own_data\); \send_mux\ threading in \mux_pool.rs\/\untime.rs\/\wss_client.rs\; \CHANGELOG.md\ [Unreleased]. GoWay fixed identically in v1.8.8 (test failed pre-fix with \[FIN DATA DATA]\).
+- **Commit:** pending ¡ª NOT committed at time of writing (both repos: goway v1.8.8 pushed, rushway DRR uncommitted).
+- **Validation:** \cargo test\ 85+7 green; loopback obfs e2e 200 (multi-request, zero panic); 6-way rushway-0.0.19<->goway-1.8.7 interop green pre-DRR; Go<->Go + Go<->RushWay green post-fix.
+- **Status:** done, uncommitted.
+- **Remaining risk:** 64KB MUX frame cap is a joint protocol lock (needs v2 to lift); last-frame DRR latency wart exists in Go only.
+- **Next action:** User decides: commit rushway DRR (suggest v0.0.20).

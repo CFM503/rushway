@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.20] - 2026-09-20
+
+### Added
+- **MUX Write-Side Fair DRR Scheduling (GoWay Parity)**: `MuxFrameWriter` now takes `send_mux(stream_id, command, frame)` alongside priority `send()` (handshake hello/ping); per-stream FIFOs + priority lane + deficit round robin (64KB quantum, 256KB cap, 256-frame total bound). Vectored-write batching preserved (batches are DRR-ordered).
+
+### Fixed
+- **FIN-Overtakes-DATA Data Loss (critical, caught by loopback e2e)**: first DRR version let a stream's FIN jump its own queued DATA → peer closed early → tail dropped (`curl 000` while the server had emitted the full response). Priority lane is now stream-aware: a control yields while its own stream still has queued DATA, still jumping other streams' bulk. Same latent race existed in GoWay (won by speed on fast links); fixed on both sides, proven by `FinNeverOvertakesOwnData` (failed pre-fix with `[FIN DATA DATA]`).
+- **Scheduler `total` Undercount**: priority-branch early return skipped `total += 1`, making `is_empty()` lie and the writer task exit early (handshake hello never emitted). One-line fix; covered by all writer tests.
+
 ## [v0.0.19] - 2026-09-18
 
 ### Added

@@ -836,7 +836,7 @@ async fn send_mux(
         obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(data).await
+    writer.send_mux(frame.stream_id, frame.command, data).await
 }
 async fn send_mux_parts(
     writer: &Arc<MuxFrameWriter>,
@@ -851,7 +851,7 @@ async fn send_mux_parts(
         &mut data, stream_id, command, payload, cipher, true, obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(data).await
+    writer.send_mux(stream_id, command, data).await
 }
 async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
     let mut frame_buf = Vec::with_capacity(64 * 1024);

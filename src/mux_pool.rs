@@ -133,7 +133,9 @@ async fn send_mux_parts_reuse(
 ) -> Result<()> {
     crate::mux_writer::encode_mux_ws_frame(scratch, stream_id, command, payload, cipher, true, obfs)
         .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(std::mem::take(scratch)).await
+    writer
+        .send_mux(stream_id, command, std::mem::take(scratch))
+        .await
 }
 async fn send_mux_parts(
     writer: &Arc<MuxFrameWriter>,

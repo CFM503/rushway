@@ -258,7 +258,7 @@ async fn send_frame_encrypted(
         obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(bytes).await
+    writer.send_mux(frame.stream_id, frame.command, bytes).await
 }
 async fn send_mux_parts_encrypted(
     writer: &Arc<MuxFrameWriter>,
@@ -273,7 +273,7 @@ async fn send_mux_parts_encrypted(
         &mut bytes, stream_id, command, payload, cipher, false, obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send(bytes).await
+    writer.send_mux(stream_id, command, bytes).await
 }
 async fn send_reset_encrypted(
     writer: &Arc<MuxFrameWriter>,

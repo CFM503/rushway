@@ -12,6 +12,7 @@ use crate::crypto::{XorCipher, XOR_KEY_SIZE};
 use crate::protocol::{write_frame_parts, MuxCommand};
 use crate::ws::{next_mask, ws_header_into};
 use anyhow::{anyhow, Result};
+use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::io::IoSlice;
 use std::pin::Pin;
@@ -24,11 +25,34 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const WRITER_QUEUE: usize = 256;
+const FEED_CAP: usize = 64;
 const BATCH_MAX_FRAMES: usize = 32;
 const BATCH_MAX_BYTES: usize = 1024 * 1024;
+/// Per-stream byte credit added each deficit round (GoWay parity).
+const DRR_QUANTUM: usize = 64 * 1024;
+/// Cap accumulated credit so a long-idle stream cannot hog the link.
+const DRR_MAX_DEFICIT: usize = 256 * 1024;
+
+/// One pre-encoded outbound frame with scheduling identity.
+///
+/// `priority` frames (WS handshake hellos/pings via [`MuxFrameWriter::send`]
+/// and non-DATA MUX commands via [`MuxFrameWriter::send_mux`]) drain from a
+/// dedicated lane ahead of bulk DATA; DATA frames are deficit-round-robin
+/// scheduled per `stream_id` (GoWay `muxOutboundWriter` parity).
+///
+/// `stream_id` is `Some` for MUX control frames (SYN/FIN/RST) so the
+/// scheduler can keep a stream's control behind its own queued DATA —
+/// otherwise a FIN would overtake its stream's data, the peer would close
+/// early, and the tail would be dropped. System frames (hello/ping) carry
+/// `None` and always jump the queue.
+pub(crate) struct OutboundFrame {
+    stream_id: Option<u32>,
+    priority: bool,
+    bytes: Vec<u8>,
+}
 
 pub(crate) struct MuxFrameWriter {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<OutboundFrame>,
     closed: Arc<AtomicBool>,
 }
 
@@ -43,7 +67,7 @@ impl MuxFrameWriter {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel(WRITER_QUEUE);
+        let (tx, rx) = mpsc::channel(FEED_CAP);
         let closed = Arc::new(AtomicBool::new(false));
         let this = Arc::new(Self {
             tx,
@@ -56,9 +80,32 @@ impl MuxFrameWriter {
         (this, handle)
     }
 
-    /// Queues one pre-encoded frame. Fails fast once the transport died;
-    /// otherwise back-pressures when the queue is full.
+    /// Queues one pre-encoded system frame (WS handshake hello, heartbeat
+    /// ping). System frames take the priority lane, ahead of MUX DATA.
+    /// Fails fast once the transport died; otherwise back-pressures when
+    /// the queue is full.
     pub async fn send(&self, frame: Vec<u8>) -> Result<()> {
+        self.send_frame(OutboundFrame {
+            stream_id: None,
+            priority: true,
+            bytes: frame,
+        })
+        .await
+    }
+
+    /// Queues one pre-encoded MUX frame. Non-DATA commands take the priority
+    /// lane; DATA frames are DRR-scheduled per stream. Same failure and
+    /// backpressure contract as [`MuxFrameWriter::send`].
+    pub async fn send_mux(&self, stream_id: u32, command: MuxCommand, frame: Vec<u8>) -> Result<()> {
+        self.send_frame(OutboundFrame {
+            stream_id: Some(stream_id),
+            priority: command != MuxCommand::Data,
+            bytes: frame,
+        })
+        .await
+    }
+
+    async fn send_frame(&self, frame: OutboundFrame) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(anyhow!("mux writer closed"));
         }
@@ -70,6 +117,140 @@ impl MuxFrameWriter {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+}
+
+struct StreamQueue {
+    frames: VecDeque<Vec<u8>>,
+    deficit: usize,
+}
+
+/// Deficit-round-robin scheduler over one MUX session's outbound frames.
+///
+/// Mirrors GoWay's `muxOutboundWriter`: a priority lane (system frames plus
+/// SYN/FIN/RST) drains first; DATA frames rotate strictly across streams
+/// with a 64KB quantum each. Per-stream FIFOs preserve in-order delivery;
+/// queue depth is bounded at [`WRITER_QUEUE`] frames total (priority + all
+/// streams), preserving the old backpressure contract.
+struct Scheduler {
+    priority: VecDeque<(Option<u32>, Vec<u8>)>,
+    streams: HashMap<u32, StreamQueue>,
+    rotation: Vec<u32>,
+    pos: usize,
+    total: usize,
+}
+
+impl Scheduler {
+    fn new() -> Self {
+        Self {
+            priority: VecDeque::new(),
+            streams: HashMap::new(),
+            rotation: Vec::new(),
+            pos: 0,
+            total: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn push(&mut self, frame: OutboundFrame) {
+        // Termination guard: the deficit caps at DRR_MAX_DEFICIT, so an
+        // oversized frame could never afford emission and would wedge the
+        // stream. MUX frames top out near 67KB — far below the cap.
+        debug_assert!(frame.bytes.len() <= DRR_MAX_DEFICIT);
+        if frame.priority {
+            self.priority.push_back((frame.stream_id, frame.bytes));
+            self.total += 1;
+            return;
+        }
+        let Some(stream_id) = frame.stream_id else {
+            // Unreachable: only send_mux (always Some) reaches here with
+            // priority == false. Guard anyway to never strand a frame.
+            self.priority.push_back((None, frame.bytes));
+            self.total += 1;
+            return;
+        };
+        let q = self.streams.entry(stream_id).or_insert_with(|| {
+            self.rotation.push(stream_id);
+            StreamQueue {
+                frames: VecDeque::new(),
+                deficit: 0,
+            }
+        });
+        q.frames.push_back(frame.bytes);
+        self.total += 1;
+    }
+
+    /// Pops the next frame to emit: priority lane first, then one DRR step.
+    ///
+    /// Intra-stream order wins over cross-stream priority: a control frame
+    /// for a stream with queued DATA yields to that DATA (it stays queued).
+    /// Otherwise a FIN/RST would overtake its own stream's tail, the peer
+    /// would close early, and the tail would be dropped. System frames
+    /// (`None`) and controls for streams with empty queues jump immediately.
+    fn next(&mut self) -> Option<Vec<u8>> {
+        if let Some(&(sid, _)) = self.priority.front() {
+            let blocked = sid.is_some_and(|id| {
+                self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
+            });
+            if !blocked {
+                let (_, frame) = self.priority.pop_front().unwrap();
+                self.total -= 1;
+                return Some(frame);
+            }
+        }
+        if self.rotation.is_empty() {
+            return None;
+        }
+        // Strict rotation: every stream gets +quantum per round and the
+        // first affordable head-of-queue wins. Deficits persist across
+        // calls, so no stream starves; unaffordable rounds simply emit
+        // nothing until credit accumulates.
+        let mut checked = 0;
+        while checked < self.rotation.len() {
+            if self.pos >= self.rotation.len() {
+                self.pos = 0;
+            }
+            let sid = self.rotation[self.pos];
+            self.pos += 1;
+            checked += 1;
+            let Some(q) = self.streams.get_mut(&sid) else {
+                continue;
+            };
+            q.deficit = (q.deficit + DRR_QUANTUM).min(DRR_MAX_DEFICIT);
+            let affordable = q.frames.front().map(|f| f.len()).unwrap_or(usize::MAX);
+            if affordable <= q.deficit {
+                q.deficit -= affordable;
+                let frame = q.frames.pop_front();
+                self.total -= 1;
+                if q.frames.is_empty() {
+                    self.remove_stream(&sid);
+                }
+                if frame.is_some() {
+                    return frame;
+                }
+            }
+        }
+        None
+    }
+
+    fn remove_stream(&mut self, sid: &u32) {
+        self.streams.remove(sid);
+        if let Some(idx) = self.rotation.iter().position(|s| s == sid) {
+            self.rotation.remove(idx);
+            if self.pos > idx {
+                self.pos -= 1;
+            }
+            if self.pos >= self.rotation.len() && !self.rotation.is_empty() {
+                self.pos = 0;
+            }
+        }
     }
 }
 
@@ -179,27 +360,54 @@ pub(crate) fn encode_mux_ws_frame(
     Ok(())
 }
 
-async fn writer_loop<W>(mut w: W, mut rx: mpsc::Receiver<Vec<u8>>)
+async fn writer_loop<W>(mut w: W, mut rx: mpsc::Receiver<OutboundFrame>)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut sched = Scheduler::new();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_MAX_FRAMES);
     loop {
-        batch.clear();
-        // Block for the first frame; channel close means all owners gone.
-        let Some(first) = rx.recv().await else {
-            break;
-        };
-        let mut bytes = first.len();
-        batch.push(first);
-        // Drain whatever else is already queued (coalescing window).
-        while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES {
+        // Admit: block for the first frame when the scheduler is empty
+        // (channel close here means all owners gone); otherwise drain the
+        // feed opportunistically while under the total queue cap. A full
+        // scheduler/feed makes senders block, preserving backpressure.
+        if sched.is_empty() {
+            match rx.recv().await {
+                Some(frame) => sched.push(frame),
+                None => break,
+            }
+        }
+        while sched.len() < WRITER_QUEUE {
             match rx.try_recv() {
-                Ok(frame) => {
+                Ok(frame) => sched.push(frame),
+                Err(_) => break,
+            }
+        }
+        // Emit one DRR-ordered batch (priority lane first, then one frame
+        // per affordable stream); vectored write preserved.
+        batch.clear();
+        let mut bytes = 0usize;
+        while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES {
+            match sched.next() {
+                Some(frame) => {
                     bytes += frame.len();
                     batch.push(frame);
                 }
-                Err(_) => break,
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            // Scheduler non-empty but nothing affordable (DRR credit still
+            // accumulating) and feed drained: park until a new frame
+            // arrives or the channel closes. recv() also returns frames
+            // already sitting in the feed, so this cannot deadlock.
+            // Deficits persist across rounds — no stream starves.
+            match rx.recv().await {
+                Some(frame) => {
+                    sched.push(frame);
+                    continue;
+                }
+                None => break,
             }
         }
         if write_batch(&mut w, &batch).await.is_err() {
@@ -426,5 +634,133 @@ mod tests {
         assert!(failed, "writer must report transport death");
         assert!(writer.is_closed());
         handle.await.unwrap();
+    }
+
+    fn drr_frame(stream_id: u32, priority: bool, len: usize, tag: u8) -> OutboundFrame {
+        let mut bytes = vec![tag; len];
+        if !bytes.is_empty() {
+            bytes[0] = tag;
+        }
+        OutboundFrame {
+            stream_id: Some(stream_id),
+            priority,
+            bytes,
+        }
+    }
+
+    fn drr_system(len: usize, tag: u8) -> OutboundFrame {
+        OutboundFrame {
+            stream_id: None,
+            priority: true,
+            bytes: vec![tag; len],
+        }
+    }
+
+    #[test]
+    fn drr_interactive_not_starved_by_bulk() {
+        // 4 bulk streams queue 8 x 64KB DATA each BEFORE the interactive
+        // stream arrives. Without fairness the interactive frames would sit
+        // at positions 32..35; DRR must interleave them from round one.
+        let mut sched = Scheduler::new();
+        for sid in 1..=4u32 {
+            for _ in 0..8 {
+                sched.push(drr_frame(sid, false, 65536, sid as u8));
+            }
+        }
+        for _ in 0..4 {
+            sched.push(drr_frame(9, false, 100, 9));
+        }
+        assert_eq!(sched.len(), 36);
+        // Drain-until-empty: a `None` only means "nothing affordable this
+        // round" (credit still accumulating), never "done".
+        let mut order = Vec::new();
+        while !sched.is_empty() {
+            if let Some(frame) = sched.next() {
+                order.push(frame[0]);
+            }
+        }
+        assert_eq!(order.len(), 36);
+        // Strict rotation over insertion order 1,2,3,4,9: each stream sends
+        // one frame per round, so stream 9 first appears at index 4.
+        let first_interactive = order.iter().position(|&t| t == 9).unwrap();
+        assert_eq!(first_interactive, 4);
+        // Per-stream FIFO: bulk tags appear in stream rounds, interactive
+        // frames spread across rounds (never clumped at the tail).
+        let last_interactive = order.iter().rposition(|&t| t == 9).unwrap();
+        assert!(last_interactive < 20, "interactive tail at {last_interactive}");
+        for sid in 1..=4u32 {
+            assert_eq!(order.iter().filter(|&&t| t == sid as u8).count(), 8);
+        }
+    }
+
+    #[test]
+    fn drr_control_never_overtakes_own_data() {
+        // Regression: a FIN must not jump ahead of its own stream's queued
+        // DATA (peer would close early and drop the tail), but it still
+        // jumps ahead of OTHER streams' bulk. System frames always go first
+        // among ready controls.
+        let mut sched = Scheduler::new();
+        sched.push(drr_system(2, 3)); // ping, queued first
+        sched.push(drr_frame(5, false, 65536, 5)); // other stream's bulk
+        sched.push(drr_frame(1, false, 100, 1)); // own DATA
+        sched.push(drr_frame(1, true, 7, 2)); // own FIN
+        let mut order = Vec::new();
+        while !sched.is_empty() {
+            if let Some(frame) = sched.next() {
+                order.push(frame[0]);
+            }
+        }
+        // Ping first; the FIN yields to DRR while its own DATA is queued
+        // (stream 5's bulk wins that round), but it still precedes nothing
+        // of its own stream: D1 always comes before FIN. Intra-stream order
+        // is what correctness needs; cross-stream order stays fair.
+        assert_eq!(order, vec![3, 5, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn send_mux_flows_through_scheduler_live_task() {
+        use crate::crypto::XorCipher;
+        use crate::ws::read_frame;
+        use tokio::io::duplex;
+        let (a, mut b) = duplex(1024 * 1024);
+        let (writer, handle) = MuxFrameWriter::spawn(a);
+        let cipher = XorCipher::new("probe");
+        let mut enc = Vec::new();
+        encode_mux_ws_frame(&mut enc, 5, MuxCommand::Data, &[7u8; 100], &cipher, true, false)
+            .unwrap();
+        writer.send_mux(5, MuxCommand::Data, enc).await.unwrap();
+        drop(writer);
+        let mut buf = Vec::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf),
+        )
+        .await
+        .expect("timed out waiting for send_mux frame - TASK STUCK");
+        let (opcode, mut payload) = res.unwrap().unwrap();
+        assert_eq!(opcode, 2);
+        cipher.apply(&mut payload);
+        let frame = MuxFrame::decode(&payload).unwrap();
+        assert_eq!(frame.stream_id, 5);
+        assert_eq!(frame.payload, vec![7u8; 100]);
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn drr_deficit_accumulates_across_rounds() {
+        // A 200KB frame needs 4 quanta (64KB x 3 = 192KB < 200KB): streams
+        // 2 and 3 emit first while stream 1 accrues 64/128/192KB over
+        // "empty" rounds, then 256KB (capped) lets it through.
+        let mut sched = Scheduler::new();
+        sched.push(drr_frame(1, false, 200 * 1024, 1));
+        sched.push(drr_frame(2, false, 65536, 2));
+        sched.push(drr_frame(3, false, 65536, 3));
+        let mut order = Vec::new();
+        while !sched.is_empty() {
+            if let Some(frame) = sched.next() {
+                order.push(frame[0]);
+            }
+        }
+        assert_eq!(order, vec![2, 3, 1]);
     }
 }
