@@ -5,6 +5,7 @@ use crate::dns::resolve_socket;
 use crate::mux_writer::MuxFrameWriter;
 use crate::protocol::{MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
+use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame, read_frame_owned,
     read_http_headers, validate_server_handshake, write_frame,
@@ -855,13 +856,20 @@ async fn handle_server_udp_parts(
     let writer_send = writer.clone();
     let cipher_send = cipher.clone();
     let send_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        while let Ok((n, source)) = udp_send.recv_from(&mut buf).await {
-            let mut packet = udp_envelope(source, &buf[..n]);
-            cipher_send.apply(&mut packet);
-            let mut w = writer_send.lock().await;
-            if write_frame(&mut *w, &packet, 2, false).await.is_err() {
-                break;
+        let mut batch = UdpBatchReader::new(udp_send);
+        loop {
+            let count = match batch.recv().await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            for i in 0..count {
+                let (pkt, source) = batch.packet(i);
+                let mut packet = udp_envelope(source, pkt);
+                cipher_send.apply(&mut packet);
+                let mut w = writer_send.lock().await;
+                if write_frame(&mut *w, &packet, 2, false).await.is_err() {
+                    return Ok::<(), anyhow::Error>(());
+                }
             }
         }
         Ok::<(), anyhow::Error>(())

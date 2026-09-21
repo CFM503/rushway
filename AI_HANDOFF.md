@@ -1814,3 +1814,13 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released as v0.0.22.
 - **Remaining risk:** Fairness magnitude on weak hardware unproven; TBF-drop RTO tails need fq_codel thinking if interactive SLAs matter.
 - **Next action:** UDP batching (`udp_relay.rs` recvmmsg) or QUIC parity — user picks.
+
+## 2026-09-21 — UDP Batched Reads via recvmmsg (GoWay #2 Parity)
+
+- **Change:** new `src/udp_batch.rs` (`UdpBatchReader`: `readable()` + `recvmmsg` on Linux, single-`recv_from` fallback elsewhere; shared-`Arc<UdpSocket>` untouched so senders keep `send_to`); all five UDP relay upload loops converted (`udp_relay`, `mux_pool`, `wss_client`, `quic` x2, `runtime` server) with identical per-datagram semantics (same buffers/cipher/framing, same break-on-error contract). `libc` promoted to direct dep (already in lockfile, offline-clean).
+- **Astra review:** unsafe confined to one function with documented invariants (fd lifetime, pointer lengths, alignment-checked family casts, endianness-explicit converts); no `set_len` tricks (full-length owned bufs + separate lens); truncation impossible (64KiB >= max datagram); backpressure/error semantics unchanged at every call site; fallback path keeps Windows/macOS behavior bit-identical.
+- **Validation:** `cargo test` 88 green (incl. new `batch_reader_delivers_in_order`); clippy zero new lints (one pre-existing-style assert fixed); WSL Debian pps: 408 → 784 MB/s (**1.92x**, full batches).
+- **Commit:** tag v0.0.23.
+- **Status:** released as v0.0.23.
+- **Remaining risk:** Write side stays single-`send_to` (matches Go scope; downlink rarely backlogs); burst-size/latency tradeoff untuned (8 is Go's number too).
+- **Next action:** User decides version/tag; then QUIC parity (last open item).

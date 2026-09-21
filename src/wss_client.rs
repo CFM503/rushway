@@ -12,6 +12,7 @@ use crate::runtime::{
     apply_socket_options, drain_join_set, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::tls;
+use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
     build_client_handshake_request, encode_ws_frame, read_frame, read_frame_owned,
     read_http_headers_timeout, redact_handshake_request, validate_client_handshake_response,
@@ -346,14 +347,21 @@ async fn handle_udp_proxy(
     let cipher_send = c.clone();
     let latest_send = latest_client.clone();
     let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        while let Ok((n, peer)) = udp_send.recv_from(&mut buf).await {
-            *latest_send.lock().await = Some(peer);
-            let mut packet = buf[..n].to_vec();
-            cipher_send.apply(&mut packet);
-            let mut w = writer_send.lock().await;
-            if write_frame(&mut *w, &packet, 2, true).await.is_err() {
-                break;
+        let mut batch = UdpBatchReader::new(udp_send);
+        loop {
+            let count = match batch.recv().await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            for i in 0..count {
+                let (pkt, peer) = batch.packet(i);
+                *latest_send.lock().await = Some(peer);
+                let mut packet = pkt.to_vec();
+                cipher_send.apply(&mut packet);
+                let mut w = writer_send.lock().await;
+                if write_frame(&mut *w, &packet, 2, true).await.is_err() {
+                    return Ok::<(), anyhow::Error>(());
+                }
             }
         }
         Ok::<(), anyhow::Error>(())

@@ -674,12 +674,13 @@ dependencies = [
 
 [[package]]
 name = "rushway"
-version = "0.0.22"
+version = "0.0.23"
 dependencies = [
  "anyhow",
  "base64",
  "clap",
  "jobserver",
+ "libc",
  "quinn",
  "rand 0.8.8",
  "rcgen",

@@ -8,6 +8,7 @@ mod proxy;
 mod quic;
 mod runtime;
 mod tls;
+mod udp_batch;
 mod udp_relay;
 mod ws;
 mod wss_client;

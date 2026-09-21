@@ -595,7 +595,7 @@ mod tests {
                 ),
                 n => (n as usize, 2),
             };
-            assert!(ws_len >= 107 && ws_len <= 107 + OBFS_PAD_MAX);
+            assert!((107..=107 + OBFS_PAD_MAX).contains(&ws_len));
             let mask: [u8; 4] = out[header_len..header_len + 4].try_into().unwrap();
             let mut mux_frame = out[header_len + 4..header_len + 4 + ws_len].to_vec();
             for (i, byte) in mux_frame.iter_mut().enumerate() {

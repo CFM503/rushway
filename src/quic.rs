@@ -10,6 +10,7 @@ use crate::runtime::{
     apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
     wait_shutdown, RuntimeConfig,
 };
+use crate::udp_batch::UdpBatchReader;
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
@@ -407,11 +408,18 @@ async fn relay_quic_udp(
     let latest_send = latest.clone();
     let mut send_task = send;
     let upload = tokio::spawn(async move {
-        let mut buf = [0u8; 64 * 1024];
-        while let Ok((n, peer)) = udp_send.recv_from(&mut buf).await {
-            *latest_send.lock().await = Some(peer);
-            if write_len_prefixed_udp(&mut send_task, &buf[..n]).await.is_err() {
-                break;
+        let mut batch = UdpBatchReader::new(udp_send);
+        loop {
+            let count = match batch.recv().await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            for i in 0..count {
+                let (pkt, peer) = batch.packet(i);
+                *latest_send.lock().await = Some(peer);
+                if write_len_prefixed_udp(&mut send_task, pkt).await.is_err() {
+                    return Ok::<(), anyhow::Error>(());
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -672,24 +680,31 @@ async fn handle_server_udp_stream(
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let udp_send = udp.clone();
     let mut sender = tokio::spawn(async move {
-        let mut buf = [0u8; 64 * 1024];
-        while let Ok((n, src)) = udp_send.recv_from(&mut buf).await {
-            let mut packet = Vec::with_capacity(22 + n);
-            packet.extend_from_slice(&[0, 0, 0]);
-            match src.ip() {
-                std::net::IpAddr::V4(ip) => {
-                    packet.push(1);
-                    packet.extend_from_slice(&ip.octets())
+        let mut batch = UdpBatchReader::new(udp_send);
+        loop {
+            let count = match batch.recv().await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            for i in 0..count {
+                let (pkt, src) = batch.packet(i);
+                let mut packet = Vec::with_capacity(22 + pkt.len());
+                packet.extend_from_slice(&[0, 0, 0]);
+                match src.ip() {
+                    std::net::IpAddr::V4(ip) => {
+                        packet.push(1);
+                        packet.extend_from_slice(&ip.octets())
+                    }
+                    std::net::IpAddr::V6(ip) => {
+                        packet.push(4);
+                        packet.extend_from_slice(&ip.octets())
+                    }
                 }
-                std::net::IpAddr::V6(ip) => {
-                    packet.push(4);
-                    packet.extend_from_slice(&ip.octets())
+                packet.extend_from_slice(&src.port().to_be_bytes());
+                packet.extend_from_slice(pkt);
+                if write_len_prefixed_udp(&mut send, &packet).await.is_err() {
+                    return Ok::<(), anyhow::Error>(());
                 }
-            }
-            packet.extend_from_slice(&src.port().to_be_bytes());
-            packet.extend_from_slice(&buf[..n]);
-            if write_len_prefixed_udp(&mut send, &packet).await.is_err() {
-                break;
             }
         }
         Ok::<(), anyhow::Error>(())

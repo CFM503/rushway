@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.23] - 2026-09-21
+
+### Added
+- **UDP Batched Reads — `recvmmsg` (GoWay #2 Parity)**: new `src/udp_batch.rs` (`UdpBatchReader`) drains up to 8 datagrams per syscall on Linux; all five UDP relay upload loops (`udp_relay`, `mux_pool`, `wss_client`, `quic` ×2, `runtime` server) converted with byte-identical per-datagram behavior. Other platforms keep single-`recv_from` fallback (no equivalent kernel API). Zero new dependencies (`libc` promoted to direct; buffers stay owned full-length, no `set_len` unsoundness).
+- **Measured**: loopback drain of 20000×512B pre-filled socket (WSL Debian): single 408 MB/s → batched 784 MB/s (**1.92×**, full 8-batches). Unit test `batch_reader_delivers_in_order` covers order + source addresses on all platforms.
+
 ## [v0.0.22] - 2026-09-21
 
 ### Measured
