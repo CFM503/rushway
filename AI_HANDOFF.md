@@ -1802,3 +1802,15 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released as v0.0.21.
 - **Remaining risk:** burst validation is loopback-only; slow-link fairness proof still open (DRR's real deliverable).
 - **Next action:** RushWay perf program: UDP batching, QUIC parity (goway frozen at v1.8.10 except critical interop bugs).
+
+## 2026-09-21 — Slow-Link Fairness A/B (first DRR end-to-end evidence)
+
+- **Setup:** WSL `tc` shaping (netem 30ms + TBF 20Mbps, deep lossless queue), Linux builds of FIFO (v0.0.19) and DRR (v0.0.21+) as servers, Windows clients, 16x4MiB bulk background, 1KB interactive probes (n=40-50).
+- **Result:** p50 identical at 32.3ms (no median regression either way); tails multi-second on BOTH with high run-to-run variance (FIFO p99 0.1-4.9s, DRR p99 3.4-5.4s). Verdict: HONEST NEGATIVE on magnitude — on a link-saturated topology the end-to-end tail is set by kernel/shaper queueing + loss recovery, not proxy scheduling.
+- **Astra review:** No inflated claims shipped. DRR's proven value stays structural (deterministic `drr_interactive_not_starved_by_bulk`, bulk throughput equal-or-better, zero new failure modes across 500+ burst flows); expected payoff zone is CPU-constrained proxies (OpenWrt/small VPS), still unmeasured.
+- **Change:** `CHANGELOG.md` [v0.0.22] Measured section only; no code changes.
+- **Commit:** tag v0.0.22.
+- **Validation:** Loopback e2e + burst suites re-run green on the release tree before tagging.
+- **Status:** released as v0.0.22.
+- **Remaining risk:** Fairness magnitude on weak hardware unproven; TBF-drop RTO tails need fq_codel thinking if interactive SLAs matter.
+- **Next action:** UDP batching (`udp_relay.rs` recvmmsg) or QUIC parity — user picks.

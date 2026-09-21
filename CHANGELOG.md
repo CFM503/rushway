@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.22] - 2026-09-21
+
+### Measured
+- **Slow-Link Fairness A/B (honest negative on magnitude)**: 20Mbps+30ms shaped link (WSL `tc`), 16×4MiB bulk background, 1KB interactive probes (n=40-50). p50 identical (32.3ms both — no median regression); tails multi-second on BOTH (FIFO p99 0.1-4.9s / DRR p99 3.4-5.4s across rounds, high variance). Conclusion: on a link-saturated topology the end-to-end tail is set by kernel/shaper queueing + loss recovery, not proxy scheduling — DRR neither wins nor loses here. Its proven value stays structural (deterministic per-stream fairness in `drr_interactive_not_starved_by_bulk`, no bulk-throughput loss) with expected payoff on CPU-constrained proxies (OpenWrt/small VPS), unmeasured. No inflated claims shipped.
+
 ## [v0.0.21] - 2026-09-20
 
 ### Fixed
