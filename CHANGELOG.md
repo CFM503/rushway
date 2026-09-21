@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.24] - 2026-09-21
+
+### Changed
+- **QUIC Transport Trim (GoWay #5 Parity)**: `max_idle_timeout` 60s→30s (faster dead-conn reclaim); explicit `max_concurrent_bidi_streams` 512 (bounds a malicious peer's stream table; was quinn default 100); `datagram_receive_buffer_size(None)` (no send/read_datagram call exists anywhere — negotiating DATAGRAM frames only cost handshake bytes, same as GoWay disabling them). Kept deliberately: keep-alive 15s (NAT safety), uni streams 0 (unused; stricter than GoWay's 128), 8/16MiB windows (bulk-tuned), MTU discovery on, Cubic (BBR reverted with evidence).
+- **Measured**: QUIC e2e still functional post-trim (c1=62/c8=83/c32=67 MiB/s); QUIC bulk remains ~3x behind WS (congestion/flow-control untouched, as scoped). WS bulk healthy (c8/c32 ~200-220).
+
 ## [v0.0.23] - 2026-09-21
 
 ### Added

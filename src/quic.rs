@@ -76,8 +76,17 @@ fn bound_udp_socket(bind: std::net::SocketAddr, buf_bytes: usize) -> Result<std:
 
 fn transport_config() -> Arc<TransportConfig> {
     let mut cfg = TransportConfig::default();
-    cfg.max_idle_timeout(Some(Duration::from_secs(60).try_into().expect("60s fits")));
+    // Trimmed (GoWay #5 parity): idle 60s -> 30s so dead mobile conns are
+    // reclaimed faster; explicit per-conn bidi stream cap bounds a
+    // malicious peer's stream table; DATAGRAM receive disabled — no
+    // send/read_datagram call exists anywhere, so negotiating it only
+    // costs handshake bytes. KeepAlive stays 15s (longer risks NAT-binding
+    // loss on strict networks); uni streams stay at 0 (unused, stricter
+    // than GoWay's 128); windows stay 8/16 MiB (bulk-tuned, GoWay parity).
+    cfg.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("30s fits")));
     cfg.keep_alive_interval(Some(Duration::from_secs(15)));
+    cfg.max_concurrent_bidi_streams(VarInt::from_u32(512));
+    cfg.datagram_receive_buffer_size(None);
     cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("8MiB fits QUIC VarInt"));
     cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("16MiB fits QUIC VarInt"));
     cfg.max_concurrent_uni_streams(0u32.into());

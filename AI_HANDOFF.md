@@ -1824,3 +1824,13 @@ Live Windows test with `-up wss://172.64.229.105:443/pyway -fakehost dedi.446710
 - **Status:** released as v0.0.23.
 - **Remaining risk:** Write side stays single-`send_to` (matches Go scope; downlink rarely backlogs); burst-size/latency tradeoff untuned (8 is Go's number too).
 - **Next action:** User decides version/tag; then QUIC parity (last open item).
+
+## 2026-09-21 — QUIC Transport Trim (GoWay #5 Parity)
+
+- **Change:** `transport_config()` only (shared by client+server): idle 60s→30s, bidi cap 100 (default) →512, datagram-receive off. Deliberately kept: keep-alive 15s, uni 0, 8/16MiB windows, MTU discovery, Cubic.
+- **Astra review:** No behavior change for any live path (no datagram/uni usage anywhere — verified by grep; stream caps far above real concurrency; idle change only reclaims dead conns faster). Quinn 0.11 API verified against vendored source (defaults read, not assumed).
+- **Validation:** `cargo test` 88 green; WS bulk healthy (rerun after noise outlier); QUIC e2e functional (c1=62/c8=83/c32=67); QUIC bulk gap (~3x) unchanged — congestion untouched per scope.
+- **Commit:** tag v0.0.24.
+- **Status:** released as v0.0.24.
+- **Remaining risk:** QUIC-UDP relay loops converted to batch reader earlier have no dedicated e2e (same helper + pattern as verified paths; acceptable); QUIC bulk gap remains future work.
+- **Next action:** User decides version/tag (suggest v0.0.24).
