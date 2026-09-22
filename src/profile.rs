@@ -21,6 +21,7 @@ pub fn finish() {
 #[cfg(unix)]
 mod imp {
     use anyhow::{anyhow, Result};
+    use pprof::protos::Message as _;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -57,6 +58,11 @@ mod imp {
         match guard.report().build() {
             Ok(report) => match report.pprof() {
                 Ok(profile) => {
+                    let mut content = Vec::new();
+                    if let Err(error) = profile.encode(&mut content) {
+                        tracing::warn!(%error, "failed to encode CPU profile");
+                        return;
+                    }
                     let mut file = match std::fs::File::create(&path) {
                         Ok(f) => f,
                         Err(error) => {
@@ -65,7 +71,7 @@ mod imp {
                         }
                     };
                     use std::io::Write as _;
-                    if let Err(error) = profile.write_to_writer(&mut file) {
+                    if let Err(error) = file.write_all(&content) {
                         tracing::warn!(path = %path.display(), %error, "failed to write CPU profile");
                         return;
                     }
