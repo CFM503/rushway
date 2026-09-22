@@ -265,7 +265,7 @@ impl SessionState {
         let reader_state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = client_reader_loop(rd, reader_state.clone()).await {
-                tracing::debug!(error=%e,"pooled MUX reader stopped");
+                tracing::warn!(error=%e,"pooled MUX reader stopped; closing session streams");
             }
             reader_state.closed.store(true, Ordering::Release);
             reader_state.active.store(0, Ordering::Release);
@@ -807,7 +807,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
                     if let Err(e) = handle_tcp_proxy(stream, cfg2, pool2).await {
-                        tracing::debug!(%peer,error=%e,"pooled proxy connection closed")
+                        tracing::warn!(%peer,error=%e,"pooled proxy connection closed with error")
                     }
                 });
             }

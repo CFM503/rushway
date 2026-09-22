@@ -440,6 +440,7 @@ async fn handle_mux_parts(
                 let syn = match SynPayload::decode(frame.payload()) {
                     Ok(v) => v,
                     Err(_) => {
+                        tracing::warn!(stream_id, "mux RST: bad syn payload");
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
@@ -448,6 +449,7 @@ async fn handle_mux_parts(
                 let target_text = match String::from_utf8(syn.target) {
                     Ok(v) => v,
                     Err(_) => {
+                        tracing::warn!(stream_id, "mux RST: target not utf-8");
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
@@ -456,12 +458,14 @@ async fn handle_mux_parts(
                 let target = match parse_target_authority(&target_text) {
                     Ok(v) => v,
                     Err(_) => {
+                        tracing::warn!(stream_id, "mux RST: bad target authority");
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
                 };
 
-                if enforce_target_policy(&cfg, &target).is_err() {
+                if let Err(e) = enforce_target_policy(&cfg, &target) {
+                    tracing::warn!(stream_id, error=%e, "mux RST: target policy");
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                     continue;
                 }
@@ -487,6 +491,7 @@ async fn handle_mux_parts(
                     }
                 };
                 if !admitted {
+                    tracing::warn!(stream_id, "mux RST: stream admission rejected (table full or duplicate id)");
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                     continue;
                 }
@@ -514,9 +519,12 @@ async fn handle_mux_parts(
 
                 // Bound pre-dial buffering: a malicious/buggy client could
                 // otherwise spray DATA frames while dial_target is in flight
-                // and grow `pending` without limit.
-                const MAX_PENDING_FRAMES: usize = 64;
-                const MAX_PENDING_BYTES: usize = 1024 * 1024;
+                // and grow `pending` without limit. Limits mirror goway's
+                // muxServerStreamBufferLimit (8 MiB): a single eager flow
+                // (e.g. 4 MiB written right after CONNECT) must survive a
+                // slow target dial instead of being reset.
+                const MAX_PENDING_FRAMES: usize = 256;
+                const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
@@ -524,6 +532,7 @@ async fn handle_mux_parts(
                     stream_id: u32,
                     obfs: bool,
                 ) {
+                    tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
                     let _ = send_reset_encrypted(writer, cipher, stream_id, obfs).await;
                     streams.write().await.remove(&stream_id);
                 }
@@ -542,7 +551,8 @@ async fn handle_mux_parts(
                             ) => {
                                 match dial {
                                     Ok(stream) => break stream,
-                                    Err(_) => {
+                                    Err(error) => {
+                                        tracing::warn!(stream_id, error=%error, "mux RST: target dial failed");
                                         let _ = send_reset_encrypted(
                                             &writer_task,
                                             &cipher_task,
