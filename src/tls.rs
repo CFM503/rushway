@@ -6,7 +6,7 @@ use rcgen::generate_simple_self_signed;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::version::{TLS12, TLS13};
-use rustls::{ClientConfig, CipherSuite, NamedGroup, RootCertStore, ServerConfig};
+use rustls::{CipherSuite, ClientConfig, NamedGroup, RootCertStore, ServerConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -45,7 +45,11 @@ const FIREFOX_SUITE_ORDER: &[CipherSuite] = &[
 
 /// GoWay `curvePrefsChrome`/`curvePrefsFirefox` restricted to ring's key
 /// exchange groups (ring has no P-521, so Firefox emits the shared subset).
-const KX_GROUP_ORDER: &[NamedGroup] = &[NamedGroup::X25519, NamedGroup::secp256r1, NamedGroup::secp384r1];
+const KX_GROUP_ORDER: &[NamedGroup] = &[
+    NamedGroup::X25519,
+    NamedGroup::secp256r1,
+    NamedGroup::secp384r1,
+];
 
 fn roots() -> RootCertStore {
     static ROOTS: OnceLock<RootCertStore> = OnceLock::new();
@@ -91,7 +95,9 @@ fn build_profile_config(profile_index: usize, verify_ssl: bool) -> Arc<ClientCon
         .with_protocol_versions(&[&TLS13, &TLS12])
         .expect("ring provider supports TLS 1.2/1.3");
     let mut config = if verify_ssl {
-        builder.with_root_certificates(roots()).with_no_client_auth()
+        builder
+            .with_root_certificates(roots())
+            .with_no_client_auth()
     } else {
         builder
             .dangerous()
@@ -224,9 +230,18 @@ mod tests {
 
     #[test]
     fn cached_configs_are_reused() {
-        assert!(Arc::ptr_eq(&profile_config(0, true), &profile_config(0, true)));
-        assert!(Arc::ptr_eq(&profile_config(0, false), &profile_config(0, false)));
-        assert!(!Arc::ptr_eq(&profile_config(0, true), &profile_config(0, false)));
+        assert!(Arc::ptr_eq(
+            &profile_config(0, true),
+            &profile_config(0, true)
+        ));
+        assert!(Arc::ptr_eq(
+            &profile_config(0, false),
+            &profile_config(0, false)
+        ));
+        assert!(!Arc::ptr_eq(
+            &profile_config(0, true),
+            &profile_config(0, false)
+        ));
     }
 
     #[test]
@@ -236,7 +251,10 @@ mod tests {
             suite_order_for_profile(0)[1],
             CipherSuite::TLS13_AES_256_GCM_SHA384
         );
-        let firefox = BROWSER_PROFILES.iter().position(|p| !p.is_chromium).unwrap();
+        let firefox = BROWSER_PROFILES
+            .iter()
+            .position(|p| !p.is_chromium)
+            .unwrap();
         assert_eq!(
             suite_order_for_profile(firefox)[1],
             CipherSuite::TLS13_CHACHA20_POLY1305_SHA256

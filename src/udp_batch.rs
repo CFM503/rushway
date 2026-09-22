@@ -106,7 +106,8 @@ fn recv_batch_linux(
         iovs[i].iov_base = bufs[i].as_mut_ptr() as *mut libc::c_void;
         iovs[i].iov_len = UDP_BUF_SIZE;
         msgs[i].msg_hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
-        msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msgs[i].msg_hdr.msg_namelen =
+            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         msgs[i].msg_hdr.msg_iov = &mut iovs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
@@ -114,7 +115,15 @@ fn recv_batch_linux(
     // SAFETY: fd is a live non-blocking UDP socket owned by `sock`
     // (outlives this call); all pointers target live stack/heap memory
     // with correct lengths; flags/timeout unused.
-    let ret = unsafe { libc::recvmmsg(fd, msgs.as_mut_ptr(), UDP_BATCH as _, 0, std::ptr::null_mut()) };
+    let ret = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            UDP_BATCH as _,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -140,10 +149,7 @@ fn sockaddr_to_std(ss: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Res
         libc::AF_INET6 if len >= std::mem::size_of::<libc::sockaddr_in6>() => {
             let a: &libc::sockaddr_in6 = unsafe { &*(ss as *const _ as *const _) };
             let ip = std::net::Ipv6Addr::from(a.sin6_addr.s6_addr);
-            Ok(SocketAddr::new(
-                ip.into(),
-                u16::from_be(a.sin6_port),
-            ))
+            Ok(SocketAddr::new(ip.into(), u16::from_be(a.sin6_port)))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

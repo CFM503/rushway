@@ -192,7 +192,10 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
                 bail!("WSS HTTP handshake response timeout; received 0 response bytes");
             } else {
                 let partial = String::from_utf8_lossy(&out);
-                tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
+                tracing::warn!(
+                    "[WSS] HTTP handshake timeout; partial response:\n{}",
+                    partial
+                );
                 bail!(
                     "WSS HTTP handshake response timeout; partial response:\n{}",
                     partial
@@ -241,7 +244,10 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
                     bail!("WSS HTTP handshake response timeout; received 0 response bytes");
                 } else {
                     let partial = String::from_utf8_lossy(&out);
-                    tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
+                    tracing::warn!(
+                        "[WSS] HTTP handshake timeout; partial response:\n{}",
+                        partial
+                    );
                     bail!(
                         "WSS HTTP handshake response timeout; partial response:\n{}",
                         partial
@@ -478,7 +484,12 @@ pub fn encode_ws_frame(payload: &[u8], opcode: u8, masked: bool) -> Result<Vec<u
     let mut header = [0u8; 14];
     let header_len = ws_header_into(&mut header, payload.len(), opcode, masked);
 
-    let total = header_len + if masked { 4 + payload.len() } else { payload.len() };
+    let total = header_len
+        + if masked {
+            4 + payload.len()
+        } else {
+            payload.len()
+        };
     let mut frame = Vec::with_capacity(total);
     frame.extend_from_slice(&header[..header_len]);
     if !masked {
@@ -776,7 +787,10 @@ mod tests {
             assert!(text.contains("Upgrade: websocket\r\n"));
             // Firefox never sends Client Hints; Chromium always does.
             if profile.is_chromium {
-                assert!(text.contains("sec-ch-ua:"), "chromium profile missing sec-ch-ua");
+                assert!(
+                    text.contains("sec-ch-ua:"),
+                    "chromium profile missing sec-ch-ua"
+                );
             } else {
                 assert!(
                     !text.contains("sec-ch-ua:"),
@@ -954,5 +968,55 @@ mod tests {
         .await
         .unwrap();
         assert!(got.is_none(), "clean connection close must yield Ok(None)");
+    }
+
+    /// Adversarial wire inputs: malformed frames must always resolve to
+    /// `Err` (never panic, never hang). Covers the length state machine,
+    /// reserved opcodes (previously an `unreachable!()` panic), fragmented
+    /// and oversized control frames, and truncation at every header stage.
+    #[tokio::test]
+    async fn read_frame_rejects_malformed() {
+        // (wire bytes, must_error). Writer drops after sending so truncated
+        // reads terminate via EOF instead of hanging.
+        let cases: Vec<(&[u8], &str)> = vec![
+            (&[0x82], "truncated 1-byte header"),
+            (&[0x82, 0x7e], "truncated extended-16 length"),
+            (
+                &[0x82, 0x7f, 0, 0, 0, 0, 0, 0, 0, 5, b'h', b'i'],
+                "truncated 64-bit-length payload",
+            ),
+            (&[0x8b, 0x00], "reserved opcode 0xB"),
+            (&[0x8f, 0x00], "reserved opcode 0xF"),
+            (&[0x02, 0x01, b'x'], "fragmented data frame (fin=0)"),
+            (&[0x00, 0x01, b'x'], "continuation opcode"),
+            (&[0x03, 0x01, b'x'], "reserved data opcode 0x3"),
+            (&[0x89, 126, 0, 126], "oversized ping (>125)"),
+            (
+                &[0x82, 0x7e, 0x10, 0x00],
+                "declared 4KiB payload, zero delivered",
+            ),
+        ];
+        for (wire, what) in cases {
+            let (mut a, mut b) = duplex(64 * 1024);
+            let owned = wire.to_vec();
+            let writer = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = a.write_all(&owned).await;
+                drop(a);
+            });
+            let mut buf = Vec::new();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_frame(
+                    &mut b,
+                    Option::<&mut tokio::io::DuplexStream>::None,
+                    &mut buf,
+                ),
+            )
+            .await
+            .expect("read_frame hung");
+            assert!(res.is_err(), "{what}: expected Err, decoded {res:?}");
+            let _ = writer.await;
+        }
     }
 }

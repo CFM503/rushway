@@ -1,4 +1,4 @@
-﻿//! Client-side physical MUX session pool for plain WebSocket (`ws://`).
+//! Client-side physical MUX session pool for plain WebSocket (`ws://`).
 //!
 //! Secure WebSocket (`wss://`) connections, including Cloudflare FakeHost and Edge
 //! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
@@ -59,7 +59,7 @@ async fn connect_with_fallback(
     let primary = dns::resolve_socket(target_host, target_port).await?;
     let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
     match timeout(conn_timeout, TcpStream::connect(primary)).await {
-        Ok(Ok(socket)) => return Ok(socket),
+        Ok(Ok(socket)) => Ok(socket),
         Ok(Err(primary_err)) => {
             let is_ip = target_host.parse::<std::net::IpAddr>().is_ok();
             let sni = cfg
@@ -77,7 +77,11 @@ async fn connect_with_fallback(
                     continue;
                 }
                 let candidate = SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
-                tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+                tracing::info!(
+                    "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
+                    candidate,
+                    sni
+                );
                 match timeout(conn_timeout, TcpStream::connect(candidate)).await {
                     Ok(Ok(socket)) => return Ok(socket),
                     Ok(Err(e)) => {
@@ -107,7 +111,11 @@ async fn connect_with_fallback(
                     continue;
                 }
                 let candidate = SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
-                tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+                tracing::info!(
+                    "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
+                    candidate,
+                    sni
+                );
                 match timeout(conn_timeout, TcpStream::connect(candidate)).await {
                     Ok(Ok(socket)) => return Ok(socket),
                     Ok(Err(e)) => {
@@ -132,8 +140,10 @@ async fn send_mux_parts_reuse(
     scratch: &mut Vec<u8>,
     obfs: bool,
 ) -> Result<()> {
-    crate::mux_writer::encode_mux_ws_frame(scratch, stream_id, command, payload, cipher, true, obfs)
-        .map_err(|e| anyhow!(e.to_string()))?;
+    crate::mux_writer::encode_mux_ws_frame(
+        scratch, stream_id, command, payload, cipher, true, obfs,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
     writer
         .send_mux(stream_id, command, std::mem::take(scratch))
         .await
@@ -147,7 +157,10 @@ async fn send_mux_parts(
     obfs: bool,
 ) -> Result<()> {
     let mut bytes = Vec::with_capacity(7 + payload.len());
-    send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut bytes, obfs).await
+    send_mux_parts_reuse(
+        writer, cipher, stream_id, command, payload, &mut bytes, obfs,
+    )
+    .await
 }
 fn parse_upstream(input: &str) -> Result<(String, String)> {
     if input.starts_with("wss://") {
@@ -417,10 +430,8 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
         let id = frame.stream_id;
         let tx = state.streams.read().await.get(&id).cloned();
         if let Some(tx) = tx {
-            if tx.send(frame).await.is_err() {
-                if state.streams.write().await.remove(&id).is_some() {
-                    state.active.fetch_sub(1, Ordering::AcqRel);
-                }
+            if tx.send(frame).await.is_err() && state.streams.write().await.remove(&id).is_some() {
+                state.active.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
@@ -450,21 +461,16 @@ impl MuxSessionPool {
             sessions.len() < target
         };
         if !need_new {
-            self.consecutive_failures
-                .store(0, Ordering::Release);
+            self.consecutive_failures.store(0, Ordering::Release);
             return;
         }
         match SessionState::connect(&self.cfg).await {
             Ok(s) => {
                 self.sessions.lock().await.push(s);
-                self.consecutive_failures
-                    .store(0, Ordering::Release);
+                self.consecutive_failures.store(0, Ordering::Release);
             }
             Err(error) => {
-                let failures = self
-                    .consecutive_failures
-                    .fetch_add(1, Ordering::AcqRel)
-                    + 1;
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 tracing::warn!(error=%error, failures, "MUX physical session creation failed; will retry with backoff");
             }
         }
@@ -703,6 +709,7 @@ async fn handle_tcp_proxy(
                 .await;
                 break;
             }
+            crate::stats::add_bytes(n as i64, 0);
             let mut off = 0;
             while off < n {
                 let end = (off + u16::MAX as usize).min(n);
@@ -732,6 +739,7 @@ async fn handle_tcp_proxy(
                         result = Err(e.into());
                         break;
                     }
+                    crate::stats::add_bytes(0, frame.payload().len() as i64);
                 }
             }
             MuxCommand::Fin => {
@@ -748,7 +756,15 @@ async fn handle_tcp_proxy(
     }
     upload.abort();
     if remote_fin {
-        let _ = send_mux_parts(&session.writer, &session.cipher, id, MuxCommand::Fin, &[], session.obfs).await;
+        let _ = send_mux_parts(
+            &session.writer,
+            &session.cipher,
+            id,
+            MuxCommand::Fin,
+            &[],
+            session.obfs,
+        )
+        .await;
     }
 
     session.close_stream(id).await;
@@ -787,6 +803,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
+                    let _conn = crate::stats::ConnGuard::new();
                     if let Err(e) = handle_tcp_proxy(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,error=%e,"pooled proxy connection closed")
                     }

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.25] - 2026-09-22
+
+### Added
+- **RushWay UX Parity (Phase 1)**: `-tui` dashboard (GoWay-parity layout, TTY-gated, 10 Hz dirty refresh), `-log-file` (last 10 WARN/ERROR, rewritten on append + exit flush), `-cpuprofile`/`-cpuprofile-duration` (pprof 99 Hz on Unix; warn-and-continue elsewhere), and `[STATS]` line with global `ConnGuard`/byte counters on TCP relay paths.
+- New modules: `src/tui.rs`, `src/stats.rs`, `src/profile.rs` (pprof, `cfg(unix)` dependency).
+- Removed accepted-but-unimplemented warnings for those flags; SPEC CLI section updated.
+- Default parity audit: `-block-local`, `-W`, `-max-conn`, `-mux-sessions`, `-connection-timeout` match GoWay head.
+
+### Changed
+- **clippy 6-idiom cleanup** (`-D warnings` clean): `mux_pool` needless-return + collapsible-if, `quic` while-let-loop, `runtime` `io::Error::other`, `tui` manual-clamp + `writeln!`.
+
+### Fixed
+- `cargo clippy --release -- -D warnings` now passes (0 warnings); `cargo fmt --check` clean.
+
+### Validation
+- `cargo test --all-targets` 96 passed; `cargo fmt --check` clean; `cargo clippy --release -- -D warnings` clean.
+- Paired note: goway server egress writer change documented in `AI_HANDOFF.md` (Phase 2); no rushway protocol change.
+
 ## [v0.0.24] - 2026-09-21
 
 ### Changed
@@ -298,3 +316,19 @@ All notable changes to this project will be documented in this file.
   - Updated `--fakehost` and `--max-conn` help text.
   - Ensured legacy flags `-help`, `-fakehost`, and related variants remain fully functional.
 - **Version**: Bumped version to `0.0.6`.
+
+## [v0.0.25] (historical draft) — Phase 1 UX (see top of file for released entry)
+
+- Implemented `-tui` dashboard (GoWay-parity layout, TTY-gated, 10 Hz dirty refresh), `-log-file` (last 10 WARN/ERROR, rewritten on append + exit flush), `-cpuprofile`/`-cpuprofile-duration` (pprof 99 Hz on Unix; warn-and-continue elsewhere), and `[STATS]` line with global `ConnGuard`/byte counters on TCP relay paths.
+- Removed accepted-but-unimplemented warnings for those flags; SPEC CLI section updated.
+- Default parity audit: `-block-local`, `-W`, `-max-conn`, `-mux-sessions`, `-connection-timeout` match GoWay head.
+- Tests: `cargo test --all-targets` 96 passed (new log-file ring, stats guard, byte counter tests).
+- Paired note: goway server egress writer change documented in `AI_HANDOFF.md` (Phase 2); no rushway protocol change.
+
+## [v0.0.25] (historical draft) — Phase 2 paired note: goway server egress writer (interop impact)
+
+- No RushWay code change this entry. Documenting the paired goway change so interop/CI expectations stay accurate:
+  - GoWay server MUX `SendFrame` now uses a dedicated `muxOutboundWriter` (unmasked fused encode) instead of `writeMu` + two-pass cipher.
+  - Wire format unchanged �� RushWay client/server need no protocol bump to interoperate.
+  - See `D:\SOFT\AI\github\way\goway\AI_HANDOFF.md` and `D:\SOFT\AI\github\way\CHANGELOG.md` for full change/validation.
+- Cross-repo handoff: Phase 1 (TUI/log-file/cpuprofile/STATS) remains the RushWay-side UX delivery; Phase 4 joint bench is the next shared milestone.

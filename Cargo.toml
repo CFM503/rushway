@@ -1,6 +1,6 @@
 [package]
 name = "rushway"
-version = "0.0.24"
+version = "0.0.25"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -29,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 webpki-roots = "0.26"
 zeroize = "=1.7.0"
+
+[target.'cfg(unix)'.dependencies]
+pprof = "0.13"
 
 [dev-dependencies]
 tempfile = "=3.13.0"

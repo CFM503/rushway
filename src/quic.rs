@@ -69,8 +69,7 @@ fn bound_udp_socket(bind: std::net::SocketAddr, buf_bytes: usize) -> Result<std:
     if sock.set_recv_buffer_size(buf_bytes).is_err() {
         tracing::debug!(bytes = buf_bytes, "QUIC UDP receive buffer request denied");
     }
-    sock.bind(&bind.into())
-        .context("QUIC UDP bind failed")?;
+    sock.bind(&bind.into()).context("QUIC UDP bind failed")?;
     Ok(sock.into())
 }
 
@@ -366,6 +365,7 @@ async fn relay_quic(
                 let _ = send.finish();
                 break;
             }
+            crate::stats::add_bytes(n as i64, 0);
             send.write_all(&buf[..n]).await?
         }
         recycle_buf(buf).await;
@@ -376,7 +376,10 @@ async fn relay_quic(
     loop {
         match recv.read(&mut buf).await? {
             Some(0) | None => break,
-            Some(n) => lw2.write_all(&buf[..n]).await?,
+            Some(n) => {
+                crate::stats::add_bytes(0, n as i64);
+                lw2.write_all(&buf[..n]).await?
+            }
         }
     }
     let _ = lw2.shutdown().await;
@@ -474,7 +477,10 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         Arc::new(quinn::TokioRuntime),
     )?;
     endpoint.set_default_client_config(client_config(verify_ssl)?);
-    tracing::debug!(bytes = socket_buf, "QUIC client UDP socket buffers requested");
+    tracing::debug!(
+        bytes = socket_buf,
+        "QUIC client UDP socket buffers requested"
+    );
     let pool = QuicClientPool::new(endpoint, server_addr, server_name, cfg.connection_timeout);
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
@@ -511,6 +517,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
+                    let _conn = crate::stats::ConnGuard::new();
                     match req.command {
                         SocksCommand::UdpAssociate => {
                             if let Err(e) = relay_quic_udp(stream, cfg2, pool2).await {
@@ -541,7 +548,10 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
         std_socket,
         Arc::new(quinn::TokioRuntime),
     )?;
-    tracing::debug!(bytes = socket_buf, "QUIC server UDP socket buffers requested");
+    tracing::debug!(
+        bytes = socket_buf,
+        "QUIC server UDP socket buffers requested"
+    );
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!("RushWay QUIC server listening on {}", bind);
     let mut set = tokio::task::JoinSet::new();
@@ -562,22 +572,17 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                         Ok(v) => v,
                         Err(_) => return,
                     };
+                    let _conn = crate::stats::ConnGuard::new();
                     match incoming.await {
                         Ok(connection) => {
                             let _permit = permit;
-                            loop {
-                                match connection.accept_bi().await {
-                                    Ok((send, recv)) => {
-                                        let cfg3 = cfg2.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(error) = handle_server_stream(send, recv, cfg3).await
-                                            {
-                                                tracing::debug!(%error,"QUIC stream closed")
-                                            }
-                                        });
+                            while let Ok((send, recv)) = connection.accept_bi().await {
+                                let cfg3 = cfg2.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = handle_server_stream(send, recv, cfg3).await {
+                                        tracing::debug!(%error,"QUIC stream closed")
                                     }
-                                    Err(_) => break,
-                                }
+                                });
                             }
                         }
                         Err(error) => tracing::debug!(%error,"QUIC connection handshake failed"),
@@ -610,7 +615,8 @@ async fn handle_server_stream(
     } else {
         line.as_str()
     };
-    if target_str.eq_ignore_ascii_case("UDP") || target_str.to_ascii_uppercase().starts_with("UDP") {
+    if target_str.eq_ignore_ascii_case("UDP") || target_str.to_ascii_uppercase().starts_with("UDP")
+    {
         return handle_server_udp_stream(send, recv, cfg).await;
     }
     let target_addr = match parse_target_authority(target_str) {
@@ -650,6 +656,7 @@ async fn handle_server_stream(
             match target_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    crate::stats::add_bytes(0, n as i64);
                     if send.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
@@ -669,7 +676,10 @@ async fn handle_server_stream(
             res = recv.read(&mut buf) => {
                 match res? {
                     Some(0) | None => break,
-                    Some(n) => target_wr.write_all(&buf[..n]).await?,
+                    Some(n) => {
+                        target_wr.write_all(&buf[..n]).await?;
+                        crate::stats::add_bytes(n as i64, 0);
+                    }
                 }
             }
         }

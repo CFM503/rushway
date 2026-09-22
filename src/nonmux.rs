@@ -12,7 +12,8 @@ use crate::runtime::{
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
     build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers,
-    validate_client_handshake_response, validate_server_handshake, write_frame, write_frame_borrowed,
+    validate_client_handshake_response, validate_server_handshake, write_frame,
+    write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Result};
 use socket2::SockRef;
@@ -64,15 +65,20 @@ async fn connect_ws_with_fallback(
             .unwrap();
         tracing::warn!(%primary, error=%failed, "[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost");
         for edge in resolve_all_ipv4(sni).await? {
-            let candidate =
-                std::net::SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
+            let candidate = std::net::SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
             if candidate.ip() == primary.ip() {
                 continue;
             }
-            tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+            tracing::info!(
+                "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
+                candidate,
+                sni
+            );
             match timeout(conn_timeout, TcpStream::connect(candidate)).await {
                 Ok(Ok(socket)) => return Ok(socket),
-                Ok(Err(e)) => tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed"),
+                Ok(Err(e)) => {
+                    tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed")
+                }
                 Err(_) => tracing::debug!(%candidate, "[WS] Fallback edge dial timed out"),
             }
         }
@@ -105,8 +111,7 @@ async fn open_upstream(
         .as_deref()
         .ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (addr, path) = parse_ws_url(upstream)?;
-    let target =
-        parse_authority_with_default(&addr, 80).map_err(|e| anyhow!(e.to_string()))?;
+    let target = parse_authority_with_default(&addr, 80).map_err(|e| anyhow!(e.to_string()))?;
     let header_host = cfg.fakehost.as_deref().unwrap_or(&target.host).to_string();
     let sni_base = cfg
         .fakehost
@@ -291,6 +296,7 @@ async fn relay_client(
             if n == 0 {
                 break;
             }
+            crate::stats::add_bytes(n as i64, 0);
             let mut w = writer_up.lock().await;
             write_frame_borrowed(&mut *w, &mut buf[..n], 2, true).await?
         }
@@ -316,6 +322,7 @@ async fn relay_client(
                         if local_wr.write_all(&payload).await.is_err() {
                             break;
                         }
+                        crate::stats::add_bytes(0, payload.len() as i64);
                     }
                     8 => break,
                     _ => {}
@@ -375,6 +382,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
+                    let _conn = crate::stats::ConnGuard::new();
                     if let Err(error) = handle_client_connection(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,%error,"non-MUX client connection closed")
                     }
@@ -413,6 +421,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 apply_socket_options(&stream, &cfg2);
                 set.spawn(async move {
                     let _permit = permit;
+                    let _conn = crate::stats::ConnGuard::new();
                     if let Err(error) = handle_server(stream, cfg2).await {
                         tracing::debug!(%peer,%error,"non-MUX transport closed")
                     }
@@ -449,8 +458,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         .map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?
         .trim()
         .to_string();
-    let target_addr =
-        parse_target_authority(&target).map_err(|e| anyhow!(e.to_string()))?;
+    let target_addr = parse_target_authority(&target).map_err(|e| anyhow!(e.to_string()))?;
     let resolved = resolve_socket(&target_addr.host, target_addr.port).await?;
     let target_stream = timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
@@ -474,6 +482,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
             if n == 0 {
                 break;
             }
+            crate::stats::add_bytes(0, n as i64);
             // Non-MUX data frames are plaintext per GoWay server.
             let mut w = writer_down.lock().await;
             write_frame_borrowed(&mut *w, &mut buf[..n], 2, false).await?
@@ -504,6 +513,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
                 if target_wr.write_all(&payload).await.is_err() {
                     break;
                 }
+                crate::stats::add_bytes(payload.len() as i64, 0);
             }
         }
     }

@@ -230,7 +230,10 @@ pub enum ProtocolError {
     PayloadTooLarge(usize),
     #[allow(dead_code)]
     TargetTooLarge(usize),
-    LengthMismatch { declared: usize, available: usize },
+    LengthMismatch {
+        declared: usize,
+        available: usize,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -331,6 +334,34 @@ mod tests {
             MuxFrame::decode(&[0, 0, 0, 1, MUX_DATA, 0, 2, 1]),
             Err(ProtocolError::LengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn syn_payload_rejects_truncated() {
+        // Empty, 1-byte, and over-declared targets must all Err, never panic.
+        assert!(SynPayload::decode(&[]).is_err());
+        assert!(SynPayload::decode(&[0]).is_err());
+        assert!(SynPayload::decode(&[0, 100, b'a', b'b', b'c']).is_err());
+        // Exact fit decodes with empty initial data.
+        let payload = SynPayload::decode(&[0, 3, b'a', b'b', b'c']).unwrap();
+        assert_eq!(payload.target, b"abc");
+        assert!(payload.initial_data.is_empty());
+        // Sweep every truncation: cuts below the declared target end
+        // (2 + 5) must Err; longer prefixes decode (remainder is
+        // initial_data, possibly empty).
+        let mut full = vec![0, 5];
+        full.extend_from_slice(b"h:1+i");
+        full.extend_from_slice(b"PAYLOAD");
+        for cut in 0..=full.len() {
+            let r = SynPayload::decode(&full[..cut]);
+            if cut < 2 + 5 {
+                assert!(r.is_err(), "truncation at {cut} decoded: {r:?}");
+            } else {
+                let p = r.unwrap();
+                assert_eq!(p.target, b"h:1+i");
+                assert_eq!(p.initial_data, &full[7..cut]);
+            }
+        }
     }
 
     #[test]

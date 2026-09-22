@@ -270,9 +270,7 @@ pub(crate) async fn connect_wss_upstream(
     wr.write_all(&request)
         .await
         .context("WebSocket request write failed")?;
-    wr.flush()
-        .await
-        .context("WebSocket request flush failed")?;
+    wr.flush().await.context("WebSocket request flush failed")?;
 
     tracing::info!("[WSS] Waiting for WebSocket 101");
     let handshake_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
@@ -283,9 +281,7 @@ pub(crate) async fn connect_wss_upstream(
     Ok((rd, Arc::new(Mutex::new(wr))))
 }
 
-pub(crate) async fn open_upstream(
-    cfg: &WssConfig,
-) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+pub(crate) async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
     connect_wss_upstream(cfg).await
 }
 
@@ -556,6 +552,7 @@ async fn handle_non_mux_connection(
             if n == 0 {
                 break;
             }
+            crate::stats::add_bytes(n as i64, 0);
             let mut w = writer_up.lock().await;
             write_frame_borrowed(&mut *w, &mut buf[..n], 2, true).await?
         }
@@ -580,6 +577,7 @@ async fn handle_non_mux_connection(
                 if local_wr.write_all(&payload).await.is_err() {
                     break;
                 }
+                crate::stats::add_bytes(0, payload.len() as i64);
             }
             Ok::<(), anyhow::Error>(())
         } => {}
@@ -631,6 +629,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
                 let cfg2 = wc.clone();
                 let pool2 = pool.clone();
                 set.spawn(async move {
+                    let _conn = crate::stats::ConnGuard::new();
                     if let Err(e) = handle_non_mux_connection(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")
                     }
@@ -684,10 +683,7 @@ impl WssSessionState {
         };
         c.apply(&mut ok);
         if ok != b"OK\n" {
-            bail!(
-                "MUX rejected: {:?}",
-                String::from_utf8_lossy(&ok).trim()
-            )
+            bail!("MUX rejected: {:?}", String::from_utf8_lossy(&ok).trim())
         };
         tracing::info!("[WSS] MUX handshake completed");
         // Hand the write half to the dedicated writer task; from here on
@@ -880,8 +876,7 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             // Terminal FIN/RST is forwarded; accounting is done once by the
             // stream owner (see handle_connection cleanup below), mirroring
             // mux_pool::client_reader_loop.
-            if tx.send(frame).await.is_err()
-                && session.streams.write().await.remove(&id).is_some()
+            if tx.send(frame).await.is_err() && session.streams.write().await.remove(&id).is_some()
             {
                 session.active.fetch_sub(1, Ordering::AcqRel);
             }
@@ -913,21 +908,16 @@ impl WssSessionPool {
             sessions.len() < target
         };
         if !need_new {
-            self.consecutive_failures
-                .store(0, Ordering::Release);
+            self.consecutive_failures.store(0, Ordering::Release);
             return;
         }
         match WssSessionState::connect(&self.cfg).await {
             Ok(s) => {
                 self.sessions.lock().await.push(s);
-                self.consecutive_failures
-                    .store(0, Ordering::Release);
+                self.consecutive_failures.store(0, Ordering::Release);
             }
             Err(error) => {
-                let failures = self
-                    .consecutive_failures
-                    .fetch_add(1, Ordering::AcqRel)
-                    + 1;
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
                 let sni = self
                     .cfg
@@ -1043,9 +1033,11 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
-                let _ = send_mux_parts(&writer, &cipher, stream_id, MuxCommand::Fin, &[], obfs).await;
+                let _ =
+                    send_mux_parts(&writer, &cipher, stream_id, MuxCommand::Fin, &[], obfs).await;
                 break;
             }
+            crate::stats::add_bytes(n as i64, 0);
             let mut off = 0;
             while off < n {
                 let end = (off + u16::MAX as usize).min(n);
@@ -1069,6 +1061,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             MuxCommand::Data => {
                 if !frame.payload().is_empty() {
                     local_wr.write_all(frame.payload()).await?;
+                    crate::stats::add_bytes(0, frame.payload().len() as i64);
                 }
             }
             MuxCommand::Fin => {
@@ -1129,6 +1122,7 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
                 let (stream, peer) = res?;
                 let pool2 = pool.clone();
                 set.spawn(async move {
+                    let _conn = crate::stats::ConnGuard::new();
                     if let Err(e) = handle_connection(stream, pool2).await {
                         tracing::debug!(%peer,error=%e,"WSS proxy connection closed")
                     }
@@ -1172,8 +1166,7 @@ mod tests {
 
     #[test]
     fn parse_wss_url_standard_port_and_root_path() {
-        let (connect_addr, host, path) =
-            parse_wss_url("wss://example.com").expect("valid wss url");
+        let (connect_addr, host, path) = parse_wss_url("wss://example.com").expect("valid wss url");
         assert_eq!(connect_addr, "example.com:443");
         assert_eq!(host, "example.com");
         assert_eq!(path, "/");
@@ -1195,7 +1188,9 @@ mod tests {
         let header_host = fakehost;
         let tls_name = sni_hostname;
         let origin = format!("https://{}", tls_name);
-        let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host.split(':').next().unwrap_or(header_host)) {
+        let sec_fetch_site = if tls_name
+            .eq_ignore_ascii_case(header_host.split(':').next().unwrap_or(header_host))
+        {
             "same-origin"
         } else {
             "cross-site"
@@ -1209,12 +1204,8 @@ mod tests {
         assert_eq!(sec_fetch_site, "same-origin");
         assert_eq!(path, "/pyway");
 
-        let (request_bytes, key) = build_client_handshake_request(
-            header_host,
-            &path,
-            Some(&origin),
-            Some(sec_fetch_site),
-        );
+        let (request_bytes, key) =
+            build_client_handshake_request(header_host, &path, Some(&origin), Some(sec_fetch_site));
         let req_text = std::str::from_utf8(&request_bytes).unwrap();
 
         assert!(req_text.starts_with("GET /pyway HTTP/1.1\r\n"));

@@ -84,17 +84,25 @@ pub async fn handle_local_udp_proxy(
                     if candidate.ip() == primary.ip() {
                         continue;
                     }
-                    tracing::info!("[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})", candidate, sni);
+                    tracing::info!(
+                        "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
+                        candidate,
+                        sni
+                    );
                     match timeout(conn_timeout, TcpStream::connect(candidate)).await {
                         Ok(Ok(s)) => {
                             fallback = Some(s);
                             break;
                         }
-                        Ok(Err(e)) => tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed"),
+                        Ok(Err(e)) => {
+                            tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed")
+                        }
                         Err(_) => tracing::debug!(%candidate, "[WS] Fallback edge dial timed out"),
                     }
                 }
-                fallback.ok_or_else(|| anyhow!("primary {primary} unreachable and all fallback edges failed"))?
+                fallback.ok_or_else(|| {
+                    anyhow!("primary {primary} unreachable and all fallback edges failed")
+                })?
             } else {
                 return Err(anyhow!("upstream connection failed to {primary}"));
             }

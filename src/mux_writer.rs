@@ -99,12 +99,16 @@ impl MuxFrameWriter {
     /// Queues one pre-encoded MUX frame. Non-DATA commands take the priority
     /// lane; DATA frames are DRR-scheduled per stream. Same failure and
     /// backpressure contract as [`MuxFrameWriter::send`].
-    pub async fn send_mux(&self, stream_id: u32, command: MuxCommand, frame: Vec<u8>) -> Result<()> {
+    pub async fn send_mux(
+        &self,
+        stream_id: u32,
+        command: MuxCommand,
+        frame: Vec<u8>,
+    ) -> Result<()> {
         // Only stream-CLOSING controls yield to their own queued DATA.
         // SYN must lead (it creates the peer-side stream); DATA never
         // takes the priority lane at all.
-        let yield_to_data =
-            command == MuxCommand::Fin || command == MuxCommand::Rst;
+        let yield_to_data = command == MuxCommand::Fin || command == MuxCommand::Rst;
         self.send_frame(OutboundFrame {
             stream_id: Some(stream_id),
             priority: command != MuxCommand::Data,
@@ -209,9 +213,8 @@ impl Scheduler {
     fn next(&mut self) -> Option<Vec<u8>> {
         if let Some(&(sid, yield_to_data, _)) = self.priority.front() {
             let blocked = yield_to_data
-                && sid.is_some_and(|id| {
-                    self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
-                });
+                && sid
+                    .is_some_and(|id| self.streams.get(&id).is_some_and(|q| !q.frames.is_empty()));
             if !blocked {
                 let (_, _, frame) = self.priority.pop_front().unwrap();
                 self.total -= 1;
@@ -350,16 +353,13 @@ pub(crate) fn encode_mux_ws_frame(
                 }
             } else {
                 let mask_u32 = u32::from_ne_bytes(key);
-                let mask64 =
-                    (mask_u32 as u64) | ((mask_u32 as u64) << 32);
+                let mask64 = (mask_u32 as u64) | ((mask_u32 as u64) << 32);
                 let n = region.len();
                 let mut i = 0;
                 while i + 8 <= n {
                     let off = i & (XOR_KEY_SIZE - 1);
-                    let kw =
-                        u64::from_ne_bytes(ks[off..off + 8].try_into().unwrap());
-                    let dw =
-                        u64::from_ne_bytes(region[i..i + 8].try_into().unwrap());
+                    let kw = u64::from_ne_bytes(ks[off..off + 8].try_into().unwrap());
+                    let dw = u64::from_ne_bytes(region[i..i + 8].try_into().unwrap());
                     region[i..i + 8].copy_from_slice(&(dw ^ kw ^ mask64).to_ne_bytes());
                     i += 8;
                 }
@@ -525,8 +525,10 @@ mod tests {
             for masked in [false, true] {
                 // Fused single-buffer path (obfs off: exact lengths).
                 let mut fused = Vec::new();
-                encode_mux_ws_frame(&mut fused, 0x01020304, command, &payload, &cipher, masked, false)
-                    .unwrap();
+                encode_mux_ws_frame(
+                    &mut fused, 0x01020304, command, &payload, &cipher, masked, false,
+                )
+                .unwrap();
                 // Lengths must match the legacy path exactly (mask keys
                 // are random per frame, so bytes themselves differ).
                 let mut mux = Vec::new();
@@ -543,11 +545,14 @@ mod tests {
                 a.write_all(&fused).await.unwrap();
                 drop(a);
                 let mut buf = Vec::new();
-                let (opcode, mut got) =
-                    read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf)
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let (opcode, mut got) = read_frame(
+                    &mut b,
+                    Option::<&mut tokio::io::DuplexStream>::None,
+                    &mut buf,
+                )
+                .await
+                .unwrap()
+                .unwrap();
                 assert_eq!(opcode, 2);
                 cipher.apply(&mut got);
                 let frame = MuxFrame::decode(&got).unwrap();
@@ -648,11 +653,14 @@ mod tests {
         drop(writer);
         let mut buf = Vec::new();
         for i in 0u8..64 {
-            let (opcode, payload) =
-                read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf)
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let (opcode, payload) = read_frame(
+                &mut b,
+                Option::<&mut tokio::io::DuplexStream>::None,
+                &mut buf,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(opcode, 2);
             assert_eq!(payload, vec![i; 1024]);
         }
@@ -747,7 +755,10 @@ mod tests {
         // Per-stream FIFO: bulk tags appear in stream rounds, interactive
         // frames spread across rounds (never clumped at the tail).
         let last_interactive = order.iter().rposition(|&t| t == 9).unwrap();
-        assert!(last_interactive < 20, "interactive tail at {last_interactive}");
+        assert!(
+            last_interactive < 20,
+            "interactive tail at {last_interactive}"
+        );
         for sid in 1..=4u32 {
             assert_eq!(order.iter().filter(|&&t| t == sid as u8).count(), 8);
         }
@@ -815,7 +826,16 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 for _ in 0..70 {
                     let mut enc = Vec::new();
-                    encode_mux_ws_frame(&mut enc, sid, MuxCommand::Data, &[sid as u8; 65535], &c, true, false).unwrap();
+                    encode_mux_ws_frame(
+                        &mut enc,
+                        sid,
+                        MuxCommand::Data,
+                        &[sid as u8; 65535],
+                        &c,
+                        true,
+                        false,
+                    )
+                    .unwrap();
                     w.send_mux(sid, MuxCommand::Data, enc).await.unwrap();
                 }
                 let mut enc = Vec::new();
@@ -828,10 +848,14 @@ mod tests {
             let mut buf = Vec::new();
             let mut count = 0usize;
             while count < 8 * 71 {
-                let (op, mut payload) = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let (op, mut payload) = read_frame(
+                    &mut b,
+                    Option::<&mut tokio::io::DuplexStream>::None,
+                    &mut buf,
+                )
+                .await
+                .unwrap()
+                .unwrap();
                 assert_eq!(op, 2);
                 cipher.apply(&mut payload);
                 let _ = MuxFrame::decode(&payload).unwrap();
@@ -861,14 +885,26 @@ mod tests {
         let (writer, handle) = MuxFrameWriter::spawn(a);
         let cipher = XorCipher::new("probe");
         let mut enc = Vec::new();
-        encode_mux_ws_frame(&mut enc, 5, MuxCommand::Data, &[7u8; 100], &cipher, true, false)
-            .unwrap();
+        encode_mux_ws_frame(
+            &mut enc,
+            5,
+            MuxCommand::Data,
+            &[7u8; 100],
+            &cipher,
+            true,
+            false,
+        )
+        .unwrap();
         writer.send_mux(5, MuxCommand::Data, enc).await.unwrap();
         drop(writer);
         let mut buf = Vec::new();
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf),
+            read_frame(
+                &mut b,
+                Option::<&mut tokio::io::DuplexStream>::None,
+                &mut buf,
+            ),
         )
         .await
         .expect("timed out waiting for send_mux frame - TASK STUCK");

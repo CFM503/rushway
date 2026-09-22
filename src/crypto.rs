@@ -109,8 +109,22 @@ mod tests {
     fn bulk_path_matches_bytewise_reference() {
         let cipher = XorCipher::new("bulk-key");
         // Unaligned lengths, digest-boundary crossing, and multi-chunk (>256KiB).
-        for len in [1usize, 7, 8, 9, 15, 31, 33, 1000, 65535, 100003, 300 * 1024 + 7] {
-            let plain: Vec<u8> = (0..len).map(|i| (i as u64 * 2654435761 % 251 + 1) as u8).collect();
+        for len in [
+            1usize,
+            7,
+            8,
+            9,
+            15,
+            31,
+            33,
+            1000,
+            65535,
+            100003,
+            300 * 1024 + 7,
+        ] {
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i as u64 * 2654435761 % 251 + 1) as u8)
+                .collect();
             let mut fast = plain.clone();
             let mut reference = plain.clone();
             cipher.apply(&mut fast);

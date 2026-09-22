@@ -22,7 +22,7 @@ GoWay v1.8.4 uses single-hyphen names such as `-up`, `-fakehost`, `-mux`, `-no-m
 
 RushWay normalizes these forms before Clap parsing, including GoWay boolean syntax such as `-mux=true` and `-block-local=false`. Ordinary `-p`, `-k`, `-W` and `-u` short forms remain valid.
 
-`-log-file`, `-tui`, and CPU profiling arguments are accepted for CLI compatibility but are not claimed as full feature parity until implemented and tested.
+`-log-file`, `-tui`, and CPU profiling arguments are implemented and covered by unit tests for their bookkeeping paths; executable TUI/dashboard and pprof sampling verification on target hardware still counts toward the release gate.
 
 ## Authentication / XOR
 

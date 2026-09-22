@@ -394,7 +394,10 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
     let mut target_host = String::new();
     let mut target_port = 80u16;
 
-    if let Some(rest) = uri.strip_prefix("http://").or_else(|| uri.strip_prefix("https://")) {
+    if let Some(rest) = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))
+    {
         let is_https = uri.starts_with("https://");
         let default_port = if is_https { 443 } else { 80 };
         let authority = rest.split('/').next().unwrap_or(rest);
@@ -409,7 +412,10 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
             .map_err(|_| ProxyParseError::InvalidHttpRequest)?;
         for line in headers_str.lines() {
             let line = line.trim();
-            if let Some(val) = line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")) {
+            if let Some(val) = line
+                .strip_prefix("Host:")
+                .or_else(|| line.strip_prefix("host:"))
+            {
                 if let Ok(target) = parse_authority_with_default(val.trim(), target_port) {
                     target_host = target.host;
                     target_port = target.port;

@@ -53,12 +53,12 @@ impl Default for RuntimeConfig {
             allow_open: false,
             max_connections: 1500,
             block_local: true,
-        tcp_nodelay: true,
-        tcp_keepalive: true,
-        socket_buffer: 0,
-        obfs: false,
+            tcp_nodelay: true,
+            tcp_keepalive: true,
+            socket_buffer: 0,
+            obfs: false,
+        }
     }
-}
 }
 #[derive(Debug)]
 struct StreamEntry {
@@ -169,8 +169,7 @@ pub(crate) async fn recycle_buf(buf: Vec<u8>) {
 pub(crate) async fn wait_shutdown() {
     #[cfg(windows)]
     {
-        let mut brk = tokio::signal::windows::ctrl_break()
-            .expect("ctrl_break handler installed");
+        let mut brk = tokio::signal::windows::ctrl_break().expect("ctrl_break handler installed");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = brk.recv() => {}
@@ -185,9 +184,7 @@ pub(crate) async fn wait_shutdown() {
 /// Drains a `JoinSet` after the accept loop exits: waits for in-flight
 /// tasks up to the drain budget, then aborts leftovers so the process can
 /// exit cleanly (flushing PGO profiles, releasing ports).
-pub(crate) async fn drain_join_set<T: Send + 'static>(
-    set: &mut tokio::task::JoinSet<T>,
-) {
+pub(crate) async fn drain_join_set<T: Send + 'static>(set: &mut tokio::task::JoinSet<T>) {
     let deadline = tokio::time::sleep(Duration::from_secs(SHUTDOWN_DRAIN_SECS));
     tokio::pin!(deadline);
     loop {
@@ -234,7 +231,7 @@ async fn dial_target(
     let stream = timeout(Duration::from_secs(timeout_secs.max(1)), async {
         let addr = resolve_socket(&target.host, target.port)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         TcpStream::connect(addr).await
     })
     .await
@@ -302,10 +299,12 @@ async fn target_to_mux(
     loop {
         match target.read(&mut buf).await {
             Ok(0) => {
-                let _ = send_mux_parts_encrypted(&writer, &cipher, id, MuxCommand::Fin, &[], obfs).await;
+                let _ = send_mux_parts_encrypted(&writer, &cipher, id, MuxCommand::Fin, &[], obfs)
+                    .await;
                 break;
             }
             Ok(n) => {
+                crate::stats::add_bytes(0, n as i64);
                 let mut off = 0;
                 while off < n {
                     let end = (off + u16::MAX as usize).min(n);
@@ -525,8 +524,7 @@ async fn handle_mux_parts(
                     stream_id: u32,
                     obfs: bool,
                 ) {
-                    let _ =
-                        send_reset_encrypted(writer, cipher, stream_id, obfs).await;
+                    let _ = send_reset_encrypted(writer, cipher, stream_id, obfs).await;
                     streams.write().await.remove(&stream_id);
                 }
                 let task = tokio::spawn(async move {
@@ -652,6 +650,7 @@ async fn handle_mux_parts(
                             streams_task.write().await.remove(&stream_id);
                             return;
                         }
+                        crate::stats::add_bytes(frame.payload().len() as i64, 0);
                     }
 
                     if client_fin {
@@ -663,6 +662,7 @@ async fn handle_mux_parts(
                                     if wr_target.write_all(frame.payload()).await.is_err() {
                                         break;
                                     }
+                                    crate::stats::add_bytes(frame.payload().len() as i64, 0);
                                 }
                                 StreamCommand::Fin => {
                                     let _ = wr_target.shutdown().await;
@@ -750,10 +750,9 @@ async fn handle_server_tcp_parts(
     let cipher = configured_cipher(&cfg.key);
     let mut target_frame = first;
     transform_payload(&cipher, &mut target_frame);
-    let target_text = String::from_utf8(target_frame)
-        .map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
-    let target = parse_target_authority(target_text.trim())
-        .map_err(|e| anyhow!(e.to_string()))?;
+    let target_text =
+        String::from_utf8(target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
+    let target = parse_target_authority(target_text.trim()).map_err(|e| anyhow!(e.to_string()))?;
     let resolved = resolve_socket(&target.host, target.port).await?;
     let target_stream = timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
@@ -778,6 +777,7 @@ async fn handle_server_tcp_parts(
             if n == 0 {
                 break;
             }
+            crate::stats::add_bytes(0, n as i64);
             let payload = buf[..n].to_vec();
             let mut w = writer_down.lock().await;
             write_frame(&mut *w, &payload, 2, false).await?;
@@ -806,6 +806,7 @@ async fn handle_server_tcp_parts(
                 if target_wr.write_all(&payload).await.is_err() {
                     break;
                 }
+                crate::stats::add_bytes(payload.len() as i64, 0);
             }
         }
     }
@@ -934,6 +935,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 apply_socket_options(&stream, &cfg2);
                 set.spawn(async move {
                     let _permit = permit;
+                    let _conn = crate::stats::ConnGuard::new();
                     let result = async {
                         let (mut rd, mut wr) = tokio::io::split(stream);
                         let request = read_http_headers(&mut rd).await?;

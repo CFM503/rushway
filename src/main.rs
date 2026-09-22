@@ -3,11 +3,14 @@ mod dns;
 mod mux_pool;
 mod mux_writer;
 mod nonmux;
+mod profile;
 mod protocol;
 mod proxy;
 mod quic;
 mod runtime;
+mod stats;
 mod tls;
+mod tui;
 mod udp_batch;
 mod udp_relay;
 mod ws;
@@ -20,6 +23,8 @@ use std::path::PathBuf;
 use tokio::io::{copy_bidirectional, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -343,6 +348,7 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                 let (stream, peer) = res?;
                 let acceptor = acceptor.clone();
                 set.spawn(async move {
+                    let _conn = stats::ConnGuard::new();
                     let result = async {
                         let mut tls_stream = acceptor.accept(stream).await?;
                         let request = ws::read_http_headers(&mut tls_stream).await?;
@@ -451,10 +457,30 @@ async fn main() -> Result<()> {
         }
     }
     let filter = tracing_filter(&args.log_level);
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(filter))
-        .with_target(false)
-        .init();
+    let env_filter = EnvFilter::new(filter);
+    // GoWay gates terminal escapes on ModeCharDevice; mirror that so piped
+    // output stays clean and `-tui` degrades gracefully.
+    let tui_active = args.tui && tui::stdout_is_tty();
+    if args.tui && !tui_active {
+        tracing::warn!("-tui requested but stdout is not a terminal; falling back to log output");
+    }
+    let ux_layer = tui::UxLayer::new(tui_active, args.log_file.is_some());
+    if tui_active {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(ux_layer)
+            .init();
+        tui::enable_tui();
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(ux_layer)
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .init();
+    }
+    if let Some(path) = args.log_file.clone() {
+        tui::configure_log_file(path);
+    }
     let mut cfg = if let Some(path) = args.config.clone() {
         load_json(path).await?
     } else {
@@ -463,30 +489,22 @@ async fn main() -> Result<()> {
     if args.config.is_none() && args.max_conn.is_none() {
         cfg.max_connections = 1500;
     }
-    if args.tui {
-        tracing::warn!("-tui accepted for GoWay CLI compatibility; RushWay currently uses log output without a TUI dashboard");
+    if let Some(path) = args.cpu_profile.clone() {
+        profile::start(path, args.cpu_profile_duration)?;
     }
-    if args.log_file.is_some() {
-        tracing::warn!(
-            "-log-file accepted for GoWay CLI compatibility; file logging is not yet enabled"
-        );
-    }
-    if args.cpu_profile.is_some() || args.cpu_profile_duration.is_some() {
-        tracing::warn!("CPU profiling flags accepted for GoWay CLI compatibility; profiling output is not yet enabled");
-    }
-    if let Some(v) = args.local_host {
+    if let Some(v) = args.local_host.clone() {
         cfg.proxy_host = v;
     }
     if let Some(v) = args.port.as_deref() {
         apply_listen_arg(&mut cfg, v)?;
     }
-    if let Some(v) = args.upstream {
+    if let Some(v) = args.upstream.clone() {
         cfg.upstream = Some(v);
     }
-    if let Some(v) = args.key {
+    if let Some(v) = args.key.clone() {
         cfg.key = Some(v);
     }
-    if let Some(v) = args.fakehost {
+    if let Some(v) = args.fakehost.clone() {
         cfg.fakehost = Some(v);
     }
     if let Some(v) = args.buffer_kib {
@@ -529,6 +547,37 @@ async fn main() -> Result<()> {
     std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
     print_banner(&cfg, args.mux_sessions, &dns_display);
 
+    // GoWay `monitorStats`: 3 s `[STATS]` line (1 s cadence feeds the TUI).
+    let level_up = args.log_level.trim().to_ascii_uppercase();
+    let stats_line = !tui_active && matches!(level_up.as_str(), "DEBUG" | "INFO" | "");
+    stats::spawn_monitor(tui_active, stats_line);
+    if tui_active {
+        let tui_cfg = tui::TuiConfig::from_runtime(
+            &cfg,
+            args.mux_sessions,
+            &dns_display,
+            args.verify_ssl,
+            &args.log_level,
+        );
+        tui::spawn_refresh_loop(tui_cfg);
+    }
+
+    let result = run_forwarding(cfg, &args).await;
+
+    // Shutdown hygiene: flush `-log-file` ring and stop `-cpuprofile` sampler.
+    tui::save_log_file();
+    profile::finish();
+    if tui::tui_enabled() {
+        // Leave the alternate screen cleanly so the shell prompt is usable.
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[2J\x1b[H");
+        let _ = out.flush();
+    }
+    result
+}
+
+async fn run_forwarding(cfg: RuntimeConfig, args: &Args) -> Result<()> {
     if let Some(upstream) = cfg.upstream.as_deref() {
         if upstream.starts_with("wss://") {
             if cfg.mux {
