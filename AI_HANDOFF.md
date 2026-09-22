@@ -2106,3 +2106,30 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 ### Next action
 - Phase 3 protocol work or deeper Phase 4 (n≥5, competitors, CPU/RSS, non-loopback) — user priority.
 
+
+## W1 execution log - 2026-09-22 (post-v0.0.25 hot path + tails + competitor install)
+
+### Change
+- `src/mux_writer.rs` `write_batch`: per-poll `Vec<IoSlice>` replaced with stack array `[IoSlice; 64]` (count capped at 64, BATCH_MAX_FRAMES=32 anyway) - removes one heap alloc per vectored write batch.
+- `src/ws.rs` `read_frame` unmask: byte loop replaced with u64 word XOR (`mask64` = mask key duplicated, same pattern as `mux_writer.rs` fused mask path) + scalar tail; payload grow loop kept on the safe `resize` path (an earlier `unsafe set_len` draft was reverted - UB over uninit memory, not worth one memset).
+- `src/mux_pool.rs` `send_mux_parts_reuse`: an experimental `scratch.clone()` was reverted - `mem::take` is strictly better (1 alloc, no copy; clone = alloc + full-frame memcpy).
+- UDP byte accounting (`stats::add_bytes`) added at every previously-missing UDP site: `udp_relay.rs` (up/down), `mux_pool.rs` handle_udp_proxy (up/down), `wss_client.rs` handle_udp_proxy (up/down), `runtime.rs` server UDP relay (up/down), `quic.rs` relay_quic_udp + handle_server_udp_stream (up/down). Direction convention: upload = bytes to upstream/target, download = bytes to local peer, matching the TCP paths.
+- WSS max-conn semaphore: `WssConfig` gains `max_connections` (from `RuntimeConfig`); both WSS client accept loops (`run_non_mux_from_config`, `run_client_from_config`) now `try_acquire_owned()` before spawn, mirroring `nonmux.rs`/`runtime.rs`/`quic.rs`/`mux_pool.rs` patterns; test constructors updated.
+- `src/profile.rs` (Unix pprof 99 Hz) reviewed - already complete from Phase 1; no change.
+- Competitors installed from GitHub release zips (winget blocked: `--proxy` requires admin setting, direct winget download fails `0x80072efd`): `tools/sing-box/sing-box-1.14.1-windows-amd64/sing-box.exe` (1.14.1) and `tools/xray/xray.exe` (26.3.27); both verified with `version`. `tools/` is git-ignored.
+
+### Validation
+- `cargo fmt` clean; `cargo clippy --release -- -D warnings` 0 warnings; `cargo test --release -q` 96+8 pass; `cargo build --release --bins` OK.
+- Local loopback `proxy_bench` (same binary, sequential, steady_state): rushway n=3 c1/c8/c32 = 78.29/278.17/288.85 median (samples 79.26/52.58/78.29, 284.08/270.11/278.17, 281.19/294.72/288.85); goway n=3 = 297.23/345.89/338.24 median (362.02/123.13/297.23, 354.39/345.89/335.56, 339.11/335.08/338.24). setup_inclusive rushway c1=144.66 (single run). One rushway sample failed with `early eof` (harness-side; reproduce before treating as product bug).
+- Same binary later produced c1=52-150 across runs - machine load dominates n=1/n=3 loopback numbers; W2 protocol (n>=5, CPU/RSS, non-loopback, competitors) is required before any superiority claim.
+
+### Status
+- W1 code items done and verified green. Competitors installed. W1 remaining: real-TTY TUI sign-off (human), then code freeze for W2.
+
+### Remaining risk
+- goway still clearly ahead on this machine's steady c1 (median 297 vs 78) and c8/c32 (~346/338 vs ~278/289); gap likely architectural (queueing/scheduling/syscall pattern), not the micro-opts above. Do not claim objective #1 met.
+- `early eof` single occurrence in bench harness - unexplained.
+- UDP add_bytes semantics (envelope bytes vs payload bytes) differ slightly per transport; counts are indicative, not wire-exact.
+
+### Next action
+- Freeze code -> W2 full Phase 4 matrix (rushway + goway + sing-box + xray; n>=5; CPU/RSS; non-loopback) -> W3 Phase 3 (version negotiation + WINDOW) + re-test.

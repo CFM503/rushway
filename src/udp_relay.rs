@@ -174,6 +174,7 @@ pub async fn handle_local_udp_proxy(
                 *latest_send.lock().await = Some(peer);
                 let mut packet = pkt.to_vec();
                 c_send.apply(&mut packet);
+                crate::stats::add_bytes(packet.len() as i64, 0);
                 let mut w = writer_send.lock().await;
                 if write_frame(&mut *w, &packet, 2, true).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
@@ -206,7 +207,9 @@ pub async fn handle_local_udp_proxy(
                     continue;
                 }
                 if let Some(peer) = *latest.lock().await {
+                    let n = packet.len();
                     let _ = udp.send_to(&packet, peer).await;
+                    crate::stats::add_bytes(0, n as i64);
                 }
             }
             Ok::<(), anyhow::Error>(())

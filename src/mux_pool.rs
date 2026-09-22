@@ -628,6 +628,7 @@ async fn handle_udp_proxy(
                 *latest_send.lock().await = Some(peer);
                 let mut data = pkt.to_vec();
                 c_send.apply(&mut data);
+                crate::stats::add_bytes(data.len() as i64, 0);
                 let mut w = writer_send.lock().await;
                 if write_frame(&mut *w, &data, 2, true).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
@@ -656,6 +657,7 @@ async fn handle_udp_proxy(
                 cipher.apply(&mut packet);
                 if let Some(peer) = *latest.lock().await {
                     let _ = udp.send_to(&packet, peer).await;
+                    crate::stats::add_bytes(0, packet.len() as i64);
                 }
             }
             Ok::<(), anyhow::Error>(())

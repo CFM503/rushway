@@ -683,8 +683,17 @@ where
             read += chunk;
         }
         if masked {
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b ^= key[i & 3];
+            let mask_u32 = u32::from_ne_bytes(key);
+            let mask64 = (mask_u32 as u64) | ((mask_u32 as u64) << 32);
+            let n = buf.len();
+            let mut i = 0;
+            while i + 8 <= n {
+                let w = u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap());
+                buf[i..i + 8].copy_from_slice(&(w ^ mask64).to_ne_bytes());
+                i += 8;
+            }
+            for (j, b) in buf[i..].iter_mut().enumerate() {
+                *b ^= key[(i + j) & 3];
             }
         }
         match opcode {

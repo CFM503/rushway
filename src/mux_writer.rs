@@ -475,12 +475,14 @@ where
     let mut off = 0usize;
     while idx < batch.len() {
         let n = poll_fn(|cx| {
-            let mut slices = Vec::with_capacity(batch.len() - idx);
-            slices.push(IoSlice::new(&batch[idx][off..]));
-            for buf in &batch[idx + 1..] {
-                slices.push(IoSlice::new(buf));
+            const MAX: usize = 64;
+            let count = (batch.len() - idx).min(MAX);
+            let mut slices: [IoSlice<'_>; MAX] = [IoSlice::new(&[]); MAX];
+            slices[0] = IoSlice::new(&batch[idx][off..]);
+            for (i, buf) in batch[idx + 1..idx + count].iter().enumerate() {
+                slices[i + 1] = IoSlice::new(buf);
             }
-            Pin::new(&mut *w).poll_write_vectored(cx, &slices)
+            Pin::new(&mut *w).poll_write_vectored(cx, &slices[..count])
         })
         .await?;
         if n == 0 {

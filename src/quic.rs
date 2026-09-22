@@ -429,6 +429,7 @@ async fn relay_quic_udp(
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
                 *latest_send.lock().await = Some(peer);
+                crate::stats::add_bytes(pkt.len() as i64, 0);
                 if write_len_prefixed_udp(&mut send_task, pkt).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
@@ -452,6 +453,7 @@ async fn relay_quic_udp(
                 }
                 if let Some(peer) = *latest.lock().await {
                     let _ = udp.send_to(&packet, peer).await;
+                    crate::stats::add_bytes(0, packet.len() as i64);
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -707,6 +709,7 @@ async fn handle_server_udp_stream(
             };
             for i in 0..count {
                 let (pkt, src) = batch.packet(i);
+                crate::stats::add_bytes(0, pkt.len() as i64);
                 let mut packet = Vec::with_capacity(22 + pkt.len());
                 packet.extend_from_slice(&[0, 0, 0]);
                 match src.ip() {
@@ -739,6 +742,7 @@ async fn handle_server_udp_stream(
                     continue;
                 }
                 let addr = dns::resolve_socket(&target.host, target.port).await?;
+                crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = udp.send_to(payload, addr).await;
             }
             Ok::<(), anyhow::Error>(())

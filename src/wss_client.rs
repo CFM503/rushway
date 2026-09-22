@@ -27,7 +27,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 
 pub(crate) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -54,6 +54,7 @@ pub(crate) struct WssConfig {
     pub(crate) tcp_keepalive: bool,
     pub(crate) socket_buffer: usize,
     pub(crate) obfs: bool,
+    pub(crate) max_connections: usize,
 }
 impl WssConfig {
     #[allow(dead_code)]
@@ -75,6 +76,7 @@ impl WssConfig {
             tcp_keepalive: cfg.tcp_keepalive,
             socket_buffer: cfg.socket_buffer,
             obfs: cfg.obfs,
+            max_connections: cfg.max_connections,
         })
     }
 }
@@ -354,6 +356,7 @@ async fn handle_udp_proxy(
                 *latest_send.lock().await = Some(peer);
                 let mut packet = pkt.to_vec();
                 cipher_send.apply(&mut packet);
+                crate::stats::add_bytes(packet.len() as i64, 0);
                 let mut w = writer_send.lock().await;
                 if write_frame(&mut *w, &packet, 2, true).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
@@ -378,6 +381,7 @@ async fn handle_udp_proxy(
                 c.apply(&mut packet);
                 if let Some(peer) = *latest_client.lock().await {
                     let _ = udp.send_to(&packet, peer).await;
+                    crate::stats::add_bytes(0, packet.len() as i64);
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -604,6 +608,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         tcp_keepalive: cfg.tcp_keepalive,
         socket_buffer: cfg.socket_buffer,
         obfs: cfg.obfs,
+        max_connections: cfg.max_connections,
     };
     let pool = NonMuxWssPool::new(wc.clone());
     let maintainer = pool.clone();
@@ -611,6 +616,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         maintainer.maintain().await;
     });
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     tracing::info!(
         "RushWay WSS non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
         wc.proxy_host,
@@ -626,9 +632,17 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
             }
             res = listener.accept() => {
                 let (stream, peer) = res?;
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer,"maximum client connections reached");
+                        continue;
+                    }
+                };
                 let cfg2 = wc.clone();
                 let pool2 = pool.clone();
                 set.spawn(async move {
+                    let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
                     if let Err(e) = handle_non_mux_connection(stream, cfg2, pool2).await {
                         tracing::debug!(%peer,error=%e,"WSS non-MUX connection closed")
@@ -1099,9 +1113,11 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
         tcp_keepalive: cfg.tcp_keepalive,
         socket_buffer: cfg.socket_buffer,
         obfs: cfg.obfs,
+        max_connections: cfg.max_connections,
     };
     let pool = WssSessionPool::new(wc.clone());
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     let pool_maintainer = pool.clone();
     tokio::spawn(async move {
         pool_maintainer.maintain().await;
@@ -1120,8 +1136,16 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
             }
             res = listener.accept() => {
                 let (stream, peer) = res?;
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer,"maximum client connections reached");
+                        continue;
+                    }
+                };
                 let pool2 = pool.clone();
                 set.spawn(async move {
+                    let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
                     if let Err(e) = handle_connection(stream, pool2).await {
                         tracing::debug!(%peer,error=%e,"WSS proxy connection closed")
@@ -1318,6 +1342,7 @@ mod tests {
             tcp_keepalive: true,
             socket_buffer: 0,
             obfs: false,
+            max_connections: 16,
         };
 
         let session = WssSessionState::connect(&cfg).await.unwrap();
@@ -1365,6 +1390,7 @@ mod tests {
             tcp_keepalive: true,
             socket_buffer: 0,
             obfs: false,
+            max_connections: 16,
         };
 
         let res = probe_wss_handshake(&cfg).await.unwrap();

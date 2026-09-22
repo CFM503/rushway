@@ -865,6 +865,7 @@ async fn handle_server_udp_parts(
             };
             for i in 0..count {
                 let (pkt, source) = batch.packet(i);
+                crate::stats::add_bytes(0, pkt.len() as i64);
                 let mut packet = udp_envelope(source, pkt);
                 cipher_send.apply(&mut packet);
                 let mut w = writer_send.lock().await;
@@ -899,6 +900,7 @@ async fn handle_server_udp_parts(
             Ok(v) => v,
             Err(_) => continue,
         };
+        crate::stats::add_bytes(payload.len() as i64, 0);
         let _ = udp.send_to(payload, addr).await?;
     }
     send_task.abort();

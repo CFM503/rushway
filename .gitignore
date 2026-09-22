@@ -5,3 +5,5 @@ dist/
 *.exe
 *.tar.gz
 *.zip
+# Local competitor installs (sing-box/xray) for Phase 4 benchmarks.
+tools/
