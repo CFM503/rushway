@@ -7,3 +7,5 @@ dist/
 *.zip
 # Local competitor installs (sing-box/xray) for Phase 4 benchmarks.
 tools/
+# Scratch space for baseline exports / A-B staging.
+tmp/

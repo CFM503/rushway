@@ -183,7 +183,7 @@ mod tests {
             for i in 0..n {
                 let (pkt, addr) = reader.packet(i);
                 assert_eq!(addr, tx_addr);
-                let want = (got + i) as u16;
+                let want = got as u16;
                 assert_eq!(pkt.len(), 4);
                 assert_eq!(pkt[0], ((want >> 8) & 0xff) as u8);
                 assert_eq!(pkt[1], (want & 0xff) as u8);

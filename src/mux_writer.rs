@@ -354,18 +354,19 @@ pub(crate) fn encode_mux_ws_frame(
             } else {
                 let mask_u32 = u32::from_ne_bytes(key);
                 let mask64 = (mask_u32 as u64) | ((mask_u32 as u64) << 32);
-                let n = region.len();
-                let mut i = 0;
-                while i + 8 <= n {
-                    let off = i & (XOR_KEY_SIZE - 1);
-                    let kw = u64::from_ne_bytes(ks[off..off + 8].try_into().unwrap());
-                    let dw = u64::from_ne_bytes(region[i..i + 8].try_into().unwrap());
-                    region[i..i + 8].copy_from_slice(&(dw ^ kw ^ mask64).to_ne_bytes());
-                    i += 8;
+                // Word-at-a-time via `&[u8; 8]` chunks: keeps the fused
+                // cipher+mask pass in registers (no outlined slice copies).
+                let (ks_words, _) = ks.as_chunks::<8>();
+                let (words, _) = region.as_chunks_mut::<8>();
+                for (idx, chunk) in words.iter_mut().enumerate() {
+                    let off = (idx << 3) & (XOR_KEY_SIZE - 1);
+                    let kw = u64::from_ne_bytes(ks_words[off >> 3]);
+                    let dw = u64::from_ne_bytes(*chunk);
+                    *chunk = (dw ^ kw ^ mask64).to_ne_bytes();
                 }
-                while i < n {
-                    region[i] ^= ks[i & (XOR_KEY_SIZE - 1)] ^ key[i & 3];
-                    i += 1;
+                let i = words.len() * 8;
+                for (j, byte) in region[i..].iter_mut().enumerate() {
+                    *byte ^= ks[(i + j) & (XOR_KEY_SIZE - 1)] ^ key[(i + j) & 3];
                 }
             }
         }

@@ -116,3 +116,39 @@ goway mode=steady sample=9 c1=220.5 c8=123.11 c32=132.29 cpu_s=2.77 rss_mb=92.5
 goway mode=steady sample=10 c1=238.71 c8=190.11 c32=177.47 cpu_s=2.45 rss_mb=97.1
 proxy_e2e_summary implementation=goway mode=setup samples=10 c1_mib_s=169.2 c8_mib_s=231.19 c32_mib_s=231.08 cpu_s=1.9 rss_peak_mb=93.25
 proxy_e2e_summary implementation=goway mode=steady samples=10 c1_mib_s=250.34 c8_mib_s=211.1 c32_mib_s=185.36 cpu_s=2.385 rss_peak_mb=94.3
+rushway mode=setup sample=1 c1=85.36 c8=173.27 c32=224.56 cpu_s=2.31 rss_mb=113.6
+rushway mode=setup sample=2 c1=116.24 c8=202.34 c32=201.99 cpu_s=2.12 rss_mb=123.5
+rushway mode=setup sample=3 c1=89.58 c8=216.04 c32=197.17 cpu_s=2.41 rss_mb=127.6
+rushway mode=setup sample=4 c1=97.1 c8=170.92 c32=169.81 cpu_s=2.73 rss_mb=150
+rushway mode=setup sample=5 c1=89.56 c8=174.93 c32=169.03 cpu_s=2.5 rss_mb=142.1
+sing-box mode=setup sample=1 c1=262.95 c8=173.48 c32=264.82 cpu_s=1.27 rss_mb=78.9
+sing-box mode=setup sample=2 c1=208.42 c8=288.29 c32=256.97 cpu_s=1.28 rss_mb=81.8
+sing-box mode=setup sample=3 c1=102.04 c8=322.46 c32=324.37 cpu_s=1.12 rss_mb=81.4
+sing-box mode=setup sample=4 c1=259.06 c8=324.41 c32=344.05 cpu_s=1.23 rss_mb=81.6
+sing-box mode=setup sample=5 c1=81.43 c8=256.05 c32=241.41 cpu_s=1.38 rss_mb=81
+rushway mode=steady sample=1 c1=65.98 c8=168.52 c32=175.86 cpu_s=2.59 rss_mb=141.2
+rushway mode=steady sample=2 c1=83.34 c8=197.38 c32=171.29 cpu_s=2.58 rss_mb=152.2
+rushway mode=steady sample=3 c1=98.28 c8=156.71 c32=97.74 cpu_s=3.03 rss_mb=155.6
+rushway mode=steady sample=4 c1=90.43 c8=259.51 c32=227.31 cpu_s=2.42 rss_mb=151
+rushway mode=steady sample=5 c1=98 c8=189 c32=219.15 cpu_s=2.2 rss_mb=147.8
+sing-box mode=steady sample=1 c1=110.36 c8=322.21 c32=287.52 cpu_s=1.27 rss_mb=80.2
+sing-box mode=steady sample=2 c1=99.71 c8=307.53 c32=283.87 cpu_s=1.22 rss_mb=81
+sing-box mode=steady sample=3 c1=81.33 c8=301.4 c32=287.47 cpu_s=1.47 rss_mb=80.4
+sing-box mode=steady sample=4 c1=274.6 c8=327.03 c32=265.75 cpu_s=1.58 rss_mb=77.8
+sing-box mode=steady sample=5 c1=187.63 c8=321.09 c32=277.69 cpu_s=1.62 rss_mb=80.7
+proxy_e2e_summary implementation=rushway mode=setup samples=5 c1_mib_s=89.58 c8_mib_s=174.93 c32_mib_s=197.17 cpu_s=2.41 rss_peak_mb=127.6
+proxy_e2e_summary implementation=sing-box mode=setup samples=5 c1_mib_s=208.42 c8_mib_s=288.29 c32_mib_s=264.82 cpu_s=1.27 rss_peak_mb=81.4
+proxy_e2e_summary implementation=rushway mode=steady samples=5 c1_mib_s=90.43 c8_mib_s=189 c32_mib_s=175.86 cpu_s=2.58 rss_peak_mb=151
+proxy_e2e_summary implementation=sing-box mode=steady samples=5 c1_mib_s=110.36 c8_mib_s=321.09 c32_mib_s=283.87 cpu_s=1.47 rss_peak_mb=80.4
+rushway mode=setup sample=1 c1=113.38 c8=246.45 c32=172.78 cpu_s=2.14 rss_mb=95.8
+rushway mode=setup sample=2 c1=145.84 c8=221.58 c32=246.19 cpu_s=2.02 rss_mb=139.6
+rushway mode=setup sample=3 c1=70.32 c8=130.61 c32=192.13 cpu_s=2.69 rss_mb=131
+rushway mode=setup sample=4 c1=98.94 c8=197.29 c32=194.68 cpu_s=2.39 rss_mb=151.5
+rushway mode=setup sample=5 c1=93.66 c8=206.46 c32=122.89 cpu_s=2.41 rss_mb=156.4
+rushway mode=steady sample=1 c1=125.98 c8=196.68 c32=153.71 cpu_s=2.42 rss_mb=150.2
+rushway mode=steady sample=2 c1=89.76 c8=154.94 c32=168.19 cpu_s=2.58 rss_mb=125.6
+rushway mode=steady sample=3 c1=112.01 c8=209 c32=210.52 cpu_s=2.41 rss_mb=140.1
+rushway mode=steady sample=4 c1=89.3 c8=194.07 c32=194.74 cpu_s=2.44 rss_mb=152
+rushway mode=steady sample=5 c1=75.83 c8=216 c32=211.78 cpu_s=2.59 rss_mb=136.8
+proxy_e2e_summary implementation=rushway mode=setup samples=5 c1_mib_s=98.94 c8_mib_s=206.46 c32_mib_s=192.13 cpu_s=2.39 rss_peak_mb=139.6
+proxy_e2e_summary implementation=rushway mode=steady samples=5 c1_mib_s=89.76 c8_mib_s=196.68 c32_mib_s=194.74 cpu_s=2.44 rss_peak_mb=140.1

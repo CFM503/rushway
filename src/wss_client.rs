@@ -888,7 +888,9 @@ async fn send_mux(
     frame: &MuxFrame,
     obfs: bool,
 ) -> Result<()> {
-    let mut data = Vec::with_capacity(7 + frame.payload.len());
+    // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
+    // a `7 + payload` pre-cap never covered WS header + mask + pad.
+    let mut data = Vec::new();
     crate::mux_writer::encode_mux_ws_frame(
         &mut data,
         frame.stream_id,
@@ -909,7 +911,9 @@ async fn send_mux_parts(
     payload: &[u8],
     obfs: bool,
 ) -> Result<()> {
-    let mut data = Vec::with_capacity(7 + payload.len());
+    // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
+    // a `7 + payload` pre-cap never covered WS header + mask + pad.
+    let mut data = Vec::new();
     crate::mux_writer::encode_mux_ws_frame(
         &mut data, stream_id, command, payload, cipher, true, obfs,
     )

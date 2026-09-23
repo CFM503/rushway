@@ -1,0 +1,11 @@
+impl,mode,sample,c1_mib_s,c8_mib_s,c32_mib_s,cpu_s,rss_peak_mb
+rushway,setup,1,113.38,246.45,172.78,2.14,95.8
+rushway,setup,2,145.84,221.58,246.19,2.02,139.6
+rushway,setup,3,70.32,130.61,192.13,2.69,131
+rushway,setup,4,98.94,197.29,194.68,2.39,151.5
+rushway,setup,5,93.66,206.46,122.89,2.41,156.4
+rushway,steady,1,125.98,196.68,153.71,2.42,150.2
+rushway,steady,2,89.76,154.94,168.19,2.58,125.6
+rushway,steady,3,112.01,209,210.52,2.41,140.1
+rushway,steady,4,89.3,194.07,194.74,2.44,152
+rushway,steady,5,75.83,216,211.78,2.59,136.8

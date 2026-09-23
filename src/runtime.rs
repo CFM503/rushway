@@ -12,7 +12,7 @@ use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr
 use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame, read_frame_owned,
-    read_http_headers, validate_server_handshake, write_frame,
+    read_http_headers, validate_server_handshake, write_frame, write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
@@ -253,7 +253,9 @@ async fn send_frame_encrypted(
     frame: &MuxFrame,
     obfs: bool,
 ) -> Result<()> {
-    let mut bytes = Vec::with_capacity(7 + frame.payload.len());
+    // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
+    // a `7 + payload` pre-cap never covered WS header + mask + pad.
+    let mut bytes = Vec::new();
     crate::mux_writer::encode_mux_ws_frame(
         &mut bytes,
         frame.stream_id,
@@ -274,7 +276,9 @@ async fn send_mux_parts_encrypted(
     payload: &[u8],
     obfs: bool,
 ) -> Result<()> {
-    let mut bytes = Vec::with_capacity(7 + payload.len());
+    // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
+    // a `7 + payload` pre-cap never covered WS header + mask + pad.
+    let mut bytes = Vec::new();
     crate::mux_writer::encode_mux_ws_frame(
         &mut bytes, stream_id, command, payload, cipher, false, obfs,
     )
@@ -922,9 +926,12 @@ async fn handle_server_tcp_parts(
                 break;
             }
             crate::stats::add_bytes(0, n as i64);
-            let payload = buf[..n].to_vec();
+            // Borrow the pooled scratch instead of `buf[..n].to_vec()`:
+            // the old copy allocated a fresh Vec per read on the download
+            // path (data frames are plaintext on non-MUX, so masking never
+            // touches the scratch).
             let mut w = writer_down.lock().await;
-            write_frame(&mut *w, &payload, 2, false).await?;
+            write_frame_borrowed(&mut *w, &mut buf[..n], 2, false).await?;
         }
         recycle_buf(buf).await;
         Result::<()>::Ok(())

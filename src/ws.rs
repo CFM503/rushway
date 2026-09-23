@@ -670,13 +670,23 @@ where
         const READ_SEGMENT: usize = 64 * 1024;
         buf.clear();
         let total = len as usize;
+        // 64 KiB-capped reserve keeps the original guard against a bogus
+        // frame length (Vec::reserve failure = process abort, uncatchable);
+        // an exact whole-frame `reserve(total)` was tried and regressed c32
+        // in paired A/B (allocator churn at high concurrency). Per-chunk
+        // `set_len` instead of `resize(.., 0)` skips the zero-fill that
+        // `read_exact` immediately overwrites (~7% CPU in pprof 2026-09-23).
         buf.reserve(total.min(READ_SEGMENT));
         let mut read: usize = 0;
         while read < total {
             let chunk = (total - read).min(READ_SEGMENT);
             let start = buf.len();
-            buf.resize(start + chunk, 0);
-            if r.read_exact(&mut buf[start..]).await.is_err() {
+            buf.reserve(chunk);
+            // SAFETY: `set_len` exposes `[start, start+chunk)`, which the
+            // `read_exact` below fully initializes before any of it is
+            // observed; on error we `truncate` back to `start` first.
+            unsafe { buf.set_len(start + chunk) };
+            if r.read_exact(&mut buf[start..start + chunk]).await.is_err() {
                 buf.truncate(start);
                 return Err(anyhow!("websocket payload truncated"));
             }
@@ -685,13 +695,14 @@ where
         if masked {
             let mask_u32 = u32::from_ne_bytes(key);
             let mask64 = (mask_u32 as u64) | ((mask_u32 as u64) << 32);
-            let n = buf.len();
-            let mut i = 0;
-            while i + 8 <= n {
-                let w = u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap());
-                buf[i..i + 8].copy_from_slice(&(w ^ mask64).to_ne_bytes());
-                i += 8;
+            // `&[u8; 8]` chunks unmask in registers; the old slice->array
+            // `try_into` outlined a per-word `copied` call.
+            let (words, _) = buf.as_chunks_mut::<8>();
+            for chunk in words.iter_mut() {
+                let w = u64::from_ne_bytes(*chunk);
+                *chunk = (w ^ mask64).to_ne_bytes();
             }
+            let i = words.len() * 8;
             for (j, b) in buf[i..].iter_mut().enumerate() {
                 *b ^= key[(i + j) & 3];
             }

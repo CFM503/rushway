@@ -48,19 +48,23 @@ impl XorCipher {
             return;
         }
         let key = &self.key;
-        let n = data.len();
-        let mut i = 0;
-        while i + 8 <= n {
-            // `i` is 8-aligned, so `off` is 8-aligned and `off + 8` never
-            // exceeds `key.len()` (== XOR_KEY_SIZE).
+        // XOR_KEY_SIZE % 8 == 0, so the keystream is whole `u64` words.
+        // `as_chunks`/`chunks_exact_mut` yield `&[u8; 8]` values the
+        // optimizer turns into register XORs; the old slice->array
+        // `try_into().unwrap()` outlined into a `copied` call that cost
+        // ~7% CPU on its own (Linux pprof 2026-09-23).
+        let (key_words, _) = key.as_chunks::<8>();
+        let (words, tail) = data.as_chunks_mut::<8>();
+        let mut i = 0usize;
+        for chunk in words {
             let off = i & (XOR_KEY_SIZE - 1);
-            let kw = u64::from_ne_bytes(key[off..off + 8].try_into().unwrap());
-            let dw = u64::from_ne_bytes(data[i..i + 8].try_into().unwrap());
-            data[i..i + 8].copy_from_slice(&(dw ^ kw).to_ne_bytes());
+            let kw = u64::from_ne_bytes(key_words[off >> 3]);
+            let dw = u64::from_ne_bytes(*chunk);
+            *chunk = (dw ^ kw).to_ne_bytes();
             i += 8;
         }
-        while i < n {
-            data[i] ^= key[i & (XOR_KEY_SIZE - 1)];
+        for byte in tail {
+            *byte ^= key[i & (XOR_KEY_SIZE - 1)];
             i += 1;
         }
     }

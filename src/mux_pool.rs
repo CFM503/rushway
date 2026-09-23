@@ -160,7 +160,10 @@ async fn send_mux_parts(
     payload: &[u8],
     obfs: bool,
 ) -> Result<()> {
-    let mut bytes = Vec::with_capacity(7 + payload.len());
+    // Empty vec: `encode_mux_ws_frame` does one exact `reserve` for the
+    // full WS+MUX size — a `7 + payload` pre-cap was always short (WS
+    // header + mask + pad missing) and forced a wasted alloc+realloc.
+    let mut bytes = Vec::new();
     send_mux_parts_reuse(
         writer, cipher, stream_id, command, payload, &mut bytes, obfs,
     )
@@ -768,7 +771,10 @@ async fn handle_tcp_proxy(
     let obfs = session.obfs;
     let upload = tokio::spawn(async move {
         let mut buf = relay_buf(cfg.buffer_size).await;
-        let mut frame_scratch = Vec::with_capacity(buf.len().min(u16::MAX as usize) + 7);
+        // Scratch is `take`n on every send (becomes empty), so an initial
+        // capacity only ever served the first frame — start empty and let
+        // the encoder's single exact `reserve` size it.
+        let mut frame_scratch = Vec::new();
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {

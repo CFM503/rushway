@@ -1,0 +1,11 @@
+impl,mode,c1_mib_s,c8_mib_s,c32_mib_s
+sing-box,setup,355.82,556.56,525.64
+sing-box,steady,261.60,414.35,461.88
+rushway,setup,61.96,233.87,290.03
+rushway,steady,177.23,241.01,333.29
+goway,steady,257.71,337.98,315.94
+goway,setup,165.92,225.28,287.15
+# WSL Debian 6-core loopback n=5 median, script scripts/g1_wsl_compare.sh,2026-09-23
+# sing-box=/root/w2bin/sing-box v1.14.1, rushway=target/release (v0.0.26+fp rebuild), goway=/root/w2bin/goway (pre-W3 build)
+# NOTE: first parallel-contaminated attempt discarded; these are sequential runs.
+# Windows counterparts: see bench/g1_gap.csv and bench/w2_loopback.csv

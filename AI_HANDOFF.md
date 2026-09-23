@@ -2253,3 +2253,50 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 ### Next action
 
 - ~~Interleaved same-session A/B~~ **done 2026-09-23 (certified, see above).** Remaining: commit both repos (user approval pending; smoke-log dir inclusion to confirm with user), then resume goal-#1 structural work vs sing-box (c8/c32 ~1.9x, steady c1 ~2.1x gap) and rushway RSS reduction.
+
+---
+
+## Round-1 speed work (2026-09-23, goal #1)
+
+### Context
+
+- Same-OS WSL loopback comparison (`scripts/g1_wsl_compare.sh`, n=5 medians, serial): sing-box 261.60/414.35/461.88 (steady), rushway 177.23/241.01/333.29, goway 257.71/337.98/315.94 — the OS gap was noise; the code gap is real (sing-box 1.4-5.7x).
+- pprof profiles (70s window, bench looped ~100x to fill it, `scripts/g1_profile_wsl.sh`, force-frame-pointer + strip=none build + `go tool pprof -symbolize=none`):
+  - server (76.74s): `__recv` 23.3%, `send` 18.0%, `realloc` 13.8%, `writev` 10.1%, `copied` 6.8% (slice->array try_into outlined), `copy_nonoverlapping` 5.6%, `XorCipher::apply` cum 11.7%, `Vec::resize`/`extend_with` 6.9% (read_frame zero-fill), `grow_amortized` 14.5% (non-empty doubling).
+  - client (67.95s): `__recv` 27.1%, `send` 17.4%, `writev` 14.2%, `copy_nonoverlapping` 13.4%, `encode_mux_ws_frame` cum 20.0%, `realloc` 4.9%, `XorCipher` 4.3%.
+
+### Edits kept (current working tree, uncommitted)
+
+1. `src/crypto.rs` `XorCipher::apply`: word-at-a-time via `as_chunks::<8>()`/`as_chunks_mut::<8>()` + key pre-chunked to `&[u8;8]` words (kills the outlined `copied`, pprof ~7%).
+2. `src/mux_writer.rs` `encode_mux_ws_frame`: fused cipher+mask loop over `as_chunks_mut::<8>()` with word key index (same fix on the outbound hot path).
+3. `src/ws.rs` unmask loop: `as_chunks_mut::<8>()` word XOR + byte tail.
+4. `src/ws.rs` `read_frame`: per-chunk `unsafe set_len` + `read_exact` instead of `resize(.., 0)` — skips the zero-fill `read_exact` immediately overwrites (~7% `resize`), while keeping `reserve(total.min(READ_SEGMENT))` so the bogus-frame-length abort guard is preserved. (An exact whole-frame `reserve(total)` variant was tried and **reverted**: paired A/B showed c32 315 vs 413 MiB/s, 1:4 pairs — allocator churn at high concurrency.)
+5. Outbound buffers: `runtime.rs` (2x `send_frame_encrypted`/`send_mux_parts_encrypted`), `mux_pool.rs` `send_mux_parts` + `frame_scratch`, `wss_client.rs` (2x) — `Vec::with_capacity(7+payload)` -> `Vec::new()` (encode does one exact reserve; avoids the double grow).
+6. `src/runtime.rs` non-MUX server download path: `buf[..n].to_vec()` per read -> `write_frame_borrowed(&mut buf[..n], ..)` (data frames are plaintext on non-MUX; import added).
+7. `src/udp_batch.rs` **test bug fix**: `want = (got + i)` double-counted inside the per-packet loop (`got` already advances); failed deterministically on Linux (recvmmsg n=8 path, first-ever execution of this test) at slot 2 with left:1 right:2, passed on Windows (non-Linux fallback returns n=1 so i is always 0). Not related to Round-1 edits (file was untouched).
+
+### Verification
+
+- Build (WSL `/root/rw-g1`, release): **0 warnings**, `cargo test --release` **106 passed / 0 failed**.
+- Baseline binary for A/B: `/root/rw-g0` = tar of current tree with the 6 pre-edit files restored from `git show HEAD:src/..` (export script `tmp/export_g0.ps1`; trap: first export with `Set-Content -NoNewline` collapsed files to one line -> 49 compile errors, fixed by dropping `-NoNewline`).
+- **Paired alternating A/B** (`scripts/g1_ab_wsl.sh <mode> <n>`, AB/BA order flipped per pair, same session, opt `/root/rw-g1` vs base `/root/rw-g0`), steady:
+  - exploratory n=5 runs were noise-dominated (c1 swinging 62-328 within one run; environment drifted across sessions — sing-box re-run itself moved 261->386 median, so cross-session comparisons are invalid; only same-session pairs count).
+  - **decisive n=8:** OPT c1/c8/c32 medians **194.42 / 266.91 / 322.49** vs BASE **137.83 / 249.73 / 314.93** (+41% / +7% / +2%); pair wins **c1 6:2, c8 6:2, c32 5:3** (dropping the warmup pair: 5:2, 5:2, 4:3). Direction positive on every metric, no regression — forward-only rule satisfied.
+  - setup n=8: OPT 169.21/285.48/360.94 vs BASE 199.15/265.41/368.72; pair wins c1 2:6 (p≈0.29 n.s., c1 noise band 44-406), **c8 7:1 (one-sided p=0.035, significant)**, c32 5:3 — no metric regressed beyond noise, c8 significant.
+- **Windows official paired A/B** (`scripts/r1_ab_bench.ps1`, template from w3_ab_bench.ps1; baseline = `git worktree add --detach` at HEAD `2beef9b` built to `bench/oldbin/rushway_v0026_ab.exe`, worktree removed after; n=8 × setup+steady, interleaved flipped order, exact sign test crit=8 @ n=8):
+  - setup: all five metrics NOISE with r1-favorable medians on 4/5 (c1 +10.11 6:2, c8 +10.84 4:4, c32 +6.61 5:3, cpu −0.14s 7:1, rss −6.4MB 5:3) → **VERDICT NOISE, none regressed** (exit 0).
+  - steady: c1 −12.75 3:5 NOISE (only base-favorable median, within noise), c8 +8.58 6:2 NOISE, c32 +9.59 6:2 NOISE, **cpu −0.17s 8:0 => FORWARD** (goal-#2 direct evidence), rss −25.2MB 7:1 NOISE (directional win) → **VERDICT FORWARD, none regressed** (exit 0).
+  - CSV `bench/r1_ab_rushway.csv`, raw log `bench/r1_ab_raw.log`.
+  - Official solo harness also run for reference: `bench/w2_loopback_r1.csv` (rushway n=5 both modes) — cross-session deltas vs `w2_loopback.csv` are informational only (this machine demonstrably drifts between sessions; e.g. WSL sing-box median moved 261->386 same day).
+
+### Verdict & next
+
+- **Round-1 shippable:** WSL paired A/B positive on every metric (steady n=8: +41%/+7%/+2%, 6:2/6:2/5:3; setup c8 7:1 significant); Windows paired A/B (n=8×2 modes) **no metric regressed beyond noise, steady cpu FORWARD 8:0, steady rss −25MB 7:1 directional**; 106 tests green, 0 warnings. Still ~1.4-2x behind sing-box on c8/c32 — Round-2 must be structural, not micro.
+- Round-2 candidates (pprof-backed, in rough order of expected win):
+  1. Prefill read window (BufReader-style 256 KiB-1 MiB) wrapping the WS reader so one `recv` covers 4-16 frames — attacks `__recv` 23-27% (read_frame currently issues one syscall per 64 KiB segment per frame).
+  2. Reduce `writev` syscall count on the client encode path (`writev` 14% + `send` 17%): writer_loop batches up to 32 frames/1 MiB but drains opportunistically — under c1 the queue is usually empty at drain time so batch=1; consider a tiny coalesce window or relay-side frame aggregation.
+  3. `bytes` buffer pool for outbound encode buffers (drop currently frees every frame buffer; `realloc` 5-14% residual).
+  4. `read_frame` tail-chunk non-empty doubling: read_frame grows its `frame_buf` from 64 KiB cap on >64 KiB frames — amortized doubling still copies; a pooled frame buf (or size-classed frame_buf pool) removes it.
+  5. `runtime.rs` RSS (+2.3/+4.7 MB trend) re-check at higher n.
+- Windows official harness: **done** — solo reference run `bench/w2_loopback_r1.csv` + decisive paired A/B `scripts/r1_ab_bench.ps1` (CSV `bench/r1_ab_rushway.csv`, verdicts above); commit of the Round-1 edits still pending user approval (suggest v0.0.27).
+- Env notes for the next agent: WSL crashed 3x this session (`Wsl/Service/E_UNEXPECTED`) during heavy cargo + parallel `wsl.exe` launches — **never launch two `wsl.exe` commands concurrently** (they serialize on the WSL server lock and one gets killed); PowerShell 5.1 has no `&&`; inline `wsl -c "python3 - <<EOF"` heredocs break under PS quoting — write scripts to disk first (`scripts/g1_udp_probe_patch*.py` pattern, since removed).
