@@ -907,9 +907,7 @@ mod tests {
         // each frame must decode cleanly with no cross-frame leakage.
         let mut scratch = vec![0u8; 70000];
         for (len, byte) in [(70000usize, 0x11u8), (13, 0x22), (50000, 0x33)] {
-            for i in 0..len {
-                scratch[i] = byte;
-            }
+            scratch[..len].fill(byte);
             write_frame_borrowed(&mut a, &mut scratch[..len], 2, true)
                 .await
                 .unwrap();

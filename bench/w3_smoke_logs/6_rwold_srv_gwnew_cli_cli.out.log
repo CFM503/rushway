@@ -1,0 +1,15 @@
+[36mGOWAY v1.8.11[0m
+[36m------------------------------------------------------------[0m
+ [+] Mode:        [32mClient (HTTP + SOCKS5)[0m
+ [+] Listen:      [33m0.0.0.0:19261[0m
+ [+] Upstream:    [35mws://127.0.0.1:19260/[0m
+ [+] SSL Verify:  [31mDisabled (Insecure)[0m
+ [+] User-Agent:  [32mBrowser Profile (Sticky TLS+UA)[0m
+ [+] Mux:         [32mEnabled (0-RTT Multiplexing, sessions: 4)[0m
+ [+] DNS:         [33mSystem default[0m
+ [+] Auth:        [32mEnabled (XOR)[0m
+ [+] Buffer:      128 KB
+ [+] Max Conns:   1500
+[36m------------------------------------------------------------[0m
+[36m[INFO] Proxy listening... (Press Ctrl+C to stop)[0m
+

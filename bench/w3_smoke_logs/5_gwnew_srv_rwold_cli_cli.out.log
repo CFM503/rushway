@@ -1,0 +1,20 @@
+[36mRushWay v0.0.25[0m
+[36m------------------------------------------------------------[0m
+ [+] Mode:        Client (WS + SOCKS5/HTTP)
+ [+] Listen:      127.0.0.1:19251
+ [+] Upstream:    ws://127.0.0.1:19250/
+ [+] Mux:         Enabled (sessions: 4)
+ [+] Obfs:        Disabled
+ [+] DNS:         System default
+ [+] Auth:        Enabled (XOR)
+ [+] Buffer:      128 KB
+ [+] Max Conns:   1500
+[36m------------------------------------------------------------[0m
+[2m2026-09-23T02:21:34.218767Z[0m [32m INFO[0m RushWay pooled client proxy listening on 127.0.0.1:19251 (4 physical MUX sessions, up to 2048 streams/session)
+[2m2026-09-23T02:21:34.722467Z[0m [33m WARN[0m pooled proxy connection closed with error [3mpeer[0m[2m=[0m127.0.0.1:6031 [3merror[0m[2m=[0munexpected end of file
+[2m2026-09-23T02:21:34.755281Z[0m [33m WARN[0m pooled proxy connection closed with error [3mpeer[0m[2m=[0m127.0.0.1:12872 [3merror[0m[2m=[0munexpected end of file
+[2m2026-09-23T02:21:34.773567Z[0m [33m WARN[0m pooled proxy connection closed with error [3mpeer[0m[2m=[0m127.0.0.1:12874 [3merror[0m[2m=[0munexpected end of file
+[2m2026-09-23T02:21:35.396116Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-09-23T02:21:35.397080Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-09-23T02:21:35.397097Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-09-23T02:21:35.397104Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)

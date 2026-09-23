@@ -1,0 +1,83 @@
+﻿goway_base mode=setup sample=1 FAILED: proxy_bench exited 
+goway_w3 mode=setup sample=1 FAILED: proxy_bench exited 
+goway_w3 mode=setup sample=2 FAILED: proxy_bench exited 
+goway_base mode=setup sample=2 FAILED: proxy_bench exited 
+goway_base mode=setup sample=3 FAILED: proxy_bench exited 
+goway_w3 mode=setup sample=3 FAILED: proxy_bench exited 
+goway_w3 mode=setup sample=4 FAILED: proxy_bench exited 
+goway_base mode=setup sample=4 FAILED: proxy_bench exited 
+goway_base mode=setup sample=5 FAILED: proxy_bench exited 
+goway_w3 mode=setup sample=5 FAILED: proxy_bench exited 
+goway_w3 mode=setup sample=6 FAILED: proxy_bench exited 
+goway_base mode=setup sample=6 FAILED: proxy_bench exited 
+goway_base mode=steady sample=1 FAILED: proxy_bench exited 
+goway_w3 mode=steady sample=1 FAILED: proxy_bench exited 
+goway_w3 mode=steady sample=2 FAILED: proxy_bench exited 
+goway_base mode=steady sample=2 FAILED: proxy_bench exited 
+goway_base mode=steady sample=3 FAILED: proxy_bench exited 
+goway_w3 mode=steady sample=3 FAILED: proxy_bench exited 
+goway_w3 mode=steady sample=4 FAILED: proxy_bench exited 
+goway_base mode=steady sample=4 FAILED: proxy_bench exited 
+goway_base mode=steady sample=5 FAILED: proxy_bench exited 
+goway_w3 mode=steady sample=5 FAILED: proxy_bench exited 
+goway_w3 mode=steady sample=6 FAILED: proxy_bench exited 
+goway_base mode=steady sample=6 FAILED: proxy_bench exited 
+AB mode=setup base(n=6): c1=149.11 c8=233.12 c32=235.29 cpu=2.08 rss=89.6 | w3(n=6): c1=171.46 c8=205.02 c32=205.43 cpu=2.22 rss=93.7
+VERDICT mode=setup : REGRESSION vs baseline on some medians
+AB mode=steady base(n=6): c1=209.6 c8=192.83 c32=193.64 cpu=2.26 rss=88.2 | w3(n=6): c1=194.35 c8=232.36 c32=227.57 cpu=2.22 rss=91.1
+VERDICT mode=steady : REGRESSION vs baseline on some medians
+REF mode=setup (independent medians, informational) base(n=10): c1=213.82 c8=205.15 c32=203.33 cpu=2.12 rss=89.3 | w3(n=10): c1=180.24 c8=207.4 c32=198.18 cpu=2.2 rss=91
+PAIRED mode=setup metric=c1 n=10 eff_n=10 crit=9 bad=4 good=6 ties=0 med_delta=9.72 median_favours_w3=9.72 => NOISE
+PAIRED mode=setup metric=c8 n=10 eff_n=10 crit=9 bad=4 good=6 ties=0 med_delta=9.06 median_favours_w3=9.06 => NOISE
+PAIRED mode=setup metric=c32 n=10 eff_n=10 crit=9 bad=5 good=5 ties=0 med_delta=2.12 median_favours_w3=2.12 => NOISE
+PAIRED mode=setup metric=cpu n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=0.19 median_favours_w3=-0.19 => NOISE
+PAIRED mode=setup metric=rss n=10 eff_n=10 crit=9 bad=7 good=3 ties=0 med_delta=2.3 median_favours_w3=-2.3 => NOISE
+VERDICT mode=setup : NOISE (no metric moved beyond noise)
+goway_base mode=steady sample=1 c1=136.42 c8=191.19 c32=197.01 cpu_s=2.23 rss_mb=90.7
+goway_w3 mode=steady sample=1 c1=150 c8=188.86 c32=196.47 cpu_s=2.09 rss_mb=99.6
+goway_w3 mode=steady sample=2 c1=393.82 c8=181.66 c32=201.64 cpu_s=2.16 rss_mb=98.2
+goway_base mode=steady sample=2 c1=170.05 c8=307.54 c32=273.99 cpu_s=1.55 rss_mb=91.9
+goway_base mode=steady sample=3 c1=292.75 c8=309.61 c32=282.7 cpu_s=1.77 rss_mb=92.4
+goway_w3 mode=steady sample=3 c1=353.75 c8=214.26 c32=193.1 cpu_s=2.16 rss_mb=107
+goway_w3 mode=steady sample=4 c1=183.56 c8=190.77 c32=197.2 cpu_s=2.06 rss_mb=89.7
+goway_base mode=steady sample=4 c1=119.22 c8=213.32 c32=197.21 cpu_s=2.19 rss_mb=93.5
+goway_base mode=steady sample=5 c1=257.89 c8=123.65 c32=177.99 cpu_s=2.28 rss_mb=84
+goway_w3 mode=steady sample=5 c1=325.09 c8=297.48 c32=266.23 cpu_s=1.8 rss_mb=88.6
+goway_w3 mode=steady sample=6 c1=264.96 c8=276.65 c32=272.15 cpu_s=1.88 rss_mb=86.8
+goway_base mode=steady sample=6 c1=366.68 c8=278.78 c32=264.12 cpu_s=1.73 rss_mb=87.3
+goway_base mode=steady sample=7 c1=138.79 c8=213.23 c32=189.79 cpu_s=2.12 rss_mb=91.6
+goway_w3 mode=steady sample=7 c1=188.3 c8=193.08 c32=189.76 cpu_s=2.19 rss_mb=94.2
+goway_w3 mode=steady sample=8 c1=203.04 c8=213.53 c32=190.13 cpu_s=2.16 rss_mb=87.6
+goway_base mode=steady sample=8 c1=181.91 c8=201.02 c32=180.18 cpu_s=1.97 rss_mb=84.1
+goway_base mode=steady sample=9 c1=438.69 c8=274.67 c32=280.7 cpu_s=1.89 rss_mb=88.9
+goway_w3 mode=steady sample=9 c1=351.5 c8=295.41 c32=256.1 cpu_s=1.61 rss_mb=95.6
+goway_w3 mode=steady sample=10 c1=342.89 c8=213.33 c32=195.54 cpu_s=2.05 rss_mb=96.5
+goway_base mode=steady sample=10 c1=271.36 c8=200.23 c32=189.42 cpu_s=2.27 rss_mb=91.7
+REF mode=steady (independent medians, informational) base(n=10): c1=219.9 c8=213.27 c32=197.11 cpu=2.04 rss=91.2 | w3(n=10): c1=295.02 c8=213.43 c32=196.83 cpu=2.08 rss=94.9
+PAIRED mode=steady metric=c1 n=10 eff_n=10 crit=9 bad=2 good=8 ties=0 med_delta=55.26 median_favours_w3=55.26 => NOISE
+PAIRED mode=steady metric=c8 n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=-2.23 median_favours_w3=-2.23 => NOISE
+PAIRED mode=steady metric=c32 n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=-0.02 median_favours_w3=-0.02 => NOISE
+PAIRED mode=steady metric=cpu n=10 eff_n=10 crit=9 bad=5 good=5 ties=0 med_delta=-0.03 median_favours_w3=0.03 => NOISE
+PAIRED mode=steady metric=rss n=10 eff_n=10 crit=9 bad=8 good=2 ties=0 med_delta=4.7 median_favours_w3=-4.7 => NOISE
+VERDICT mode=steady : NOISE (no metric moved beyond noise)
+REF mode=setup (independent medians, informational) base(n=10): c1=213.82 c8=205.15 c32=203.33 cpu=2.12 rss=89.3 | w3(n=10): c1=180.24 c8=207.4 c32=198.18 cpu=2.2 rss=91
+PAIRED mode=setup metric=c1 n=10 eff_n=10 crit=9 bad=4 good=6 ties=0 med_delta=9.72 median_favours_w3=9.72 => NOISE
+PAIRED mode=setup metric=c8 n=10 eff_n=10 crit=9 bad=4 good=6 ties=0 med_delta=9.06 median_favours_w3=9.06 => NOISE
+PAIRED mode=setup metric=c32 n=10 eff_n=10 crit=9 bad=5 good=5 ties=0 med_delta=2.12 median_favours_w3=2.12 => NOISE
+PAIRED mode=setup metric=cpu n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=0.19 median_favours_w3=-0.19 => NOISE
+PAIRED mode=setup metric=rss n=10 eff_n=10 crit=9 bad=7 good=3 ties=0 med_delta=2.3 median_favours_w3=-2.3 => NOISE
+VERDICT mode=setup : NOISE (no metric moved beyond noise)
+REF mode=setup (independent medians, informational) base(n=10): c1=213.82 c8=205.15 c32=203.33 cpu=2.12 rss=89.3 | w3(n=10): c1=180.24 c8=207.4 c32=198.18 cpu=2.2 rss=91
+PAIRED mode=setup metric=c1 n=10 eff_n=10 crit=9 bad=4 good=6 ties=0 med_delta=9.72 median_favours_w3=9.72 => NOISE
+PAIRED mode=setup metric=c8 n=10 eff_n=10 crit=9 bad=4 good=6 ties=0 med_delta=9.06 median_favours_w3=9.06 => NOISE
+PAIRED mode=setup metric=c32 n=10 eff_n=10 crit=9 bad=5 good=5 ties=0 med_delta=2.12 median_favours_w3=2.12 => NOISE
+PAIRED mode=setup metric=cpu n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=0.19 median_favours_w3=-0.19 => NOISE
+PAIRED mode=setup metric=rss n=10 eff_n=10 crit=9 bad=7 good=3 ties=0 med_delta=2.3 median_favours_w3=-2.3 => NOISE
+VERDICT mode=setup : NOISE (no metric moved beyond noise)
+REF mode=steady (independent medians, informational) base(n=10): c1=219.9 c8=213.27 c32=197.11 cpu=2.04 rss=91.2 | w3(n=10): c1=295.02 c8=213.43 c32=196.83 cpu=2.08 rss=94.9
+PAIRED mode=steady metric=c1 n=10 eff_n=10 crit=9 bad=2 good=8 ties=0 med_delta=55.26 median_favours_w3=55.26 => NOISE
+PAIRED mode=steady metric=c8 n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=-2.23 median_favours_w3=-2.23 => NOISE
+PAIRED mode=steady metric=c32 n=10 eff_n=10 crit=9 bad=6 good=4 ties=0 med_delta=-0.02 median_favours_w3=-0.02 => NOISE
+PAIRED mode=steady metric=cpu n=10 eff_n=10 crit=9 bad=5 good=5 ties=0 med_delta=-0.03 median_favours_w3=0.03 => NOISE
+PAIRED mode=steady metric=rss n=10 eff_n=10 crit=9 bad=8 good=2 ties=0 med_delta=4.7 median_favours_w3=-4.7 => NOISE
+VERDICT mode=steady : NOISE (no metric moved beyond noise)

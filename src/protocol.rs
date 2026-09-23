@@ -5,7 +5,11 @@
 //!   uint8 command
 //!   uint16 payload length (big endian)
 //!
-//! Commands are SYN=0x01, DATA=0x02, FIN=0x03 and RST=0x04.
+//! Commands are SYN=0x01, DATA=0x02, FIN=0x03, RST=0x04 plus the W3
+//! flow-control extensions VERSION=0x05 and WINDOW=0x06. VERSION/WINDOW
+//! are probe-negotiated: peers that predate them skip the unknown command
+//! (decode error -> whole frame skipped, one mux frame per WS frame), so
+//! old endpoints keep v1 behavior automatically.
 
 use std::fmt;
 
@@ -14,7 +18,23 @@ pub const MUX_SYN: u8 = 0x01;
 pub const MUX_DATA: u8 = 0x02;
 pub const MUX_FIN: u8 = 0x03;
 pub const MUX_RST: u8 = 0x04;
+pub const MUX_VERSION: u8 = 0x05;
+pub const MUX_WINDOW: u8 = 0x06;
 pub const MAX_MUX_PAYLOAD: usize = u16::MAX as usize;
+
+/// Wire version advertised in the VERSION frame payload.
+#[allow(dead_code)]
+pub const MUX_PROTO_VERSION: u8 = 1;
+/// Initial per-stream receive window advertised in VERSION (KiB).
+#[allow(dead_code)]
+pub const MUX_INITIAL_WINDOW_KIB: u16 = 8192;
+/// Send a WINDOW refund once this many consumed bytes have accumulated.
+#[allow(dead_code)]
+pub const MUX_WINDOW_REFRESH: usize = 1024 * 1024;
+/// Floor applied to a peer-advertised window so a broken/zero VERSION
+/// can never starve the sender (frames are at most 64 KiB).
+#[allow(dead_code)]
+pub const MUX_WINDOW_MIN_KIB: u16 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxCommand {
@@ -22,6 +42,8 @@ pub enum MuxCommand {
     Data,
     Fin,
     Rst,
+    Version,
+    Window,
 }
 
 impl MuxCommand {
@@ -31,6 +53,8 @@ impl MuxCommand {
             Self::Data => MUX_DATA,
             Self::Fin => MUX_FIN,
             Self::Rst => MUX_RST,
+            Self::Version => MUX_VERSION,
+            Self::Window => MUX_WINDOW,
         }
     }
 }
@@ -44,9 +68,52 @@ impl TryFrom<u8> for MuxCommand {
             MUX_DATA => Ok(Self::Data),
             MUX_FIN => Ok(Self::Fin),
             MUX_RST => Ok(Self::Rst),
+            MUX_VERSION => Ok(Self::Version),
+            MUX_WINDOW => Ok(Self::Window),
             other => Err(ProtocolError::UnknownCommand(other)),
         }
     }
+}
+
+/// VERSION payload: `[u8 version][u16 window_kib BE]` (3 bytes).
+#[allow(dead_code)]
+pub fn encode_version_payload(window_kib: u16) -> [u8; 3] {
+    [
+        MUX_PROTO_VERSION,
+        (window_kib >> 8) as u8,
+        window_kib as u8,
+    ]
+}
+
+/// Decodes a VERSION payload; rejects truncation and out-of-range window
+/// (returns the floored window in KiB).
+#[allow(dead_code)]
+pub fn decode_version_payload(payload: &[u8]) -> Option<(u8, u16)> {
+    if payload.len() != 3 {
+        return None;
+    }
+    let kib = u16::from_be_bytes([payload[1], payload[2]]).max(MUX_WINDOW_MIN_KIB);
+    Some((payload[0], kib))
+}
+
+/// WINDOW payload: `[u32 credit_bytes BE]` (4 bytes).
+#[allow(dead_code)]
+pub fn encode_window_payload(credit: u32) -> [u8; 4] {
+    credit.to_be_bytes()
+}
+
+/// Decodes a WINDOW payload; rejects truncation, zero and absurd credits
+/// (larger than the max possible window: u16 KiB => 64 MiB).
+#[allow(dead_code)]
+pub fn decode_window_payload(payload: &[u8]) -> Option<u32> {
+    if payload.len() != 4 {
+        return None;
+    }
+    let credit = u32::from_be_bytes(payload[..4].try_into().unwrap());
+    if credit == 0 || credit > (u16::MAX as u32) * 1024 {
+        return None;
+    }
+    Some(credit)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,12 +368,67 @@ mod tests {
             MuxCommand::Data,
             MuxCommand::Fin,
             MuxCommand::Rst,
+            MuxCommand::Version,
+            MuxCommand::Window,
         ] {
             let frame = MuxFrame::new(7, command, vec![]).unwrap();
             let mut bytes = Vec::new();
             frame.encode(&mut bytes).unwrap();
             assert_eq!(MuxFrame::decode(&bytes).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn version_and_window_wire_values() {
+        assert_eq!(MuxCommand::Version.as_u8(), 0x05);
+        assert_eq!(MuxCommand::Window.as_u8(), 0x06);
+        assert_eq!(MuxCommand::try_from(0x05).unwrap(), MuxCommand::Version);
+        assert_eq!(MuxCommand::try_from(0x06).unwrap(), MuxCommand::Window);
+        assert!(matches!(
+            MuxCommand::try_from(0x07),
+            Err(ProtocolError::UnknownCommand(0x07))
+        ));
+    }
+
+    #[test]
+    fn version_payload_round_trip_and_validation() {
+        let payload = encode_version_payload(1024);
+        assert_eq!(payload, [MUX_PROTO_VERSION, 0x04, 0x00]);
+        assert_eq!(decode_version_payload(&payload), Some((1, 1024)));
+        // Truncation / overlong payloads rejected.
+        assert_eq!(decode_version_payload(&payload[..2]), None);
+        assert_eq!(decode_version_payload(&[0, 0, 0, 0]), None);
+        // Zero/undersized window floored to the 64 KiB minimum.
+        assert_eq!(decode_version_payload(&[1, 0, 0]), Some((1, 64)));
+        assert_eq!(decode_version_payload(&[1, 0, 32]), Some((1, 64)));
+    }
+
+    #[test]
+    fn window_payload_round_trip_and_validation() {
+        assert_eq!(decode_window_payload(&encode_window_payload(65536)), Some(65536));
+        assert_eq!(decode_window_payload(&encode_window_payload(1)), Some(1));
+        assert_eq!(decode_window_payload(&[0, 0, 0]), None);
+        assert_eq!(decode_window_payload(&[0, 0, 0, 0, 0]), None);
+        assert_eq!(decode_window_payload(&encode_window_payload(0)), None);
+        // Credits above the largest possible window are rejected.
+        let too_big = ((u16::MAX as u32) * 1024) + 1;
+        assert_eq!(decode_window_payload(&encode_window_payload(too_big)), None);
+    }
+
+    #[test]
+    fn version_window_frames_decode_owned() {
+        // Stream 0 control frames must survive decode_owned (the client
+        // reader routes non-DATA commands by stream id).
+        let mut encoded = Vec::new();
+        write_frame_parts(&mut encoded, 0, MuxCommand::Version, &encode_version_payload(1024))
+            .unwrap();
+        let frame = MuxFrame::decode_owned(encoded).unwrap();
+        assert_eq!(frame.stream_id, 0);
+        assert_eq!(frame.command, MuxCommand::Version);
+        assert_eq!(
+            decode_version_payload(frame.payload()),
+            Some((MUX_PROTO_VERSION, 1024))
+        );
     }
 
     #[test]

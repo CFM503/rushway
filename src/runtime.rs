@@ -2,8 +2,12 @@
 
 use crate::crypto::XorCipher;
 use crate::dns::resolve_socket;
+use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
-use crate::protocol::{MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
+use crate::protocol::{
+    decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
+};
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
@@ -14,7 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
@@ -64,6 +68,10 @@ impl Default for RuntimeConfig {
 struct StreamEntry {
     tx: mpsc::Sender<StreamCommand>,
     cancel: watch::Sender<bool>,
+    /// Server→client send credit (drained by target_to_mux, replenished
+    /// by WINDOW frames from the client). Unbounded until the client's
+    /// VERSION frame arrives.
+    gate: Arc<CreditGate>,
 }
 #[derive(Debug)]
 enum StreamCommand {
@@ -294,6 +302,7 @@ async fn target_to_mux(
     buffer_size: usize,
     cipher: XorCipher,
     obfs: bool,
+    gate: Arc<CreditGate>,
 ) {
     let mut buf = relay_buf(buffer_size).await;
     loop {
@@ -308,6 +317,7 @@ async fn target_to_mux(
                 let mut off = 0;
                 while off < n {
                     let end = (off + u16::MAX as usize).min(n);
+                    gate.acquire(end - off).await;
                     if send_mux_parts_encrypted(
                         &writer,
                         &cipher,
@@ -351,6 +361,7 @@ async fn server_stream_task(
         buffer_size,
         cipher.clone(),
         obfs,
+        CreditGate::new(),
     ));
     let mut is_fin = false;
     while let Some(cmd) = rx.recv().await {
@@ -383,6 +394,39 @@ async fn server_stream_task(
         reader.abort();
     }
 }
+/// Accumulates consumed bytes per stream and emits a WINDOW refund once
+/// the refresh threshold is reached. Refund accounting only runs after the
+/// peer's VERSION arrived (un-negotiated peers never send/receive WINDOW).
+async fn maybe_send_window(
+    writer: &Arc<MuxFrameWriter>,
+    cipher: &XorCipher,
+    stream_id: u32,
+    obfs: bool,
+    peer_window: &StdMutex<Option<u16>>,
+    refund_pending: &mut u32,
+    consumed: usize,
+) {
+    let negotiated = peer_window.lock().unwrap().is_some();
+    if !negotiated {
+        *refund_pending = 0;
+        return;
+    }
+    *refund_pending = refund_pending.saturating_add(consumed as u32);
+    if (*refund_pending as usize) < MUX_WINDOW_REFRESH {
+        return;
+    }
+    let credit = std::mem::take(refund_pending);
+    let _ = send_mux_parts_encrypted(
+        writer,
+        cipher,
+        stream_id,
+        MuxCommand::Window,
+        &encode_window_payload(credit),
+        obfs,
+    )
+    .await;
+}
+
 async fn handle_mux_parts(
     mut rd: ReadHalf<TcpStream>,
     wr: WriteHalf<TcpStream>,
@@ -404,6 +448,21 @@ async fn handle_mux_parts(
     writer
         .send(encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?)
         .await?;
+
+    // W3 version negotiation: advertise our protocol version + initial
+    // receive window right after the session handshake. Old clients skip
+    // the unknown command; new clients answer with their own VERSION.
+    let peer_window: Arc<StdMutex<Option<u16>>> = Arc::new(StdMutex::new(None));
+    let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
+    send_mux_parts_encrypted(
+        &writer,
+        &cipher,
+        0,
+        MuxCommand::Version,
+        &version_payload,
+        cfg.obfs,
+    )
+    .await?;
 
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
@@ -472,6 +531,10 @@ async fn handle_mux_parts(
 
                 let (tx, mut rx) = mpsc::channel(64);
                 let (cancel, cancelled) = watch::channel(false);
+                let gate = CreditGate::new();
+                if let Some(kib) = *peer_window.lock().unwrap() {
+                    gate.enable(i64::from(kib) * 1024);
+                }
 
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
@@ -485,6 +548,7 @@ async fn handle_mux_parts(
                             StreamEntry {
                                 tx: tx.clone(),
                                 cancel: cancel.clone(),
+                                gate: gate.clone(),
                             },
                         );
                         true
@@ -516,6 +580,8 @@ async fn handle_mux_parts(
                 let writer_task = writer.clone();
                 let cipher_task = cipher.clone();
                 let cfg_task = cfg.clone();
+                let gate_task = gate;
+                let peer_window_task = peer_window.clone();
 
                 // Bound pre-dial buffering: a malicious/buggy client could
                 // otherwise spray DATA frames while dial_target is in flight
@@ -652,7 +718,13 @@ async fn handle_mux_parts(
                         cfg_task.buffer_size,
                         cipher_task.clone(),
                         cfg_task.obfs,
+                        gate_task.clone(),
                     ));
+
+                    // W3 receive-side refunds: credit the client's upload
+                    // window once we have consumed >= 64 KiB toward the
+                    // target. Only accumulated once the client negotiated.
+                    let mut refund_pending: u32 = 0;
 
                     for frame in pending {
                         if wr_target.write_all(frame.payload()).await.is_err() {
@@ -660,7 +732,18 @@ async fn handle_mux_parts(
                             streams_task.write().await.remove(&stream_id);
                             return;
                         }
-                        crate::stats::add_bytes(frame.payload().len() as i64, 0);
+                        let len = frame.payload().len();
+                        crate::stats::add_bytes(len as i64, 0);
+                        maybe_send_window(
+                            &writer_task,
+                            &cipher_task,
+                            stream_id,
+                            cfg_task.obfs,
+                            &peer_window_task,
+                            &mut refund_pending,
+                            len,
+                        )
+                        .await;
                     }
 
                     if client_fin {
@@ -672,7 +755,18 @@ async fn handle_mux_parts(
                                     if wr_target.write_all(frame.payload()).await.is_err() {
                                         break;
                                     }
-                                    crate::stats::add_bytes(frame.payload().len() as i64, 0);
+                                    let len = frame.payload().len();
+                                    crate::stats::add_bytes(len as i64, 0);
+                                    maybe_send_window(
+                                        &writer_task,
+                                        &cipher_task,
+                                        stream_id,
+                                        cfg_task.obfs,
+                                        &peer_window_task,
+                                        &mut refund_pending,
+                                        len,
+                                    )
+                                    .await;
                                 }
                                 StreamCommand::Fin => {
                                     let _ = wr_target.shutdown().await;
@@ -737,7 +831,47 @@ async fn handle_mux_parts(
                     let _ = cancel.send(true);
                 }
             }
+
+            MuxCommand::Version => {
+                // W3 negotiation: first VERSION wins; enable send credit on
+                // every registered stream (streams created later enable at
+                // admission time).
+                if let Some((version, kib)) = decode_version_payload(frame.payload()) {
+                    if version >= 1 {
+                        let already = {
+                            let mut pw = peer_window.lock().unwrap();
+                            let seen = pw.is_some();
+                            if !seen {
+                                *pw = Some(kib);
+                            }
+                            seen
+                        };
+                        if !already {
+                            let window = i64::from(kib) * 1024;
+                            for entry in streams.read().await.values() {
+                                entry.gate.enable(window);
+                            }
+                            tracing::debug!(kib, "peer VERSION received; send window enabled");
+                        }
+                    }
+                }
+            }
+
+            MuxCommand::Window => {
+                if let Some(credit) = decode_window_payload(frame.payload()) {
+                    if let Some(entry) = streams.read().await.get(&frame.stream_id) {
+                        entry.gate.release(i64::from(credit));
+                    }
+                }
+            }
         }
+    }
+
+    // Unblock any target_to_mux sender parked on credit: the session is
+    // over, so remaining sends must fail at the socket, not on WINDOWs
+    // that will never arrive.
+    for entry in streams.read().await.values() {
+        entry.gate.close();
     }
 
     for task in stream_tasks {

@@ -2,8 +2,12 @@
 
 use crate::crypto::XorCipher;
 use crate::dns;
+use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
-use crate::protocol::{MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload};
+use crate::protocol::{
+    decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
+};
 use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
     TargetAddr,
@@ -23,7 +27,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -662,6 +666,11 @@ struct WssSessionState {
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
     streams: Arc<RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
+    /// Peer-advertised receive window in KiB once its VERSION arrived
+    /// (None => un-negotiated: v1 unbounded sends, no WINDOW refunds).
+    peer_window: StdMutex<Option<u16>>,
+    /// Per-stream upload credit gates (populated in open_stream).
+    gates: StdMutex<HashMap<u32, Arc<CreditGate>>>,
     next_id: AtomicU32,
     active: AtomicUsize,
     closed: AtomicBool,
@@ -706,15 +715,31 @@ impl WssSessionState {
             .map_err(|_| anyhow!("upstream writer unexpectedly shared"))?
             .into_inner();
         let (writer, _writer_task) = MuxFrameWriter::spawn(writer);
+        let cipher_for_version = c.clone();
+        let obfs_for_version = cfg.obfs;
         let session = Arc::new(Self {
-            writer,
+            writer: writer.clone(),
             cipher: c.clone(),
             obfs: cfg.obfs,
             streams: Arc::new(RwLock::new(HashMap::new())),
+            peer_window: StdMutex::new(None),
+            gates: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         });
+        // W3 version negotiation: advertise our version + initial receive
+        // window right after the session handshake (mirrors mux_pool).
+        let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
+        send_mux_parts(
+            &writer,
+            &cipher_for_version,
+            0,
+            MuxCommand::Version,
+            &version_payload,
+            obfs_for_version,
+        )
+        .await?;
         let reader_session = session.clone();
         tokio::spawn(async move {
             if let Err(error) = wss_reader_loop(&mut rd, reader_session.clone()).await {
@@ -723,6 +748,12 @@ impl WssSessionState {
             reader_session.closed.store(true, Ordering::Release);
             let mut streams = reader_session.streams.write().await;
             streams.clear();
+            // Unblock upload tasks parked on credit: no WINDOW will arrive.
+            let mut gates = reader_session.gates.lock().unwrap();
+            for gate in gates.values() {
+                gate.close();
+            }
+            gates.clear();
             reader_session.active.store(0, Ordering::Release)
         });
         let heartbeat_session = session.clone();
@@ -770,11 +801,11 @@ impl WssSessionState {
         self: &Arc<Self>,
         target: &TargetAddr,
         initial_data: Vec<u8>,
-    ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>)> {
+    ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>, Arc<CreditGate>)> {
         if !self.try_reserve() {
             bail!("WSS physical session is full or closed")
         };
-        let (id, rx) = {
+        let (id, rx, gate) = {
             let mut streams = self.streams.write().await;
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
@@ -791,8 +822,20 @@ impl WssSessionState {
                 }
             }
             let (tx, rx) = mpsc::channel(64);
+            // Scoped gate registration: lock order streams -> gates ->
+            // peer_window so a racing VERSION arm can never miss this
+            // stream, and the guard dies before the send awaits.
+            let gate = {
+                let mut gates = self.gates.lock().unwrap();
+                let gate = CreditGate::new();
+                if let Some(kib) = *self.peer_window.lock().unwrap() {
+                    gate.enable(i64::from(kib) * 1024);
+                }
+                gates.insert(stream_id, gate.clone());
+                gate
+            };
             streams.insert(stream_id, tx);
-            (stream_id, rx)
+            (stream_id, rx, gate)
         };
         let target_bytes = format!("{}:{}", target.host, target.port).into_bytes();
         let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_bytes.len());
@@ -815,6 +858,7 @@ impl WssSessionState {
             MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
         if let Err(error) = send_mux(&self.writer, &self.cipher, &syn, self.obfs).await {
             self.streams.write().await.remove(&id);
+            self.gates.lock().unwrap().remove(&id);
             self.active.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
@@ -830,11 +874,12 @@ impl WssSessionState {
             .await
             {
                 self.streams.write().await.remove(&id);
+                self.gates.lock().unwrap().remove(&id);
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 return Err(error);
             }
         }
-        Ok((id, rx))
+        Ok((id, rx, gate))
     }
 }
 async fn send_mux(
@@ -884,6 +929,37 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
         }
         session.cipher.apply(&mut payload);
         let frame = MuxFrame::decode_owned(payload).map_err(|e| anyhow!(e.to_string()))?;
+        // W3 control frames are session/stream-level: handle them here
+        // instead of routing into per-stream channels (VERSION uses
+        // stream id 0 and would otherwise be dropped silently).
+        match frame.command {
+            MuxCommand::Version => {
+                if let Some((version, kib)) = decode_version_payload(frame.payload()) {
+                    if version >= 1 {
+                        let gates = session.gates.lock().unwrap();
+                        let mut pw = session.peer_window.lock().unwrap();
+                        if pw.is_none() {
+                            *pw = Some(kib);
+                            drop(pw);
+                            let window = i64::from(kib) * 1024;
+                            for gate in gates.values() {
+                                gate.enable(window);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            MuxCommand::Window => {
+                if let Some(credit) = decode_window_payload(frame.payload()) {
+                    if let Some(gate) = session.gates.lock().unwrap().get(&frame.stream_id) {
+                        gate.release(i64::from(credit));
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
         let id = frame.stream_id;
         let sender = { session.streams.read().await.get(&id).cloned() };
         if let Some(tx) = sender {
@@ -965,7 +1041,12 @@ impl WssSessionPool {
         self: &Arc<Self>,
         target: &TargetAddr,
         initial_data: Vec<u8>,
-    ) -> Result<(Arc<WssSessionState>, u32, mpsc::Receiver<OwnedMuxFrame>)> {
+    ) -> Result<(
+        Arc<WssSessionState>,
+        u32,
+        mpsc::Receiver<OwnedMuxFrame>,
+        Arc<CreditGate>,
+    )> {
         let snapshot = {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
@@ -980,8 +1061,8 @@ impl WssSessionPool {
             if !session.available() {
                 continue;
             }
-            if let Ok((id, rx)) = session.open_stream(target, initial_data.clone()).await {
-                return Ok((session, id, rx));
+            if let Ok((id, rx, gate)) = session.open_stream(target, initial_data.clone()).await {
+                return Ok((session, id, rx, gate));
             }
         }
         let limit = configured_session_count();
@@ -1014,7 +1095,7 @@ impl WssSessionPool {
             })?;
             let opened = session.open_stream(target, initial_data).await?;
             self.sessions.lock().await.push(session.clone());
-            return Ok((session, opened.0, opened.1));
+            return Ok((session, opened.0, opened.1, opened.2));
         }
         bail!("all WSS physical MUX sessions are full or unavailable")
     }
@@ -1029,7 +1110,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         bail!("WSS path only supports CONNECT or UDP ASSOCIATE")
     };
     let initial_data = req.initial_payload.unwrap_or_default();
-    let (session, stream_id, mut rx) = pool.acquire(&req.target, initial_data).await?;
+    let (session, stream_id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
     let obfs = session.obfs;
@@ -1055,6 +1136,8 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             let mut off = 0;
             while off < n {
                 let end = (off + u16::MAX as usize).min(n);
+                // W3 upload gate: bounded once the server's VERSION is in.
+                gate.acquire(end - off).await;
                 send_mux_parts(
                     &writer,
                     &cipher,
@@ -1070,12 +1153,33 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
+    // W3 receive-side refund accumulator (client -> server WINDOW).
+    let mut refund_pending: u32 = 0;
     while let Some(frame) = rx.recv().await {
         match frame.command {
             MuxCommand::Data => {
                 if !frame.payload().is_empty() {
+                    let len = frame.payload().len();
                     local_wr.write_all(frame.payload()).await?;
-                    crate::stats::add_bytes(0, frame.payload().len() as i64);
+                    crate::stats::add_bytes(0, len as i64);
+                    let negotiated = session.peer_window.lock().unwrap().is_some();
+                    if negotiated {
+                        refund_pending = refund_pending.saturating_add(len as u32);
+                        if refund_pending as usize >= MUX_WINDOW_REFRESH {
+                            let credit = std::mem::take(&mut refund_pending);
+                            send_mux_parts(
+                                &session.writer,
+                                &session.cipher,
+                                stream_id,
+                                MuxCommand::Window,
+                                &encode_window_payload(credit),
+                                session.obfs,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        refund_pending = 0;
+                    }
                 }
             }
             MuxCommand::Fin => {
@@ -1083,7 +1187,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 break;
             }
             MuxCommand::Rst => break,
-            MuxCommand::Syn => {}
+            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {}
         }
     }
     upload.abort();
@@ -1091,6 +1195,9 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     // (send failure) or the session may have been torn down (active zeroed).
     if session.streams.write().await.remove(&stream_id).is_some() {
         session.active.fetch_sub(1, Ordering::AcqRel);
+    }
+    if let Some(gate) = session.gates.lock().unwrap().remove(&stream_id) {
+        gate.close();
     }
     Ok(())
 }
@@ -1247,6 +1354,9 @@ mod tests {
     }
 
     #[test]
+    // Intentionally exercises the `None` branch of the production
+    // fakehost-selection expressions with a literal None.
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn without_fakehost_uses_upstream_host() {
         let upstream = "wss://gateway.example.com:443/ws";
         let (connect_addr, host, path) = parse_wss_url(upstream).unwrap();

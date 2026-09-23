@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.26] - 2026-09-23
+
+### Added
+- **Mux VERSION/WINDOW credit flow control (Phase 3, dual-stack)**: `MuxCmdVERSION=0x05` / `MuxCmdWINDOW=0x06` control frames on stream_id=0, negotiated post-handshake; per-stream `CreditGate` (new `src/flow.rs`) enabled idempotently on first VERSION (window 8 MiB), WINDOW refunds every 1 MiB consumed, capped at advertised window; every stream Close path wakes waiters (no deadlock), oversized acquires clamp to window. Wired into `protocol.rs`, `runtime.rs` (server), `mux_pool.rs` (client), `wss_client.rs`. WS MUX scope only; unknown-cmd frames skipped silently → probe negotiation is safe against old peers.
+- `scripts/w3_compat_smoke.ps1`: cross-impl + old/new compatibility smoke (8/8 PASS; `bench/w3_smoke_logs/`).
+- `scripts/w3_ab_bench.ps1`: interleaved same-session A/B vs HEAD-built goway v1.8.11 with paired per-sample deltas + exact two-sided sign test (verdict method for the forward-only rule).
+
+### Changed
+- Defaults retuned after round-1 regression: `MUX_INITIAL_WINDOW_KIB` 1024→8192 (8 MiB), `MUX_WINDOW_REFRESH` 65536→1048576 (1 MiB) — bulk flows never stall on credit RTTs; slow receivers still bounded at 8 MiB/stream (unbounded pre-W3).
+
+### Validation
+- `cargo clippy --all-targets` 0 warnings; `cargo test` 106+12 pass; compat smoke 8/8 PASS (twice, incl. post-retune).
+- Interleaved paired A/B (n=10 setup + n=10 steady vs goway v1.8.11): every throughput/CPU/RSS metric NOISE (none regressed beyond noise) → goway-side W3 certified non-inferior under the forward-only standing rule; numbers in `AI_HANDOFF.md` / `PROGRESS.md` and `bench/w3_ab_goway.csv`.
+
 ## [v0.0.25] - 2026-09-22
 
 ### Added

@@ -1,0 +1,19 @@
+[36mRushWay v0.0.25[0m
+[36m------------------------------------------------------------[0m
+ [+] Mode:        Server
+ [+] Listen:      127.0.0.1:19260
+ [+] Upstream:    N/A (Server mode)
+ [+] Mux:         Enabled (server)
+ [+] Obfs:        Disabled
+ [+] DNS:         System default
+ [+] Auth:        Enabled (XOR)
+ [+] Buffer:      128 KB
+ [+] Max Conns:   1500
+[36m------------------------------------------------------------[0m
+[2m2026-09-23T02:21:37.011162Z[0m [32m INFO[0m RushWay server listening on 127.0.0.1:19260
+[2m2026-09-23T02:21:37.049761Z[0m [33m WARN[0m [WSS] HTTP handshake connection closed by peer; received 0 response bytes (early eof)
+[2m2026-09-23T02:21:37.051219Z[0m [34mDEBUG[0m QUIC server UDP socket buffers requested [3mbytes[0m[2m=[0m8388608
+[2m2026-09-23T02:21:37.087138Z[0m [34mDEBUG[0m transport connection closed [3mpeer[0m[2m=[0m127.0.0.1:12958 [3merror[0m[2m=[0mWSS HTTP handshake connection closed by peer; received 0 response bytes (early eof)
+[2m2026-09-23T02:21:37.088376Z[0m [32m INFO[0m RushWay QUIC server listening on 127.0.0.1:19260
+[2m2026-09-23T02:21:38.237151Z[0m [33m WARN[0m [WSS] HTTP handshake connection closed by peer; received 0 response bytes (early eof)
+[2m2026-09-23T02:21:38.238143Z[0m [34mDEBUG[0m transport connection closed [3mpeer[0m[2m=[0m127.0.0.1:10405 [3merror[0m[2m=[0mWSS HTTP handshake connection closed by peer; received 0 response bytes (early eof)

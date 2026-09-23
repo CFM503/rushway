@@ -1,5 +1,6 @@
 mod crypto;
 mod dns;
+mod flow;
 mod mux_pool;
 mod mux_writer;
 mod nonmux;

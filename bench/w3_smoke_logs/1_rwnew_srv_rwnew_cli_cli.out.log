@@ -1,0 +1,23 @@
+[36mRushWay v0.0.25[0m
+[36m------------------------------------------------------------[0m
+ [+] Mode:        Client (WS + SOCKS5/HTTP)
+ [+] Listen:      127.0.0.1:19211
+ [+] Upstream:    ws://127.0.0.1:19210/
+ [+] Mux:         Enabled (sessions: 4)
+ [+] Obfs:        Disabled
+ [+] DNS:         System default
+ [+] Auth:        Enabled (XOR)
+ [+] Buffer:      128 KB
+ [+] Max Conns:   1500
+[36m------------------------------------------------------------[0m
+[2m2026-09-23T02:21:21.344431Z[0m [32m INFO[0m RushWay pooled client proxy listening on 127.0.0.1:19211 (4 physical MUX sessions, up to 2048 streams/session)
+[2m2026-09-23T02:21:21.346757Z[0m [34mDEBUG[0m peer VERSION received; send window enabled [3mkib[0m[2m=[0m8192
+[2m2026-09-23T02:21:21.398619Z[0m [33m WARN[0m pooled proxy connection closed with error [3mpeer[0m[2m=[0m127.0.0.1:8111 [3merror[0m[2m=[0munexpected end of file
+[2m2026-09-23T02:21:21.430415Z[0m [33m WARN[0m pooled proxy connection closed with error [3mpeer[0m[2m=[0m127.0.0.1:8113 [3merror[0m[2m=[0munexpected end of file
+[2m2026-09-23T02:21:21.473202Z[0m [33m WARN[0m pooled proxy connection closed with error [3mpeer[0m[2m=[0m127.0.0.1:8115 [3merror[0m[2m=[0munexpected end of file
+[2m2026-09-23T02:21:21.475519Z[0m [34mDEBUG[0m peer VERSION received; send window enabled [3mkib[0m[2m=[0m8192
+[2m2026-09-23T02:21:21.580382Z[0m [34mDEBUG[0m peer VERSION received; send window enabled [3mkib[0m[2m=[0m8192
+[2m2026-09-23T02:21:21.806892Z[0m [34mDEBUG[0m peer VERSION received; send window enabled [3mkib[0m[2m=[0m8192
+[2m2026-09-23T02:21:22.316920Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-09-23T02:21:22.317951Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-09-23T02:21:22.318001Z[0m [33m WARN[0m pooled MUX reader stopped; closing session streams [3merror[0m[2m=[0m远程主机强迫关闭了一个现有的连接。 (os error 10054)

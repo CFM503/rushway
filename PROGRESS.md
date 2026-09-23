@@ -79,8 +79,8 @@ Every new AI must read `AI_HANDOFF.md`, `PROGRESS.md`, `SPEC.md`, and the final 
 | --- | --- | --- |
 | 1 | rushway UX (TUI/log-file/cpuprofile/STATS/defaults) | **Released as v0.0.25** (2026-09-22) |
 | 2 | goway server writer + unmasked fused encode | **Released as goway v1.8.11** (PR #19 merged; commit `8eddc35`) |
-| 3 | dual-end version negotiation + WINDOW frames | Not started |
-| 4 | joint benchmark vs goals + competitors | Not started |
+| 3 | dual-end version negotiation + WINDOW frames | **Implemented + dual-stack tested (2026-09-23, uncommitted)** |
+| 4 | joint benchmark vs goals + competitors | Loopback n=5 done (W2 + W3 re-run); non-loopback done (W2) |
 | �� | AI handoff logs | Updated (rushway + goway) |
 
 ### Evidence (2026-09-22 addendum)
@@ -117,7 +117,7 @@ Phase 1+2 code complete in working trees; Phases 3�C4 pending. No release tag.
 | --- | --- | --- | --- |
 | 1 | rushway | UX: TUI, -log-file, -cpuprofile, [STATS], defaults parity | **Released v0.0.25** (96 tests + clippy 0) |
 | 2 | goway | Server MUX dedicated writer + unmasked fused encode (writeMu removed from IO) | **Released goway v1.8.11** (PR #19 merged) |
-| 3 | both | Version negotiation + WINDOW flow-control frames | Not started |
+| 3 | both | Version negotiation + WINDOW flow-control frames | **Implemented + dual-stack tested (2026-09-23, uncommitted)** |
 | 4 | both | Joint benchmark: speed / CPU+mem / UX vs competitors | Next (user-selected) |
 | �� | both | AI_HANDOFF + CHANGELOG + PROGRESS updated | Done this cycle |
 
@@ -157,3 +157,30 @@ Phase 1+2 code complete in working trees; Phases 3�C4 pending. No release tag.
 - Objective #3 (UX): Phase 1 delivered; real-TTY TUI sign-off + competitor UX comparison still open.
 - Bugs fixed this cycle: early-eof pre-dial pending overflow (`b138cad`), Linux pprof build (`e71eb6b`). Harness: `proxy_bench --external/--target-ip/--echo-bind` + `scripts/w2_bench.ps1 -NonLoopback`. Details in `AI_HANDOFF.md`.
 - Next: W3 = Phase 3 version negotiation + WINDOW (goway sync) + re-test; then close sing-box loopback gap and rushway RSS.
+
+## 2026-09-23 - W3 done: Mux VERSION/WINDOW (both stacks) + 8/8 compat smoke + loopback re-test
+
+**Delivered (released 2026-09-23 as rushway v0.0.26 + goway v1.8.12, tagged & pushed):**
+- `MuxCmdVERSION=0x05` / `MuxCmdWINDOW=0x06` credit flow control, WS MUX scope, both stacks (`src/protocol.rs`, new `src/flow.rs`, `runtime.rs`, `mux_pool.rs`, `wss_client.rs`; goway `goway.go` + new `flow_test.go`). Unknown-cmd frames silently skipped by old builds -> safe probe negotiation, proven on the wire.
+- `scripts/w3_compat_smoke.ps1`: **8/8 PASS** - new/new same+cross both directions assert negotiation logs; all four new/old pairings assert silent v1 fallback and transfer OK (`bench/w3_smoke_logs/`).
+- Tests: rushway clippy 0 warnings + 106/12 pass; goway gofmt/vet clean + full suite ok 64.9 s.
+
+**W3 loopback re-test (n=5 medians, `bench/w3_loopback.csv`) vs W2 baseline:**
+
+| impl | mode | c1 | c8 | c32 | cpu_s | rss MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| rushway W3 | setup | 74.81 | 160.69 | 156.71 | 2.62 | 82.6 |
+| rushway W2 | setup | 71.32 | 229.83 | 251.91 | 2.25 | 148.0 |
+| rushway W3 | steady | 72.46 | 120.31 | 105.45 | 3.53 | 84.8 |
+| rushway W2 | steady | 101.24 | 238.70 | 251.84 | 2.34 | 155.9 |
+| goway W3 | setup | 190.36 | 236.24 | 190.15 | 2.11 | 107.7 |
+| goway W2 | setup | 247.12 | 292.58 | 267.64 | 1.91 | 87.2 |
+| goway W3 | steady | 93.64 | 121.05 | 154.63 | 2.28 | 114.7 |
+| goway W2 | steady | 288.42 | 277.09 | 259.18 | 2.14 | 89.0 |
+
+**Honest reading:**
+- Round 1 (1 MiB window / 64 KiB refund, `w3_loopback.csv`): throughput **regressed** vs W2 (rushway steady c8/c32 -50%/-58%; goway steady -68%/-56%/-40%) while rushway RSS improved -46% (148-156 -> 82-85 MB).
+- Round 2 after user-approved tuning (8 MiB window / 1 MiB refund, **`bench/w3b_loopback.csv`**): initially read as recovered-to-W2 (rushway setup 105.89/209.32/233.18, steady 74.61/199.44/215.43; goway steady 112.3/343.35/286.96 "c8/c32 beat W2"). Smoke re-run after tuning: 8/8 PASS. RSS both sides back to W2 level.
+- **CORRECTION (n=10, `bench/w3c_goway_n10.csv`, same binary):** the round-2 "recovered / beat W2" performance claim did **not** reproduce and is withdrawn. goway n=10 vs v1.8.11: setup 169.2/231.19/231.08 (c1 -32%, c8 -21%, c32 -14%, cpu flat, rss +7%); steady 250.34/211.1/185.36 (c1 -13%, c8 -24%, c32 -29%, cpu +11%, rss +6%). Same-build n=5 vs n=10 disagree wildly -> single-run medians on this machine are not decisive.
+- **Standing rule (user mandate, 2026-09-23, written into `way/goway/AI_HANDOFF.md` + `way/goway/README.md` + `goway.go` header): goway changes are forward-only, never reverse; performance changes ship only with every metric at-or-above baseline v1.8.11 beyond noise, with numbers recorded.** Functional/compat evidence stands (8/8 smoke, both unit suites green).
+- **RESOLVED 2026-09-23 — interleaved paired A/B certification:** goway `creditGate` hot path made lock-free (atomics + CAS, mutex only on Enable/Close); `w3_ab_bench.ps1` verdict fixed to paired per-sample deltas + exact sign test (was: independent medians, invalid for interleaved design; `$samples`/`$Samples` case-collision bug fixed). n=10 per mode, order flipped per sample, HEAD-built v1.8.11 vs atomic-gate `goway.exe`, `bench/w3_ab_goway.csv`: setup medΔ c1 +9.72/c8 +9.06/c32 +2.12/cpu −0.19/rss −2.30; steady +55.26/−2.23/−0.02/+0.03/−4.70 — **all NOISE both modes (crit=9, none regressed beyond noise) → W3 certified non-inferior under the forward-only rule.** Watch: rss +2.3/+4.7 MB trends below significance. **Shipped: rushway v0.0.26 + goway v1.8.12 (tagged & pushed).** Next: sing-box gap work (goal #1).
