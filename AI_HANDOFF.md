@@ -2298,5 +2298,9 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
   3. `bytes` buffer pool for outbound encode buffers (drop currently frees every frame buffer; `realloc` 5-14% residual).
   4. `read_frame` tail-chunk non-empty doubling: read_frame grows its `frame_buf` from 64 KiB cap on >64 KiB frames — amortized doubling still copies; a pooled frame buf (or size-classed frame_buf pool) removes it.
   5. `runtime.rs` RSS (+2.3/+4.7 MB trend) re-check at higher n.
-- Windows official harness: **done** — solo reference run `bench/w2_loopback_r1.csv` + decisive paired A/B `scripts/r1_ab_bench.ps1` (CSV `bench/r1_ab_rushway.csv`, verdicts above); commit of the Round-1 edits still pending user approval (suggest v0.0.27).
+- Windows official harness: **done** — solo reference run `bench/w2_loopback_r1.csv` + decisive paired A/B `scripts/r1_ab_bench.ps1` (CSV `bench/r1_ab_rushway.csv`, verdicts above).
+
+### Release
+
+- **v0.0.27 committed `3bf6a04` + tagged (2026-09-23)**: 21 files, +759/−43 — 7 source edits (crypto/mux_writer/ws word-at-a-time cipher+mask, read_frame set_len no-zero-fill with min-64KiB reserve guard kept, 5x outbound `Vec::new()`, non-MUX download `write_frame_borrowed`, udp_batch test double-count fix), version bump 0.0.26→0.0.27, `tmp/` gitignored, G1 scripts + bench CSVs/logs (g1_gap, g1_wsl_loopback, r1_ab_*, w2_loopback_r1, w2_raw append), this handoff. Pushed to origin main + tags same day.
 - Env notes for the next agent: WSL crashed 3x this session (`Wsl/Service/E_UNEXPECTED`) during heavy cargo + parallel `wsl.exe` launches — **never launch two `wsl.exe` commands concurrently** (they serialize on the WSL server lock and one gets killed); PowerShell 5.1 has no `&&`; inline `wsl -c "python3 - <<EOF"` heredocs break under PS quoting — write scripts to disk first (`scripts/g1_udp_probe_patch*.py` pattern, since removed).
