@@ -61,7 +61,6 @@ jobs:
           target: armv7-unknown-linux-musleabihf
           args: --release
           toolchain: 1.88.0
-          toolchain: 1.88.0
       - name: Package KWRT ARMv7
         run: tar -C target/armv7-unknown-linux-musleabihf/release -czf rushway-kwrt-armv7.tar.gz rushway
       - uses: actions/upload-artifact@v4
