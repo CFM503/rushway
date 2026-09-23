@@ -1,14 +1,15 @@
 #!/bin/bash
-# G1 Round-1 A/B: paired alternating baseline(HEAD) vs optimized rushway on the
+# G1 Round-N A/B: paired alternating baseline vs optimized rushway on the
 # same WSL host, AB/BA order per pair, to cancel environment drift.
 # usage: g1_ab_wsl.sh <mode> [n]
 #   mode: steady | setup
+# env: OPT / BASE binary paths (default Round-0 trees)
 set -u
 MODE=${1:?mode: steady|setup}
 N=${2:-5}
-OPT=/root/rw-g1/target/release/rushway
-BASE=/root/rw-g0/target/release/rushway
-PB=/root/rw-g1/target/release/proxy_bench
+OPT=${OPT:-/root/rw-g1/target/release/rushway}
+BASE=${BASE:-/root/rw-g0/target/release/rushway}
+PB=${PB:-/root/rw-g1/target/release/proxy_bench}
 KEY=rushway-proxy-bench-test-key
 ST=""
 [ "$MODE" = "steady" ] && ST="--steady-state"

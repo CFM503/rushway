@@ -2305,3 +2305,42 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 - **v0.0.27 committed `3bf6a04` + tagged (2026-09-23)**: 21 files, +759/−43 — 7 source edits (crypto/mux_writer/ws word-at-a-time cipher+mask, read_frame set_len no-zero-fill with min-64KiB reserve guard kept, 5x outbound `Vec::new()`, non-MUX download `write_frame_borrowed`, udp_batch test double-count fix), version bump 0.0.26→0.0.27, `tmp/` gitignored, G1 scripts + bench CSVs/logs (g1_gap, g1_wsl_loopback, r1_ab_*, w2_loopback_r1, w2_raw append), this handoff. Pushed to origin main + tags same day.
 - Env notes for the next agent: WSL crashed 3x this session (`Wsl/Service/E_UNEXPECTED`) during heavy cargo + parallel `wsl.exe` launches — **never launch two `wsl.exe` commands concurrently** (they serialize on the WSL server lock and one gets killed); PowerShell 5.1 has no `&&`; inline `wsl -c "python3 - <<EOF"` heredocs break under PS quoting — write scripts to disk first (`scripts/g1_udp_probe_patch*.py` pattern, since removed).
 - **Process rule (user-mandated, 2026-09-23): never emit no-op placeholder tool calls — and watch for relapse of the same class of mistake.** This session repeatedly fired `wsl -d Debian -- bash -lc "sleep 0"` batches alongside real commands as filler/pre-warm — they do nothing, polluted the user's terminal view, and (being parallel `wsl.exe` launches) actively provoked the `E_UNEXPECTED`/`ChildProcess.kill` failures above. Worse, the violation recurred twice *in the very messages that committed the rule*: first seven `sleep 0` calls shipped with the rule's own commit, then six more with the follow-up commit that recorded that relapse. Writing a rule down does not enforce it — **before sending any tool block, re-read this entry and strip anything that neither changes state nor returns needed information**. Every tool call must carry real work; when a dependent step is not ready, wait for the next turn instead of padding with stubs. Parallel-batch only genuinely independent calls. Treat this as the representative case of a broader ban: no filler, no ceremonial "verification" no-ops, no calls emitted merely to look busy or to pad a batch — if it does not change state or return needed information, do not send it. Zero tolerance: a relapse is itself a reportable incident; log it, do not normalize it.
+
+---
+
+## Round-2 attempt: WS prefill read window — REJECTED (2026-09-23, goal #1)
+
+### What was tried
+
+- Wrapped every WS/upstream read end (`split` immediately, before `read_http_headers`) in `tokio::io::BufReader::with_capacity(256 KiB)` via new `ws::wrap_ws_reader` + `WS_READ_WINDOW`: server `run_server` dispatch, non-MUX `open_upstream`/`handle_server`/`PooledUpstream`, mux_pool dial + `client_reader_loop` + UDP path, `udp_relay`, `wss_client` `BoxReader` alias. Local/target relay reads intentionally **not** wrapped (would add a full extra memcpy with no header-read win).
+- Mechanism intent: one `recv` covers many frames; kill the 2-byte/12-byte header syscalls inside `read_frame` (`__recv` 23–27% of pprof).
+
+### Evidence (all same-session paired)
+
+- WSL build/test: 0 warnings, **106/106 green**.
+- WSL `g1_ab_wsl.sh` (BASE=`/root/rw-g1r1` = `git archive HEAD` v0.0.27, OPT=rw-g1 R2): steady n=8 medians OPT 201/299/389 vs BASE 221/292/403 (c1 4:4 pure order flip; setup n=8: c1 6:2 / c8 7:1 forward lean but c32 −7% 4:4 noise). Throughput alone was inconclusive → decisive gate was Windows CPU.
+- **Windows `r1_ab_bench.ps1` retargeted to BASE=`bench/oldbin/rushway_r1_ab.exe` (worktree build of HEAD) vs R2, n=8×2 modes — `bench/r2_ab_rushway.csv`, `bench/r2_ab_raw.log`:**
+  - **setup: REGRESSION** — `cpu` **8:0 bad** (med Δ **+0.38 s**, ~+17% CPU) and `c32` **8:0 bad** (med Δ **−47 MiB/s**); both hit crit=8 (exact sign test p≤0.05). rss 5:3 noise, c1 5:3 good, c8 6:2 bad-but-below-crit — verdict line `REGRESSION vs baseline beyond noise`.
+  - **steady: NOISE** on all five metrics (cpu med Δ −0.08 s, 5:3 good — no CPU win either).
+- Forward-only rule ⇒ **rejected**. Under `git checkout --` the six `src/` files + `scripts/r1_ab_bench.ps1`; WSL tree resynced from Windows; rebuild **0 warnings, 106/106 green** on the reverted tree.
+
+### Why it lost (for the next attempt)
+
+1. On the official 4 MiB bulk bench, frames are large → BufReader saves few `recv`s but forces **every payload byte through an extra memcpy** (kernel→window→`frame_buf`); `copy_nonoverlap` was already 13% on the client profile. Setup mode (fresh conns, handshake + first bulk) paid CPU 8:0 and c32 8:0.
+2. `__recv` pprof time is mostly kernel-copy-into-user, which still happens with BufReader — only syscall *entries* drop. Header-read syscalls are real but tiny vs bulk copy cost on this workload.
+3. 256 KiB×2 ends×conns also nudged RSS up (setup rss med +10 MB, 5:3 noise-but-directional).
+
+### Kept / artifacts
+
+- `scripts/g1_ab_wsl.sh`: now honors `OPT`/`BASE`/`PB` env overrides (needed to A/B against any tree; default paths unchanged).
+- `bench/oldbin/rushway_r1_ab.exe`: Round-1 (HEAD) Windows baseline for future rounds (gitignored `*.exe`).
+- `bench/r2_ab_rushway.csv`, `bench/r2_ab_raw.log`: rejection evidence (untracked until this commit).
+- `scripts/r1_ab_bench.ps1`: restored to v0.0.26/R1 labels at HEAD — **retarget BinA to `rushway_r1_ab.exe` and labels to the new pair on the next A/B round**.
+- `r1_ab_bench.ps1 -File` cannot parse `-Modes setup,steady` (ValidateSet array) — use `-Command "& { ... -Modes @('setup','steady') }"`.
+
+### Next Round-2 candidate (unchanged order)
+
+2. **writev/send coalescing on the client encode path** (`writev` 14% + `send` 17%): `writer_loop` already batches 32 frames/1 MiB but drains opportunistically → c1 batch=1; needs a short coalesce wait or relay-side frame aggregation.
+3. Outbound encode buffer pool (residual `realloc` 5–14%).
+4. Pooled/size-classed `frame_buf` (amortized doubling copies).
+5. Re-check `runtime.rs` RSS trend at higher n.
