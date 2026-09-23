@@ -2133,3 +2133,43 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 
 ### Next action
 - Freeze code -> W2 full Phase 4 matrix (rushway + goway + sing-box + xray; n>=5; CPU/RSS; non-loopback) -> W3 Phase 3 (version negotiation + WINDOW) + re-test.
+
+## 2026-09-23 - W2 Phase 4 complete: early-eof fix + full matrix (loopback + non-loopback)
+
+### Bug 1 - bench "early eof" (~20% rushway samples) - FIXED
+
+- **Bug:** proxy_bench payload read got 0 bytes ("early eof") after CONNECT established; only on rushway, ~2/5 loopback setup samples (also seen in W1 n=3 runs).
+- **Root cause (proven):** server `dial_target` pre-dial pending cap was 1 MiB / 64 frames; CONNECT payload bursts 4 MiB and a loopback dial occasionally finishes after 1 MiB arrives -> `mux RST: pre-dial pending overflow` (logged only at debug, invisible at --log ERROR) -> client SOCKS closed -> bench read_exact EOF (tokio read_exact.rs:44). Evidence chain: failing-sample server log WARN overflow stream_id=2/3 + client "upstream reset after CONNECT established"; repro 4/15 fail -> post-fix 20/20, then full matrix 40/40 with zero overflow warns.
+- **Astra review:** threshold-only change; goway parity target (muxServerStreamBufferLimit=8MB, 15s stall, ingress 128); cap still bounded (8 MiB x admitted streams); no protocol/state-machine change; write path untouched. RST sites upgraded to tracing::warn (bad syn payload, bad target, policy reject, pending overflow, dial fail, reader death, conn close) so future RSTs are visible at WARN.
+- **Fix:** `src/runtime.rs` MAX_PENDING_BYTES 1->8 MiB, MAX_PENDING_FRAMES 64->256; warn upgrades in runtime.rs/mux_pool.rs. Commit `b138cad`. clippy -D warnings 0; tests 96+8 green.
+
+### Bug 2 - Linux build broken (profile.rs pprof) - FIXED
+
+- **Bug:** WSL `cargo build --release --bin rushway` fails E0599: no method `pprof` on pprof::Report; then `write_to_writer` missing on Profile.
+- **Root cause (proven):** `pprof = "0.13"` default features = ["cpp"]; `Report::pprof()` is gated on prost-codec (enabled via _protobuf); this prost Message has no write_to_writer (use encode + write_all). Unix profile.rs branch had never been compiled in-tree (no .github/workflows present despite PROGRESS citing historical CI).
+- **Astra review:** build-only fix; non-Unix path unchanged; encode-to-Vec then write_all preserves output bytes (raw protobuf, no length prefix).
+- **Fix:** Cargo.toml unix dep `features = ["prost-codec"]`; profile.rs `use pprof::protos::Message as _` + encode/write_all. Commit `e71eb6b`. WSL clippy -D warnings 0; Windows clippy/tests green.
+
+### W2 matrix results (n=5 medians; full rows in bench/w2_loopback.csv + bench/w2_nonloopback.csv)
+
+- **Loopback setup:** rushway 71.32/229.83/251.91 (cpu 2.25, rss 148); goway 247.12/292.58/267.64 (1.91, 87.2); sing-box 107.43/376.47/360.57 (1.25, 79.6); xray 43.01/177.49/185.09 (3.20, 63).
+- **Loopback steady:** rushway 101.24/238.70/251.84 (2.34, 155.9); goway 288.42/277.09/259.18 (2.14, 89); sing-box 216.84/382.92/387.05 (1.25, 78.2); xray 42.36/174.51/178.64 (3.56, 65).
+- **Non-loopback setup (Win client+echo / WSL server, 2 vSwitch crossings):** rushway 22.65/21.33/16.76 (5.73, 152.6); goway 20.83/20.66/17.28 (9.62, 82); sing-box 21.36/17.51/15.46 (9.66, 106.2); xray 20.72/15.80/13.96 (12.18, 68.6).
+- **Non-loopback steady:** rushway 20.07/21.52/18.64 (5.25, 153.8); goway 17.92/19.05/16.75 (10.80, 85.4); sing-box 21.49/17.63/14.35 (10.35, 105.4); xray 21.62/17.73/15.04 (11.55, 68.8).
+
+### Verdict vs the three objectives
+
+- **#1 speed:** NOT demonstrated. Loopback: sing-box leads c8/c32 ~1.7-1.9x and steady c1 ~2.1x; goway leads c1 ~2.8x; rushway only clearly beats xray. Non-loopback: path caps everyone to ~15-23 MiB/s; rushway best/tied on c8 and c1, c32 mixed vs goway.
+- **#2 CPU/RSS optimal:** NOT met. Non-loopback CPU best (5.3-5.7s vs 9.6-12.2), but loopback CPU loses to sing-box (2.34 vs 1.25); RSS highest of all four everywhere (148-156 MB vs 63-106).
+- **#3 UX:** Phase 1 delivered; real-TTY TUI sign-off + competitor UX comparison still open.
+
+### Harness + environment (for the next agent)
+
+- `proxy_bench`: --external, --client-port, --target-ip, --echo-bind, stage-labelled errors, per-flow byte counts.
+- `scripts/w2_bench.ps1`: unified 4-impl start/stop, config templating (xray VLESS+WS / sing-box VLESS+WS, path /bench, fixed UUID), CPU (delta process CPU) + peak RSS sampling, n-sample CSV + median summaries, -NonLoopback mode. Non-loopback servers run IN WSL (binaries in /root/w2bin incl. linux sing-box/xray + go1.26-built goway + cargo-built rushway) hosted by a HELD wsl.exe foreground wrapper (`run.sh` writes linux $$ to pidfile then exec) because `setsid`-backgrounded processes die when the wsl.exe invocation exits. WSL cold first call ~12s, warm ~135ms. PS traps: native stderr redirect `2>$null` throws under $ErrorActionPreference=Stop (suppress inside `bash -c '... 2>/dev/null'`); `$` in double quotes eaten by PS; tool child-process reaping unreliable for Start-Process trees (use WMI Win32_Process.Create to launch detached runs).
+- Topology note: non-loopback = bench->client (loopback) + client->server (vSwitch) + server->echo (vSwitch); echo reachable at Windows IP because proxy_bench binds 0.0.0.0 there. All four impls cross the same legs.
+- Data: `bench/w2_loopback.csv`, `bench/w2_raw.log`, `bench/w2_nonloopback.csv`, `bench/w2_nonloop_raw.log` (40/40 zero-failure each leg).
+
+### Next action
+
+- W3: Phase 3 version negotiation + WINDOW flow control (goway repo must mirror) -> dual-stack re-test; then structural work on the sing-box loopback gap (c8/c32 ~1.9x, steady c1 ~2.1x) and rushway RSS (highest of four; steady-state ~156 MB peak).

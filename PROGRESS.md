@@ -123,31 +123,37 @@ Phase 1+2 code complete in working trees; Phases 3�C4 pending. No release tag.
 
 **Objectives still open:** #1 and #2 need Phase 4 numbers; #3 has Phase 1 delivery but needs real-TTY sign-off and competitor UX comparison.
 
-### Phase 4 local paired bench (2026-09-22) — setup_inclusive, n=3 medians, Windows loopback WS
-| impl | c1 MiB/s | c8 MiB/s | c32 MiB/s |
-| --- | --- | --- | --- |
-| rushway (Phase 1 tree) | 68.66 | 130.78 | 136.86 |
-| goway Phase 2 | 145.22 | 157.03 | 174.26 |
-| goway baseline (v1.8.10) | 107.84 | 187.15 | 199.58 |
+### W2 Phase 4 full matrix (2026-09-23) — 4 impls x n=5 x setup/steady, CPU + peak RSS
 
-### Phase 4 steady_state, n=3 medians, Windows loopback WS
-| impl | c1 MiB/s | c8 MiB/s | c32 MiB/s |
-| --- | --- | --- | --- |
-| rushway (Phase 1 tree) | 80.48 | 129.08 | 132.62 |
-| goway Phase 2 | 149.55 | 175.95 | 166.54 |
-| goway baseline (v1.8.10) | 157.85 | 160.48 | 160.94 |
+**Windows loopback** (`bench/w2_loopback.csv`, medians, all 40 samples passed after early-eof fix):
 
-Raw samples: `%TEMP%\bench_{rush,goway2,goway0}_{setup,steady}.txt`. Competitive set (sing-box/xray) not installed — open gap for objective #1 “beats all proxies”. n=3 Windows loopback is high-variance; do not claim superiority from this alone. Historical v0.0.3 CI medians (GoWay setup c1/c8/c32 = 265.76/370.99/475.67) are a different environment and not comparable to this cycle’s loopback numbers.
+| impl | mode | c1 MiB/s | c8 MiB/s | c32 MiB/s | cpu_s | rss MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| rushway | setup | 71.32 | 229.83 | 251.91 | 2.25 | 148.0 |
+| rushway | steady | 101.24 | 238.70 | 251.84 | 2.34 | 155.9 |
+| goway v1.8.11 | setup | 247.12 | 292.58 | 267.64 | 1.91 | 87.2 |
+| goway v1.8.11 | steady | 288.42 | 277.09 | 259.18 | 2.14 | 89.0 |
+| sing-box 1.14.1 | setup | 107.43 | 376.47 | 360.57 | 1.25 | 79.6 |
+| sing-box 1.14.1 | steady | 216.84 | 382.92 | 387.05 | 1.25 | 78.2 |
+| xray 26.3.27 | setup | 43.01 | 177.49 | 185.09 | 3.20 | 63.0 |
+| xray 26.3.27 | steady | 42.36 | 174.51 | 178.64 | 3.56 | 65.0 |
 
-# Phase 4 paired bench log — 2026-09-22 Windows loopback WS, setup_inclusive n=3 medians (proxy_bench)
+**Non-loopback** (`bench/w2_nonloopback.csv`, Windows client+echo / WSL servers, two Hyper-V vSwitch crossings, all 40 samples passed):
 
-## Summary lines (exact)
+| impl | mode | c1 MiB/s | c8 MiB/s | c32 MiB/s | cpu_s | rss MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| rushway | setup | 22.65 | 21.33 | 16.76 | 5.73 | 152.6 |
+| rushway | steady | 20.07 | 21.52 | 18.64 | 5.25 | 153.8 |
+| goway v1.8.11 | setup | 20.83 | 20.66 | 17.28 | 9.62 | 82.0 |
+| goway v1.8.11 | steady | 17.92 | 19.05 | 16.75 | 10.80 | 85.4 |
+| sing-box 1.14.1 | setup | 21.36 | 17.51 | 15.46 | 9.66 | 106.2 |
+| sing-box 1.14.1 | steady | 21.49 | 17.63 | 14.35 | 10.35 | 105.4 |
+| xray 26.3.27 | setup | 20.72 | 15.80 | 13.96 | 12.18 | 68.6 |
+| xray 26.3.27 | steady | 21.62 | 17.73 | 15.04 | 11.55 | 68.8 |
 
-- `proxy_e2e_summary implementation=rushway mode=setup samples=3 payload_mib=4 roundtrip_echo=1 c1_mib_s=68.66 c8_mib_s=130.78 c32_mib_s=136.86`
-- `proxy_e2e_summary implementation=goway2 mode=setup samples=3 payload_mib=4 roundtrip_echo=1 c1_mib_s=145.22 c8_mib_s=157.03 c32_mib_s=174.26`
-- `proxy_e2e_summary implementation=goway0 mode=setup samples=3 payload_mib=4 roundtrip_echo=1 c1_mib_s=107.84 c8_mib_s=187.15 c32_mib_s=199.58`
-- `proxy_e2e_summary implementation=rushway mode=steady samples=3 payload_mib=4 roundtrip_echo=1 c1_mib_s=80.48 c8_mib_s=129.08 c32_mib_s=132.62`
-- `proxy_e2e_summary implementation=goway2 mode=steady samples=3 payload_mib=4 roundtrip_echo=1 c1_mib_s=149.55 c8_mib_s=175.95 c32_mib_s=166.54`
-- `proxy_e2e_summary implementation=goway0 mode=steady samples=3 payload_mib=4 roundtrip_echo=1 c1_mib_s=157.85 c8_mib_s=160.48 c32_mib_s=160.94`
-
-**Interpretation (honest):** On this n=3 Windows loopback matrix, goway Phase 2 does **not** clearly beat goway baseline (baseline wins setup c8/c32 and steady c1; Phase 2 wins setup c1 and steady c8/c32 — noise-dominated). rushway trails both goway arms on every cell. Objective #1 is **not** demonstrated. Competitor set still open.
+**Interpretation (honest):**
+- Objective #1 (beats all proxies): **not demonstrated.** Loopback: sing-box leads c8/c32 by ~1.7-1.9x and steady c1 ~2.1x; goway leads c1 ~2.8x; rushway only clearly beats xray. Non-loopback: path caps all impls to ~15-23 MiB/s; rushway best or tied on c8 and c1, c32 mixed vs goway.
+- Objective #2 (best CPU/RSS): **not met.** Non-loopback CPU: rushway clearly best (5.3-5.7 s vs 9.6-12.2). Loopback CPU: sing-box best (1.25 s vs rushway 2.34). RSS: rushway highest everywhere (148-156 MB vs 63-106).
+- Objective #3 (UX): Phase 1 delivered; real-TTY TUI sign-off + competitor UX comparison still open.
+- Bugs fixed this cycle: early-eof pre-dial pending overflow (`b138cad`), Linux pprof build (`e71eb6b`). Harness: `proxy_bench --external/--target-ip/--echo-bind` + `scripts/w2_bench.ps1 -NonLoopback`. Details in `AI_HANDOFF.md`.
+- Next: W3 = Phase 3 version negotiation + WINDOW (goway sync) + re-test; then close sing-box loopback gap and rushway RSS.

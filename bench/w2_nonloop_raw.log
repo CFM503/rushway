@@ -1,0 +1,48 @@
+﻿rushway mode=setup sample=1 c1=22.59 c8=19.65 c32=16.14 cpu_s=5.8 rss_mb=150.9
+rushway mode=setup sample=2 c1=18.92 c8=22.22 c32=17.66 cpu_s=5.45 rss_mb=161.1
+rushway mode=setup sample=3 c1=25.33 c8=21.53 c32=16.76 cpu_s=5.93 rss_mb=152.6
+rushway mode=setup sample=4 c1=22.65 c8=20.46 c32=17.22 cpu_s=5.42 rss_mb=157.5
+rushway mode=setup sample=5 c1=27.56 c8=21.33 c32=16.51 cpu_s=5.73 rss_mb=151.7
+goway mode=setup sample=1 c1=20.73 c8=20.97 c32=17.28 cpu_s=9.12 rss_mb=120.2
+goway mode=setup sample=2 c1=19.75 c8=20.66 c32=17.42 cpu_s=9.63 rss_mb=80.5
+goway mode=setup sample=3 c1=21.69 c8=19 c32=15.51 cpu_s=10.46 rss_mb=81.1
+goway mode=setup sample=4 c1=20.83 c8=20.72 c32=17.86 cpu_s=8.92 rss_mb=82.1
+goway mode=setup sample=5 c1=20.88 c8=20.07 c32=16.48 cpu_s=9.62 rss_mb=82
+sing-box mode=setup sample=1 c1=18.41 c8=17.44 c32=15.66 cpu_s=9.63 rss_mb=109.8
+sing-box mode=setup sample=2 c1=23.2 c8=18.22 c32=15.65 cpu_s=9.5 rss_mb=106.3
+sing-box mode=setup sample=3 c1=22.26 c8=18.9 c32=15.46 cpu_s=9.66 rss_mb=105.6
+sing-box mode=setup sample=4 c1=20.07 c8=16.91 c32=14.39 cpu_s=10.92 rss_mb=105.1
+sing-box mode=setup sample=5 c1=21.36 c8=17.51 c32=13.77 cpu_s=10.69 rss_mb=106.2
+xray mode=setup sample=1 c1=20.72 c8=15.8 c32=13.95 cpu_s=12.47 rss_mb=68.6
+xray mode=setup sample=2 c1=17.54 c8=15.65 c32=14.55 cpu_s=11.94 rss_mb=68.6
+xray mode=setup sample=3 c1=22.2 c8=15.25 c32=15.09 cpu_s=11.61 rss_mb=67.9
+xray mode=setup sample=4 c1=17.04 c8=16 c32=12.73 cpu_s=12.43 rss_mb=69.3
+xray mode=setup sample=5 c1=23.06 c8=16.38 c32=13.96 cpu_s=12.18 rss_mb=68.1
+rushway mode=steady sample=1 c1=19.47 c8=20.36 c32=17.36 cpu_s=5.51 rss_mb=156.7
+rushway mode=steady sample=2 c1=19.47 c8=21.52 c32=17.19 cpu_s=5.25 rss_mb=157.3
+rushway mode=steady sample=3 c1=20.17 c8=20.54 c32=18.92 cpu_s=5.23 rss_mb=147.8
+rushway mode=steady sample=4 c1=23.66 c8=22.84 c32=18.64 cpu_s=5.35 rss_mb=153.8
+rushway mode=steady sample=5 c1=20.07 c8=23.52 c32=19.8 cpu_s=5.14 rss_mb=151.4
+goway mode=steady sample=1 c1=18.81 c8=19.36 c32=17.39 cpu_s=10.85 rss_mb=84.4
+goway mode=steady sample=2 c1=17.92 c8=19.05 c32=16.2 cpu_s=10.33 rss_mb=85.4
+goway mode=steady sample=3 c1=13.02 c8=18.2 c32=17.76 cpu_s=10.8 rss_mb=93.2
+goway mode=steady sample=4 c1=20.56 c8=21.72 c32=16.75 cpu_s=8.76 rss_mb=85.9
+goway mode=steady sample=5 c1=16.54 c8=17.85 c32=15.11 cpu_s=11.17 rss_mb=82.8
+sing-box mode=steady sample=1 c1=21.68 c8=18.08 c32=14.75 cpu_s=10.19 rss_mb=105.6
+sing-box mode=steady sample=2 c1=21.49 c8=17.63 c32=14.69 cpu_s=10.35 rss_mb=105.3
+sing-box mode=steady sample=3 c1=15.82 c8=19.62 c32=14.3 cpu_s=10.17 rss_mb=104.8
+sing-box mode=steady sample=4 c1=17.71 c8=16.12 c32=12.61 cpu_s=10.82 rss_mb=105.4
+sing-box mode=steady sample=5 c1=22.16 c8=14.78 c32=14.35 cpu_s=11.04 rss_mb=106.2
+xray mode=steady sample=1 c1=22.28 c8=17.73 c32=14.46 cpu_s=10.95 rss_mb=68.8
+xray mode=steady sample=2 c1=18.79 c8=16.26 c32=15.26 cpu_s=11.84 rss_mb=68.2
+xray mode=steady sample=3 c1=21.71 c8=18.62 c32=15.04 cpu_s=11.36 rss_mb=69
+xray mode=steady sample=4 c1=21.62 c8=13.99 c32=14.82 cpu_s=12.02 rss_mb=69.1
+xray mode=steady sample=5 c1=17.65 c8=18.25 c32=15.05 cpu_s=11.55 rss_mb=68.5
+proxy_e2e_summary implementation=rushway mode=setup samples=5 c1_mib_s=22.65 c8_mib_s=21.33 c32_mib_s=16.76 cpu_s=5.73 rss_peak_mb=152.6
+proxy_e2e_summary implementation=goway mode=setup samples=5 c1_mib_s=20.83 c8_mib_s=20.66 c32_mib_s=17.28 cpu_s=9.62 rss_peak_mb=82
+proxy_e2e_summary implementation=sing-box mode=setup samples=5 c1_mib_s=21.36 c8_mib_s=17.51 c32_mib_s=15.46 cpu_s=9.66 rss_peak_mb=106.2
+proxy_e2e_summary implementation=xray mode=setup samples=5 c1_mib_s=20.72 c8_mib_s=15.8 c32_mib_s=13.96 cpu_s=12.18 rss_peak_mb=68.6
+proxy_e2e_summary implementation=rushway mode=steady samples=5 c1_mib_s=20.07 c8_mib_s=21.52 c32_mib_s=18.64 cpu_s=5.25 rss_peak_mb=153.8
+proxy_e2e_summary implementation=goway mode=steady samples=5 c1_mib_s=17.92 c8_mib_s=19.05 c32_mib_s=16.75 cpu_s=10.8 rss_peak_mb=85.4
+proxy_e2e_summary implementation=sing-box mode=steady samples=5 c1_mib_s=21.49 c8_mib_s=17.63 c32_mib_s=14.35 cpu_s=10.35 rss_peak_mb=105.4
+proxy_e2e_summary implementation=xray mode=steady samples=5 c1_mib_s=21.62 c8_mib_s=17.73 c32_mib_s=15.04 cpu_s=11.55 rss_peak_mb=68.8
