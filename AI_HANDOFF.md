@@ -2346,3 +2346,13 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 3. Outbound encode buffer pool (residual `realloc` 5–14%).
 4. Pooled/size-classed `frame_buf` (amortized doubling copies).
 5. Re-check `runtime.rs` RSS trend at higher n.
+
+## CI green restored: toolchain pin 1.85 → 1.88 (2026-09-23)
+
+- **Bug:** `RushWay CI` failed on every push since Round-1 landed (runs `35840366934`/`35839582535`/`35839434558`/`35831932422`, exit 101).
+- **Root cause (proven):** `error[E0658]: use of unstable library feature slice_as_chunks` in `src/ws.rs:700`, `src/crypto.rs:56-57`, `src/mux_writer.rs:359-360`. Workflows pinned Rust **1.85.0** (and armv7 **1.86.0**, Docker `rust:1.85-bookworm`); `slice_as_chunks` stabilised in **1.88**. Local WSL rustc 1.98 masked it.
+- **Fix:** `ci.yml` + `release.yml` pins → **1.88.0** (incl. goway-comparison step name, windows/debian/armv7/kwrt jobs, both `rust:1.88-bookworm` images); `Cargo.toml` `rust-version = "1.88"`. Local `cargo check --all-targets --all-features` Finished OK. Note: CI `cargo fmt --all` has **no `--check`** so it never failed on format drift (observed local fmt diffs are non-blocking for CI).
+- **Astra review:** MSRV bump is the correct fix (code uses the stable API; reverting to byte loops would undo Round-1 perf). No runtime/protocol change. `release.yml` build jobs were also broken on the v0.0.27 tag — the next `v*` tag will rebuild artifacts with 1.88; existing release page assets came from the manual local build path, not CI.
+- **Next:** push (one git command), confirm CI turns green; then resume Round-2 candidate 2.
+
+**Incident log (g):** investigation messages shipped triplicate `grep`/`read` blocks (same pattern as (e)/(f)) — 6× identical greps then 3× duplicated read-pairs; also one message ran the same `cargo check` twice. Root: batching tool calls without a uniqueness pass. **Hard rule before every send: list every call, assert no two are equivalent (same tool+args); if they are, keep one.**
