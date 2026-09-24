@@ -254,8 +254,8 @@ async fn send_frame_encrypted(
     obfs: bool,
 ) -> Result<()> {
     // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
-    // a `7 + payload` pre-cap never covered WS header + mask + pad.
-    let mut bytes = Vec::new();
+    // start from a pooled buffer when available so the reserve is a no-op.
+    let mut bytes = crate::mux_writer::acquire_encode_buf();
     crate::mux_writer::encode_mux_ws_frame(
         &mut bytes,
         frame.stream_id,
@@ -277,8 +277,8 @@ async fn send_mux_parts_encrypted(
     obfs: bool,
 ) -> Result<()> {
     // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
-    // a `7 + payload` pre-cap never covered WS header + mask + pad.
-    let mut bytes = Vec::new();
+    // start from a pooled buffer when available so the reserve is a no-op.
+    let mut bytes = crate::mux_writer::acquire_encode_buf();
     crate::mux_writer::encode_mux_ws_frame(
         &mut bytes, stream_id, command, payload, cipher, false, obfs,
     )

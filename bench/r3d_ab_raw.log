@@ -1,0 +1,46 @@
+﻿rushway_base mode=setup sample=1 c1=163.4 c8=349.3 c32=301.17 cpu_s=1.95 rss_mb=139.7
+rushway_r3d mode=setup sample=1 c1=124.02 c8=382.73 c32=377.07 cpu_s=1.83 rss_mb=98.9
+rushway_r3d mode=setup sample=2 c1=196.74 c8=383.11 c32=367.12 cpu_s=1.91 rss_mb=115.9
+rushway_base mode=setup sample=2 c1=94.37 c8=367.74 c32=354.67 cpu_s=2.05 rss_mb=126.3
+rushway_base mode=setup sample=3 c1=199.68 c8=335.75 c32=351.95 cpu_s=1.73 rss_mb=136.1
+rushway_r3d mode=setup sample=3 c1=114.95 c8=403.24 c32=372.3 cpu_s=1.78 rss_mb=125.9
+rushway_r3d mode=setup sample=4 c1=227.98 c8=373.64 c32=370.51 cpu_s=1.83 rss_mb=143.7
+rushway_base mode=setup sample=4 c1=55.31 c8=348.87 c32=359.63 cpu_s=1.94 rss_mb=88.4
+rushway_base mode=setup sample=5 c1=80.37 c8=341.02 c32=342.58 cpu_s=1.95 rss_mb=82.7
+rushway_r3d mode=setup sample=5 c1=173.64 c8=400.92 c32=381.24 cpu_s=1.97 rss_mb=135.2
+rushway_r3d mode=setup sample=6 c1=92.15 c8=357.31 c32=390.25 cpu_s=1.72 rss_mb=96.6
+rushway_base mode=setup sample=6 c1=113.96 c8=347.37 c32=348.58 cpu_s=2.02 rss_mb=101
+rushway_base mode=setup sample=7 c1=47.09 c8=328.37 c32=332.9 cpu_s=1.64 rss_mb=93.8
+rushway_r3d mode=setup sample=7 c1=77.17 c8=364.31 c32=366.9 cpu_s=2.02 rss_mb=116.3
+rushway_r3d mode=setup sample=8 c1=122.47 c8=419.98 c32=373.93 cpu_s=1.81 rss_mb=127.5
+rushway_base mode=setup sample=8 c1=172.38 c8=346.1 c32=344.42 cpu_s=1.94 rss_mb=108.7
+rushway_base mode=steady sample=1 c1=104.85 c8=345.27 c32=357.55 cpu_s=2.03 rss_mb=86.1
+rushway_r3d mode=steady sample=1 c1=142.54 c8=412.45 c32=384.46 cpu_s=1.75 rss_mb=99.7
+rushway_r3d mode=steady sample=2 c1=103.46 c8=411.74 c32=368.28 cpu_s=1.88 rss_mb=91.8
+rushway_base mode=steady sample=2 c1=72.94 c8=318.23 c32=361.86 cpu_s=1.83 rss_mb=99.5
+rushway_base mode=steady sample=3 c1=74.49 c8=324.41 c32=336.91 cpu_s=2.2 rss_mb=86
+rushway_r3d mode=steady sample=3 c1=217.04 c8=364.11 c32=373.72 cpu_s=1.86 rss_mb=100.5
+rushway_r3d mode=steady sample=4 c1=97.53 c8=366.06 c32=378.45 cpu_s=1.88 rss_mb=92
+rushway_base mode=steady sample=4 c1=96.33 c8=323.04 c32=357.44 cpu_s=2.11 rss_mb=105.9
+rushway_base mode=steady sample=5 c1=181.44 c8=311.25 c32=340.4 cpu_s=2.06 rss_mb=105.2
+rushway_r3d mode=steady sample=5 c1=97.66 c8=375.16 c32=365.77 cpu_s=1.77 rss_mb=101.6
+rushway_r3d mode=steady sample=6 c1=78.84 c8=374.94 c32=372.63 cpu_s=1.78 rss_mb=90.8
+rushway_base mode=steady sample=6 c1=127.77 c8=312.51 c32=345.89 cpu_s=2.08 rss_mb=82.8
+rushway_base mode=steady sample=7 c1=123.14 c8=341.05 c32=349.08 cpu_s=1.89 rss_mb=72.6
+rushway_r3d mode=steady sample=7 c1=143.62 c8=395.51 c32=371.93 cpu_s=1.72 rss_mb=125.4
+rushway_r3d mode=steady sample=8 c1=151.29 c8=367.02 c32=369.22 cpu_s=1.83 rss_mb=89.6
+rushway_base mode=steady sample=8 c1=83.59 c8=300.09 c32=350.18 cpu_s=1.8 rss_mb=100.9
+REF mode=setup (independent medians, informational) base(n=8): c1=104.16 c8=346.74 c32=346.5 cpu=1.94 rss=104.8 | r3d(n=8): c1=123.24 c8=382.92 c32=373.12 cpu=1.83 rss=121.1
+PAIRED mode=setup metric=c1 n=8 eff_n=8 crit=8 bad=4 good=4 ties=0 med_delta=4.14 median_favours_r3d=4.14 => NOISE
+PAIRED mode=setup metric=c8 n=8 eff_n=8 crit=8 bad=0 good=8 ties=0 med_delta=34.68 median_favours_r3d=34.68 => FORWARD
+PAIRED mode=setup metric=c32 n=8 eff_n=8 crit=8 bad=0 good=8 ties=0 med_delta=31.75 median_favours_r3d=31.75 => FORWARD
+PAIRED mode=setup metric=cpu n=8 eff_n=8 crit=8 bad=3 good=5 ties=0 med_delta=-0.11 median_favours_r3d=0.11 => NOISE
+PAIRED mode=setup metric=rss n=8 eff_n=8 crit=8 bad=4 good=4 ties=0 med_delta=7.2 median_favours_r3d=-7.2 => NOISE
+VERDICT mode=setup : FORWARD vs baseline on at least one metric, none regressed beyond noise
+REF mode=steady (independent medians, informational) base(n=8): c1=100.59 c8=320.64 c32=349.63 cpu=2.04 rss=92.8 | r3d(n=8): c1=123 c8=375.05 c32=372.28 cpu=1.81 rss=95.8
+PAIRED mode=steady metric=c1 n=8 eff_n=8 crit=8 bad=2 good=6 ties=0 med_delta=25.5 median_favours_r3d=25.5 => NOISE
+PAIRED mode=steady metric=c8 n=8 eff_n=8 crit=8 bad=0 good=8 ties=0 med_delta=63.17 median_favours_r3d=63.17 => FORWARD
+PAIRED mode=steady metric=c32 n=8 eff_n=8 crit=8 bad=0 good=8 ties=0 med_delta=24.11 median_favours_r3d=24.11 => FORWARD
+PAIRED mode=steady metric=cpu n=8 eff_n=8 crit=8 bad=2 good=6 ties=0 med_delta=-0.25 median_favours_r3d=0.25 => NOISE
+PAIRED mode=steady metric=rss n=8 eff_n=8 crit=8 bad=4 good=4 ties=0 med_delta=2.2 median_favours_r3d=-2.2 => NOISE
+VERDICT mode=steady : FORWARD vs baseline on at least one metric, none regressed beyond noise

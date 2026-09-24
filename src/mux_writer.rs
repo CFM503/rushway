@@ -18,7 +18,7 @@ use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -28,10 +28,59 @@ const WRITER_QUEUE: usize = 256;
 const FEED_CAP: usize = 256;
 const BATCH_MAX_FRAMES: usize = 32;
 const BATCH_MAX_BYTES: usize = 1024 * 1024;
+/// Encode-buffer pool: outbound frames are pre-encoded into an owned `Vec`
+/// that the writer task only reads, then drops. Recycling those buffers
+/// after a successful write removes the per-frame malloc/free that showed
+/// up as `realloc`/`grow_amortized` on the encode hot path.
+///
+/// Kept deliberately small: one batch is at most [`BATCH_MAX_FRAMES`], and
+/// a larger pool showed up as a clear setup-mode RSS regression (8:0) in
+/// the first A/B — 32 × ~80 KiB ≈ 2.5 MiB retained ceiling.
+const ENCODE_POOL_MAX_COUNT: usize = 32;
+/// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
+/// ~80 KiB so a rare huge frame cannot pin memory.
+const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
 /// Per-stream byte credit added each deficit round (GoWay parity).
 const DRR_QUANTUM: usize = 64 * 1024;
 /// Cap accumulated credit so a long-idle stream cannot hog the link.
 const DRR_MAX_DEFICIT: usize = 256 * 1024;
+
+static ENCODE_POOL: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
+
+fn encode_pool() -> &'static StdMutex<Vec<Vec<u8>>> {
+    ENCODE_POOL.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+/// Takes a pooled encode buffer (cleared, capacity retained) or a fresh
+/// empty `Vec` when the pool is empty. The writer returns written frames
+/// via [`recycle_encode_buf`].
+pub(crate) fn acquire_encode_buf() -> Vec<u8> {
+    let mut pool = encode_pool()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match pool.pop() {
+        Some(mut buf) => {
+            buf.clear();
+            buf
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Returns a post-write frame buffer to the pool (best-effort: zero-cap or
+/// oversized buffers are dropped).
+pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
+    if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
+        return;
+    }
+    buf.clear();
+    let mut pool = encode_pool()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if pool.len() < ENCODE_POOL_MAX_COUNT {
+        pool.push(buf);
+    }
+}
 
 /// One pre-encoded outbound frame with scheduling identity.
 ///
@@ -406,7 +455,9 @@ where
         // rounds (frames are far below the deficit cap). Breaking at the
         // first None instead would strand the tail whenever no further
         // arrivals come to wake us (caught live: 4MiB tail stall).
-        batch.clear();
+        // `batch` is drained (not cleared) after each write so frame buffers
+        // return to the encode pool instead of being freed.
+        debug_assert!(batch.is_empty());
         let mut bytes = 0usize;
         while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES {
             match sched.next() {
@@ -446,20 +497,36 @@ where
                             batch.push(frame);
                             if batch.len() >= BATCH_MAX_FRAMES {
                                 let _ = write_batch(&mut w, &batch).await;
-                                batch.clear();
+                                for buf in batch.drain(..) {
+                                    recycle_encode_buf(buf);
+                                }
                             }
                         }
                     }
                     if !batch.is_empty() {
                         let _ = write_batch(&mut w, &batch).await;
+                        for buf in batch.drain(..) {
+                            recycle_encode_buf(buf);
+                        }
                     }
                     break;
                 }
             }
         }
         if write_batch(&mut w, &batch).await.is_err() {
+            for buf in batch.drain(..) {
+                recycle_encode_buf(buf);
+            }
             break;
         }
+        for buf in batch.drain(..) {
+            recycle_encode_buf(buf);
+        }
+    }
+    // Shutdown drain path already wrote leftovers above; recycle anything
+    // still sitting in `batch` from a partial fill that never wrote.
+    for buf in batch.drain(..) {
+        recycle_encode_buf(buf);
     }
     let _ = w.shutdown().await;
 }
@@ -628,6 +695,27 @@ mod tests {
             10
         };
         ws_header_len + if masked { 4 } else { 0 } + mux_len
+    }
+
+    #[test]
+    fn encode_pool_reuses_capacity() {
+        let mut a = acquire_encode_buf();
+        a.reserve(64 * 1024);
+        a.extend_from_slice(&[0xAB; 64 * 1024]);
+        let cap = a.capacity();
+        recycle_encode_buf(a);
+        let b = acquire_encode_buf();
+        assert_eq!(b.len(), 0, "pooled buf must be cleared");
+        assert!(
+            b.capacity() >= cap,
+            "pooled buf must retain capacity (got {} want >= {})",
+            b.capacity(),
+            cap
+        );
+        // Oversized buffers are not retained.
+        let mut huge = Vec::with_capacity(ENCODE_POOL_MAX_CAP + 1);
+        huge.extend_from_slice(&[1u8; ENCODE_POOL_MAX_CAP + 1]);
+        recycle_encode_buf(huge);
     }
 
     #[tokio::test]

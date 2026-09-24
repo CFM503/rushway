@@ -2358,3 +2358,94 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 **Incident log (g):** investigation messages shipped triplicate `grep`/`read` blocks (same pattern as (e)/(f)) — 6× identical greps then 3× duplicated read-pairs; also one message ran the same `cargo check` twice. Root: batching tool calls without a uniqueness pass. **Hard rule before every send: list every call, assert no two are equivalent (same tool+args); if they are, keep one.**
 
 **Incident log (h):** the fix message shipped **4 identical `edit`+`commit`+`push` pairs** — first contained the real workflow/Cargo changes; the next three only re-appended this handoff section (4 duplicate commits `7bc6c00`→`7d93701`→`37c01ab`→`68a745b`, file grew to 4 copies). Cleanup commit removes the triplicates. **Same hard rule: if any two calls in a block are equivalent, keep one; git push exactly once per message.**
+
+**Incident log (i):** Round-2 candidate 2 implementation message shipped **4× identical const-insert edits + 4× identical writer_loop edits in one parallel block**. First const edit won; three failed on "oldString not found"; then three more re-inserted (file grew to 4× `COALESCE_*` consts → `error[E0428]` until manually deduped). The four writer_loop edits: one succeeded, three also reported success (idempotent re-apply after first changed the block? actually failed silently/one won). Root: no uniqueness pass + **parallel edits to the same file**. **Hard rule: never issue multiple `edit` calls against one file in a single message; one edit, verify, then next.**
+
+---
+
+## Round-2 attempt: writer_loop cold-wake coalesce — REJECTED (2026-09-24, goal #1)
+
+### What was tried
+
+- In `src/mux_writer.rs` `writer_loop`: after a cold empty-queue `rx.recv()`, if the first frame was **non-priority DATA ≥ 4096 bytes**, wait up to **50 µs** (`COALESCE_WINDOW`) for sibling frames via `timeout_at` before the usual `try_recv` drain/emit. Priority/control and small (setup) frames kept the original zero-delay path.
+- Mechanism intent: under c1, opportunistic drain often sees `batch.len()==1` → `write_all` (no writev); a short wait after a cold wake was supposed to fold the next in-flight DATA frame into one vectored write (pprof: `writev` 14% + `send` 17%).
+
+### Evidence (same-session paired, Windows)
+
+- `cargo check --all-targets --all-features` Finished OK; **106/106 tests green**, 0 warnings (before revert).
+- Baseline binary: `bench/oldbin/rushway_r2_base.exe` (copy of pre-change HEAD `d4b286c` release build). Candidate: `target\release\rushway.exe` after the edit.
+- Harness: `scripts/r2c_ab_bench.ps1` (clone of `r1_ab_bench.ps1`, labels `rushway_base` vs `rushway_r2c`, n=8 × setup+steady).
+- Artifacts: `bench/r2c_ab_rushway.csv`, `bench/r2c_ab_raw.log`.
+- **setup: NOISE on all five metrics** (c1 6:2 bad below crit=8, c8 6:2 good, c32 5:3 good, cpu 5:3 good, rss 6:2 good). Verdict: `NOISE (no metric moved beyond noise)`.
+- **steady: NOISE on all five metrics** (c1 4:4, c8 6:2 good, c32 5:3 good, cpu 4:4, rss 5:3 good). Verdict: `NOISE (no metric moved beyond noise)`.
+- Forward-only rule: **no metric FORWARD beyond noise (crit=8)** ⇒ not a positive optimization ⇒ **rejected**. No REGRESSION either — pure wash.
+
+### Why it lost (for the next attempt)
+
+1. Gate only fires on **cold empty-queue wakes** with bulk frames. Sustained bulk usually leaves `sched` non-empty after a write (sibling already drained by the next `try_recv`), so the 50 µs window rarely changed batch composition.
+2. On loopback 4 MiB, a single 64 KiB-class frame already costs one large `send`; coalescing two into `writev` saves one syscall but not enough bytes to move medians past n=8 sign test noise.
+3. Timer wake itself adds a tiny CPU cost on every cold bulk wake (visible only as noise, not as setup CPU regression this round).
+
+### Kept / artifacts
+
+- `bench/oldbin/rushway_r2_base.exe`: HEAD (d4b286c) baseline for future round pairs (gitignored).
+- `scripts/r2c_ab_bench.ps1`, `bench/r2c_ab_rushway.csv`, `bench/r2c_ab_raw.log`: rejection evidence.
+- Source: `git checkout -- src/mux_writer.rs` — tree clean vs origin/main (only untracked A/B artifacts remain).
+
+### Next Round-2 candidates (updated order)
+
+3. **Outbound encode buffer pool** (pprof residual `realloc` 5–14% / `grow_amortized` ~14% on encode paths) — pure allocation win, no added latency by design; strongest next positive-only bet.
+4. Pooled/size-classed `frame_buf` (`read_frame` amortized doubling copies).
+5. Relay-side frame aggregation (larger WS frames → fewer headers/syscalls) — heavier design, needs careful GoWay parity check first.
+6. Re-check `runtime.rs` RSS trend at higher n.
+
+### Status / next action
+
+- **Status:** rejected (noise, not forward). Working tree clean at origin/main.
+- **Next action:** start candidate 3 (encode buffer pool) under the same positive A/B gate; do not re-try coalesce with only a window tweak — the cold-wake gate itself is the structural limiter.
+
+## Round-2 attempt: outbound encode buffer pool — ACCEPTED (2026-09-24, goal #1/#2)
+
+### What was tried
+
+- New process-wide encode pool in `src/mux_writer.rs`: `acquire_encode_buf()` / `recycle_encode_buf()` (static `OnceLock<StdMutex<Vec<Vec<u8>>>>`, caps **32 × 80 KiB**).
+- `writer_loop` now **drains** (not `clear`s) each written batch and returns frame `Vec`s to the pool — removes the per-frame malloc/free that pprof showed as `realloc` 13.8% + `grow_amortized` 14.5%.
+- Call sites switched from `Vec::new()` per send to `acquire_encode_buf()`:
+  - `runtime.rs` `send_frame_encrypted` / `send_mux_parts_encrypted`
+  - `mux_pool.rs` `send_mux_parts` / `send_mux_parts_reuse` (pool refill after `mem::take`) / upload `frame_scratch` init
+  - `wss_client.rs` `send_mux` / `send_mux_parts`
+- Root cause addressed: `encode_mux_ws_frame` already does one exact `reserve`, but every send either started from `Vec::new()` or `mem::take` emptied the scratch — so the reserve always hit a zero-cap buffer.
+
+### Evidence (same-session paired, Windows)
+
+- `cargo check` Finished OK; **107/107 tests green** (new `encode_pool_reuses_capacity`); 0 warnings.
+- Harness: `scripts/r3d_ab_bench.ps1`, BASE=`bench/oldbin/rushway_r2_base.exe` (pre-pool HEAD), OPT=`target\release\rushway.exe`, n=8 × setup+steady.
+- **First A/B (pool 256×128 KiB):** setup c8 FORWARD 8:0 but **RSS REGRESSED 8:0** (med +33 MB) → rejected that sizing.
+- **Tightened pool (32×80 KiB ≈ 2.5 MiB ceiling), second A/B — `bench/r3d_ab_{rushway.csv,raw.log}`:**
+  - **setup: FORWARD** — c8 **8:0 good** (med Δ **+34.7 MiB/s**), c32 **8:0 good** (med Δ **+31.8**); c1/cpu/rss all noise; **none regressed**.
+  - **steady: FORWARD** — c8 **8:0 good** (med Δ **+63.2**), c32 **8:0 good** (med Δ **+24.1**); c1/cpu/rss noise (cpu med **−0.25 s** directional good); **none regressed**.
+- Forward-only rule ⇒ **accepted**.
+
+### Why it won
+
+1. Bulk DATA encode is the dominant allocation source under proxy_bench (4 MiB/flow → many ~64 KiB frames). Pooling after write turns steady-state encode into `clear` + no-op `reserve`.
+2. Throughput wins are largest at c8/c32 where many concurrent streams recycle into the same pool; c1 is noisier (fewer concurrent frames) but still 6:2/2:6 lean good, not regress.
+3. RSS cost is only the pool ceiling — with 32×80 KiB it sits inside noise.
+
+### Kept / artifacts
+
+- Source: `src/mux_writer.rs` (pool + drain/recycle), `src/runtime.rs`, `src/mux_pool.rs`, `src/wss_client.rs`.
+- Test: `mux_writer::tests::encode_pool_reuses_capacity`.
+- A/B: `scripts/r3d_ab_bench.ps1`, `bench/r3d_ab_rushway.csv`, `bench/r3d_ab_raw.log`.
+- Rejected-sizing evidence: first r3d run (overlarge pool) is superseded; second run is the acceptance record.
+
+### Remaining risk / next
+
+- Pool is global per process (client+server share when co-located in one process — not the bench topology, but fine for production single-role processes).
+- `clippy::uninit_vec` on `ws.rs:684` is pre-existing (Round-1 read path), unrelated.
+- Next: candidate 4 (pooled/size-classed `frame_buf` for `read_frame` doubling), then RSS trend re-check; candidate 5 relay-side aggregation only after GoWay parity review.
+
+### Status
+
+- **Status:** accepted (forward on c8+c32 in both modes, no metric beyond-noise regressed).
+- **Next action:** commit this change + handoff when the user asks; then start candidate 4.

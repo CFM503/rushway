@@ -144,6 +144,12 @@ async fn send_mux_parts_reuse(
     scratch: &mut Vec<u8>,
     obfs: bool,
 ) -> Result<()> {
+    // Prefer the caller's local scratch only while it still owns capacity
+    // (first frame); after `mem::take` the pool supplies the next buffer
+    // so the encoder's exact `reserve` hits existing capacity.
+    if scratch.capacity() == 0 {
+        *scratch = crate::mux_writer::acquire_encode_buf();
+    }
     crate::mux_writer::encode_mux_ws_frame(
         scratch, stream_id, command, payload, cipher, true, obfs,
     )
@@ -160,10 +166,9 @@ async fn send_mux_parts(
     payload: &[u8],
     obfs: bool,
 ) -> Result<()> {
-    // Empty vec: `encode_mux_ws_frame` does one exact `reserve` for the
-    // full WS+MUX size — a `7 + payload` pre-cap was always short (WS
-    // header + mask + pad missing) and forced a wasted alloc+realloc.
-    let mut bytes = Vec::new();
+    // Start from the encode pool (or an empty Vec when cold) so the
+    // encoder's one exact `reserve` is a no-op on a warm pool.
+    let mut bytes = crate::mux_writer::acquire_encode_buf();
     send_mux_parts_reuse(
         writer, cipher, stream_id, command, payload, &mut bytes, obfs,
     )
@@ -771,10 +776,9 @@ async fn handle_tcp_proxy(
     let obfs = session.obfs;
     let upload = tokio::spawn(async move {
         let mut buf = relay_buf(cfg.buffer_size).await;
-        // Scratch is `take`n on every send (becomes empty), so an initial
-        // capacity only ever served the first frame — start empty and let
-        // the encoder's single exact `reserve` size it.
-        let mut frame_scratch = Vec::new();
+        // Local first-frame scratch; after each `mem::take` the next
+        // buffer comes from the writer-side encode pool (capacity reused).
+        let mut frame_scratch = crate::mux_writer::acquire_encode_buf();
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
