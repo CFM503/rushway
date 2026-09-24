@@ -2449,3 +2449,116 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 
 - **Status:** accepted (forward on c8+c32 in both modes, no metric beyond-noise regressed).
 - **Next action:** commit this change + handoff when the user asks; then start candidate 4.
+
+## Round-2 attempt: read-frame buffer pool — REJECTED (2026-09-24, goal #1)
+
+### What was tried
+
+- New process-wide read pool in `src/ws.rs`: `acquire_read_buf()` / `recycle_read_buf()` (64 × 96 KiB ceiling).
+- `read_frame` data-frame path: after `mem::take(buf)`, refill `*buf` from the pool so the next frame's `reserve` is a no-op (was `*buf = Vec::new()` → capacity 0 every frame).
+- `OwnedMuxFrame::Drop` returns `storage` to the read pool after the stream task finishes writing.
+- Explicit `recycle_read_buf(payload)` on plain-payload download paths (`runtime.rs`, `nonmux.rs`, `wss_client.rs`).
+- Root cause addressed: inbound data frames previously re-allocated from capacity 0 on every `read_frame` call after the first (`mem::take` gave the capacity to the returned payload, which was then dropped).
+
+### Evidence (same-session paired, Windows)
+
+- Baseline: `bench/oldbin/rushway_r3_base.exe` (copy of accepted candidate-3 HEAD `bbbc0a9`).
+- Candidate: `target\release\rushway.exe` after read-pool edits.
+- Harness: `scripts/r4_ab_bench.ps1`, labels `rushway_base` vs `rushway_r4`, n=8 × setup+steady.
+- Artifacts: `bench/r4_ab_rushway.csv`, `bench/r4_ab_raw.log`.
+- `cargo check` OK; **108/108 tests green** (incl. `ws::tests::read_pool_reuses_capacity`) before revert.
+- **setup: NOISE on all five metrics** (c1 4:4, c8 4:4, c32 4:4, cpu 5:3 bad, rss 3:5 good).
+- **steady: NOISE on all five metrics** (c1 6:2 bad, c8 5:3 bad, c32 3:5 good, cpu 4:3:1, rss 4:4).
+- Forward-only rule: no metric FORWARD beyond noise (crit=8) ⇒ **rejected**. No REGRESSION either — pure wash.
+
+### Why it lost (for the next attempt)
+
+1. proxy_bench inbound path is dominated by MUX decode + channel hop + `write_all`; the one `reserve` saved per frame is small vs. loopback + TCP costs already in the baseline.
+2. Pool refill only helps when the pool is warm with a same-sized buffer; control/handshake frames and cross-connection churn leave the pool empty often enough that many acquires still hit `Vec::new()`.
+3. `OwnedMuxFrame::Drop` adds a mutex acquire on every frame drop — small, but it works against the allocation saving at n=8 noise floor.
+4. Steady c1 leaned 6:2 **bad** (med −32 MiB/s) without reaching crit — suggestive of drop-path lock cost, not proven.
+
+### Kept / artifacts
+
+- `scripts/r4_ab_bench.ps1`, `bench/r4_ab_rushway.csv`, `bench/r4_ab_raw.log`: rejection evidence.
+- `bench/oldbin/rushway_r3_base.exe`: candidate-3 baseline for future pairs (gitignored).
+- Source: `git checkout -- src/ws.rs src/protocol.rs src/runtime.rs src/nonmux.rs src/wss_client.rs src/bin/mux_bench.rs` — tree clean vs origin/main (only untracked A/B artifacts remain).
+
+### Next Round-2 candidates (updated order)
+
+5. Relay-side frame aggregation (larger WS frames → fewer headers/syscalls) — heavier design, needs careful GoWay parity check first.
+6. Re-check `runtime.rs` RSS trend at higher n.
+- Read-path pooling (candidate 4) is closed: do not retry with only pool-size tweaks — the per-frame `reserve` is below the noise floor on this bench.
+
+### Status / next action
+
+- **Status:** rejected (noise, not forward). Working tree at origin/main + this handoff (ahead 1 with accepted candidate 3); rejection chapters committed with v0.0.28.
+- **Next action:** candidate 5 (after GoWay parity review) or RSS re-check / goal #3 TUI.
+
+## Round-2 attempt: bulk direct-read zero-copy encode — REJECTED (2026-09-24, goal #1)
+
+### What was tried
+
+- Reinterpreted candidate 5 after GoWay parity review: GoWay `muxOutboundWriter` writes one frame at a time with no writev aggregation and copies payload into BufPool before enqueue — rushway's writev batching already beat that; the remaining gap was the `extend_from_slice(payload)` copy inside `encode_mux_ws_frame` (pprof: server encode cum ~14%, of which `write_frame_parts` ~38% was that copy; client similar).
+- Design: read TCP **directly into the encode buffer** after a fixed header gap (`DIRECT_HDR_RESERVE_*` = 21 masked / 17 unmasked), then seal in place via new `finish_direct_encode` (shift payload left with `copy_within` when actual header < reserve, append obfs pad, fused cipher+mask via shared `seal_mux_region`).
+- Hot paths rewritten: `mux_pool::handle_tcp_proxy` upload loop and `runtime::target_to_mux` — no relay-buf staging, one read ≤ `u16::MAX` per MUX DATA frame; FIN/RST still on `encode_mux_ws_frame`.
+- `encode_mux_ws_frame` refactored to call the same `seal_mux_region` so direct and non-direct paths share the seal pass.
+- Unit tests: `finish_direct_encode_matches_encode_mux_ws_frame` (byte-for-byte unmasked; masked round-trip decode), `prepare_direct_read_grows_mid_sized_pool_buffer`.
+
+### Bug found and fixed before the accepted A/B
+
+- First A/B: **all 16 r5 runs ConnectionReset** on `payload_echo_read`. Root cause: `prepare_direct_read` used `buf.reserve(need - buf.capacity())` after `clear()` (len=0). `Vec::reserve` is relative to **len**, so a pooled buffer already holding `[need/2, need)` never grew; `set_len(need)` then went past capacity → heap corruption → peer reset.
+- Fix: `if buf.capacity() < need { buf.reserve(need); }` (with len=0 this guarantees capacity ≥ need) + `debug_assert` + regression test. Smoke pair then succeeded (r5 beat base on every metric, n=1).
+
+### Evidence (same-session paired, Windows)
+
+- Baseline: `bench/oldbin/rushway_r3_base.exe` (accepted candidate-3 HEAD `bbbc0a9`).
+- Candidate: `target\release\rushway.exe` after direct-encode edits + reserve fix.
+- Harness: `scripts/r5_ab_bench.ps1`, labels `rushway_base` vs `rushway_r5`, n=8 × setup+steady.
+- Artifacts: `bench/r5_ab_rushway.csv`, `bench/r5_ab_raw.log` (first failed run overwritten by the post-fix full run).
+- `cargo check` OK; **108/108 tests green** (107 prior + new direct-encode tests) before A/B.
+- **setup: NOISE on all five metrics** (c1 6:2 good med +33.6, c8 5:3 bad, c32 5:3 bad, cpu 4:4, rss 3:5 good) — no metric reached crit=8.
+- **steady: NOISE on all five metrics** (c1 7:1 good med +15.5, c8 4:4, c32 4:4, cpu 2:6 good, rss 7:1 good med −19.4) — no metric reached crit=8.
+- Forward-only rule: **no FORWARD beyond noise** ⇒ **rejected**. No REGRESSION either — pure wash (c1/rss leaned good both modes but 7:1 < 8:0).
+
+### Why it lost (for the next attempt)
+
+1. The eliminated `extend_from_slice` copy is a single pass over ≤64 KiB per frame; on loopback proxy_bench that sits below the same noise floor that killed candidate 4's per-frame `reserve` save.
+2. Direct path forces one read ≤ `u16::MAX` per frame (was: read `buffer_size` 128 KiB then split) — **more read syscalls** trade against the saved memcpy; net wash is consistent with the data.
+3. c1 and rss leaned good in both modes (7:1 / 6:2) without hitting crit — suggestive of real but sub-noise-floor wins; not enough under the pre-registered gate.
+4. Setup c8/c32 leaned slightly bad (5:3) — cold-path control/handshake frames still use `encode_mux_ws_frame`, so the direct path only pays off after bulk starts.
+
+### Kept / artifacts
+
+- `scripts/r5_ab_bench.ps1`, `bench/r5_ab_rushway.csv`, `bench/r5_ab_raw.log`: rejection evidence.
+- `bench/oldbin/rushway_r3_base.exe`: candidate-3 baseline (gitignored).
+- Source: `git checkout -- src/mux_writer.rs src/mux_pool.rs src/runtime.rs` — tree back to origin/main + this handoff only (untracked r4/r5 A/B artifacts remain).
+
+### Next Round-2 candidates (updated order)
+
+5. **Closed:** bulk direct-read zero-copy — do not retry with only header-reserve or read-size tweaks; the memcpy/syscall trade is at the noise floor on this bench.
+6. Re-check `runtime.rs` RSS trend at higher n.
+- Candidates 4 and 5 both closed: remaining gap is at the noise floor for micro-optimizations of the MUX DATA path.
+
+### Status / next action
+
+- **Status:** rejected (noise, not forward). Source reverted to origin/main; candidate-3 (`bbbc0a9`) remains the only Round-2 change on main. This chapter + candidate-4 chapter land with the v0.0.28 release commit.
+- **Next action:** RSS trend re-check (candidate 6) is the only remaining Round-2 item; otherwise stop Round-2 micro-opts and proceed to goal #3 real-TTY TUI sign-off.
+
+## Release: v0.0.28 (2026-09-24, goal #1/#2)
+
+### Scope (vs v0.0.27)
+
+- **Ship:** Round-2 candidate 3 — outbound encode buffer pool (`bbbc0a9`), A/B forward on setup+steady c8/c32 (8:0 both modes).
+- **Do not ship:** Round-2 candidates 2 (WS prefill), 2c (cold-wake coalesce), 4 (read-frame pool), 5 (bulk direct-read zero-copy) — all rejected and source-reverted; rejection chapters + A/B artifacts in this commit.
+- **CI:** Rust 1.88 pin, `release.yml` duplicate-toolchain fix (release builds need ≥1.88 for `slice_as_chunks`).
+
+### Validation
+
+- `cargo check` / `cargo test` green on the encode-pool HEAD before the rejection-chapter-only docs commit; source tree after candidate-5 revert identical to `bbbc0a9`.
+- A/B evidence: `bench/r3d_ab_*` (accept), `bench/r4_ab_*` / `bench/r5_ab_*` (reject), `bench/r1_ab_*` (Round-1).
+
+### Status
+
+- **Status:** version bumped 0.0.27→0.0.28; tagged; pushed with Release.
+- **Next action:** goal #3 real-TTY TUI sign-off; optional candidate 6 RSS n-recheck.

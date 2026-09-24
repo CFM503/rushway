@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.28] - 2026-09-24
+
+### Added
+- **Outbound encode buffer pool (Round-2 candidate 3)**: process-wide pool (32 × 80 KiB ceiling) recycles pre-encoded MUX frames after the writer flushes them; bulk DATA encode becomes `clear` + no-op `reserve` instead of per-frame `malloc`/`free`. Writer loop drains batches back into the pool (`recycle_encode_buf`).
+
+### Changed
+- Round-2 A/B harnesses and rejection evidence committed: `scripts/r{4,5}_ab_bench.ps1`, `bench/r{4,5}_ab_{rushway.csv,raw.log}`.
+
+### Rejected (source not shipped)
+- **WS prefill read window**: setup cpu/c32 8:0 REGRESSED — reverted.
+- **writer_loop cold-wake coalesce**: NOISE both modes — reverted.
+- **read-frame buffer pool**: NOISE both modes — reverted.
+- **bulk direct-read zero-copy encode**: NOISE both modes (after fixing a `Vec::reserve` capacity bug that caused ConnectionReset on first run) — reverted. Full analysis in `AI_HANDOFF.md`.
+
+### Validation
+- Candidate 3 accepted: Windows paired A/B n=8 × setup+steady — setup c8/c32 FORWARD 8:0, steady c8/c32 FORWARD 8:0, no metric beyond-noise regressed (`bench/r3d_ab_rushway.csv`).
+- `cargo test` 108+12 green at candidate-3 HEAD; post-revert tree matches `bbbc0a9` source.
+- CI: Rust pin 1.85→1.88 (`slice_as_chunks`); duplicate `toolchain` key fixed in `release.yml`.
+
 ## [v0.0.26] - 2026-09-23
 
 ### Added
