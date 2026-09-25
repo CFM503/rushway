@@ -2,7 +2,7 @@ use crate::crypto::XorCipher;
 use crate::dns::{self, resolve_all_ipv4};
 use crate::proxy::{parse_authority_with_default, parse_socks5_udp_datagram, TargetAddr};
 use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
-use crate::udp_batch::UdpBatchReader;
+use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
     build_client_handshake_request, read_frame, read_http_headers,
     validate_client_handshake_response, write_frame,
@@ -184,6 +184,7 @@ pub async fn handle_local_udp_proxy(
         Ok::<(), anyhow::Error>(())
     });
     let mut dummy = [0u8; 1];
+    let mut batch_writer = UdpBatchWriter::new(udp.clone());
     tokio::select! {
         _ = control.read(&mut dummy) => {}
         _ = async {
@@ -208,10 +209,11 @@ pub async fn handle_local_udp_proxy(
                 }
                 if let Some(peer) = *latest.lock().await {
                     let n = packet.len();
-                    let _ = udp.send_to(&packet, peer).await;
+                    let _ = batch_writer.send(&packet, peer).await;
                     crate::stats::add_bytes(0, n as i64);
                 }
             }
+            let _ = batch_writer.flush().await;
             Ok::<(), anyhow::Error>(())
         } => {}
     }

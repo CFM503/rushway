@@ -9,7 +9,7 @@ use crate::protocol::{
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
 };
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
-use crate::udp_batch::UdpBatchReader;
+use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame, read_frame_owned,
     read_http_headers, validate_server_handshake, write_frame, write_frame_borrowed,
@@ -1053,6 +1053,7 @@ async fn handle_server_udp_parts(
         Ok::<(), anyhow::Error>(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut batch_writer = UdpBatchWriter::new(udp.clone());
     loop {
         let Some((opcode, mut packet)) = read_frame(
             &mut rd,
@@ -1077,8 +1078,9 @@ async fn handle_server_udp_parts(
             Err(_) => continue,
         };
         crate::stats::add_bytes(payload.len() as i64, 0);
-        let _ = udp.send_to(payload, addr).await?;
+        let _ = batch_writer.send(payload, addr).await;
     }
+    let _ = batch_writer.flush().await;
     send_task.abort();
     Ok(())
 }

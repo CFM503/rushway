@@ -81,6 +81,90 @@ impl UdpBatchReader {
     }
 }
 
+/// Batched UDP outbound writer.
+///
+/// Uses `sendmmsg` on Linux to emit up to [`UDP_BATCH`] datagrams per syscall,
+/// amortizing kernel context switch overhead during DNS bursts and high-PPS traffic.
+/// Falls back to single `try_send_to` calls on non-Linux platforms.
+pub(crate) struct UdpBatchWriter {
+    sock: Arc<tokio::net::UdpSocket>,
+    queue: Vec<(Vec<u8>, SocketAddr)>,
+}
+
+impl UdpBatchWriter {
+    pub(crate) fn new(sock: Arc<tokio::net::UdpSocket>) -> Self {
+        Self {
+            sock,
+            queue: Vec::with_capacity(UDP_BATCH),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Appends a datagram to the batch. Flushes automatically when reaching [`UDP_BATCH`].
+    pub(crate) async fn push(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
+        self.queue.push((payload.to_vec(), addr));
+        if self.queue.len() >= UDP_BATCH {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Flushes all pending datagrams in the batch.
+    pub(crate) async fn flush(&mut self) -> io::Result<usize> {
+        if self.queue.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0;
+        while !self.queue.is_empty() {
+            self.sock.writable().await?;
+            let take = self.queue.len().min(UDP_BATCH);
+            let slice: Vec<(&[u8], SocketAddr)> = self.queue[..take]
+                .iter()
+                .map(|(p, a)| (p.as_slice(), *a))
+                .collect();
+
+            #[cfg(target_os = "linux")]
+            match send_batch_linux(&self.sock, &slice) {
+                Ok(n) if n > 0 => {
+                    self.queue.drain(..n);
+                    total += n;
+                }
+                Ok(_) => break,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            match send_batch_fallback(&self.sock, &slice) {
+                Ok(n) if n > 0 => {
+                    self.queue.drain(..n);
+                    total += n;
+                }
+                Ok(_) => break,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+
+    /// Immediately sends a datagram, flushing any previously queued datagrams in the same syscall.
+    pub(crate) async fn send(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
+        self.push(payload, addr).await?;
+        self.flush().await?;
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn recv_batch_linux(
     sock: &tokio::net::UdpSocket,
@@ -158,6 +242,109 @@ fn sockaddr_to_std(ss: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Res
     }
 }
 
+#[cfg(target_os = "linux")]
+fn std_to_sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin as *const _ as *const u8,
+                    &mut ss as *mut _ as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+            (ss, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flow_info(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin6 as *const _ as *const u8,
+                    &mut ss as *mut _ as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                );
+            }
+            (ss, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn send_batch_linux(
+    sock: &tokio::net::UdpSocket,
+    pkts: &[(&[u8], SocketAddr)],
+) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    if pkts.is_empty() {
+        return Ok(0);
+    }
+    let count = pkts.len().min(UDP_BATCH);
+    let fd = sock.as_raw_fd();
+
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; UDP_BATCH];
+    let mut msgs: [libc::mmsghdr; UDP_BATCH] = unsafe { std::mem::zeroed() };
+    let mut addrs: [libc::sockaddr_storage; UDP_BATCH] = unsafe { std::mem::zeroed() };
+
+    for i in 0..count {
+        let (payload, dest) = pkts[i];
+        let (ss, ss_len) = std_to_sockaddr(dest);
+        addrs[i] = ss;
+        iovs[i].iov_base = payload.as_ptr() as *mut libc::c_void;
+        iovs[i].iov_len = payload.len();
+
+        msgs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+        msgs[i].msg_hdr.msg_namelen = ss_len;
+        msgs[i].msg_hdr.msg_iov = &mut iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    let ret = unsafe {
+        libc::sendmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            count as _,
+            0,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ret as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn send_batch_fallback(
+    sock: &tokio::net::UdpSocket,
+    pkts: &[(&[u8], SocketAddr)],
+) -> io::Result<usize> {
+    if pkts.is_empty() {
+        return Ok(0);
+    }
+    let (payload, dest) = pkts[0];
+    sock.try_send_to(payload, dest).map(|_| 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +378,30 @@ mod tests {
             }
         }
         assert_eq!(got, K);
+    }
+
+    #[tokio::test]
+    async fn batch_writer_delivers_in_order() {
+        let rx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut writer = UdpBatchWriter::new(tx);
+        const K: usize = 32;
+        for i in 0..K {
+            let msg = [((i >> 8) & 0xff) as u8, (i & 0xff) as u8, 0xEF, 0x12];
+            writer.push(&msg, rx_addr).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        let mut buf = [0u8; 128];
+        for i in 0..K {
+            let (n, _) = rx.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 4);
+            let want = i as u16;
+            assert_eq!(buf[0], ((want >> 8) & 0xff) as u8);
+            assert_eq!(buf[1], (want & 0xff) as u8);
+            assert_eq!(buf[2], 0xEF);
+            assert_eq!(buf[3], 0x12);
+        }
     }
 }

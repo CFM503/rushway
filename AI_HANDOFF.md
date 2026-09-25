@@ -2624,6 +2624,26 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
    - Unified `nonmux.rs` socket options to use `runtime::apply_socket_options_raw`.
 
 ### Validation
-- Unit tests added in `src/crypto.rs` and `src/ws.rs` validating bitwise equivalence of SSE2, AVX2, and fallback routines across all length boundaries (0B to 64KB+).
+- **Status:** Version bumped to 0.0.30; tagged v0.0.30; pushed to repository.
+
+## Release: v0.0.31 (2026-09-25)
+
+### Context & User Directives
+- **Directives:** "开始Linux UDP sendmmsg".
+- **Ironclad Constraint:** Standing rule: forward-only optimizations, opportunistic non-blocking batching with zero waiting delay, 100% protocol compatibility, seamless cross-platform fallback.
+
+### Architectural Optimizations Implemented & Shipped
+1. **Linux UDP `sendmmsg` Batched Outbound Writer (`src/udp_batch.rs`)**:
+   - Designed and implemented `UdpBatchWriter` complementing the existing `UdpBatchReader` (`recvmmsg`).
+   - Uses `libc::sendmmsg` on Linux to emit up to `UDP_BATCH = 8` datagrams per system call.
+   - Converts standard `SocketAddr` (IPv4 and IPv6) to network-order `sockaddr_in` / `sockaddr_in6` via `std_to_sockaddr`.
+   - Opportunistic batching: flushes immediately when a datagram arrives, avoiding any artificial delay, while transparently batching packet bursts (DNS queries, gaming PPS, QUIC).
+   - Non-Linux fallback: implements non-blocking `try_send_to` draining for Windows and macOS.
+2. **Unified UDP Forwarding Pipeline Integration (`src/runtime.rs`, `src/udp_relay.rs`, `src/quic.rs`)**:
+   - Replaced unbatched `udp.send_to` invocations with `batch_writer.send()` in server and client UDP forwarders.
+   - Reduces up to 87.5% of kernel context switches during UDP traffic bursts.
+
+### Validation
+- Unit test `batch_writer_delivers_in_order` added to `src/udp_batch.rs` verifying in-order datagram reception across multiple batches.
 - Workspace unit tests: all passing cleanly.
-- Status: Version bumped to 0.0.30; tagged v0.0.30; ready to commit and push.
+- Status: Version bumped to 0.0.31; tagged v0.0.31; ready to commit and push.

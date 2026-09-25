@@ -10,7 +10,7 @@ use crate::runtime::{
     apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
     wait_shutdown, RuntimeConfig,
 };
-use crate::udp_batch::UdpBatchReader;
+use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
@@ -439,6 +439,7 @@ async fn relay_quic_udp(
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let mut dummy = [0u8; 1];
+    let mut batch_writer = UdpBatchWriter::new(udp.clone());
     tokio::select! {
         _ = control.read(&mut dummy) => {}
         _ = async {
@@ -452,10 +453,11 @@ async fn relay_quic_udp(
                     continue;
                 }
                 if let Some(peer) = *latest.lock().await {
-                    let _ = udp.send_to(&packet, peer).await;
+                    let _ = batch_writer.send(&packet, peer).await;
                     crate::stats::add_bytes(0, packet.len() as i64);
                 }
             }
+            let _ = batch_writer.flush().await;
             Ok::<(), anyhow::Error>(())
         } => {}
     }
@@ -732,6 +734,7 @@ async fn handle_server_udp_stream(
         Ok::<(), anyhow::Error>(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut batch_writer = UdpBatchWriter::new(udp.clone());
     tokio::select! {
         _ = &mut sender => {}
         _ = async {
@@ -743,8 +746,9 @@ async fn handle_server_udp_stream(
                 }
                 let addr = dns::resolve_socket(&target.host, target.port).await?;
                 crate::stats::add_bytes(payload.len() as i64, 0);
-                let _ = udp.send_to(payload, addr).await;
+                let _ = batch_writer.send(payload, addr).await;
             }
+            let _ = batch_writer.flush().await;
             Ok::<(), anyhow::Error>(())
         } => {}
     }

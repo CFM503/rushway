@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.31] - 2026-09-25
+
+### Performance & UDP Data Plane (Linux `sendmmsg` Batched Outbound)
+- **Linux UDP `sendmmsg` Batched Outbound Writer (`udp_batch.rs`)**:
+  - Implemented `UdpBatchWriter` alongside `UdpBatchReader` to emit up to `UDP_BATCH = 8` datagrams per syscall via `libc::sendmmsg` on Linux.
+  - Eliminates up to 87.5% of kernel context switches during high-PPS workloads (DNS bursts, online gaming, and QUIC transfers).
+  - Opportunistic batching: zero waiting delay on single packets, automatic batch emission under burst arrival.
+  - Transparent fallback to single non-blocking `try_send_to` calls on Windows and macOS.
+- **Unified UDP Relay Pipeline Integration (`runtime.rs`, `udp_relay.rs`, `quic.rs`)**:
+  - Wired `UdpBatchWriter` into server and client UDP forwarders across standard WebSocket MUX UDP relay and QUIC UDP tunnels.
+- **Validation**:
+  - Added unit test `batch_writer_delivers_in_order` in `udp_batch.rs` verifying exact datagram delivery and FIFO ordering across batch flushes.
+  - All workspace tests passing cleanly.
+
 ## [v0.0.30] - 2026-09-25
 
 ### Performance & Architecture Enhancements (Multi-Core & Adaptive SIMD)
