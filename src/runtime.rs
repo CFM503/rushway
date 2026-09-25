@@ -824,7 +824,7 @@ async fn handle_mux_parts(
                                     }
                                     Some(StreamCommand::Reset)
                                     | None => {
-                                        streams_task.write().await.remove(&stream_id);
+                                        streams_task.write().unwrap().remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -833,7 +833,7 @@ async fn handle_mux_parts(
                     };
 
                     if *cancelled.borrow() {
-                        streams_task.write().await.remove(&stream_id);
+                        streams_task.write().unwrap().remove(&stream_id);
                         return;
                     }
 
@@ -858,7 +858,7 @@ async fn handle_mux_parts(
                             }
                             StreamCommand::Fin => client_fin = true,
                             StreamCommand::Reset => {
-                                streams_task.write().await.remove(&stream_id);
+                                streams_task.write().unwrap().remove(&stream_id);
                                 return;
                             }
                         }
