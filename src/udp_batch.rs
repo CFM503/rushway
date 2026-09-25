@@ -268,7 +268,7 @@ fn std_to_sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t
             let sin6 = libc::sockaddr_in6 {
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: v6.port().to_be(),
-                sin6_flowinfo: v6.flow_info(),
+                sin6_flowinfo: v6.flowinfo(),
                 sin6_addr: libc::in6_addr {
                     s6_addr: v6.ip().octets(),
                 },

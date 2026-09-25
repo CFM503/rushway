@@ -2676,3 +2676,16 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 ### Validation
 - Unit test `test_apply_socket_and_listener_options` added in `src/runtime.rs` verifying seamless execution and error-free operation on both client and server sockets.
 - Status: Version bumped to 0.0.32; tagged v0.0.32; committed and pushed to remote repository.
+
+### CI/CD & Build Pipeline Fixes (GitHub Actions Release Workflow)
+- **Problem:** GitHub Actions releases failed on versions 0.0.29, 0.0.30, 0.0.31, 0.0.32:
+  1. *Windows x64:* `.cargo/config.toml` link flag `link-self-contained=yes` clashed with Ubuntu MinGW `crt2.o`; `libmimalloc-sys` failed compilation due to Ubuntu 22.04 MinGW missing `ERROR_COMMITMENT_MINIMUM`.
+  2. *Linux/ARM:* `src/udp_batch.rs:271` used nonexistent `v6.flow_info()` instead of standard `v6.flowinfo()`.
+  3. *Main:* `src/main.rs:355` had borrow of moved value `cfg` inside loop in `run_wss_server`.
+  4. *Workflow Dispatch:* `publish` job in `release.yml` had condition `startsWith(github.ref, 'refs/tags/v')`, skipping publication entirely on manual `workflow_dispatch` button clicks.
+- **Fixes Applied:**
+  1. Enhanced `.github/workflows/release.yml` with `workflow_dispatch` inputs (`tag_name`, `draft`, `prerelease`) and allowed `publish` on `workflow_dispatch`. Added `workflow_dispatch` to `ci.yml`.
+  2. Removed `.cargo/config.toml`.
+  3. Scoped `mimalloc` in `Cargo.toml` and `src/main.rs` to `target_os = "linux"` (64-bit).
+  4. Fixed `v6.flowinfo()` in `src/udp_batch.rs`.
+  5. Cloned `cfg2` before `set.spawn` in `src/main.rs`.

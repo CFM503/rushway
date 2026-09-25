@@ -28,7 +28,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_os = "linux"
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -354,6 +357,7 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                 let (stream, peer) = res?;
                 runtime::apply_socket_options(&stream, &cfg);
                 let acceptor = acceptor.clone();
+                let cfg2 = cfg.clone();
                 set.spawn(async move {
                     let _conn = stats::ConnGuard::new();
                     let result = async {
@@ -376,7 +380,7 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                         }
                         let mut internal = internal
                             .ok_or_else(|| anyhow!("private WS runtime did not start"))?;
-                        runtime::apply_socket_options(&internal, &cfg);
+                        runtime::apply_socket_options(&internal, &cfg2);
                         let (request, key) = ws::build_client_handshake_request(
                             &format!("127.0.0.1:{internal_port}"),
                             "/",

@@ -22,8 +22,17 @@ All notable changes to this project will be documented in this file.
 - **Comprehensive Socket & Listener Option Coverage**:
   - Injected missing `apply_socket_options` on client accept loops in `nonmux.rs` and `quic.rs`.
   - Injected missing `apply_socket_options` on inbound TLS and internal loopback streams in `main.rs:run_wss_server`.
-- **Validation**:
-  - Added unit test `test_apply_socket_and_listener_options` in `runtime.rs` verifying seamless execution and error-free operation on both client and server sockets.
+### CI/CD & Build Pipeline Fixes
+- **Interactive Manual Release Button (`workflow_dispatch`) (`.github/workflows/release.yml`)**:
+  - Enhanced `release.yml` with configurable `workflow_dispatch` inputs (`tag_name`, `draft`, `prerelease`), adding a "Run workflow" button in GitHub Actions web UI for one-click manual builds and releases.
+  - Fixed `publish` job execution logic (`startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'`), allowing manual releases without being skipped by branch triggers.
+  - Automatically identifies tag name from input, git tag ref, or `Cargo.toml`.
+  - Added `workflow_dispatch` trigger to `ci.yml` for on-demand CI runs.
+- **Fixed Cross-Compilation Linking & Syntax Errors**:
+  - Removed `.cargo/config.toml` link flag (`link-self-contained=yes`) which conflicted with Ubuntu MinGW `x86_64-w64-mingw32-ld` runtime libraries (`crt2.o`).
+  - Scoped `mimalloc` memory allocator to 64-bit Linux in `Cargo.toml` and `main.rs`, preventing MinGW C compilation error (`ERROR_COMMITMENT_MINIMUM`).
+  - Fixed `SocketAddrV6::flowinfo()` call in `udp_batch.rs` (previously invalid `flow_info()`).
+  - Fixed borrow of moved value `cfg` inside loop in `main.rs:run_wss_server`.
 
 ## [v0.0.31] - 2026-09-25
 

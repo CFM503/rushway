@@ -2,6 +2,21 @@ name: RushWay Release Artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag to build and publish (leave empty for current version)'
+        required: false
+        default: ''
+      draft:
+        description: 'Publish as draft release'
+        type: boolean
+        required: false
+        default: false
+      prerelease:
+        description: 'Publish as prerelease'
+        type: boolean
+        required: false
+        default: false
   push:
     tags:
       - 'v*'
@@ -15,6 +30,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
       - name: Install MinGW toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - uses: dtolnay/rust-toolchain@stable
@@ -36,6 +53,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
       - name: Build inside Debian 12 (Bookworm)
         run: |
           docker run --rm \
@@ -54,6 +73,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
       - name: Build ARMv7 musl binary with cross-rs
         uses: houseabsolute/actions-rust-cross@v1
         with:
@@ -71,13 +92,16 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs:
       - windows-x64
       - debian12-x64
       - kwrt-armv7
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -85,10 +109,26 @@ jobs:
       - name: Generate SHA256 checksums
         working-directory: release-assets
         run: sha256sum * > SHA256SUMS.txt
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION=$(grep '^version =' Cargo.toml | head -n1 | cut -d '"' -f2)
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Release ${{ steps.vars.outputs.tag }}
           generate_release_notes: true
+          draft: ${{ github.event.inputs.draft == 'true' }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
           files: |
             release-assets/rushway-windows-x64.zip
             release-assets/rushway-debian12-x64.tar.gz
