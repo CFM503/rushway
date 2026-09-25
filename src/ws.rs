@@ -474,6 +474,137 @@ fn check_frame_args(payload_len: usize, opcode: u8) -> Result<()> {
     Ok(())
 }
 
+/// Applies or removes WebSocket 4-byte XOR masking in place.
+/// Uses runtime-detected AVX2 (256-bit) or SSE2 (128-bit) unrolled vector loops.
+pub(crate) fn apply_ws_mask(buf: &mut [u8], key: [u8; 4]) {
+    if buf.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::crypto::has_avx2() {
+            unsafe {
+                apply_ws_mask_avx2(buf, key);
+            }
+            return;
+        } else {
+            unsafe {
+                apply_ws_mask_sse2(buf, key);
+            }
+            return;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        apply_ws_mask_fallback(buf, key);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_ws_mask_avx2(buf: &mut [u8], key: [u8; 4]) {
+    use std::arch::x86_64::*;
+    let len = buf.len();
+    let k32 = u32::from_ne_bytes(key) as i32;
+    let k_vec = _mm256_set1_epi32(k32);
+    let mut i = 0;
+    while i + 128 <= len {
+        let d0 = _mm256_loadu_si256(buf.as_ptr().add(i) as *const __m256i);
+        let d1 = _mm256_loadu_si256(buf.as_ptr().add(i + 32) as *const __m256i);
+        let d2 = _mm256_loadu_si256(buf.as_ptr().add(i + 64) as *const __m256i);
+        let d3 = _mm256_loadu_si256(buf.as_ptr().add(i + 96) as *const __m256i);
+
+        _mm256_storeu_si256(buf.as_mut_ptr().add(i) as *mut __m256i, _mm256_xor_si256(d0, k_vec));
+        _mm256_storeu_si256(buf.as_mut_ptr().add(i + 32) as *mut __m256i, _mm256_xor_si256(d1, k_vec));
+        _mm256_storeu_si256(buf.as_mut_ptr().add(i + 64) as *mut __m256i, _mm256_xor_si256(d2, k_vec));
+        _mm256_storeu_si256(buf.as_mut_ptr().add(i + 96) as *mut __m256i, _mm256_xor_si256(d3, k_vec));
+        i += 128;
+    }
+    while i + 32 <= len {
+        let d = _mm256_loadu_si256(buf.as_ptr().add(i) as *const __m256i);
+        _mm256_storeu_si256(buf.as_mut_ptr().add(i) as *mut __m256i, _mm256_xor_si256(d, k_vec));
+        i += 32;
+    }
+    let k_sse = _mm_set1_epi32(k32);
+    while i + 16 <= len {
+        let d = _mm_loadu_si128(buf.as_ptr().add(i) as *const __m128i);
+        _mm_storeu_si128(buf.as_mut_ptr().add(i) as *mut __m128i, _mm_xor_si128(d, k_sse));
+        i += 16;
+    }
+    let k64 = (u32::from_ne_bytes(key) as u64) | ((u32::from_ne_bytes(key) as u64) << 32);
+    while i + 8 <= len {
+        let d = (buf.as_ptr().add(i) as *const u64).read_unaligned();
+        (buf.as_mut_ptr().add(i) as *mut u64).write_unaligned(d ^ k64);
+        i += 8;
+    }
+    while i < len {
+        *buf.get_unchecked_mut(i) ^= key[i & 3];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn apply_ws_mask_sse2(buf: &mut [u8], key: [u8; 4]) {
+    use std::arch::x86_64::*;
+    let len = buf.len();
+    let k32 = u32::from_ne_bytes(key) as i32;
+    let k_sse = _mm_set1_epi32(k32);
+    let mut i = 0;
+    while i + 64 <= len {
+        let d0 = _mm_loadu_si128(buf.as_ptr().add(i) as *const __m128i);
+        let d1 = _mm_loadu_si128(buf.as_ptr().add(i + 16) as *const __m128i);
+        let d2 = _mm_loadu_si128(buf.as_ptr().add(i + 32) as *const __m128i);
+        let d3 = _mm_loadu_si128(buf.as_ptr().add(i + 48) as *const __m128i);
+
+        _mm_storeu_si128(buf.as_mut_ptr().add(i) as *mut __m128i, _mm_xor_si128(d0, k_sse));
+        _mm_storeu_si128(buf.as_mut_ptr().add(i + 16) as *mut __m128i, _mm_xor_si128(d1, k_sse));
+        _mm_storeu_si128(buf.as_mut_ptr().add(i + 32) as *mut __m128i, _mm_xor_si128(d2, k_sse));
+        _mm_storeu_si128(buf.as_mut_ptr().add(i + 48) as *mut __m128i, _mm_xor_si128(d3, k_sse));
+        i += 64;
+    }
+    while i + 16 <= len {
+        let d = _mm_loadu_si128(buf.as_ptr().add(i) as *const __m128i);
+        _mm_storeu_si128(buf.as_mut_ptr().add(i) as *mut __m128i, _mm_xor_si128(d, k_sse));
+        i += 16;
+    }
+    let k64 = (u32::from_ne_bytes(key) as u64) | ((u32::from_ne_bytes(key) as u64) << 32);
+    while i + 8 <= len {
+        let d = (buf.as_ptr().add(i) as *const u64).read_unaligned();
+        (buf.as_mut_ptr().add(i) as *mut u64).write_unaligned(d ^ k64);
+        i += 8;
+    }
+    while i < len {
+        *buf.get_unchecked_mut(i) ^= key[i & 3];
+        i += 1;
+    }
+}
+
+pub(crate) fn apply_ws_mask_fallback(buf: &mut [u8], key: [u8; 4]) {
+    let mut mask32 = [0u8; 32];
+    for i in 0..8 {
+        mask32[i * 4..i * 4 + 4].copy_from_slice(&key);
+    }
+    let (chunks32, tail32) = buf.as_chunks_mut::<32>();
+    let chunks32_len = chunks32.len();
+    for chunk in chunks32 {
+        for b in 0..32 {
+            chunk[b] ^= mask32[b];
+        }
+    }
+    let (words, tail) = tail32.as_chunks_mut::<8>();
+    let words_len = words.len();
+    let mask64 = u64::from_ne_bytes(mask32[..8].try_into().unwrap());
+    for chunk in words {
+        let w = u64::from_ne_bytes(*chunk);
+        *chunk = (w ^ mask64).to_ne_bytes();
+    }
+    let start = chunks32_len * 32 + words_len * 8;
+    for (j, b) in tail.iter_mut().enumerate() {
+        *b ^= key[(start + j) & 3];
+    }
+}
+
 /// Encodes one complete WebSocket frame (header + optional mask + masked
 /// payload) into an owned byte buffer. The masking PRNG call happens here,
 /// on the caller's task, so a dedicated writer task can flush pre-encoded
@@ -499,9 +630,7 @@ pub fn encode_ws_frame(payload: &[u8], opcode: u8, masked: bool) -> Result<Vec<u
     let key = next_mask();
     frame.extend_from_slice(&key);
     frame.extend_from_slice(payload);
-    for (i, byte) in frame[header_len + 4..].iter_mut().enumerate() {
-        *byte ^= key[i & 3];
-    }
+    apply_ws_mask(&mut frame[header_len + 4..], key);
     Ok(frame)
 }
 
@@ -532,9 +661,7 @@ pub async fn write_frame_borrowed<W: AsyncWrite + Unpin>(
     let header_len = ws_header_into(&mut header, scratch.len(), opcode, masked);
     let key_opt = if masked {
         let key = next_mask();
-        for (i, byte) in scratch.iter_mut().enumerate() {
-            *byte ^= key[i & 3];
-        }
+        apply_ws_mask(scratch, key);
         Some(key)
     } else {
         None
@@ -693,28 +820,7 @@ where
             read += chunk;
         }
         if masked {
-            let mut mask32 = [0u8; 32];
-            for i in 0..8 {
-                mask32[i * 4..i * 4 + 4].copy_from_slice(&key);
-            }
-            let (chunks32, tail32) = buf.as_chunks_mut::<32>();
-            let chunks32_len = chunks32.len();
-            for chunk in chunks32 {
-                for b in 0..32 {
-                    chunk[b] ^= mask32[b];
-                }
-            }
-            let (words, tail) = tail32.as_chunks_mut::<8>();
-            let words_len = words.len();
-            let mask64 = u64::from_ne_bytes(mask32[..8].try_into().unwrap());
-            for chunk in words {
-                let w = u64::from_ne_bytes(*chunk);
-                *chunk = (w ^ mask64).to_ne_bytes();
-            }
-            let start = chunks32_len * 32 + words_len * 8;
-            for (j, b) in tail.iter_mut().enumerate() {
-                *b ^= key[(start + j) & 3];
-            }
+            apply_ws_mask(buf, key);
         }
         match opcode {
             1 | 2 => {
@@ -1044,6 +1150,27 @@ mod tests {
             .expect("read_frame hung");
             assert!(res.is_err(), "{what}: expected Err, decoded {res:?}");
             let _ = writer.await;
+        }
+    }
+
+    #[test]
+    fn test_apply_ws_mask_matches_reference() {
+        let key = [0x12, 0x34, 0x56, 0x78];
+        for len in [
+            0usize, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+            255, 256, 1000, 4096, 65535,
+        ] {
+            let orig: Vec<u8> = (0..len).map(|x| (x * 11 + 5) as u8).collect();
+            let mut expected = orig.clone();
+            for (i, b) in expected.iter_mut().enumerate() {
+                *b ^= key[i & 3];
+            }
+            let mut actual = orig.clone();
+            apply_ws_mask(&mut actual, key);
+            assert_eq!(actual, expected, "apply_ws_mask mismatch at len {len}");
+            // Round-trip back to original
+            apply_ws_mask(&mut actual, key);
+            assert_eq!(actual, orig, "apply_ws_mask round-trip failed at len {len}");
         }
     }
 }

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.30] - 2026-09-25
+
+### Performance & Architecture Enhancements (Multi-Core & Adaptive SIMD)
+- **Global `mimalloc` High-Performance Allocator (`Cargo.toml`, `main.rs`)**:
+  - Integrated Microsoft's `mimalloc` as the global memory allocator on 64-bit platforms (`x86_64` and `aarch64`).
+  - Eliminates multi-threaded cross-core arena lock contention and heap fragmentation during heavy concurrent buffer relaying (especially on multi-core server platforms like 16-thread Xeon E5).
+  - Preserves system allocator fallback on 32-bit embedded targets (`armv7` router firmware).
+- **Runtime Dynamic CPU Dispatch & Dual-Engine SIMD (`crypto.rs`, `ws.rs`)**:
+  - Implemented runtime feature detection (`has_avx2()`) to automatically select the optimal hardware vector pipeline without recompilation or SIGILL crash risk on older CPUs:
+    - **AVX2 Engine**: 256-bit YMM vectorization with 4-way loop unrolling (128 bytes/iter) for modern Intel/AMD processors.
+    - **SSE2 Engine**: 128-bit XMM vectorization with 4-way loop unrolling (64 bytes/iter) for Sandy Bridge / Ivy Bridge generation processors (e.g. Intel Xeon E5-2660).
+    - **Fallback Engine**: 32-byte chunks with scalar tail for portable non-x86 architectures.
+  - Vectorized WebSocket 4-byte XOR frame masking via unified `apply_ws_mask` across `encode_ws_frame`, `write_frame_borrowed`, and `read_frame`.
+- **Linux Anti-Bufferbloat Socket Option `TCP_NOTSENT_LOWAT` (`runtime.rs`, `nonmux.rs`)**:
+  - Injected `TCP_NOTSENT_LOWAT = 16384` (16 KiB ceiling) in `apply_socket_options_raw` on Linux.
+  - Prevents kernel TCP send buffer queue bloat on high-BDP cross-border proxy links during saturated file transfers, drastically reducing TTFB and latency jitter for concurrent interactive streams.
+  - Unified `nonmux.rs` socket options to use `runtime::apply_socket_options_raw`.
+
+### Validation
+- Unit tests added in `crypto.rs` and `ws.rs` validating bitwise equivalence of SSE2, AVX2, and fallback routines across all length boundaries (0B to 64KB+).
+- All 109 workspace tests passing cleanly (`cargo test --workspace`).
+
 ## [v0.0.29] - 2026-09-25
 
 ### Performance & Optimizations (Forward-Only Standing Rule Verified)

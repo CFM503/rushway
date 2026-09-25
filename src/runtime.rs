@@ -235,6 +235,23 @@ pub(crate) fn apply_socket_options_raw(
         let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
         let _ = sock.set_tcp_keepalive(&ka);
     }
+    #[cfg(target_os = "linux")]
+    {
+        // TCP_NOTSENT_LOWAT bounds unsent bytes buffered in the kernel send
+        // queue before poll/epoll reports writable. This prevents bufferbloat
+        // on high-BDP cross-border links (Cloudflare/HTTP2 standard practice: 16 KiB).
+        use std::os::fd::AsRawFd;
+        let lowat: libc::c_uint = 16384;
+        unsafe {
+            let _ = libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                &lowat as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&lowat) as libc::socklen_t,
+            );
+        }
+    }
 }
 pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
     apply_socket_options_raw(stream, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);

@@ -1,6 +1,6 @@
 [package]
 name = "rushway"
-version = "0.0.29"
+version = "0.0.30"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -29,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 webpki-roots = "0.26"
 zeroize = "=1.7.0"
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.13", features = ["prost-codec"] }

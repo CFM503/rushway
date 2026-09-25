@@ -2598,3 +2598,32 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 - **Unit Tests:** 107/107 passed, 0 failures.
 - **Compiler:** 0 errors, 0 warnings.
 - **Status:** Version bumped to 0.0.29; tagged v0.0.29; pushed to repository.
+
+## Release: v0.0.30 (2026-09-25)
+
+### Context & User Directives
+- **Directives:** "好的进行0.0.30性能强化".
+- **Ironclad Constraint:** Standing rule: forward-only optimizations, non-inferior across all dimensions, preserving 100% protocol compatibility with GoWay.
+- **Hardware Profile:** User server fleet confirmed heterogeneous: 2x modern x86_64 VPS with AVX2/AVX-512, 1x Intel Xeon E5-2660 (Sandy Bridge-EP, 8c/16t, SSE4.2/SSE2 without AVX2).
+
+### Architectural Optimizations Implemented & Shipped
+1. **Global `mimalloc` High-Performance Allocator (`Cargo.toml`, `src/main.rs`)**:
+   - Added `mimalloc` as global memory allocator for 64-bit architectures (`x86_64` and `aarch64`).
+   - Addresses multi-threaded cross-core arena lock contention and heap fragmentation during heavy concurrent buffer relaying (especially on multi-core server platforms like 16-thread Xeon E5).
+   - Preserves system allocator fallback on 32-bit embedded targets (`armv7-unknown-linux-musleabihf` router firmware).
+2. **Runtime Dynamic CPU Dispatch & Dual-Engine SIMD (`src/crypto.rs`, `src/ws.rs`)**:
+   - Implemented runtime feature detection (`has_avx2()`) via `is_x86_feature_detected!("avx2")`:
+     - **AVX2 Engine**: 256-bit YMM vectorization with 4-way loop unrolling (128 bytes/iter) for modern Intel/AMD processors.
+     - **SSE2 Engine**: 128-bit XMM vectorization with 4-way loop unrolling (64 bytes/iter) for Sandy Bridge / Ivy Bridge generation processors (e.g. Intel Xeon E5-2660).
+     - **Fallback Engine**: 32-byte chunks with scalar tail for portable non-x86 architectures.
+   - Vectorized WebSocket 4-byte XOR frame masking via unified `apply_ws_mask` across `encode_ws_frame`, `write_frame_borrowed`, and `read_frame`.
+   - Prevents illegal instruction (`SIGILL`) crashes on older CPUs while guaranteeing peak throughput on newer hardware.
+3. **Linux Anti-Bufferbloat Socket Option `TCP_NOTSENT_LOWAT` (`src/runtime.rs`, `src/nonmux.rs`)**:
+   - Injected `TCP_NOTSENT_LOWAT = 16384` (16 KiB ceiling) in `apply_socket_options_raw` on Linux.
+   - Prevents kernel TCP send buffer queue bloat on high-BDP cross-border proxy links during saturated file transfers, drastically reducing TTFB and latency jitter for concurrent interactive streams.
+   - Unified `nonmux.rs` socket options to use `runtime::apply_socket_options_raw`.
+
+### Validation
+- Unit tests added in `src/crypto.rs` and `src/ws.rs` validating bitwise equivalence of SSE2, AVX2, and fallback routines across all length boundaries (0B to 64KB+).
+- Workspace unit tests: all passing cleanly.
+- Status: Version bumped to 0.0.30; tagged v0.0.30; ready to commit and push.

@@ -87,17 +87,12 @@ async fn connect_ws_with_fallback(
     Err(failed)
 }
 fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
-    let sock = SockRef::from(stream);
-    let _ = sock.set_nodelay(cfg.tcp_nodelay);
-    if cfg.socket_buffer > 0 {
-        let bytes = cfg.socket_buffer.saturating_mul(1024);
-        let _ = sock.set_send_buffer_size(bytes);
-        let _ = sock.set_recv_buffer_size(bytes);
-    }
-    if cfg.tcp_keepalive {
-        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
-        let _ = sock.set_tcp_keepalive(&ka);
-    }
+    crate::runtime::apply_socket_options_raw(
+        stream,
+        cfg.tcp_nodelay,
+        cfg.socket_buffer,
+        cfg.tcp_keepalive,
+    );
 }
 
 async fn open_upstream(
