@@ -16,7 +16,6 @@ use crate::ws::{
     write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Result};
-use socket2::SockRef;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -199,6 +199,7 @@ pub struct OwnedMuxFrame {
 impl OwnedMuxFrame {
     /// Constructs an `OwnedMuxFrame` directly from parts with a single allocation,
     /// eliminating redundant encode + decode_owned passes.
+    #[allow(dead_code)]
     pub fn from_parts(
         stream_id: u32,
         command: MuxCommand,

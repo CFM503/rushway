@@ -188,10 +188,10 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
                 Ok(_) => {
                     out.push(b[0]);
                     if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
-                        return Ok(out);
+                        return Ok(());
                     }
                     if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" {
-                        return Ok(out);
+                        return Ok(());
                     }
                     if out.len() >= MAX_HTTP_HEADER_SIZE {
                         bail!("header too large");
@@ -225,7 +225,10 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
     .await;
 
     match read_result {
-        Ok(res) => res,
+        Ok(res) => {
+            res?;
+            Ok(out)
+        }
         Err(_elapsed) => {
             if out.is_empty() {
                 tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
