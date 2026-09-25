@@ -253,24 +253,23 @@ pub(crate) fn apply_fused_xor(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
     if region.is_empty() || ks.is_empty() {
         return;
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            unsafe { apply_fused_xor_avx2(region, ks, key) };
-            return;
-        } else {
-            unsafe { apply_fused_xor_sse2(region, ks, key) };
-            return;
+    for chunk in region.chunks_mut(ks.len()) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has_avx2() {
+                unsafe { apply_fused_xor_avx2(chunk, ks, key) };
+            } else {
+                unsafe { apply_fused_xor_sse2(chunk, ks, key) };
+            }
         }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { apply_fused_xor_neon(region, ks, key) };
-        return;
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        apply_fused_xor_fallback(region, ks, key);
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { apply_fused_xor_neon(chunk, ks, key) };
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            apply_fused_xor_fallback(chunk, ks, key);
+        }
     }
 }
 
@@ -613,39 +612,40 @@ mod tests {
         let ws_mask = [0x12, 0x34, 0x56, 0x78];
         for len in [
             0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256,
-            1000, 2048,
+            1000, 2048, 2049, 4096, 4097, 8192, 65536,
         ] {
             let orig: Vec<u8> = (0..len).map(|x| (x * 7 + 3) as u8).collect();
             let mut ref_buf = orig.clone();
             for (i, b) in ref_buf.iter_mut().enumerate() {
                 *b ^= key_data[i % key_data.len()] ^ ws_mask[i & 3];
             }
-            let key_expanded: Vec<u8> = (0..len).map(|i| key_data[i % key_data.len()]).collect();
 
             let mut fused_buf = orig.clone();
-            apply_fused_xor(&mut fused_buf, &key_expanded, ws_mask);
+            apply_fused_xor(&mut fused_buf, &key_data, ws_mask);
             assert_eq!(fused_buf, ref_buf, "fused dispatcher mismatch at len {len}");
 
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut sse_buf = orig.clone();
-                unsafe {
-                    apply_fused_xor_sse2(&mut sse_buf, &key_expanded, ws_mask);
-                }
-                assert_eq!(sse_buf, ref_buf, "fused SSE2 mismatch at len {len}");
-
-                if has_avx2() {
-                    let mut avx_buf = orig.clone();
+            if len <= key_data.len() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut sse_buf = orig.clone();
                     unsafe {
-                        apply_fused_xor_avx2(&mut avx_buf, &key_expanded, ws_mask);
+                        apply_fused_xor_sse2(&mut sse_buf, &key_data, ws_mask);
                     }
-                    assert_eq!(avx_buf, ref_buf, "fused AVX2 mismatch at len {len}");
-                }
-            }
+                    assert_eq!(sse_buf, ref_buf, "fused SSE2 mismatch at len {len}");
 
-            let mut fb_buf = orig.clone();
-            apply_fused_xor_fallback(&mut fb_buf, &key_expanded, ws_mask);
-            assert_eq!(fb_buf, ref_buf, "fused fallback mismatch at len {len}");
+                    if has_avx2() {
+                        let mut avx_buf = orig.clone();
+                        unsafe {
+                            apply_fused_xor_avx2(&mut avx_buf, &key_data, ws_mask);
+                        }
+                        assert_eq!(avx_buf, ref_buf, "fused AVX2 mismatch at len {len}");
+                    }
+                }
+
+                let mut fb_buf = orig.clone();
+                apply_fused_xor_fallback(&mut fb_buf, &key_data, ws_mask);
+                assert_eq!(fb_buf, ref_buf, "fused fallback mismatch at len {len}");
+            }
         }
     }
 }
