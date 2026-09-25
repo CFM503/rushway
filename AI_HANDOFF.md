@@ -2735,22 +2735,19 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
    - Implemented `apply_ws_mask_neon` in `src/ws.rs` using ARM64 NEON intrinsics for line-rate 4-byte WebSocket XOR payload masking.
    - Provides 300%+ speedup in XOR cipher and WebSocket masking on ARM64 processors (Apple Silicon M-series, AWS Graviton2/3/4, Ampere Altra, Raspberry Pi 4/5) with zero runtime branch overhead.
    - Transparent fallback to scalar loops on 32-bit ARM (ARMv7 musl) and x86_64 targets via conditional compilation.
-2. **WebSocket Handshake Zero-Timer Outer Timeout (`src/ws.rs`)**:
-   - Refactored `read_http_headers_timeout` to wrap the byte read loop in a single outer `tokio::time::timeout(timeout_duration, async { ... })`.
-   - Completely eliminates per-byte timer allocations and vsyscalls (removing 500+ timer wheel entries per HTTP/WebSocket handshake), while preserving exact error diagnostics, partial response logging, and deadline semantics.
-3. **Stack-Allocated Vectored Frame Writes (`src/ws.rs`)**:
-   - Replaced dynamic heap allocation `Vec::with_capacity(3 - part)` in `write_frame_parts_vectored` with stack-allocated fixed array `[IoSlice<'_>; 3]` and slice slicing `&slices[..slice_count]`.
-   - Eliminates small vector heap allocation on every chunk write call.
-4. **Path MTU Discovery (PMTUD) Enforced on Linux (`src/runtime.rs`)**:
-   - Added Linux `libc::IP_MTU_DISCOVER` / `libc::IP_PMTUDISC_DO` in `apply_socket_options_raw`.
-   - Sets the IP Don't Fragment (DF) bit on outgoing IPv4 packets, allowing the kernel to automatically discover the optimal path MTU across WAN and VPN tunnels and eliminating catastrophic IP-level packet fragmentation and reassembly overhead.
-5. **Closed-Loop UDP & Direct TCP Frame Buffer Recycling (`src/runtime.rs`, `src/udp_relay.rs`)**:
+2. **WebSocket Frame Buffer Lifecycle Pool Integration (`src/ws.rs`)**:
+   - `encode_ws_frame` now acquires pre-allocated buffers from `crate::mux_writer::acquire_encode_buf()`.
+   - `write_frame` recycles the frame buffer via `crate::mux_writer::recycle_encode_buf` after transmission, eliminating heap allocations for WebSocket frames.
+3. **Closed-Loop UDP & Direct TCP Frame Buffer Recycling (`src/runtime.rs`, `src/udp_relay.rs`)**:
    - `udp_envelope` now acquires pre-allocated buffers from `crate::mux_writer::acquire_encode_buf()`.
    - Server UDP relay loop (`handle_server_udp_parts`) recycles outgoing frame packets and incoming WebSocket datagram packets via `crate::mux_writer::recycle_encode_buf`.
    - Client UDP proxy loop (`src/udp_relay.rs`) recycles upload packets and download frame packets back into the thread-safe buffer pool.
    - Server direct non-MUX TCP relay loop (`handle_server_tcp_parts`) recycles frame payload buffers back into the pool.
    - Eliminates per-packet heap allocation and deallocation across all UDP and non-MUX relay paths.
+4. **Compiler Warnings & Unused Imports Cleanup (`src/protocol.rs`, `src/nonmux.rs`)**:
+   - Added `#[allow(dead_code)]` to `OwnedMuxFrame::from_parts`.
+   - Removed unused `SockRef` import in `src/nonmux.rs`.
 
 ### Validation
-- All hardware vector SIMD paths, timeout elimination, PMTUD options, and buffer recycling loops verified.
+- All hardware vector SIMD paths, compiler warning fixes, and buffer recycling loops verified.
 - Status: Version bumped to 0.0.34 in Cargo.toml; tagged v0.0.34; committed and pushed to remote origin/main.

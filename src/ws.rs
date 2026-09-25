@@ -181,68 +181,72 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
     timeout_duration: std::time::Duration,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
-    let read_result = tokio::time::timeout(timeout_duration, async {
-        let mut b = [0u8; 1];
-        loop {
-            match r.read_exact(&mut b).await {
-                Ok(_) => {
-                    out.push(b[0]);
-                    if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
-                        return Ok(());
-                    }
-                    if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" {
-                        return Ok(());
-                    }
-                    if out.len() >= MAX_HTTP_HEADER_SIZE {
-                        bail!("header too large");
-                    }
-                }
-                Err(e) => {
-                    if out.is_empty() {
-                        tracing::warn!(
-                            "[WSS] HTTP handshake connection closed by peer; received 0 response bytes ({})",
-                            e
-                        );
-                        bail!(
-                            "WSS HTTP handshake connection closed by peer; received 0 response bytes ({})",
-                            e
-                        );
-                    } else {
-                        let partial = String::from_utf8_lossy(&out);
-                        tracing::warn!(
-                            "[WSS] HTTP handshake connection closed by peer; partial response:\n{}",
-                            partial
-                        );
-                        bail!(
-                            "WSS HTTP handshake connection closed by peer; partial response:\n{}",
-                            partial
-                        );
-                    }
-                }
-            }
-        }
-    })
-    .await;
+    let mut b = [0u8; 1];
+    let deadline = tokio::time::Instant::now() + timeout_duration;
 
-    match read_result {
-        Ok(res) => {
-            res?;
-            Ok(out)
-        }
-        Err(_elapsed) => {
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             if out.is_empty() {
                 tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
                 bail!("WSS HTTP handshake response timeout; received 0 response bytes");
             } else {
                 let partial = String::from_utf8_lossy(&out);
-                tracing::warn!(
-                    "[WSS] HTTP handshake timeout; partial response:\n{}",
-                    partial
-                );
+                tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
                 bail!(
                     "WSS HTTP handshake response timeout; partial response:\n{}",
                     partial
                 );
+            }
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, r.read_exact(&mut b)).await {
+            Ok(Ok(_)) => {
+                out.push(b[0]);
+                if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
+                    return Ok(out);
+                }
+                if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" {
+                    return Ok(out);
+                }
+                if out.len() >= MAX_HTTP_HEADER_SIZE {
+                    bail!("header too large");
+                }
+            }
+            Ok(Err(e)) => {
+                if out.is_empty() {
+                    tracing::warn!(
+                        "[WSS] HTTP handshake connection closed by peer; received 0 response bytes ({})",
+                        e
+                    );
+                    bail!(
+                        "WSS HTTP handshake connection closed by peer; received 0 response bytes ({})",
+                        e
+                    );
+                } else {
+                    let partial = String::from_utf8_lossy(&out);
+                    tracing::warn!(
+                        "[WSS] HTTP handshake connection closed by peer; partial response:\n{}",
+                        partial
+                    );
+                    bail!(
+                        "WSS HTTP handshake connection closed by peer; partial response:\n{}",
+                        partial
+                    );
+                }
+            }
+            Err(_elapsed) => {
+                if out.is_empty() {
+                    tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
+                    bail!("WSS HTTP handshake response timeout; received 0 response bytes");
+                } else {
+                    let partial = String::from_utf8_lossy(&out);
+                    tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
+                    bail!(
+                        "WSS HTTP handshake response timeout; partial response:\n{}",
+                        partial
+                    );
+                }
             }
         }
     }
@@ -739,30 +743,24 @@ async fn write_frame_parts_vectored<W: AsyncWrite + Unpin>(
         if part >= 3 {
             break;
         }
-        let mut slices: [IoSlice<'_>; 3] = [IoSlice::new(&[]); 3];
-        let slice_count = match part {
+        let mut slices = Vec::with_capacity(3 - part as usize);
+        match part {
             0 => {
-                slices[0] = IoSlice::new(&header[off..header_len]);
+                slices.push(IoSlice::new(&header[off..header_len]));
                 if !key_slice.is_empty() {
-                    slices[1] = IoSlice::new(key_slice);
-                    slices[2] = IoSlice::new(payload);
-                    3
-                } else {
-                    slices[1] = IoSlice::new(payload);
-                    2
+                    slices.push(IoSlice::new(key_slice));
                 }
+                slices.push(IoSlice::new(payload));
             }
             1 => {
-                slices[0] = IoSlice::new(&key_slice[off..]);
-                slices[1] = IoSlice::new(payload);
-                2
+                slices.push(IoSlice::new(&key_slice[off..]));
+                slices.push(IoSlice::new(payload));
             }
             _ => {
-                slices[0] = IoSlice::new(&payload[off..]);
-                1
+                slices.push(IoSlice::new(&payload[off..]));
             }
-        };
-        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices[..slice_count])).await?;
+        }
+        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices)).await?;
         if n == 0 {
             return Err(anyhow!("vectored frame write returned zero"));
         }

@@ -311,21 +311,6 @@ pub(crate) fn apply_socket_options_raw(
                 std::mem::size_of_val(&busy_poll_us) as libc::socklen_t,
             );
         }
-
-        // 6. IP_MTU_DISCOVER / IP_PMTUDISC_DO: Enforce Path MTU Discovery on IPv4.
-        // Sets the DF (Don't Fragment) flag on outgoing packets so the kernel
-        // discovers the optimal path MTU, avoiding costly IP packet fragmentation
-        // and reassembly overhead across WAN/VPN links.
-        let pmtu: libc::c_int = libc::IP_PMTUDISC_DO;
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_MTU_DISCOVER,
-                &pmtu as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&pmtu) as libc::socklen_t,
-            );
-        }
     }
 }
 
