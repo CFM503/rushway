@@ -314,13 +314,21 @@ async fn relay_client(
                 match opcode {
                     2 => {
                         // Non-MUX data frames are plaintext per GoWay server.
-                        if local_wr.write_all(&payload).await.is_err() {
+                        let len = payload.len();
+                        let write_res = local_wr.write_all(&payload).await;
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        if write_res.is_err() {
                             break;
                         }
-                        crate::stats::add_bytes(0, payload.len() as i64);
+                        crate::stats::add_bytes(0, len as i64);
                     }
-                    8 => break,
-                    _ => {}
+                    8 => {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        break;
+                    }
+                    _ => {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                    }
                 }
             }
             Result::<()>::Ok(())
@@ -502,16 +510,21 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
                     break;
                 };
                 if opcode == 8 {
+                    crate::mux_writer::recycle_encode_buf(payload);
                     break;
                 }
                 if opcode != 2 {
+                    crate::mux_writer::recycle_encode_buf(payload);
                     continue;
                 }
                 // Non-MUX data frames are plaintext per GoWay server.
-                if target_wr.write_all(&payload).await.is_err() {
+                let len = payload.len();
+                let write_res = target_wr.write_all(&payload).await;
+                crate::mux_writer::recycle_encode_buf(payload);
+                if write_res.is_err() {
                     break;
                 }
-                crate::stats::add_bytes(payload.len() as i64, 0);
+                crate::stats::add_bytes(len as i64, 0);
             }
         }
     }

@@ -5,11 +5,10 @@ use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -17,20 +16,16 @@ const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
 
-type Cache = Arc<Mutex<HashMap<String, (IpAddr, Instant)>>>;
-struct State {
-    server: Option<IpAddr>,
-    cache: Cache,
-}
-static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+static SERVER: RwLock<Option<IpAddr>> = RwLock::new(None);
+static CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::new();
+static ALL_V4_CACHE: OnceLock<RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>>> = OnceLock::new();
 
-fn state() -> &'static Mutex<State> {
-    STATE.get_or_init(|| {
-        Mutex::new(State {
-            server: None,
-            cache: Arc::new(Mutex::new(HashMap::new())),
-        })
-    })
+fn cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn all_v4_cache() -> &'static RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>> {
+    ALL_V4_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 pub(crate) async fn configure(server: Option<String>) -> Result<()> {
@@ -42,7 +37,7 @@ pub(crate) async fn configure(server: Option<String>) -> Result<()> {
         ),
         None => None,
     };
-    state().lock().await.server = parsed;
+    *SERVER.write().unwrap_or_else(|e| e.into_inner()) = parsed;
     Ok(())
 }
 
@@ -51,20 +46,16 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     if let Ok(ip) = clean.parse::<IpAddr>() {
         return Ok(ip);
     }
-    let (server, cache) = {
-        let guard = state().lock().await;
-        (guard.server, guard.cache.clone())
-    };
     let key = clean.trim_end_matches('.').to_ascii_lowercase();
-    {
-        let mut guard = cache.lock().await;
-        if let Some((ip, expires)) = guard.get(&key).copied() {
+    // Fast path: synchronous read lock, zero tokio yield, nanosecond cache hit
+    if let Ok(guard) = cache().read() {
+        if let Some(&(ip, expires)) = guard.get(&key) {
             if expires > Instant::now() {
                 return Ok(ip);
             }
-            guard.remove(&key);
         }
     }
+    let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
     let remote_result = match server {
         Some(server_ip) => resolve_remote(&key, server_ip).await,
         None => Err(anyhow!("remote DNS not configured")),
@@ -80,22 +71,15 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
                 .ok_or_else(|| anyhow!("system DNS returned no addresses for {host}"))?
         }
     };
-    cache
-        .lock()
-        .await
+    cache()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(key, (resolved, Instant::now() + CACHE_TTL));
     Ok(resolved)
 }
 
 pub(crate) async fn resolve_socket(host: &str, port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(resolve_host(host).await?, port))
-}
-
-type AllV4Cache = Mutex<HashMap<String, (Vec<Ipv4Addr>, Instant)>>;
-static ALL_V4_CACHE: OnceLock<AllV4Cache> = OnceLock::new();
-
-fn all_v4_cache() -> &'static AllV4Cache {
-    ALL_V4_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
@@ -107,18 +91,15 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         return Ok(Vec::new());
     }
     let key = clean.trim_end_matches('.').to_ascii_lowercase();
-    {
-        let guard = all_v4_cache().lock().await;
+    // Fast path: synchronous read lock, zero tokio yield
+    if let Ok(guard) = all_v4_cache().read() {
         if let Some((ips, expires)) = guard.get(&key) {
             if *expires > Instant::now() && !ips.is_empty() {
                 return Ok(ips.clone());
             }
         }
     }
-    let server = {
-        let guard = state().lock().await;
-        guard.server
-    };
+    let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
     let remote_result = match server {
         Some(server_ip) => query_remote_all_ipv4(&key, server_ip).await,
         None => Err(anyhow!("remote DNS not configured")),
@@ -163,8 +144,8 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         bail!("no IPv4 addresses resolved for {host}");
     }
     all_v4_cache()
-        .lock()
-        .await
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(key, (unique.clone(), Instant::now() + CACHE_TTL));
     Ok(unique)
 }

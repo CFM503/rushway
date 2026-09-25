@@ -825,7 +825,7 @@ where
         match opcode {
             1 | 2 => {
                 let owned = std::mem::take(buf);
-                *buf = Vec::new();
+                *buf = crate::mux_writer::acquire_encode_buf();
                 return Ok(Some((opcode, owned)));
             }
             8 => return Ok(None),

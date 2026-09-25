@@ -911,6 +911,25 @@ async fn send_mux(
     .map_err(|e| anyhow!(e.to_string()))?;
     writer.send_mux(frame.stream_id, frame.command, data).await
 }
+async fn send_mux_parts_reuse(
+    writer: &Arc<MuxFrameWriter>,
+    cipher: &XorCipher,
+    stream_id: u32,
+    command: MuxCommand,
+    payload: &[u8],
+    scratch: &mut Vec<u8>,
+    obfs: bool,
+) -> Result<()> {
+    if scratch.capacity() == 0 {
+        *scratch = crate::mux_writer::acquire_encode_buf();
+    }
+    crate::mux_writer::encode_mux_ws_frame(
+        scratch, stream_id, command, payload, cipher, true, obfs,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+    writer.send_mux(stream_id, command, std::mem::take(scratch)).await
+}
+
 async fn send_mux_parts(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
@@ -922,11 +941,7 @@ async fn send_mux_parts(
     // Exact sizing happens inside `encode_mux_ws_frame`; start from the
     // encode pool so the reserve is a no-op on a warm pool.
     let mut data = crate::mux_writer::acquire_encode_buf();
-    crate::mux_writer::encode_mux_ws_frame(
-        &mut data, stream_id, command, payload, cipher, true, obfs,
-    )
-    .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send_mux(stream_id, command, data).await
+    send_mux_parts_reuse(writer, cipher, stream_id, command, payload, &mut data, obfs).await
 }
 async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
     let mut frame_buf = Vec::with_capacity(64 * 1024);
@@ -1137,11 +1152,12 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     let buffer_size = pool.cfg.buffer_size;
     let upload = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
+        let mut frame_scratch = crate::mux_writer::acquire_encode_buf();
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
                 let _ =
-                    send_mux_parts(&writer, &cipher, stream_id, MuxCommand::Fin, &[], obfs).await;
+                    send_mux_parts_reuse(&writer, &cipher, stream_id, MuxCommand::Fin, &[], &mut frame_scratch, obfs).await;
                 break;
             }
             crate::stats::add_bytes(n as i64, 0);
@@ -1150,12 +1166,13 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 let end = (off + u16::MAX as usize).min(n);
                 // W3 upload gate: bounded once the server's VERSION is in.
                 gate.acquire(end - off).await;
-                send_mux_parts(
+                send_mux_parts_reuse(
                     &writer,
                     &cipher,
                     stream_id,
                     MuxCommand::Data,
                     &buf[off..end],
+                    &mut frame_scratch,
                     obfs,
                 )
                 .await?;
@@ -1170,9 +1187,16 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     while let Some(frame) = rx.recv().await {
         match frame.command {
             MuxCommand::Data => {
-                if !frame.payload().is_empty() {
-                    let len = frame.payload().len();
-                    local_wr.write_all(frame.payload()).await?;
+                let payload_empty = frame.payload().is_empty();
+                let len = frame.payload().len();
+                let write_res = if !payload_empty {
+                    local_wr.write_all(frame.payload()).await
+                } else {
+                    Ok(())
+                };
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                write_res?;
+                if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
                     let negotiated = session.peer_window.lock().unwrap().is_some();
                     if negotiated {
@@ -1195,11 +1219,17 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 }
             }
             MuxCommand::Fin => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 local_wr.shutdown().await?;
                 break;
             }
-            MuxCommand::Rst => break,
-            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {}
+            MuxCommand::Rst => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                break;
+            }
+            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+            }
         }
     }
     upload.abort();

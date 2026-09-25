@@ -823,12 +823,19 @@ async fn handle_tcp_proxy(
     while let Some(frame) = rx.recv().await {
         match frame.command {
             MuxCommand::Data => {
-                if !frame.payload().is_empty() {
-                    let len = frame.payload().len();
-                    if let Err(e) = local_wr.write_all(frame.payload()).await {
-                        result = Err(e.into());
-                        break;
-                    }
+                let payload_empty = frame.payload().is_empty();
+                let len = frame.payload().len();
+                let write_res = if !payload_empty {
+                    local_wr.write_all(frame.payload()).await
+                } else {
+                    Ok(())
+                };
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                if let Err(e) = write_res {
+                    result = Err(e.into());
+                    break;
+                }
+                if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
                     let negotiated = session.peer_window.lock().unwrap().is_some();
                     if negotiated {
@@ -851,15 +858,19 @@ async fn handle_tcp_proxy(
                 }
             }
             MuxCommand::Fin => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 let _ = local_wr.shutdown().await;
                 remote_fin = true;
                 break;
             }
             MuxCommand::Rst => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 result = Err(anyhow!("upstream reset after CONNECT established"));
                 break;
             }
-            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {}
+            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+            }
         }
     }
     upload.abort();

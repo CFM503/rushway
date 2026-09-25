@@ -197,6 +197,27 @@ pub struct OwnedMuxFrame {
 }
 
 impl OwnedMuxFrame {
+    /// Constructs an `OwnedMuxFrame` directly from parts with a single allocation,
+    /// eliminating redundant encode + decode_owned passes.
+    pub fn from_parts(
+        stream_id: u32,
+        command: MuxCommand,
+        payload: &[u8],
+    ) -> Result<Self, ProtocolError> {
+        let payload_len = payload.len();
+        if payload_len > MAX_MUX_PAYLOAD {
+            return Err(ProtocolError::PayloadTooLarge(payload_len));
+        }
+        let mut storage = Vec::with_capacity(MUX_HEADER_LEN + payload_len);
+        write_frame_parts(&mut storage, stream_id, command, payload)?;
+        Ok(Self {
+            stream_id,
+            command,
+            storage,
+            payload_len,
+        })
+    }
+
     /// Payload bounded by the declared MUX length. Storage may hold extra
     /// trailing bytes (GoWay `-obfs` padding); those must never leak into
     /// the relayed stream.
@@ -500,5 +521,13 @@ mod tests {
         // this was the live data-leak (pad bytes forwarded into streams).
         let owned = MuxFrame::decode_owned(encoded).unwrap();
         assert_eq!(owned.payload(), b"hi");
+    }
+
+    #[test]
+    fn owned_mux_frame_from_parts() {
+        let frame = OwnedMuxFrame::from_parts(42, MuxCommand::Data, b"hello world").unwrap();
+        assert_eq!(frame.stream_id, 42);
+        assert_eq!(frame.command, MuxCommand::Data);
+        assert_eq!(frame.payload(), b"hello world");
     }
 }

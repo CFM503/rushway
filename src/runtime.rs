@@ -297,6 +297,20 @@ pub(crate) fn apply_socket_options_raw(
                 std::mem::size_of_val(&user_timeout_ms) as libc::socklen_t,
             );
         }
+
+        // 5. SO_BUSY_POLL: Low-latency socket polling in microseconds (Linux 3.11+).
+        // Polls the device driver receive queue for incoming packets for 50µs before
+        // sleeping, drastically cutting tail latency and context switch overhead on busy servers.
+        let busy_poll_us: libc::c_int = 50;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                &busy_poll_us as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&busy_poll_us) as libc::socklen_t,
+            );
+        }
     }
 }
 
@@ -306,6 +320,8 @@ pub(crate) fn apply_socket_options_raw(
 /// - TCP_FASTOPEN (RFC 7413): Enables TCP Fast Open on server-side listeners with
 ///   a queue depth of 256. This allows clients supporting TFO to send SYN+data,
 ///   eliminating 1 RTT of latency during connection establishment.
+/// - TCP_DEFER_ACCEPT: Defers wakeup of accept() until the first data packet arrives
+///   (up to 3 seconds), eliminating empty connection wakeups and reducing context switches.
 pub(crate) fn apply_listener_options(listener: &TcpListener) {
     #[cfg(target_os = "linux")]
     {
@@ -318,6 +334,17 @@ pub(crate) fn apply_listener_options(listener: &TcpListener) {
                 libc::TCP_FASTOPEN,
                 &qlen as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&qlen) as libc::socklen_t,
+            );
+        }
+
+        let defer_secs: libc::c_int = 3;
+        unsafe {
+            let _ = libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_DEFER_ACCEPT,
+                &defer_secs as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&defer_secs) as libc::socklen_t,
             );
         }
     }
@@ -363,6 +390,25 @@ async fn send_frame_encrypted(
     .map_err(|e| anyhow!(e.to_string()))?;
     writer.send_mux(frame.stream_id, frame.command, bytes).await
 }
+async fn send_mux_parts_encrypted_reuse(
+    writer: &Arc<MuxFrameWriter>,
+    cipher: &XorCipher,
+    stream_id: u32,
+    command: MuxCommand,
+    payload: &[u8],
+    scratch: &mut Vec<u8>,
+    obfs: bool,
+) -> Result<()> {
+    if scratch.capacity() == 0 {
+        *scratch = crate::mux_writer::acquire_encode_buf();
+    }
+    crate::mux_writer::encode_mux_ws_frame(
+        scratch, stream_id, command, payload, cipher, false, obfs,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+    writer.send_mux(stream_id, command, std::mem::take(scratch)).await
+}
+
 async fn send_mux_parts_encrypted(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
@@ -374,11 +420,10 @@ async fn send_mux_parts_encrypted(
     // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
     // start from a pooled buffer when available so the reserve is a no-op.
     let mut bytes = crate::mux_writer::acquire_encode_buf();
-    crate::mux_writer::encode_mux_ws_frame(
-        &mut bytes, stream_id, command, payload, cipher, false, obfs,
+    send_mux_parts_encrypted_reuse(
+        writer, cipher, stream_id, command, payload, &mut bytes, obfs,
     )
-    .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send_mux(stream_id, command, bytes).await
+    .await
 }
 async fn send_reset_encrypted(
     writer: &Arc<MuxFrameWriter>,
@@ -404,11 +449,20 @@ async fn target_to_mux(
     gate: Arc<CreditGate>,
 ) {
     let mut buf = relay_buf(buffer_size).await;
+    let mut frame_scratch = crate::mux_writer::acquire_encode_buf();
     loop {
         match target.read(&mut buf).await {
             Ok(0) => {
-                let _ = send_mux_parts_encrypted(&writer, &cipher, id, MuxCommand::Fin, &[], obfs)
-                    .await;
+                let _ = send_mux_parts_encrypted_reuse(
+                    &writer,
+                    &cipher,
+                    id,
+                    MuxCommand::Fin,
+                    &[],
+                    &mut frame_scratch,
+                    obfs,
+                )
+                .await;
                 break;
             }
             Ok(n) => {
@@ -417,12 +471,13 @@ async fn target_to_mux(
                 while off < n {
                     let end = (off + u16::MAX as usize).min(n);
                     gate.acquire(end - off).await;
-                    if send_mux_parts_encrypted(
+                    if send_mux_parts_encrypted_reuse(
                         &writer,
                         &cipher,
                         id,
                         MuxCommand::Data,
                         &buf[off..end],
+                        &mut frame_scratch,
                         obfs,
                     )
                     .await
@@ -466,7 +521,9 @@ async fn server_stream_task(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             StreamCommand::Data(frame) => {
-                if wr.write_all(frame.payload()).await.is_err() {
+                let write_res = wr.write_all(frame.payload()).await;
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                if write_res.is_err() {
                     break;
                 }
             }
@@ -660,15 +717,12 @@ async fn handle_mux_parts(
                 }
 
                 if !syn.initial_data.is_empty() {
-                    let initial = MuxFrame::new(stream_id, MuxCommand::Data, syn.initial_data)
-                        .map_err(|e| anyhow!(e.to_string()))?;
-
-                    let mut encoded = Vec::with_capacity(7 + initial.payload.len());
-                    initial
-                        .encode(&mut encoded)
-                        .map_err(|e| anyhow!(e.to_string()))?;
-                    let owned =
-                        MuxFrame::decode_owned(encoded).map_err(|e| anyhow!(e.to_string()))?;
+                    let owned = OwnedMuxFrame::from_parts(
+                        stream_id,
+                        MuxCommand::Data,
+                        &syn.initial_data,
+                    )
+                    .map_err(|e| anyhow!(e.to_string()))?;
 
                     tx.send(StreamCommand::Data(owned))
                         .await
@@ -826,12 +880,14 @@ async fn handle_mux_parts(
                     let mut refund_pending: u32 = 0;
 
                     for frame in pending {
-                        if wr_target.write_all(frame.payload()).await.is_err() {
+                        let write_res = wr_target.write_all(frame.payload()).await;
+                        let len = frame.payload().len();
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                        if write_res.is_err() {
                             reader.abort();
                             streams_task.write().await.remove(&stream_id);
                             return;
                         }
-                        let len = frame.payload().len();
                         crate::stats::add_bytes(len as i64, 0);
                         maybe_send_window(
                             &writer_task,
@@ -851,10 +907,12 @@ async fn handle_mux_parts(
                         while let Some(command) = rx.recv().await {
                             match command {
                                 StreamCommand::Data(frame) => {
-                                    if wr_target.write_all(frame.payload()).await.is_err() {
+                                    let write_res = wr_target.write_all(frame.payload()).await;
+                                    let len = frame.payload().len();
+                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                    if write_res.is_err() {
                                         break;
                                     }
-                                    let len = frame.payload().len();
                                     crate::stats::add_bytes(len as i64, 0);
                                     maybe_send_window(
                                         &writer_task,

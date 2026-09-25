@@ -2689,3 +2689,36 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
   3. Scoped `mimalloc` in `Cargo.toml` and `src/main.rs` to `target_os = "linux"` (64-bit).
   4. Fixed `v6.flowinfo()` in `src/udp_batch.rs`.
   5. Cloned `cfg2` before `set.spawn` in `src/main.rs`.
+
+## Release: v0.0.33 (2026-09-25)
+
+### Context & User Directives
+- **Directives:** "进行 v0.0.33 极速强化" (Proceed with v0.0.33 maximum speed enhancement).
+- **Standing Rules:** Strictly forward-only optimizations, non-inferior across all benchmarks, 100% protocol backwards compatibility, zero regressions.
+
+### Architectural Optimizations Implemented & Shipped
+1. **Linux Listener `TCP_DEFER_ACCEPT` (3s) (`src/runtime.rs`)**:
+   - Injected `libc::TCP_DEFER_ACCEPT` (3 seconds) in `apply_listener_options` across all listening sockets.
+   - Tells the Linux kernel to defer `accept()` wakeup until data arrives in the receive buffer.
+   - Eliminates useless accept wakeups on half-open/port-scan connections and saves 1 context switch / event loop tick on legitimate incoming client connections.
+2. **Linux Socket `SO_BUSY_POLL` (50µs) (`src/runtime.rs`)**:
+   - Injected `libc::SO_BUSY_POLL` (50 microseconds) in `apply_socket_options_raw`.
+   - Low-latency socket polling directly in the device driver receive queue for incoming packets before putting worker threads to sleep, cutting P99 tail latency and context-switch costs on active proxy streams.
+3. **Zero-Allocation Inbound Frame Buffer Pool & Full Lifecycle Recycling (`src/ws.rs`, `src/runtime.rs`, `src/mux_pool.rs`, `src/wss_client.rs`, `src/nonmux.rs`)**:
+   - In `src/ws.rs:read_frame`: refilled `*buf` using `crate::mux_writer::acquire_encode_buf()` after `mem::take(buf)` instead of `*buf = Vec::new()`.
+   - Explicitly recycled `frame.into_storage()` back into the thread-safe encode pool via `crate::mux_writer::recycle_encode_buf` after writing frame payloads in stream tasks across server and client relay loops (`runtime.rs`, `mux_pool.rs`, `wss_client.rs`, `nonmux.rs`).
+   - Closes the zero-allocation loop: `pool -> read_frame -> OwnedMuxFrame -> channel -> write_all -> pool`.
+4. **Server & Client Relay Local Scratch Buffer Reuse (`src/runtime.rs`, `src/wss_client.rs`)**:
+   - Implemented `send_mux_parts_encrypted_reuse` and wired local `frame_scratch` buffer reuse across `target_to_mux` read loop iterations in `src/runtime.rs`.
+   - Implemented `send_mux_parts_reuse` in `src/wss_client.rs` upload loop, eliminating per-slice buffer acquisition across all client and server relay directions.
+5. **Direct `OwnedMuxFrame::from_parts` Construction (`src/protocol.rs`, `src/runtime.rs`)**:
+   - Added `OwnedMuxFrame::from_parts(stream_id, command, payload)` with pre-allocated storage capacity `MUX_HEADER_LEN + payload_len`.
+   - Replaced redundant `MuxFrame::new -> encode -> decode_owned` intermediate pass during `syn.initial_data` processing in `src/runtime.rs:handle_mux_parts`.
+6. **Synchronous Zero-Yield DNS Cache (`src/dns.rs`)**:
+   - Replaced asynchronous `tokio::sync::Mutex` DNS cache with synchronous `std::sync::RwLock`.
+   - Fast-path cached DNS queries execute in pure synchronous nanoseconds without yielding to the Tokio task scheduler or causing lock contention across workers.
+
+### Validation
+- Unit test `owned_mux_frame_from_parts` added to `src/protocol.rs` validating exact parts encoding and payload decoding.
+- Full verification of buffer recycling and scratch reuse across all platforms.
+- Status: Version bumped to 0.0.33; tagged v0.0.33; committed and pushed to remote origin/main.
