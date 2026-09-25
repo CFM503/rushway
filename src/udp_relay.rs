@@ -213,7 +213,8 @@ pub async fn handle_local_udp_proxy(
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                if let Some(peer) = *latest.lock().unwrap() {
+                let peer_opt = *latest.lock().unwrap();
+                if let Some(peer) = peer_opt {
                     let n = packet.len();
                     let _ = batch_writer.send(&packet, peer).await;
                     crate::stats::add_bytes(0, n as i64);

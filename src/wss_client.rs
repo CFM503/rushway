@@ -988,14 +988,15 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             _ => {}
         }
         let id = frame.stream_id;
-        let sender = { session.streams.read().unwrap().get(&id).cloned() };
+        let sender = session.streams.read().unwrap().get(&id).cloned();
         if let Some(tx) = sender {
             // Terminal FIN/RST is forwarded; accounting is done once by the
             // stream owner (see handle_connection cleanup below), mirroring
             // mux_pool::client_reader_loop.
-            if tx.send(frame).await.is_err() && session.streams.write().unwrap().remove(&id).is_some()
-            {
-                session.active.fetch_sub(1, Ordering::AcqRel);
+            if tx.send(frame).await.is_err() {
+                if session.streams.write().unwrap().remove(&id).is_some() {
+                    session.active.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         }
     }

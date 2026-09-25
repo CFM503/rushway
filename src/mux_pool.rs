@@ -360,52 +360,54 @@ impl SessionState {
         .encode()
         .map_err(|e| anyhow!(e.to_string()))?;
 
-        let mut streams = self.streams.write().unwrap();
+        let (id, rx, gate) = {
+            let mut streams = self.streams.write().unwrap();
 
-        if self.closed.load(Ordering::Acquire) {
-            bail!("MUX session is closed")
-        }
-
-        loop {
-            let active = self.active.load(Ordering::Acquire);
-            if active >= MAX_STREAMS_PER_SESSION {
-                bail!("MUX session is full")
+            if self.closed.load(Ordering::Acquire) {
+                bail!("MUX session is closed")
             }
-            if self
-                .active
-                .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
 
-        let mut id;
-        loop {
-            id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            if id == 0 {
+            loop {
+                let active = self.active.load(Ordering::Acquire);
+                if active >= MAX_STREAMS_PER_SESSION {
+                    bail!("MUX session is full")
+                }
+                if self
+                    .active
+                    .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+
+            let mut id;
+            loop {
                 id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if id == 0 {
+                    id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                }
+                if !streams.contains_key(&id) {
+                    break;
+                }
             }
-            if !streams.contains_key(&id) {
-                break;
-            }
-        }
-        let (tx, rx) = mpsc::channel(32);
-        // Gates lock nests inside streams lock and guards the peer_window
-        // check so a racing VERSION arm can never miss this stream
-        // (lock order everywhere: streams -> gates -> peer_window).
-        // Scoped block: the guard must be dead before the send awaits.
-        let gate = {
-            let mut gates = self.gates.lock().unwrap();
-            let gate = CreditGate::new();
-            if let Some(kib) = *self.peer_window.lock().unwrap() {
-                gate.enable(i64::from(kib) * 1024);
-            }
-            gates.insert(id, gate.clone());
-            gate
+            let (tx, rx) = mpsc::channel(32);
+            // Gates lock nests inside streams lock and guards the peer_window
+            // check so a racing VERSION arm can never miss this stream
+            // (lock order everywhere: streams -> gates -> peer_window).
+            // Scoped block: the guard must be dead before the send awaits.
+            let gate = {
+                let mut gates = self.gates.lock().unwrap();
+                let gate = CreditGate::new();
+                if let Some(kib) = *self.peer_window.lock().unwrap() {
+                    gate.enable(i64::from(kib) * 1024);
+                }
+                gates.insert(id, gate.clone());
+                gate
+            };
+            streams.insert(id, tx);
+            (id, rx, gate)
         };
-        streams.insert(id, tx);
-        drop(streams);
 
         if let Err(e) = send_mux_parts(
             &self.writer,
@@ -511,8 +513,10 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
         let id = frame.stream_id;
         let tx = state.streams.read().unwrap().get(&id).cloned();
         if let Some(tx) = tx {
-            if tx.send(frame).await.is_err() && state.streams.write().unwrap().remove(&id).is_some() {
-                state.active.fetch_sub(1, Ordering::AcqRel);
+            if tx.send(frame).await.is_err() {
+                if state.streams.write().unwrap().remove(&id).is_some() {
+                    state.active.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         }
     }

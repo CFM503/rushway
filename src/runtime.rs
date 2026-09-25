@@ -959,8 +959,8 @@ async fn handle_mux_parts(
 
             MuxCommand::Data => {
                 let id = frame.stream_id;
-
-                if let Some(tx) = streams.read().unwrap().get(&id).map(|s| s.tx.clone()) {
+                let tx = streams.read().unwrap().get(&id).map(|s| s.tx.clone());
+                if let Some(tx) = tx {
                     if tx.send(StreamCommand::Data(frame)).await.is_err() {
                         streams.write().unwrap().remove(&id);
                     }
@@ -968,23 +968,23 @@ async fn handle_mux_parts(
             }
 
             MuxCommand::Fin => {
-                if let Some(tx) = streams
+                let tx = streams
                     .read()
                     .unwrap()
                     .get(&frame.stream_id)
-                    .map(|s| s.tx.clone())
-                {
+                    .map(|s| s.tx.clone());
+                if let Some(tx) = tx {
                     let _ = tx.send(StreamCommand::Fin).await;
                 }
             }
 
             MuxCommand::Rst => {
-                if let Some((tx, cancel)) = streams
+                let target = streams
                     .read()
                     .unwrap()
                     .get(&frame.stream_id)
-                    .map(|s| (s.tx.clone(), s.cancel.clone()))
-                {
+                    .map(|s| (s.tx.clone(), s.cancel.clone()));
+                if let Some((tx, cancel)) = target {
                     let _ = tx.send(StreamCommand::Reset).await;
                     let _ = cancel.send(true);
                 }
