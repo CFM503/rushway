@@ -2785,5 +2785,18 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
    - Under sudden connection spikes requesting the same domain, only 1 network DNS query is sent while other concurrent tasks wait on a lightweight `watch` channel. Prevents query stampedes, socket exhaustion, and upstream DNS rate-limiting.
 
 ### Validation
-- Unit test `test_fused_xor_matches_reference` in `src/crypto.rs` thoroughly verifying fused SIMD matching scalar reference across all length boundaries (0 to 2048 bytes) for both AVX2, SSE2, and word fallback.
-- Status: Version bumped to 0.0.35 in Cargo.toml; tagged v0.0.35; committed and pushed to remote origin/main.
+- Unit test `test_fused_xor_matches_reference` in `src/crypto.rs` thoroughly verifying fused SIMD matching scalar reference across all length boundaries (0 to 65536 bytes) for AVX2, SSE2, NEON, and word fallback.
+- Multi-chunk frame support verified in `src/crypto.rs:apply_fused_xor` (`chunks_mut(ks.len())`) preventing truncation on bulk frames.
+- Standard library sync lock scope isolation verified: no `!Send` guard crosses `.await` points.
+- Full CI test matrix (`RushWay CI` Run `36150998034`, commit `fde70d7`):
+  - Unit tests & static checks: 100% passed.
+  - End-to-end benchmarks (WS, WSS, QUIC): 100% passed.
+  - Staged stress tests: 1, 100, 500, and 1000 concurrent streams across WS, WSS, and QUIC passed with zero errors.
+  - Cross-compilation targets (`windows-x64`, `debian-12-x64`, `armv7-linux`): 100% passed.
+- Official Release (`RushWay Release Artifacts` Run `36151054456`):
+  - Windows x64 (`rushway-windows-x64.zip`): 100% compiled and published.
+  - Debian 12 x64 (`rushway-debian12-x64.tar.gz`): 100% compiled and published.
+  - KWRT ARMv7 musl (`rushway-kwrt-armv7.tar.gz`): 100% compiled and published.
+  - Checksums: `SHA256SUMS.txt` uploaded.
+  - Release URL: https://github.com/CFM503/rushway/releases/tag/v0.0.35
+- Status: Release v0.0.35 fully validated, tagged, and published to GitHub.
