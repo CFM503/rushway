@@ -13,7 +13,8 @@ use crate::proxy::{
     TargetAddr,
 };
 use crate::runtime::{
-    apply_socket_options, drain_join_set, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    apply_socket_options, apply_socket_options_raw, drain_join_set, recycle_buf, relay_buf,
+    wait_shutdown, RuntimeConfig,
 };
 use crate::tls;
 use crate::udp_batch::UdpBatchReader;
@@ -644,6 +645,12 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
                     }
                 };
                 let cfg2 = wc.clone();
+                apply_socket_options_raw(
+                    &stream,
+                    cfg2.tcp_nodelay,
+                    cfg2.socket_buffer,
+                    cfg2.tcp_keepalive,
+                );
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
@@ -1254,6 +1261,12 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
                         continue;
                     }
                 };
+                apply_socket_options_raw(
+                    &stream,
+                    pool.cfg.tcp_nodelay,
+                    pool.cfg.socket_buffer,
+                    pool.cfg.tcp_keepalive,
+                );
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;

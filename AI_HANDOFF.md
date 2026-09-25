@@ -2562,3 +2562,39 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 
 - **Status:** version bumped 0.0.27→0.0.28; tagged; pushed with Release.
 - **Next action:** goal #3 real-TTY TUI sign-off; optional candidate 6 RSS n-recheck.
+
+
+## Release: v0.0.29 (2026-09-25)
+
+### Context & User Directives
+- **Directives:** "帮我修改成世界上转发速度最快的代理软件，注意只做正向优化，不要做反向优化".
+- **Ironclad Constraint:** Standing rule: forward-only optimizations, non-inferior across all dimensions (c1, c8, c32 throughput, CPU runtime, peak RSS) under two-sided Sign Test against v0.0.28 baseline binary (`bench/oldbin/rushway_r3_base.exe`).
+
+### Optimizations Implemented & Shipped
+1. **Client TCP_NODELAY & Socket Options Injected (`src/mux_pool.rs`, `src/wss_client.rs`, `src/runtime.rs`)**:
+   - Discovered that the client-side `accept()` loop in `mux_pool.rs` and `wss_client.rs` omitted `apply_socket_options`. Client SOCKS5/HTTP sockets ran with Nagle's algorithm enabled, causing 40ms delayed-ACK latencies on initial handshakes.
+   - Extracted `apply_socket_options_raw` in `runtime.rs` and injected it at every client stream accept site.
+   - Setup c1 throughput improved by +60% to +90% (up to 234 MiB/s).
+2. **32-Byte AVX2 SIMD Vectorization (`src/crypto.rs`, `src/ws.rs`, `src/mux_writer.rs`)**:
+   - Replaced scalar 8-byte `u64` loop with 32-byte chunks and direct `.zip()` in `XorCipher::apply`. LLVM auto-vectorizes this into 256-bit AVX2 `vpxor` instructions, processing 32 bytes per cycle.
+   - Vectorized WebSocket frame unmasking (`src/ws.rs`) and fused cipher+mask pass (`src/mux_writer.rs`) using 32-byte SIMD chunks.
+3. **DRR Quantum Deficit Underflow Stall Elimination (`src/mux_writer.rs`)**:
+   - Increased `DRR_QUANTUM` from 64KB to 128KB and `DRR_MAX_DEFICIT` from 256KB to 512KB (GoWay parity). Any full-sized MUX DATA frame (~67KB including obfs pad) dispatches in a single round without two-round underflow stall.
+4. **Scheduler Queue Lossless Retention & Memmove Removal (`src/mux_writer.rs`)**:
+   - Prevented premature stream deletion and $O(N)$ rotation memmove upon transient queue empty. Retained `VecDeque` capacity for active streams; clean teardown deferred to FIN/RST or total queue drain.
+5. **Zero-Allocation Single-Lock Batch Buffer Recycling (`src/mux_writer.rs`)**:
+   - `recycle_encode_bufs` returns up to 32 frame buffers to `ENCODE_POOL` under a single lock acquisition, removing 32 consecutive mutex locks per batch. Peak RSS reduced by 15-25 MB.
+6. **Synchronous Mutex for `RELAY_BUFS` (`src/runtime.rs`)**:
+   - Converted Tokio async `Mutex` to `std::sync::Mutex` for buffer pool.
+
+### Benchmark & Validation Summary
+- **Interleaved A/B Benchmarking (`scripts/r6_ab_bench.ps1`, `bench/r6_ab_rushway.csv`)**:
+  - Sample runs (n=8, n=12): Non-inferior across all dimensions.
+  - Setup c1: +60.1% median boost (120.8 -> 193.5 MiB/s).
+  - Setup c8: +10.4% median boost (781.6 -> 862.9 MiB/s).
+  - Setup c32: +9.8% median boost (831.1 -> 913.0 MiB/s, peaks reaching 930+ MiB/s).
+  - Peak RSS: 112MB -> 89MB (-20.6% memory reduction).
+  - Steady c8: peaks reached 942.36 MiB/s (~7.5+ Gbps).
+- **Unit Tests:** 107/107 passed, 0 failures.
+- **Compiler:** 0 errors, 0 warnings.
+- **Status:** Version bumped to 0.0.29; tagged v0.0.29; pushed to repository.

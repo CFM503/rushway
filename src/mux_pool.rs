@@ -908,6 +908,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                     }
                 };
                 let cfg2 = cfg.clone();
+                apply_socket_options(&stream, &cfg2);
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;

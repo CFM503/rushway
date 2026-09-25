@@ -693,18 +693,27 @@ where
             read += chunk;
         }
         if masked {
-            let mask_u32 = u32::from_ne_bytes(key);
-            let mask64 = (mask_u32 as u64) | ((mask_u32 as u64) << 32);
-            // `&[u8; 8]` chunks unmask in registers; the old slice->array
-            // `try_into` outlined a per-word `copied` call.
-            let (words, _) = buf.as_chunks_mut::<8>();
-            for chunk in words.iter_mut() {
+            let mut mask32 = [0u8; 32];
+            for i in 0..8 {
+                mask32[i * 4..i * 4 + 4].copy_from_slice(&key);
+            }
+            let (chunks32, tail32) = buf.as_chunks_mut::<32>();
+            let chunks32_len = chunks32.len();
+            for chunk in chunks32 {
+                for b in 0..32 {
+                    chunk[b] ^= mask32[b];
+                }
+            }
+            let (words, tail) = tail32.as_chunks_mut::<8>();
+            let words_len = words.len();
+            let mask64 = u64::from_ne_bytes(mask32[..8].try_into().unwrap());
+            for chunk in words {
                 let w = u64::from_ne_bytes(*chunk);
                 *chunk = (w ^ mask64).to_ne_bytes();
             }
-            let i = words.len() * 8;
-            for (j, b) in buf[i..].iter_mut().enumerate() {
-                *b ^= key[(i + j) & 3];
+            let start = chunks32_len * 32 + words_len * 8;
+            for (j, b) in tail.iter_mut().enumerate() {
+                *b ^= key[(start + j) & 3];
             }
         }
         match opcode {

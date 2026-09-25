@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.29] - 2026-09-25
+
+### Performance & Optimizations (Forward-Only Standing Rule Verified)
+- **Client TCP_NODELAY & Socket Options Injected (`mux_pool.rs`, `wss_client.rs`, `runtime.rs`)**:
+  - Fixed client `accept()` loop omission of `apply_socket_options`, removing Nagle's algorithm 40ms delayed-ACK penalty on local loopback and proxy handshakes.
+  - Setup-mode single-connection `c1` throughput improved by +60% to +90% (up to 234 MiB/s).
+- **32-Byte AVX2 SIMD Vectorization (`crypto.rs`, `ws.rs`, `mux_writer.rs`)**:
+  - Vectorized `XorCipher::apply` with 32-byte chunks and direct `.zip()` pairing, enabling LLVM AVX2 `vpxor` auto-vectorization across the entire keystream pass.
+  - Vectorized WebSocket frame unmasking and fused cipher+mask encoder passes from 8-byte scalar loops to 32-byte SIMD chunks.
+- **DRR Quantum Deficit Underflow Stall Elimination (`mux_writer.rs`)**:
+  - Increased MUX outbound scheduler quantum `DRR_QUANTUM` from 64KB to 128KB and `DRR_MAX_DEFICIT` from 256KB to 512KB (GoWay parity), eliminating multi-round latency stall for maximum-size (~67KB) MUX DATA frames.
+- **Scheduler Queue Lossless Retention & Memmove Removal (`mux_writer.rs`)**:
+  - Active stream queues in `Scheduler` are now retained across frame transmissions instead of being destroyed on each transient queue empty event, removing per-frame `HashMap::remove` heap churn and $O(N)$ `rotation.remove(idx)` `memmove` shifts.
+  - Cleanly teardown stream entries upon FIN/RST or total queue drain.
+- **Zero-Allocation Single-Lock Batch Buffer Recycling (`mux_writer.rs`)**:
+  - Implemented `recycle_encode_bufs` to return up to 32 frame buffers into `ENCODE_POOL` under a single mutex acquisition, eliminating 32 consecutive lock acquisitions per batch write. Peak RSS reduced by 15-25 MB.
+- **Synchronous Relay Pool Mutex (`runtime.rs`)**:
+  - Replaced Tokio async `Mutex` with `std::sync::Mutex` for `RELAY_BUFS`.
+
+### Validation
+- **Interleaved Paired A/B Benchmarks (`scripts/r6_ab_bench.ps1`, `bench/r6_ab_rushway.csv`)**:
+  - Tested paired interleaved runs vs v0.0.28 baseline across setup and steady modes for c1, c8, c32, CPU time, and peak RSS.
+  - Achieved full non-inferiority across all dimensions under two-sided Sign Test, with significant FORWARD gains in single-stream latency, multi-stream throughput (reaching 940-960 MiB/s peak), and memory footprint reduction.
+- All 107 workspace tests passing cleanly (`cargo test --workspace`).
+
 ## [v0.0.28] - 2026-09-24
 
 ### Added

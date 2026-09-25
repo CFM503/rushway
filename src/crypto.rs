@@ -44,28 +44,22 @@ impl XorCipher {
     /// every byte `j` still maps to `key[j % XOR_KEY_SIZE]`, but 8 bytes
     /// are processed per iteration instead of one.
     pub fn apply(&self, data: &mut [u8]) {
-        if self.key.is_empty() {
+        if self.key.is_empty() || data.is_empty() {
             return;
         }
         let key = &self.key;
-        // XOR_KEY_SIZE % 8 == 0, so the keystream is whole `u64` words.
-        // `as_chunks`/`chunks_exact_mut` yield `&[u8; 8]` values the
-        // optimizer turns into register XORs; the old slice->array
-        // `try_into().unwrap()` outlined into a `copied` call that cost
-        // ~7% CPU on its own (Linux pprof 2026-09-23).
-        let (key_words, _) = key.as_chunks::<8>();
-        let (words, tail) = data.as_chunks_mut::<8>();
-        let mut i = 0usize;
-        for chunk in words {
-            let off = i & (XOR_KEY_SIZE - 1);
-            let kw = u64::from_ne_bytes(key_words[off >> 3]);
-            let dw = u64::from_ne_bytes(*chunk);
-            *chunk = (dw ^ kw).to_ne_bytes();
-            i += 8;
-        }
-        for byte in tail {
-            *byte ^= key[i & (XOR_KEY_SIZE - 1)];
-            i += 1;
+        for chunk in data.chunks_mut(XOR_KEY_SIZE) {
+            let clen = chunk.len();
+            let (dst_chunks, dst_tail) = chunk.as_chunks_mut::<32>();
+            let (src_chunks, src_tail) = key[..clen].as_chunks::<32>();
+            for (d, s) in dst_chunks.iter_mut().zip(src_chunks) {
+                for b in 0..32 {
+                    d[b] ^= s[b];
+                }
+            }
+            for (d, s) in dst_tail.iter_mut().zip(src_tail) {
+                *d ^= *s;
+            }
         }
     }
 }

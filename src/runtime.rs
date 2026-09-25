@@ -140,10 +140,10 @@ pub(crate) const SHUTDOWN_DRAIN_SECS: u64 = 5;
 const POOLED_BUF_MAX_SIZE: usize = 1024 * 1024;
 const POOLED_BUF_MAX_COUNT: usize = 128;
 
-static RELAY_BUFS: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+static RELAY_BUFS: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
 
-fn relay_bufs() -> &'static Mutex<Vec<Vec<u8>>> {
-    RELAY_BUFS.get_or_init(|| Mutex::new(Vec::new()))
+fn relay_bufs() -> &'static StdMutex<Vec<Vec<u8>>> {
+    RELAY_BUFS.get_or_init(|| StdMutex::new(Vec::new()))
 }
 
 /// Gets a zeroed relay buffer of exactly `relay_buffer_size(requested)`
@@ -151,7 +151,7 @@ fn relay_bufs() -> &'static Mutex<Vec<Vec<u8>>> {
 pub(crate) async fn relay_buf(requested: usize) -> Vec<u8> {
     let size = relay_buffer_size(requested);
     if size <= POOLED_BUF_MAX_SIZE {
-        let mut pool = relay_bufs().lock().await;
+        let mut pool = relay_bufs().lock().unwrap();
         if let Some(pos) = pool.iter().position(|b| b.len() == size) {
             return pool.swap_remove(pos);
         }
@@ -165,7 +165,7 @@ pub(crate) async fn recycle_buf(buf: Vec<u8>) {
     if buf.len() > POOLED_BUF_MAX_SIZE {
         return;
     }
-    let mut pool = relay_bufs().lock().await;
+    let mut pool = relay_bufs().lock().unwrap();
     if pool.len() < POOLED_BUF_MAX_COUNT {
         pool.push(buf);
     }
@@ -218,18 +218,26 @@ pub(crate) fn enforce_target_policy(cfg: &RuntimeConfig, target: &TargetAddr) ->
     }
     Ok(())
 }
-pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
+pub(crate) fn apply_socket_options_raw(
+    stream: &TcpStream,
+    nodelay: bool,
+    socket_buffer: usize,
+    keepalive: bool,
+) {
     let sock = SockRef::from(stream);
-    let _ = sock.set_nodelay(cfg.tcp_nodelay);
-    if cfg.socket_buffer > 0 {
-        let bytes = cfg.socket_buffer.saturating_mul(1024);
+    let _ = sock.set_nodelay(nodelay);
+    if socket_buffer > 0 {
+        let bytes = socket_buffer.saturating_mul(1024);
         let _ = sock.set_send_buffer_size(bytes);
         let _ = sock.set_recv_buffer_size(bytes);
     }
-    if cfg.tcp_keepalive {
+    if keepalive {
         let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
         let _ = sock.set_tcp_keepalive(&ka);
     }
+}
+pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
+    apply_socket_options_raw(stream, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
 }
 async fn dial_target(
     target: &TargetAddr,

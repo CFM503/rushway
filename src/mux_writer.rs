@@ -8,7 +8,7 @@
 //! loop is pure I/O, and consecutive queued frames are coalesced into
 //! vectored writes.
 
-use crate::crypto::{XorCipher, XOR_KEY_SIZE};
+use crate::crypto::XorCipher;
 use crate::protocol::{write_frame_parts, MuxCommand};
 use crate::ws::{next_mask, ws_header_into};
 use anyhow::{anyhow, Result};
@@ -41,9 +41,11 @@ const ENCODE_POOL_MAX_COUNT: usize = 32;
 /// ~80 KiB so a rare huge frame cannot pin memory.
 const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
 /// Per-stream byte credit added each deficit round (GoWay parity).
-const DRR_QUANTUM: usize = 64 * 1024;
+/// Set to 128KB so that even maximum-size MUX frames (~67KB) can be
+/// dispatched in a single round without deficit underflow stall.
+const DRR_QUANTUM: usize = 128 * 1024;
 /// Cap accumulated credit so a long-idle stream cannot hog the link.
-const DRR_MAX_DEFICIT: usize = 256 * 1024;
+const DRR_MAX_DEFICIT: usize = 512 * 1024;
 
 static ENCODE_POOL: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
 
@@ -53,7 +55,7 @@ fn encode_pool() -> &'static StdMutex<Vec<Vec<u8>>> {
 
 /// Takes a pooled encode buffer (cleared, capacity retained) or a fresh
 /// empty `Vec` when the pool is empty. The writer returns written frames
-/// via [`recycle_encode_buf`].
+/// via [`recycle_encode_bufs`].
 pub(crate) fn acquire_encode_buf() -> Vec<u8> {
     let mut pool = encode_pool()
         .lock()
@@ -69,6 +71,7 @@ pub(crate) fn acquire_encode_buf() -> Vec<u8> {
 
 /// Returns a post-write frame buffer to the pool (best-effort: zero-cap or
 /// oversized buffers are dropped).
+#[allow(dead_code)]
 pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
     if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
         return;
@@ -79,6 +82,28 @@ pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
         .unwrap_or_else(|e| e.into_inner());
     if pool.len() < ENCODE_POOL_MAX_COUNT {
         pool.push(buf);
+    }
+}
+
+/// Returns a batch of post-write frame buffers to the pool under a single
+/// mutex acquisition, with zero allocation.
+pub(crate) fn recycle_encode_bufs<I>(bufs: I)
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let mut pool = encode_pool()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for mut buf in bufs {
+        if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
+            continue;
+        }
+        if pool.len() < ENCODE_POOL_MAX_COUNT {
+            buf.clear();
+            pool.push(buf);
+        } else {
+            break;
+        }
     }
 }
 
@@ -265,10 +290,23 @@ impl Scheduler {
                 && sid
                     .is_some_and(|id| self.streams.get(&id).is_some_and(|q| !q.frames.is_empty()));
             if !blocked {
-                let (_, _, frame) = self.priority.pop_front().unwrap();
+                let (sid_opt, yield_flag, frame) = self.priority.pop_front().unwrap();
                 self.total -= 1;
+                if yield_flag {
+                    if let Some(id) = sid_opt {
+                        self.remove_stream(&id);
+                    }
+                }
                 return Some(frame);
             }
+        }
+        if self.total == 0 {
+            if !self.streams.is_empty() {
+                self.streams.clear();
+                self.rotation.clear();
+                self.pos = 0;
+            }
+            return None;
         }
         if self.rotation.is_empty() {
             return None;
@@ -288,15 +326,15 @@ impl Scheduler {
             let Some(q) = self.streams.get_mut(&sid) else {
                 continue;
             };
+            if q.frames.is_empty() {
+                continue;
+            }
             q.deficit = (q.deficit + DRR_QUANTUM).min(DRR_MAX_DEFICIT);
             let affordable = q.frames.front().map(|f| f.len()).unwrap_or(usize::MAX);
             if affordable <= q.deficit {
                 q.deficit -= affordable;
                 let frame = q.frames.pop_front();
                 self.total -= 1;
-                if q.frames.is_empty() {
-                    self.remove_stream(&sid);
-                }
                 if frame.is_some() {
                     return frame;
                 }
@@ -396,26 +434,35 @@ pub(crate) fn encode_mux_ws_frame(
         None => cipher.apply(region),
         Some(key) => {
             let ks = cipher.keystream();
+            let mut mask32 = [0u8; 32];
+            for i in 0..8 {
+                mask32[i * 4..i * 4 + 4].copy_from_slice(&key);
+            }
             if ks.is_empty() {
-                for (i, byte) in region.iter_mut().enumerate() {
-                    *byte ^= key[i & 3];
+                let (chunks32, tail32) = region.as_chunks_mut::<32>();
+                let chunks_len = chunks32.len();
+                for chunk in chunks32 {
+                    for b in 0..32 {
+                        chunk[b] ^= mask32[b];
+                    }
+                }
+                let start = chunks_len * 32;
+                for (j, byte) in tail32.iter_mut().enumerate() {
+                    *byte ^= key[(start + j) & 3];
                 }
             } else {
-                let mask_u32 = u32::from_ne_bytes(key);
-                let mask64 = (mask_u32 as u64) | ((mask_u32 as u64) << 32);
-                // Word-at-a-time via `&[u8; 8]` chunks: keeps the fused
-                // cipher+mask pass in registers (no outlined slice copies).
-                let (ks_words, _) = ks.as_chunks::<8>();
-                let (words, _) = region.as_chunks_mut::<8>();
-                for (idx, chunk) in words.iter_mut().enumerate() {
-                    let off = (idx << 3) & (XOR_KEY_SIZE - 1);
-                    let kw = u64::from_ne_bytes(ks_words[off >> 3]);
-                    let dw = u64::from_ne_bytes(*chunk);
-                    *chunk = (dw ^ kw ^ mask64).to_ne_bytes();
+                let clen = region.len().min(ks.len());
+                let (dst_chunks, dst_tail) = region[..clen].as_chunks_mut::<32>();
+                let (ks_chunks, _) = ks[..clen].as_chunks::<32>();
+                let chunks_len = dst_chunks.len();
+                for (d, k) in dst_chunks.iter_mut().zip(ks_chunks) {
+                    for b in 0..32 {
+                        d[b] ^= k[b] ^ mask32[b];
+                    }
                 }
-                let i = words.len() * 8;
-                for (j, byte) in region[i..].iter_mut().enumerate() {
-                    *byte ^= ks[(i + j) & (XOR_KEY_SIZE - 1)] ^ key[(i + j) & 3];
+                let start = chunks_len * 32;
+                for (j, byte) in dst_tail.iter_mut().enumerate() {
+                    *byte ^= ks[start + j] ^ key[(start + j) & 3];
                 }
             }
         }
@@ -497,37 +544,27 @@ where
                             batch.push(frame);
                             if batch.len() >= BATCH_MAX_FRAMES {
                                 let _ = write_batch(&mut w, &batch).await;
-                                for buf in batch.drain(..) {
-                                    recycle_encode_buf(buf);
-                                }
+                                recycle_encode_bufs(batch.drain(..));
                             }
                         }
                     }
                     if !batch.is_empty() {
                         let _ = write_batch(&mut w, &batch).await;
-                        for buf in batch.drain(..) {
-                            recycle_encode_buf(buf);
-                        }
+                        recycle_encode_bufs(batch.drain(..));
                     }
                     break;
                 }
             }
         }
         if write_batch(&mut w, &batch).await.is_err() {
-            for buf in batch.drain(..) {
-                recycle_encode_buf(buf);
-            }
+            recycle_encode_bufs(batch.drain(..));
             break;
         }
-        for buf in batch.drain(..) {
-            recycle_encode_buf(buf);
-        }
+        recycle_encode_bufs(batch.drain(..));
     }
     // Shutdown drain path already wrote leftovers above; recycle anything
     // still sitting in `batch` from a partial fill that never wrote.
-    for buf in batch.drain(..) {
-        recycle_encode_buf(buf);
-    }
+    recycle_encode_bufs(batch.drain(..));
     let _ = w.shutdown().await;
 }
 

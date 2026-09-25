@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "rushway"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "base64",
