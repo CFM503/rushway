@@ -69,7 +69,17 @@ impl XorCipher {
                 return;
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            for chunk in data.chunks_mut(XOR_KEY_SIZE) {
+                let clen = chunk.len();
+                unsafe {
+                    apply_chunk_neon(chunk, &key[..clen]);
+                }
+            }
+            return;
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             for chunk in data.chunks_mut(XOR_KEY_SIZE) {
                 let clen = chunk.len();
@@ -167,6 +177,47 @@ pub(crate) unsafe fn apply_chunk_sse2(chunk: &mut [u8], key: &[u8]) {
         let k = _mm_loadu_si128(key.as_ptr().add(i) as *const __m128i);
         let d = _mm_loadu_si128(chunk.as_ptr().add(i) as *const __m128i);
         _mm_storeu_si128(chunk.as_mut_ptr().add(i) as *mut __m128i, _mm_xor_si128(d, k));
+        i += 16;
+    }
+    while i + 8 <= len {
+        let k = (key.as_ptr().add(i) as *const u64).read_unaligned();
+        let d = (chunk.as_ptr().add(i) as *const u64).read_unaligned();
+        (chunk.as_mut_ptr().add(i) as *mut u64).write_unaligned(d ^ k);
+        i += 8;
+    }
+    while i < len {
+        *chunk.get_unchecked_mut(i) ^= *key.get_unchecked(i);
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn apply_chunk_neon(chunk: &mut [u8], key: &[u8]) {
+    use std::arch::aarch64::*;
+    let len = chunk.len();
+    debug_assert!(key.len() >= len);
+    let mut i = 0;
+    while i + 64 <= len {
+        let k0 = vld1q_u8(key.as_ptr().add(i));
+        let k1 = vld1q_u8(key.as_ptr().add(i + 16));
+        let k2 = vld1q_u8(key.as_ptr().add(i + 32));
+        let k3 = vld1q_u8(key.as_ptr().add(i + 48));
+
+        let d0 = vld1q_u8(chunk.as_ptr().add(i));
+        let d1 = vld1q_u8(chunk.as_ptr().add(i + 16));
+        let d2 = vld1q_u8(chunk.as_ptr().add(i + 32));
+        let d3 = vld1q_u8(chunk.as_ptr().add(i + 48));
+
+        vst1q_u8(chunk.as_mut_ptr().add(i), veorq_u8(d0, k0));
+        vst1q_u8(chunk.as_mut_ptr().add(i + 16), veorq_u8(d1, k1));
+        vst1q_u8(chunk.as_mut_ptr().add(i + 32), veorq_u8(d2, k2));
+        vst1q_u8(chunk.as_mut_ptr().add(i + 48), veorq_u8(d3, k3));
+        i += 64;
+    }
+    while i + 16 <= len {
+        let k = vld1q_u8(key.as_ptr().add(i));
+        let d = vld1q_u8(chunk.as_ptr().add(i));
+        vst1q_u8(chunk.as_mut_ptr().add(i), veorq_u8(d, k));
         i += 16;
     }
     while i + 8 <= len {

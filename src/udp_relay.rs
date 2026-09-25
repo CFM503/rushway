@@ -151,12 +151,15 @@ pub async fn handle_local_udp_proxy(
         bail!("upstream closed during UDP handshake")
     };
     if opcode != 2 {
+        crate::mux_writer::recycle_encode_buf(ok);
         bail!("invalid UDP handshake response opcode")
     }
     c.apply(&mut ok);
     if ok != b"OK\n" {
+        crate::mux_writer::recycle_encode_buf(ok);
         bail!("upstream rejected UDP handshake")
     }
+    crate::mux_writer::recycle_encode_buf(ok);
     let latest = Arc::new(Mutex::new(None::<SocketAddr>));
     let udp_send = udp.clone();
     let writer_send = writer.clone();
@@ -172,11 +175,14 @@ pub async fn handle_local_udp_proxy(
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
                 *latest_send.lock().await = Some(peer);
-                let mut packet = pkt.to_vec();
+                let mut packet = crate::mux_writer::acquire_encode_buf();
+                packet.extend_from_slice(pkt);
                 c_send.apply(&mut packet);
                 crate::stats::add_bytes(packet.len() as i64, 0);
                 let mut w = writer_send.lock().await;
-                if write_frame(&mut *w, &packet, 2, true).await.is_err() {
+                let res = write_frame(&mut *w, &packet, 2, true).await;
+                crate::mux_writer::recycle_encode_buf(packet);
+                if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -199,12 +205,19 @@ pub async fn handle_local_udp_proxy(
                     break;
                 };
                 if opcode != 2 {
+                    crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
                 c.apply(&mut packet);
-                let (target, _payload) =
-                    parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+                let (target, _payload) = match parse_socks5_udp_datagram(&packet) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        crate::mux_writer::recycle_encode_buf(packet);
+                        return Err(anyhow!(e.to_string()));
+                    }
+                };
                 if enforce_target_policy(&cfg, &target).is_err() {
+                    crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
                 if let Some(peer) = *latest.lock().await {
@@ -212,6 +225,7 @@ pub async fn handle_local_udp_proxy(
                     let _ = batch_writer.send(&packet, peer).await;
                     crate::stats::add_bytes(0, n as i64);
                 }
+                crate::mux_writer::recycle_encode_buf(packet);
             }
             let _ = batch_writer.flush().await;
             Ok::<(), anyhow::Error>(())

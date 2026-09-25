@@ -311,6 +311,21 @@ pub(crate) fn apply_socket_options_raw(
                 std::mem::size_of_val(&busy_poll_us) as libc::socklen_t,
             );
         }
+
+        // 6. IP_MTU_DISCOVER / IP_PMTUDISC_DO: Enforce Path MTU Discovery on IPv4.
+        // Sets the DF (Don't Fragment) flag on outgoing packets so the kernel
+        // discovers the optimal path MTU, avoiding costly IP packet fragmentation
+        // and reassembly overhead across WAN/VPN links.
+        let pmtu: libc::c_int = libc::IP_PMTUDISC_DO;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &pmtu as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&pmtu) as libc::socklen_t,
+            );
+        }
     }
 }
 
@@ -1102,15 +1117,19 @@ async fn handle_server_tcp_parts(
                     break;
                 };
                 if opcode == 8 {
+                    crate::mux_writer::recycle_encode_buf(payload);
                     break;
                 }
                 if opcode != 2 {
+                    crate::mux_writer::recycle_encode_buf(payload);
                     continue;
                 }
                 if target_wr.write_all(&payload).await.is_err() {
+                    crate::mux_writer::recycle_encode_buf(payload);
                     break;
                 }
                 crate::stats::add_bytes(payload.len() as i64, 0);
+                crate::mux_writer::recycle_encode_buf(payload);
             }
         }
     }
@@ -1122,7 +1141,11 @@ async fn resolve_udp_target(target: &TargetAddr) -> Result<SocketAddr> {
     resolve_socket(&target.host, target.port).await
 }
 fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(22 + payload.len());
+    let mut out = crate::mux_writer::acquire_encode_buf();
+    let needed = 22 + payload.len();
+    if out.capacity() < needed {
+        out.reserve(needed - out.capacity());
+    }
     out.extend_from_slice(&[0, 0, 0]);
     match source.ip() {
         IpAddr::V4(ip) => {
@@ -1173,7 +1196,9 @@ async fn handle_server_udp_parts(
                 let mut packet = udp_envelope(source, pkt);
                 cipher_send.apply(&mut packet);
                 let mut w = writer_send.lock().await;
-                if write_frame(&mut *w, &packet, 2, false).await.is_err() {
+                let res = write_frame(&mut *w, &packet, 2, false).await;
+                crate::mux_writer::recycle_encode_buf(packet);
+                if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -1193,20 +1218,31 @@ async fn handle_server_udp_parts(
             break;
         };
         if opcode != 2 {
+            crate::mux_writer::recycle_encode_buf(packet);
             continue;
         }
         cipher.apply(&mut packet);
-        let (target, payload) =
-            parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+        let (target, payload) = match parse_socks5_udp_datagram(&packet) {
+            Ok(res) => res,
+            Err(e) => {
+                crate::mux_writer::recycle_encode_buf(packet);
+                return Err(anyhow!(e.to_string()));
+            }
+        };
         if cfg.block_local && is_blocked_local_host(&target.host) {
+            crate::mux_writer::recycle_encode_buf(packet);
             continue;
         }
         let addr = match resolve_udp_target(&target).await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                crate::mux_writer::recycle_encode_buf(packet);
+                continue;
+            }
         };
         crate::stats::add_bytes(payload.len() as i64, 0);
         let _ = batch_writer.send(payload, addr).await;
+        crate::mux_writer::recycle_encode_buf(packet);
     }
     let _ = batch_writer.flush().await;
     send_task.abort();
