@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.35] - 2026-09-25
+
+### Performance & Peak Throughput (AVX2/NEON Fused SIMD, Zero-Alloc UDP, Mutex Elimination & DNS SingleFlight)
+- **Fused Keystream XOR + WebSocket Masking SIMD Vectorization (`crypto.rs`, `mux_writer.rs`)**:
+  - Implemented single-pass `apply_fused_xor` combining keystream XOR and WebSocket 4-byte frame masking into a unified SIMD operation.
+  - AVX2 256-bit unrolled path (`apply_fused_xor_avx2`, 128 bytes/iter), SSE2 128-bit unrolled path (`apply_fused_xor_sse2`, 64 bytes/iter), and ARM64 NEON path (`apply_fused_xor_neon`, 64 bytes/iter) with automatic CPU feature detection.
+  - Reduces memory read/write passes from two to one in `encode_mux_ws_frame`, halving memory bandwidth demand and CPU cache thrashing on high-throughput MUX WebSocket connections.
+- **ARMv7 64-bit Word-at-a-Time Fast Path (`crypto.rs`)**:
+  - Optimized `apply_chunk_fallback` to process 64-bit chunk words (`u64::from_ne_bytes`) instead of byte-by-byte scalar iteration.
+  - Boosts throughput and dramatically lowers CPU cycle consumption on embedded 32-bit ARM routers (KWRT ARMv7 musl OpenWrt).
+- **Zero-Allocation WebSocket Vectored Write (`ws.rs`)**:
+  - Replaced heap-allocated `Vec::with_capacity(3 - part)` in `write_frame_parts_vectored` with stack-allocated `[IoSlice<'_>; 3]` array.
+  - Eliminates all small heap allocations during multi-part vectored WebSocket frame transmission.
+- **Zero-Allocation UDP Batch Writer & Fast-Path Try-Send (`udp_batch.rs`)**:
+  - Added non-blocking `try_send_to` fast path in `UdpBatchWriter::send` when the batch queue is empty, bypassing queue overhead and queuing latency for standalone datagrams.
+  - Replaced `.collect::<Vec<_>>()` in `flush()` with a stack-allocated `[(&[u8], SocketAddr); UDP_BATCH]` array.
+  - Integrated buffer pool (`acquire_encode_buf` / `recycle_encode_buf`) for all queued datagrams with full RAII recycling in `Drop`.
+- **Direct Unidirectional Relay Mutex Elimination (`nonmux.rs`, `runtime.rs`, `udp_relay.rs`)**:
+  - Eliminated unnecessary `Arc<Mutex<WriteHalf<TcpStream>>>` wrappers in 1:1 unidirectional relay loops (`handle_server_tcp_parts`, `handle_server_udp_parts`, `open_upstream`, `relay_client`, `handle_server`).
+  - Sockets are split cleanly and `WriteHalf` is moved directly to its dedicated writer task, eliminating Tokio async mutex lock/unlock scheduling overhead per frame.
+  - In `udp_relay.rs`, converted `latest: Arc<Mutex<Option<SocketAddr>>>` to `std::sync::Mutex` for zero-yield atomic peer address updates.
+- **Ultra-Low Latency Synchronous Stream Routing (`runtime.rs`, `mux_pool.rs`, `wss_client.rs`)**:
+  - Migrated active stream tables (`streams: HashMap<u32, ...>`) from `tokio::sync::RwLock` to `std::sync::RwLock`.
+  - In-memory stream lookups take ~10ns and never cross `.await` boundaries; switching to synchronous atomic standard-library locks eliminates Tokio future/waker overhead on every incoming DATA frame.
+- **DNS SingleFlight Concurrent Query Deduplication (`dns.rs`)**:
+  - Implemented `IN_FLIGHT: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<IpAddr>>>>>` with RAII cleanup in `resolve_host`.
+  - Under sudden connection spikes requesting the same domain, only 1 network DNS query is sent while other concurrent tasks wait on a lightweight `watch` channel. Prevents query stampedes, socket exhaustion, and upstream DNS rate-limiting.
+
 ## [v0.0.34] - 2026-09-25
 
 ### Performance & Hardware Acceleration (ARM64 SIMD Vectorization & Zero-Allocation Buffer Pools)

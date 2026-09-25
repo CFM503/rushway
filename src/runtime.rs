@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone)]
@@ -622,7 +622,8 @@ async fn handle_mux_parts(
 
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
-    let streams: Arc<RwLock<HashMap<u32, StreamEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+    let streams: Arc<std::sync::RwLock<HashMap<u32, StreamEntry>>> =
+        Arc::new(std::sync::RwLock::new(HashMap::new()));
     let mut stream_tasks = Vec::new();
     let mut frame_buf = Vec::with_capacity(64 * 1024);
 
@@ -695,7 +696,7 @@ async fn handle_mux_parts(
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
                 let admitted = {
-                    let mut guard = streams.write().await;
+                    let mut guard = streams.write().unwrap();
                     if guard.len() >= 2048 || guard.contains_key(&stream_id) {
                         false
                     } else {
@@ -747,13 +748,13 @@ async fn handle_mux_parts(
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
-                    streams: &Arc<RwLock<HashMap<u32, StreamEntry>>>,
+                    streams: &Arc<std::sync::RwLock<HashMap<u32, StreamEntry>>>,
                     stream_id: u32,
                     obfs: bool,
                 ) {
                     tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
                     let _ = send_reset_encrypted(writer, cipher, stream_id, obfs).await;
-                    streams.write().await.remove(&stream_id);
+                    streams.write().unwrap().remove(&stream_id);
                 }
                 let task = tokio::spawn(async move {
                     let mut cancelled = cancelled;
@@ -779,7 +780,7 @@ async fn handle_mux_parts(
                                             cfg_task.obfs,
                                         )
                                         .await;
-                                        streams_task.write().await.remove(&stream_id);
+                                        streams_task.write().unwrap().remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -788,12 +789,12 @@ async fn handle_mux_parts(
                             changed = cancelled.changed() => {
                                 match changed {
                                     Ok(()) if *cancelled.borrow() => {
-                                        streams_task.write().await.remove(&stream_id);
+                                        streams_task.write().unwrap().remove(&stream_id);
                                         return;
                                     }
                                     Ok(()) => {}
                                     Err(_) => {
-                                        streams_task.write().await.remove(&stream_id);
+                                        streams_task.write().unwrap().remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -885,7 +886,7 @@ async fn handle_mux_parts(
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         if write_res.is_err() {
                             reader.abort();
-                            streams_task.write().await.remove(&stream_id);
+                            streams_task.write().unwrap().remove(&stream_id);
                             return;
                         }
                         crate::stats::add_bytes(len as i64, 0);
@@ -950,7 +951,7 @@ async fn handle_mux_parts(
                         reader.abort();
                     }
 
-                    streams_task.write().await.remove(&stream_id);
+                    streams_task.write().unwrap().remove(&stream_id);
                 });
 
                 stream_tasks.push(task);
@@ -959,9 +960,9 @@ async fn handle_mux_parts(
             MuxCommand::Data => {
                 let id = frame.stream_id;
 
-                if let Some(tx) = streams.read().await.get(&id).map(|s| s.tx.clone()) {
+                if let Some(tx) = streams.read().unwrap().get(&id).map(|s| s.tx.clone()) {
                     if tx.send(StreamCommand::Data(frame)).await.is_err() {
-                        streams.write().await.remove(&id);
+                        streams.write().unwrap().remove(&id);
                     }
                 }
             }
@@ -969,7 +970,7 @@ async fn handle_mux_parts(
             MuxCommand::Fin => {
                 if let Some(tx) = streams
                     .read()
-                    .await
+                    .unwrap()
                     .get(&frame.stream_id)
                     .map(|s| s.tx.clone())
                 {
@@ -980,7 +981,7 @@ async fn handle_mux_parts(
             MuxCommand::Rst => {
                 if let Some((tx, cancel)) = streams
                     .read()
-                    .await
+                    .unwrap()
                     .get(&frame.stream_id)
                     .map(|s| (s.tx.clone(), s.cancel.clone()))
                 {
@@ -1005,7 +1006,7 @@ async fn handle_mux_parts(
                         };
                         if !already {
                             let window = i64::from(kib) * 1024;
-                            for entry in streams.read().await.values() {
+                            for entry in streams.read().unwrap().values() {
                                 entry.gate.enable(window);
                             }
                             tracing::debug!(kib, "peer VERSION received; send window enabled");
@@ -1016,7 +1017,7 @@ async fn handle_mux_parts(
 
             MuxCommand::Window => {
                 if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(entry) = streams.read().await.get(&frame.stream_id) {
+                    if let Some(entry) = streams.read().unwrap().get(&frame.stream_id) {
                         entry.gate.release(i64::from(credit));
                     }
                 }
@@ -1027,7 +1028,7 @@ async fn handle_mux_parts(
     // Unblock any target_to_mux sender parked on credit: the session is
     // over, so remaining sends must fail at the socket, not on WINDOWs
     // that will never arrive.
-    for entry in streams.read().await.values() {
+    for entry in streams.read().unwrap().values() {
         entry.gate.close();
     }
 
@@ -1035,7 +1036,7 @@ async fn handle_mux_parts(
         task.abort();
     }
 
-    streams.write().await.clear();
+    streams.write().unwrap().clear();
 
     Ok(())
 }
@@ -1044,7 +1045,7 @@ async fn handle_mux_parts(
 /// all subsequent data frames are plaintext.
 async fn handle_server_tcp_parts(
     mut rd: ReadHalf<TcpStream>,
-    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    mut wr: WriteHalf<TcpStream>,
     cfg: RuntimeConfig,
     first: Vec<u8>,
 ) -> Result<()> {
@@ -1064,12 +1065,8 @@ async fn handle_server_tcp_parts(
     apply_socket_options(&target_stream, &cfg);
     let mut ok = b"OK\n".to_vec();
     transform_payload(&cipher, &mut ok);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &ok, 2, false).await?;
-    }
+    write_frame(&mut wr, &ok, 2, false).await?;
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
-    let writer_down = writer.clone();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
@@ -1083,8 +1080,7 @@ async fn handle_server_tcp_parts(
             // the old copy allocated a fresh Vec per read on the download
             // path (data frames are plaintext on non-MUX, so masking never
             // touches the scratch).
-            let mut w = writer_down.lock().await;
-            write_frame_borrowed(&mut *w, &mut buf[..n], 2, false).await?;
+            write_frame_borrowed(&mut wr, &mut buf[..n], 2, false).await?;
         }
         recycle_buf(buf).await;
         Result::<()>::Ok(())
@@ -1148,7 +1144,7 @@ fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
 }
 async fn handle_server_udp_parts(
     mut rd: ReadHalf<TcpStream>,
-    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+    mut wr: WriteHalf<TcpStream>,
     cfg: RuntimeConfig,
     first_payload: Vec<u8>,
 ) -> Result<()> {
@@ -1160,13 +1156,9 @@ async fn handle_server_udp_parts(
     };
     let mut ok = b"OK\n".to_vec();
     transform_payload(&cipher, &mut ok);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &ok, 2, false).await?
-    };
+    write_frame(&mut wr, &ok, 2, false).await?;
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let udp_send = udp.clone();
-    let writer_send = writer.clone();
     let cipher_send = cipher.clone();
     let send_task = tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
@@ -1180,8 +1172,7 @@ async fn handle_server_udp_parts(
                 crate::stats::add_bytes(0, pkt.len() as i64);
                 let mut packet = udp_envelope(source, pkt);
                 cipher_send.apply(&mut packet);
-                let mut w = writer_send.lock().await;
-                let res = write_frame(&mut *w, &packet, 2, false).await;
+                let res = write_frame(&mut wr, &packet, 2, false).await;
                 crate::mux_writer::recycle_encode_buf(packet);
                 if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
@@ -1272,7 +1263,6 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                         let key = validate_server_handshake(&request)?;
                         wr.write_all(&build_server_handshake_response(&key)).await?;
                         wr.flush().await?;
-                        let writer = Arc::new(Mutex::new(wr));
                         let mut buf = Vec::with_capacity(64 * 1024);
                         let Some((opcode, first)) =
                             read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut buf)
@@ -1287,17 +1277,14 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                         let cipher = configured_cipher(&cfg2.key);
                         transform_payload(&cipher, &mut plain);
                         if plain == b"UDP\n" {
-                            return handle_server_udp_parts(rd, writer, cfg2, first).await;
+                            return handle_server_udp_parts(rd, wr, cfg2, first).await;
                         }
                         if plain == b"MUX\n" {
-                            let wr = Arc::try_unwrap(writer)
-                                .map_err(|_| anyhow!("upstream writer unexpectedly shared"))?
-                                .into_inner();
                             return handle_mux_parts(rd, wr, cfg2, first).await;
                         }
                         // Anything else is a plain non-MUX target ("host:port\n"),
                         // exactly like goway.go handleServer's fallthrough branch.
-                        handle_server_tcp_parts(rd, writer, cfg2, first).await
+                        handle_server_tcp_parts(rd, wr, cfg2, first).await
                     }
                     .await;
                     if let Err(e) = result {

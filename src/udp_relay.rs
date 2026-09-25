@@ -9,10 +9,9 @@ use crate::ws::{
 };
 use anyhow::{anyhow, bail, Result};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
 fn cipher(key: &Option<String>) -> XorCipher {
@@ -132,14 +131,10 @@ pub async fn handle_local_udp_proxy(
     wr.flush().await?;
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
-    let writer = Arc::new(Mutex::new(wr));
     let c = cipher(&cfg.key);
     let mut hello = b"UDP\n".to_vec();
     c.apply(&mut hello);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &hello, 2, true).await?
-    };
+    write_frame(&mut wr, &hello, 2, true).await?;
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let Some((opcode, mut ok)) = read_frame(
         &mut rd,
@@ -160,9 +155,8 @@ pub async fn handle_local_udp_proxy(
         bail!("upstream rejected UDP handshake")
     }
     crate::mux_writer::recycle_encode_buf(ok);
-    let latest = Arc::new(Mutex::new(None::<SocketAddr>));
+    let latest = Arc::new(StdMutex::new(None::<SocketAddr>));
     let udp_send = udp.clone();
-    let writer_send = writer.clone();
     let c_send = c.clone();
     let latest_send = latest.clone();
     let upload = tokio::spawn(async move {
@@ -174,13 +168,12 @@ pub async fn handle_local_udp_proxy(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                *latest_send.lock().await = Some(peer);
+                *latest_send.lock().unwrap() = Some(peer);
                 let mut packet = crate::mux_writer::acquire_encode_buf();
                 packet.extend_from_slice(pkt);
                 c_send.apply(&mut packet);
                 crate::stats::add_bytes(packet.len() as i64, 0);
-                let mut w = writer_send.lock().await;
-                let res = write_frame(&mut *w, &packet, 2, true).await;
+                let res = write_frame(&mut wr, &packet, 2, true).await;
                 crate::mux_writer::recycle_encode_buf(packet);
                 if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
@@ -220,7 +213,7 @@ pub async fn handle_local_udp_proxy(
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                if let Some(peer) = *latest.lock().await {
+                if let Some(peer) = *latest.lock().unwrap() {
                     let n = packet.len();
                     let _ = batch_writer.send(&packet, peer).await;
                     crate::stats::add_bytes(0, n as i64);

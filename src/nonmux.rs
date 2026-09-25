@@ -98,7 +98,7 @@ async fn open_upstream(
     cfg: &RuntimeConfig,
 ) -> Result<(
     tokio::io::ReadHalf<TcpStream>,
-    Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>,
+    tokio::io::WriteHalf<TcpStream>,
 )> {
     let upstream = cfg
         .upstream
@@ -128,7 +128,7 @@ async fn open_upstream(
     wr.flush().await?;
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
-    Ok((rd, Arc::new(Mutex::new(wr))))
+    Ok((rd, wr))
 }
 
 /// Pre-warmed non-MUX upstream pool, mirroring GoWay `ConnPool`.
@@ -140,7 +140,7 @@ async fn open_upstream(
 /// pre-warmed dial cache, not a reuse pool).
 struct PooledUpstream {
     rd: tokio::io::ReadHalf<TcpStream>,
-    wr: Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>,
+    wr: tokio::io::WriteHalf<TcpStream>,
     created: Instant,
     last_used: Instant,
 }
@@ -187,7 +187,7 @@ impl NonMuxPool {
         self: &Arc<Self>,
     ) -> Result<(
         tokio::io::ReadHalf<TcpStream>,
-        Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>,
+        tokio::io::WriteHalf<TcpStream>,
     )> {
         let pooled = {
             let mut conns = self.conns.lock().await;
@@ -242,14 +242,11 @@ async fn relay_client(
     pool: Arc<NonMuxPool>,
 ) -> Result<()> {
     enforce_target_policy(&cfg, &req.target)?;
-    let (mut rd, writer) = pool.get_or_dial().await?;
+    let (mut rd, mut wr) = pool.get_or_dial().await?;
     let c = cipher(&cfg.key);
     let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
     c.apply(&mut hello);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &hello, 2, true).await?
-    };
+    write_frame(&mut wr, &hello, 2, true).await?;
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let Some((opcode, mut ok)) = read_frame(
         &mut rd,
@@ -275,13 +272,11 @@ async fn relay_client(
             .await?
     };
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    let writer_up = writer.clone();
     // GoWay v1.8.5 non-MUX TCP: only the target handshake ("host:port\n")
     // and "OK\n" are XOR-encrypted. All subsequent data frames are plaintext.
     if let Some(initial) = req.initial_payload {
         let payload = initial;
-        let mut w = writer_up.lock().await;
-        write_frame(&mut *w, &payload, 2, true).await?;
+        write_frame(&mut wr, &payload, 2, true).await?;
     }
     let mut upload = tokio::spawn(async move {
         let mut buf = relay_buf(cfg.buffer_size).await;
@@ -291,8 +286,7 @@ async fn relay_client(
                 break;
             }
             crate::stats::add_bytes(n as i64, 0);
-            let mut w = writer_up.lock().await;
-            write_frame_borrowed(&mut *w, &mut buf[..n], 2, true).await?
+            write_frame_borrowed(&mut wr, &mut buf[..n], 2, true).await?
         }
         recycle_buf(buf).await;
         Result::<()>::Ok(())
@@ -443,7 +437,6 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let key = validate_server_handshake(&request)?;
     wr.write_all(&build_server_handshake_response(&key)).await?;
     wr.flush().await?;
-    let writer = Arc::new(Mutex::new(wr));
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let Some((opcode, mut target_frame)) = read_frame(
         &mut rd,
@@ -473,12 +466,8 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     apply_socket_options(&target_stream, &cfg);
     let mut ok = b"OK\n".to_vec();
     c.apply(&mut ok);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &ok, 2, false).await?
-    };
+    write_frame(&mut wr, &ok, 2, false).await?;
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
-    let writer_down = writer.clone();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
@@ -489,8 +478,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
             }
             crate::stats::add_bytes(0, n as i64);
             // Non-MUX data frames are plaintext per GoWay server.
-            let mut w = writer_down.lock().await;
-            write_frame_borrowed(&mut *w, &mut buf[..n], 2, false).await?
+            write_frame_borrowed(&mut wr, &mut buf[..n], 2, false).await?
         }
         recycle_buf(buf).await;
         Result::<()>::Ok(())

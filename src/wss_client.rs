@@ -32,7 +32,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
 pub(crate) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -673,7 +673,7 @@ struct WssSessionState {
     obfs: bool,
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
-    streams: Arc<RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
+    streams: Arc<std::sync::RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
     /// Peer-advertised receive window in KiB once its VERSION arrived
     /// (None => un-negotiated: v1 unbounded sends, no WINDOW refunds).
     peer_window: StdMutex<Option<u16>>,
@@ -729,7 +729,7 @@ impl WssSessionState {
             writer: writer.clone(),
             cipher: c.clone(),
             obfs: cfg.obfs,
-            streams: Arc::new(RwLock::new(HashMap::new())),
+            streams: Arc::new(std::sync::RwLock::new(HashMap::new())),
             peer_window: StdMutex::new(None),
             gates: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
@@ -754,7 +754,7 @@ impl WssSessionState {
                 tracing::debug!(%error,"WSS physical session reader stopped")
             };
             reader_session.closed.store(true, Ordering::Release);
-            let mut streams = reader_session.streams.write().await;
+            let mut streams = reader_session.streams.write().unwrap();
             streams.clear();
             // Unblock upload tasks parked on credit: no WINDOW will arrive.
             let mut gates = reader_session.gates.lock().unwrap();
@@ -814,7 +814,7 @@ impl WssSessionState {
             bail!("WSS physical session is full or closed")
         };
         let (id, rx, gate) = {
-            let mut streams = self.streams.write().await;
+            let mut streams = self.streams.write().unwrap();
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 bail!("WSS physical session closed")
@@ -865,7 +865,7 @@ impl WssSessionState {
         let syn =
             MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
         if let Err(error) = send_mux(&self.writer, &self.cipher, &syn, self.obfs).await {
-            self.streams.write().await.remove(&id);
+            self.streams.write().unwrap().remove(&id);
             self.gates.lock().unwrap().remove(&id);
             self.active.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
@@ -881,7 +881,7 @@ impl WssSessionState {
             )
             .await
             {
-                self.streams.write().await.remove(&id);
+                self.streams.write().unwrap().remove(&id);
                 self.gates.lock().unwrap().remove(&id);
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 return Err(error);
@@ -988,12 +988,12 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             _ => {}
         }
         let id = frame.stream_id;
-        let sender = { session.streams.read().await.get(&id).cloned() };
+        let sender = { session.streams.read().unwrap().get(&id).cloned() };
         if let Some(tx) = sender {
             // Terminal FIN/RST is forwarded; accounting is done once by the
             // stream owner (see handle_connection cleanup below), mirroring
             // mux_pool::client_reader_loop.
-            if tx.send(frame).await.is_err() && session.streams.write().await.remove(&id).is_some()
+            if tx.send(frame).await.is_err() && session.streams.write().unwrap().remove(&id).is_some()
             {
                 session.active.fetch_sub(1, Ordering::AcqRel);
             }
@@ -1235,7 +1235,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     upload.abort();
     // Conditional decrement: the reader may have already reaped the stream
     // (send failure) or the session may have been torn down (active zeroed).
-    if session.streams.write().await.remove(&stream_id).is_some() {
+    if session.streams.write().unwrap().remove(&stream_id).is_some() {
         session.active.fetch_sub(1, Ordering::AcqRel);
     }
     if let Some(gate) = session.gates.lock().unwrap().remove(&stream_id) {

@@ -434,36 +434,10 @@ pub(crate) fn encode_mux_ws_frame(
         None => cipher.apply(region),
         Some(key) => {
             let ks = cipher.keystream();
-            let mut mask32 = [0u8; 32];
-            for i in 0..8 {
-                mask32[i * 4..i * 4 + 4].copy_from_slice(&key);
-            }
             if ks.is_empty() {
-                let (chunks32, tail32) = region.as_chunks_mut::<32>();
-                let chunks_len = chunks32.len();
-                for chunk in chunks32 {
-                    for b in 0..32 {
-                        chunk[b] ^= mask32[b];
-                    }
-                }
-                let start = chunks_len * 32;
-                for (j, byte) in tail32.iter_mut().enumerate() {
-                    *byte ^= key[(start + j) & 3];
-                }
+                crate::ws::apply_ws_mask(region, key);
             } else {
-                let clen = region.len().min(ks.len());
-                let (dst_chunks, dst_tail) = region[..clen].as_chunks_mut::<32>();
-                let (ks_chunks, _) = ks[..clen].as_chunks::<32>();
-                let chunks_len = dst_chunks.len();
-                for (d, k) in dst_chunks.iter_mut().zip(ks_chunks) {
-                    for b in 0..32 {
-                        d[b] ^= k[b] ^ mask32[b];
-                    }
-                }
-                let start = chunks_len * 32;
-                for (j, byte) in dst_tail.iter_mut().enumerate() {
-                    *byte ^= ks[start + j] ^ key[(start + j) & 3];
-                }
+                crate::crypto::apply_fused_xor(region, ks, key);
             }
         }
     }

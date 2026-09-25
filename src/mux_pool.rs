@@ -33,7 +33,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
 const DEFAULT_SESSION_COUNT: usize = 4;
@@ -199,7 +199,7 @@ struct SessionState {
     obfs: bool,
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
-    streams: Arc<RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
+    streams: Arc<std::sync::RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
     /// Peer-advertised receive window in KiB once its VERSION arrived
     /// (None => un-negotiated: v1 unbounded sends, no WINDOW refunds).
     peer_window: StdMutex<Option<u16>>,
@@ -280,7 +280,7 @@ impl SessionState {
             writer: writer.clone(),
             cipher: cipher.clone(),
             obfs: cfg.obfs,
-            streams: Arc::new(RwLock::new(HashMap::new())),
+            streams: Arc::new(std::sync::RwLock::new(HashMap::new())),
             peer_window: StdMutex::new(None),
             gates: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
@@ -294,7 +294,7 @@ impl SessionState {
             }
             reader_state.closed.store(true, Ordering::Release);
             reader_state.active.store(0, Ordering::Release);
-            reader_state.streams.write().await.clear();
+            reader_state.streams.write().unwrap().clear();
             // Unblock upload tasks parked on credit: no WINDOW will arrive.
             let mut gates = reader_state.gates.lock().unwrap();
             for gate in gates.values() {
@@ -360,7 +360,7 @@ impl SessionState {
         .encode()
         .map_err(|e| anyhow!(e.to_string()))?;
 
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write().unwrap();
 
         if self.closed.load(Ordering::Acquire) {
             bail!("MUX session is closed")
@@ -417,7 +417,7 @@ impl SessionState {
         )
         .await
         {
-            if self.streams.write().await.remove(&id).is_some() {
+            if self.streams.write().unwrap().remove(&id).is_some() {
                 self.active.fetch_sub(1, Ordering::AcqRel);
             }
             self.gates.lock().unwrap().remove(&id);
@@ -436,7 +436,7 @@ impl SessionState {
             )
             .await
             {
-                if self.streams.write().await.remove(&id).is_some() {
+                if self.streams.write().unwrap().remove(&id).is_some() {
                     self.active.fetch_sub(1, Ordering::AcqRel);
                 }
                 self.gates.lock().unwrap().remove(&id);
@@ -448,7 +448,7 @@ impl SessionState {
         Ok((id, rx, gate))
     }
     async fn close_stream(&self, id: u32) {
-        if self.streams.write().await.remove(&id).is_some() {
+        if self.streams.write().unwrap().remove(&id).is_some() {
             self.active.fetch_sub(1, Ordering::AcqRel);
         }
         if let Some(gate) = self.gates.lock().unwrap().remove(&id) {
@@ -509,9 +509,9 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
             _ => {}
         }
         let id = frame.stream_id;
-        let tx = state.streams.read().await.get(&id).cloned();
+        let tx = state.streams.read().unwrap().get(&id).cloned();
         if let Some(tx) = tx {
-            if tx.send(frame).await.is_err() && state.streams.write().await.remove(&id).is_some() {
+            if tx.send(frame).await.is_err() && state.streams.write().unwrap().remove(&id).is_some() {
                 state.active.fetch_sub(1, Ordering::AcqRel);
             }
         }

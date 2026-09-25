@@ -234,15 +234,246 @@ pub(crate) unsafe fn apply_chunk_neon(chunk: &mut [u8], key: &[u8]) {
 
 pub(crate) fn apply_chunk_fallback(chunk: &mut [u8], key: &[u8]) {
     let clen = chunk.len();
-    let (dst_chunks, dst_tail) = chunk.as_chunks_mut::<32>();
-    let (src_chunks, src_tail) = key[..clen].as_chunks::<32>();
-    for (d, s) in dst_chunks.iter_mut().zip(src_chunks) {
-        for b in 0..32 {
-            d[b] ^= s[b];
-        }
+    let key = &key[..clen];
+    let (dst_words, dst_tail) = chunk.as_chunks_mut::<8>();
+    let (src_words, src_tail) = key.as_chunks::<8>();
+    for (d, s) in dst_words.iter_mut().zip(src_words) {
+        let dw = u64::from_ne_bytes(*d);
+        let sw = u64::from_ne_bytes(*s);
+        *d = (dw ^ sw).to_ne_bytes();
     }
     for (d, s) in dst_tail.iter_mut().zip(src_tail) {
         *d ^= *s;
+    }
+}
+
+/// Applies fused keystream XOR + WebSocket 4-byte mask in a single pass.
+/// Mathematically identical to `cipher.apply(data)` followed by `apply_ws_mask(data, key)`.
+pub(crate) fn apply_fused_xor(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
+    if region.is_empty() || ks.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { apply_fused_xor_avx2(region, ks, key) };
+            return;
+        } else {
+            unsafe { apply_fused_xor_sse2(region, ks, key) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { apply_fused_xor_neon(region, ks, key) };
+        return;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        apply_fused_xor_fallback(region, ks, key);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn apply_fused_xor_avx2(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
+    use std::arch::x86_64::*;
+    let len = region.len().min(ks.len());
+    let k32 = u32::from_ne_bytes(key) as i32;
+    let k_vec = _mm256_set1_epi32(k32);
+    let mut i = 0;
+    while i + 128 <= len {
+        let k0 = _mm256_loadu_si256(ks.as_ptr().add(i) as *const __m256i);
+        let k1 = _mm256_loadu_si256(ks.as_ptr().add(i + 32) as *const __m256i);
+        let k2 = _mm256_loadu_si256(ks.as_ptr().add(i + 64) as *const __m256i);
+        let k3 = _mm256_loadu_si256(ks.as_ptr().add(i + 96) as *const __m256i);
+
+        let d0 = _mm256_loadu_si256(region.as_ptr().add(i) as *const __m256i);
+        let d1 = _mm256_loadu_si256(region.as_ptr().add(i + 32) as *const __m256i);
+        let d2 = _mm256_loadu_si256(region.as_ptr().add(i + 64) as *const __m256i);
+        let d3 = _mm256_loadu_si256(region.as_ptr().add(i + 96) as *const __m256i);
+
+        _mm256_storeu_si256(
+            region.as_mut_ptr().add(i) as *mut __m256i,
+            _mm256_xor_si256(_mm256_xor_si256(d0, k0), k_vec),
+        );
+        _mm256_storeu_si256(
+            region.as_mut_ptr().add(i + 32) as *mut __m256i,
+            _mm256_xor_si256(_mm256_xor_si256(d1, k1), k_vec),
+        );
+        _mm256_storeu_si256(
+            region.as_mut_ptr().add(i + 64) as *mut __m256i,
+            _mm256_xor_si256(_mm256_xor_si256(d2, k2), k_vec),
+        );
+        _mm256_storeu_si256(
+            region.as_mut_ptr().add(i + 96) as *mut __m256i,
+            _mm256_xor_si256(_mm256_xor_si256(d3, k3), k_vec),
+        );
+        i += 128;
+    }
+    while i + 32 <= len {
+        let k = _mm256_loadu_si256(ks.as_ptr().add(i) as *const __m256i);
+        let d = _mm256_loadu_si256(region.as_ptr().add(i) as *const __m256i);
+        _mm256_storeu_si256(
+            region.as_mut_ptr().add(i) as *mut __m256i,
+            _mm256_xor_si256(_mm256_xor_si256(d, k), k_vec),
+        );
+        i += 32;
+    }
+    let k_sse = _mm_set1_epi32(k32);
+    while i + 16 <= len {
+        let k = _mm_loadu_si128(ks.as_ptr().add(i) as *const __m128i);
+        let d = _mm_loadu_si128(region.as_ptr().add(i) as *const __m128i);
+        _mm_storeu_si128(
+            region.as_mut_ptr().add(i) as *mut __m128i,
+            _mm_xor_si128(_mm_xor_si128(d, k), k_sse),
+        );
+        i += 16;
+    }
+    let k64 = (u32::from_ne_bytes(key) as u64) | ((u32::from_ne_bytes(key) as u64) << 32);
+    while i + 8 <= len {
+        let k = (ks.as_ptr().add(i) as *const u64).read_unaligned();
+        let d = (region.as_ptr().add(i) as *const u64).read_unaligned();
+        (region.as_mut_ptr().add(i) as *mut u64).write_unaligned(d ^ k ^ k64);
+        i += 8;
+    }
+    while i < len {
+        *region.get_unchecked_mut(i) ^= *ks.get_unchecked(i) ^ key[i & 3];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub(crate) unsafe fn apply_fused_xor_sse2(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
+    use std::arch::x86_64::*;
+    let len = region.len().min(ks.len());
+    let k32 = u32::from_ne_bytes(key) as i32;
+    let k_vec = _mm_set1_epi32(k32);
+    let mut i = 0;
+    while i + 64 <= len {
+        let k0 = _mm_loadu_si128(ks.as_ptr().add(i) as *const __m128i);
+        let k1 = _mm_loadu_si128(ks.as_ptr().add(i + 16) as *const __m128i);
+        let k2 = _mm_loadu_si128(ks.as_ptr().add(i + 32) as *const __m128i);
+        let k3 = _mm_loadu_si128(ks.as_ptr().add(i + 48) as *const __m128i);
+
+        let d0 = _mm_loadu_si128(region.as_ptr().add(i) as *const __m128i);
+        let d1 = _mm_loadu_si128(region.as_ptr().add(i + 16) as *const __m128i);
+        let d2 = _mm_loadu_si128(region.as_ptr().add(i + 32) as *const __m128i);
+        let d3 = _mm_loadu_si128(region.as_ptr().add(i + 48) as *const __m128i);
+
+        _mm_storeu_si128(
+            region.as_mut_ptr().add(i) as *mut __m128i,
+            _mm_xor_si128(_mm_xor_si128(d0, k0), k_vec),
+        );
+        _mm_storeu_si128(
+            region.as_mut_ptr().add(i + 16) as *mut __m128i,
+            _mm_xor_si128(_mm_xor_si128(d1, k1), k_vec),
+        );
+        _mm_storeu_si128(
+            region.as_mut_ptr().add(i + 32) as *mut __m128i,
+            _mm_xor_si128(_mm_xor_si128(d2, k2), k_vec),
+        );
+        _mm_storeu_si128(
+            region.as_mut_ptr().add(i + 48) as *mut __m128i,
+            _mm_xor_si128(_mm_xor_si128(d3, k3), k_vec),
+        );
+        i += 64;
+    }
+    while i + 16 <= len {
+        let k = _mm_loadu_si128(ks.as_ptr().add(i) as *const __m128i);
+        let d = _mm_loadu_si128(region.as_ptr().add(i) as *const __m128i);
+        _mm_storeu_si128(
+            region.as_mut_ptr().add(i) as *mut __m128i,
+            _mm_xor_si128(_mm_xor_si128(d, k), k_vec),
+        );
+        i += 16;
+    }
+    let k64 = (u32::from_ne_bytes(key) as u64) | ((u32::from_ne_bytes(key) as u64) << 32);
+    while i + 8 <= len {
+        let k = (ks.as_ptr().add(i) as *const u64).read_unaligned();
+        let d = (region.as_ptr().add(i) as *const u64).read_unaligned();
+        (region.as_mut_ptr().add(i) as *mut u64).write_unaligned(d ^ k ^ k64);
+        i += 8;
+    }
+    while i < len {
+        *region.get_unchecked_mut(i) ^= *ks.get_unchecked(i) ^ key[i & 3];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn apply_fused_xor_neon(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
+    use std::arch::aarch64::*;
+    let len = region.len().min(ks.len());
+    let mask16 = [
+        key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
+        key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
+    ];
+    let mask_vec = vld1q_u8(mask16.as_ptr());
+    let mut i = 0;
+    while i + 64 <= len {
+        let k0 = vld1q_u8(ks.as_ptr().add(i));
+        let k1 = vld1q_u8(ks.as_ptr().add(i + 16));
+        let k2 = vld1q_u8(ks.as_ptr().add(i + 32));
+        let k3 = vld1q_u8(ks.as_ptr().add(i + 48));
+
+        let d0 = vld1q_u8(region.as_ptr().add(i));
+        let d1 = vld1q_u8(region.as_ptr().add(i + 16));
+        let d2 = vld1q_u8(region.as_ptr().add(i + 32));
+        let d3 = vld1q_u8(region.as_ptr().add(i + 48));
+
+        vst1q_u8(region.as_mut_ptr().add(i), veorq_u8(veorq_u8(d0, k0), mask_vec));
+        vst1q_u8(
+            region.as_mut_ptr().add(i + 16),
+            veorq_u8(veorq_u8(d1, k1), mask_vec),
+        );
+        vst1q_u8(
+            region.as_mut_ptr().add(i + 32),
+            veorq_u8(veorq_u8(d2, k2), mask_vec),
+        );
+        vst1q_u8(
+            region.as_mut_ptr().add(i + 48),
+            veorq_u8(veorq_u8(d3, k3), mask_vec),
+        );
+        i += 64;
+    }
+    while i + 16 <= len {
+        let k = vld1q_u8(ks.as_ptr().add(i));
+        let d = vld1q_u8(region.as_ptr().add(i));
+        vst1q_u8(region.as_mut_ptr().add(i), veorq_u8(veorq_u8(d, k), mask_vec));
+        i += 16;
+    }
+    let mask64 = u64::from_ne_bytes([
+        key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
+    ]);
+    while i + 8 <= len {
+        let k = (ks.as_ptr().add(i) as *const u64).read_unaligned();
+        let d = (region.as_ptr().add(i) as *const u64).read_unaligned();
+        (region.as_mut_ptr().add(i) as *mut u64).write_unaligned(d ^ k ^ mask64);
+        i += 8;
+    }
+    while i < len {
+        *region.get_unchecked_mut(i) ^= *ks.get_unchecked(i) ^ key[i & 3];
+        i += 1;
+    }
+}
+
+pub(crate) fn apply_fused_xor_fallback(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
+    let len = region.len().min(ks.len());
+    let mask64 = u64::from_ne_bytes([
+        key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
+    ]);
+    let (dst_words, dst_tail) = region[..len].as_chunks_mut::<8>();
+    let (ks_words, ks_tail) = ks[..len].as_chunks::<8>();
+    for (d, k) in dst_words.iter_mut().zip(ks_words) {
+        let dw = u64::from_ne_bytes(*d);
+        let kw = u64::from_ne_bytes(*k);
+        *d = (dw ^ kw ^ mask64).to_ne_bytes();
+    }
+    let offset = dst_words.len() * 8;
+    for (j, (d, k)) in dst_tail.iter_mut().zip(ks_tail).enumerate() {
+        *d ^= *k ^ key[(offset + j) & 3];
     }
 }
 
@@ -375,4 +606,47 @@ mod tests {
             assert_eq!(fb_buf, ref_buf, "fallback mismatch at len {len}");
         }
     }
+
+    #[test]
+    fn test_fused_xor_matches_reference() {
+        let key_data: Vec<u8> = (0..2048).map(|x| (x * 13 + 7) as u8).collect();
+        let ws_mask = [0x12, 0x34, 0x56, 0x78];
+        for len in [
+            0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256,
+            1000, 2048,
+        ] {
+            let orig: Vec<u8> = (0..len).map(|x| (x * 7 + 3) as u8).collect();
+            let mut ref_buf = orig.clone();
+            for (i, b) in ref_buf.iter_mut().enumerate() {
+                *b ^= key_data[i % key_data.len()] ^ ws_mask[i & 3];
+            }
+            let key_expanded: Vec<u8> = (0..len).map(|i| key_data[i % key_data.len()]).collect();
+
+            let mut fused_buf = orig.clone();
+            apply_fused_xor(&mut fused_buf, &key_expanded, ws_mask);
+            assert_eq!(fused_buf, ref_buf, "fused dispatcher mismatch at len {len}");
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut sse_buf = orig.clone();
+                unsafe {
+                    apply_fused_xor_sse2(&mut sse_buf, &key_expanded, ws_mask);
+                }
+                assert_eq!(sse_buf, ref_buf, "fused SSE2 mismatch at len {len}");
+
+                if has_avx2() {
+                    let mut avx_buf = orig.clone();
+                    unsafe {
+                        apply_fused_xor_avx2(&mut avx_buf, &key_expanded, ws_mask);
+                    }
+                    assert_eq!(avx_buf, ref_buf, "fused AVX2 mismatch at len {len}");
+                }
+            }
+
+            let mut fb_buf = orig.clone();
+            apply_fused_xor_fallback(&mut fb_buf, &key_expanded, ws_mask);
+            assert_eq!(fb_buf, ref_buf, "fused fallback mismatch at len {len}");
+        }
+    }
 }
+

@@ -111,7 +111,9 @@ impl UdpBatchWriter {
 
     /// Appends a datagram to the batch. Flushes automatically when reaching [`UDP_BATCH`].
     pub(crate) async fn push(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.queue.push((payload.to_vec(), addr));
+        let mut buf = crate::mux_writer::acquire_encode_buf();
+        buf.extend_from_slice(payload);
+        self.queue.push((buf, addr));
         if self.queue.len() >= UDP_BATCH {
             self.flush().await?;
         }
@@ -124,18 +126,21 @@ impl UdpBatchWriter {
             return Ok(0);
         }
         let mut total = 0;
+        let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
         while !self.queue.is_empty() {
             self.sock.writable().await?;
             let take = self.queue.len().min(UDP_BATCH);
-            let slice: Vec<(&[u8], SocketAddr)> = self.queue[..take]
-                .iter()
-                .map(|(p, a)| (p.as_slice(), *a))
-                .collect();
+            let mut slice: [(&[u8], SocketAddr); UDP_BATCH] = [(&[], dummy_addr); UDP_BATCH];
+            for i in 0..take {
+                slice[i] = (self.queue[i].0.as_slice(), self.queue[i].1);
+            }
 
             #[cfg(target_os = "linux")]
-            match send_batch_linux(&self.sock, &slice) {
+            match send_batch_linux(&self.sock, &slice[..take]) {
                 Ok(n) if n > 0 => {
-                    self.queue.drain(..n);
+                    for (buf, _) in self.queue.drain(..n) {
+                        crate::mux_writer::recycle_encode_buf(buf);
+                    }
                     total += n;
                 }
                 Ok(_) => break,
@@ -144,9 +149,11 @@ impl UdpBatchWriter {
             }
 
             #[cfg(not(target_os = "linux"))]
-            match send_batch_fallback(&self.sock, &slice) {
+            match send_batch_fallback(&self.sock, &slice[..take]) {
                 Ok(n) if n > 0 => {
-                    self.queue.drain(..n);
+                    for (buf, _) in self.queue.drain(..n) {
+                        crate::mux_writer::recycle_encode_buf(buf);
+                    }
                     total += n;
                 }
                 Ok(_) => break,
@@ -159,9 +166,24 @@ impl UdpBatchWriter {
 
     /// Immediately sends a datagram, flushing any previously queued datagrams in the same syscall.
     pub(crate) async fn send(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
+        if self.queue.is_empty() {
+            match self.sock.try_send_to(payload, addr) {
+                Ok(_) => return Ok(()),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
         self.push(payload, addr).await?;
         self.flush().await?;
         Ok(())
+    }
+}
+
+impl Drop for UdpBatchWriter {
+    fn drop(&mut self) {
+        for (buf, _) in self.queue.drain(..) {
+            crate::mux_writer::recycle_encode_buf(buf);
+        }
     }
 }
 

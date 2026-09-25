@@ -5,10 +5,11 @@ use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,6 +20,8 @@ const MAX_PACKET: usize = 4096;
 static SERVER: RwLock<Option<IpAddr>> = RwLock::new(None);
 static CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::new();
 static ALL_V4_CACHE: OnceLock<RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>>> = OnceLock::new();
+static IN_FLIGHT: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<IpAddr>>>>> =
+    OnceLock::new();
 
 fn cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
@@ -26,6 +29,10 @@ fn cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
 
 fn all_v4_cache() -> &'static RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>> {
     ALL_V4_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<IpAddr>>>> {
+    IN_FLIGHT.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 pub(crate) async fn configure(server: Option<String>) -> Result<()> {
@@ -55,27 +62,98 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
             }
         }
     }
+
+    // SingleFlight coordination: deduplicate concurrent in-flight DNS lookups for the same host.
+    let mut waiter = None;
+    let mut tx = None;
+    {
+        let mut inflight = in_flight().lock().unwrap();
+        // Double check cache inside lock
+        if let Ok(guard) = cache().read() {
+            if let Some(&(ip, expires)) = guard.get(&key) {
+                if expires > Instant::now() {
+                    return Ok(ip);
+                }
+            }
+        }
+        if let Some(rx) = inflight.get(&key) {
+            waiter = Some(rx.clone());
+        } else {
+            let (sender, receiver) = watch::channel(None);
+            inflight.insert(key.clone(), receiver);
+            tx = Some(sender);
+        }
+    }
+
+    if let Some(mut rx) = waiter {
+        while rx.borrow().is_none() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+        if let Some(ip) = *rx.borrow() {
+            return Ok(ip);
+        }
+        if let Ok(guard) = cache().read() {
+            if let Some(&(ip, expires)) = guard.get(&key) {
+                if expires > Instant::now() {
+                    return Ok(ip);
+                }
+            }
+        }
+        bail!("concurrent DNS resolution failed for {host}");
+    }
+
+    struct InFlightGuard<'a>(&'a str);
+    impl<'a> Drop for InFlightGuard<'a> {
+        fn drop(&mut self) {
+            if let Ok(mut inflight) = in_flight().lock() {
+                inflight.remove(self.0);
+            }
+        }
+    }
+    let _guard = InFlightGuard(&key);
+
     let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
     let remote_result = match server {
         Some(server_ip) => resolve_remote(&key, server_ip).await,
         None => Err(anyhow!("remote DNS not configured")),
     };
-    let resolved = match remote_result {
-        Ok(ip) => ip,
+    let query_result = match remote_result {
+        Ok(ip) => Ok(ip),
         Err(remote_error) => {
             tracing::warn!(host=%host, error=%remote_error, "remote DNS failed; falling back to system DNS");
-            let mut addresses = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await??;
-            addresses
-                .next()
-                .map(|addr| addr.ip())
-                .ok_or_else(|| anyhow!("system DNS returned no addresses for {host}"))?
+            match timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
+                Ok(Ok(mut addresses)) => addresses
+                    .next()
+                    .map(|addr| addr.ip())
+                    .ok_or_else(|| anyhow!("system DNS returned no addresses for {host}")),
+                Ok(Err(e)) => Err(e.into()),
+                Err(_) => Err(anyhow!("system DNS timeout for {host}")),
+            }
         }
     };
-    cache()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (resolved, Instant::now() + CACHE_TTL));
-    Ok(resolved)
+
+    drop(_guard);
+
+    match query_result {
+        Ok(resolved) => {
+            cache()
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (resolved, Instant::now() + CACHE_TTL));
+            if let Some(sender) = tx {
+                let _ = sender.send(Some(resolved));
+            }
+            Ok(resolved)
+        }
+        Err(e) => {
+            if let Some(sender) = tx {
+                let _ = sender.send(None);
+            }
+            Err(e)
+        }
+    }
 }
 
 pub(crate) async fn resolve_socket(host: &str, port: u16) -> Result<SocketAddr> {

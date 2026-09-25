@@ -743,24 +743,34 @@ async fn write_frame_parts_vectored<W: AsyncWrite + Unpin>(
         if part >= 3 {
             break;
         }
-        let mut slices = Vec::with_capacity(3 - part as usize);
-        match part {
+        let mut slices: [IoSlice<'_>; 3] = [
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+        ];
+        let count = match part {
             0 => {
-                slices.push(IoSlice::new(&header[off..header_len]));
+                slices[0] = IoSlice::new(&header[off..header_len]);
                 if !key_slice.is_empty() {
-                    slices.push(IoSlice::new(key_slice));
+                    slices[1] = IoSlice::new(key_slice);
+                    slices[2] = IoSlice::new(payload);
+                    3
+                } else {
+                    slices[1] = IoSlice::new(payload);
+                    2
                 }
-                slices.push(IoSlice::new(payload));
             }
             1 => {
-                slices.push(IoSlice::new(&key_slice[off..]));
-                slices.push(IoSlice::new(payload));
+                slices[0] = IoSlice::new(&key_slice[off..]);
+                slices[1] = IoSlice::new(payload);
+                2
             }
             _ => {
-                slices.push(IoSlice::new(&payload[off..]));
+                slices[0] = IoSlice::new(&payload[off..]);
+                1
             }
-        }
-        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices)).await?;
+        };
+        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices[..count])).await?;
         if n == 0 {
             return Err(anyhow!("vectored frame write returned zero"));
         }
