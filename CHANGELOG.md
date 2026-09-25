@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.32] - 2026-09-25
+
+### Performance & Kernel TCP Data Plane (4-in-1 Linux Kernel Optimizations)
+- **Server-Side TCP Fast Open (`TCP_FASTOPEN`, RFC 7413) (`runtime.rs`, `main.rs`, `nonmux.rs`, `mux_pool.rs`, `wss_client.rs`, `quic.rs`)**:
+  - Implemented `apply_listener_options` with `libc::TCP_FASTOPEN` (queue depth 256) across all server and client TCP listening sockets (`run_server`, `run_wss_server`, `nonmux`, `mux_pool`, `wss_client`, `quic`).
+  - Allows TFO-capable clients to deliver payload in the SYN packet, saving an entire round-trip time (~150ms on trans-Pacific / trans-Eurasian WAN links) during connection setup.
+  - Transparent fallback for non-TFO clients with 100% protocol compatibility.
+- **Dynamic BBR Congestion Control (`TCP_CONGESTION`) (`runtime.rs`)**:
+  - Dynamically configured `b"bbr\0"` per socket in `apply_socket_options_raw`.
+  - On cross-border / WAN links with 1%~3% random packet loss, prevents Cubic's catastrophic throughput collapse caused by loss-triggered window halving; BBR estimates bottleneck bandwidth and min-RTT to maintain near line-rate throughput.
+  - Safe best-effort: silently falls back to system congestion control if BBR is not loaded in the kernel.
+- **Delayed ACK Elimination (`TCP_QUICKACK`) (`runtime.rs`)**:
+  - Enabled `TCP_QUICKACK = 1` during initial socket setup in `apply_socket_options_raw`.
+  - Suppresses receiver-side 40ms delayed-ACK timers during initial HTTP/WebSocket proxy handshakes and protocol headers exchange.
+- **Zombie Connection Cleanup (`TCP_USER_TIMEOUT`, RFC 5482) (`runtime.rs`)**:
+  - Injected `TCP_USER_TIMEOUT = 30000` (30 seconds) in `apply_socket_options_raw`.
+  - Forcefully terminates broken connections and silent network drops after 30 seconds of unacknowledged data, preventing sockets from remaining stuck for 15+ minutes in kernel retransmission queues.
+- **Comprehensive Socket & Listener Option Coverage**:
+  - Injected missing `apply_socket_options` on client accept loops in `nonmux.rs` and `quic.rs`.
+  - Injected missing `apply_socket_options` on inbound TLS and internal loopback streams in `main.rs:run_wss_server`.
+- **Validation**:
+  - Added unit test `test_apply_socket_and_listener_options` in `runtime.rs` verifying seamless execution and error-free operation on both client and server sockets.
+
 ## [v0.0.31] - 2026-09-25
 
 ### Performance & UDP Data Plane (Linux `sendmmsg` Batched Outbound)

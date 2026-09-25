@@ -350,6 +350,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
         maintainer.maintain().await;
     });
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    crate::runtime::apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
         "RushWay non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
@@ -374,6 +375,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                     }
                 };
                 let cfg2 = cfg.clone();
+                apply_socket_options(&stream, &cfg2);
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
@@ -390,6 +392,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
 }
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    crate::runtime::apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
         "RushWay non-MUX server listening on {}:{}",

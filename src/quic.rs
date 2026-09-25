@@ -7,8 +7,8 @@ use crate::proxy::{
     ClientProxyRequest, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
-    apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
-    wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, drain_join_set, enforce_target_policy,
+    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use anyhow::{anyhow, bail, Context, Result};
@@ -487,6 +487,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
     );
     let pool = QuicClientPool::new(endpoint, server_addr, server_name, cfg.connection_timeout);
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
         "RushWay QUIC client proxy listening on {}:{}",
@@ -502,6 +503,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
             }
             res = listener.accept() => {
                 let (mut stream, peer) = res?;
+                apply_socket_options(&stream, &cfg);
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
                     Err(_) => {

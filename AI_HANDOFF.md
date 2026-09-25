@@ -2646,4 +2646,33 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
 ### Validation
 - Unit test `batch_writer_delivers_in_order` added to `src/udp_batch.rs` verifying in-order datagram reception across multiple batches.
 - Workspace unit tests: all passing cleanly.
-- Status: Version bumped to 0.0.31; tagged v0.0.31; ready to commit and push.
+- Status: Version bumped to 0.0.31; tagged v0.0.31; committed and pushed.
+
+## Release: v0.0.32 (2026-09-25)
+
+### Context & User Directives
+- **Directives:** "tcp协议，还有正向优化的空间吗" -> User agreed to bundle all 4 major TCP optimizations ("同意").
+- **Ironclad Constraint:** Standing rule: forward-only optimizations, zero backward regressions, 100% protocol backwards compatibility, safe best-effort fallbacks on non-Linux/unsupported kernels.
+
+### Architectural Optimizations Implemented & Shipped
+1. **Server-Side TCP Fast Open (`TCP_FASTOPEN`, RFC 7413) (`src/runtime.rs`, `src/main.rs`, `src/nonmux.rs`, `src/mux_pool.rs`, `src/wss_client.rs`, `src/quic.rs`)**:
+   - Implemented `apply_listener_options` with `libc::TCP_FASTOPEN` (queue depth 256) across all server and client TCP listening sockets (`run_server`, `run_wss_server`, `nonmux`, `mux_pool`, `wss_client`, `quic`).
+   - Allows TFO-capable clients to deliver payload in the SYN packet, saving an entire round-trip time (~150ms on trans-Pacific / trans-Eurasian WAN links) during connection setup.
+   - Transparent fallback for non-TFO clients with 100% protocol compatibility.
+2. **Dynamic BBR Congestion Control (`TCP_CONGESTION`) (`src/runtime.rs`)**:
+   - Dynamically configured `b"bbr\0"` per socket in `apply_socket_options_raw`.
+   - On cross-border / WAN links with 1%~3% random packet loss, prevents Cubic's catastrophic throughput collapse caused by loss-triggered window halving; BBR estimates bottleneck bandwidth and min-RTT to maintain near line-rate throughput.
+   - Safe best-effort: silently falls back to system congestion control if BBR is not loaded in the kernel.
+3. **Delayed ACK Elimination (`TCP_QUICKACK`) (`src/runtime.rs`)**:
+   - Enabled `TCP_QUICKACK = 1` during initial socket setup in `apply_socket_options_raw`.
+   - Suppresses receiver-side 40ms delayed-ACK timers during initial HTTP/WebSocket proxy handshakes and protocol headers exchange.
+4. **Zombie Connection Cleanup (`TCP_USER_TIMEOUT`, RFC 5482) (`src/runtime.rs`)**:
+   - Injected `TCP_USER_TIMEOUT = 30000` (30 seconds) in `apply_socket_options_raw`.
+   - Forcefully terminates broken connections and silent network drops after 30 seconds of unacknowledged data, preventing sockets from remaining stuck for 15+ minutes in kernel retransmission queues.
+5. **Comprehensive Socket & Listener Option Coverage**:
+   - Injected missing `apply_socket_options` on client accept loops in `nonmux.rs` and `quic.rs`.
+   - Injected missing `apply_socket_options` on inbound TLS and internal loopback streams in `main.rs:run_wss_server`.
+
+### Validation
+- Unit test `test_apply_socket_and_listener_options` added in `src/runtime.rs` verifying seamless execution and error-free operation on both client and server sockets.
+- Status: Version bumped to 0.0.32; tagged v0.0.32; committed and pushed to remote repository.

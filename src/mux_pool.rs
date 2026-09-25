@@ -16,8 +16,8 @@ use crate::proxy::{
     TargetAddr,
 };
 use crate::runtime::{
-    apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
-    wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, drain_join_set, enforce_target_policy,
+    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
@@ -882,6 +882,7 @@ async fn handle_tcp_proxy(
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     let pool = MuxSessionPool::new(cfg.clone());
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    apply_listener_options(&listener);
     let pool_maintainer = pool.clone();
     tokio::spawn(async move {
         pool_maintainer.maintain().await;

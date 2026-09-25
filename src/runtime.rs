@@ -237,21 +237,91 @@ pub(crate) fn apply_socket_options_raw(
     }
     #[cfg(target_os = "linux")]
     {
-        // TCP_NOTSENT_LOWAT bounds unsent bytes buffered in the kernel send
+        use std::os::fd::AsRawFd;
+        let fd = stream.as_raw_fd();
+
+        // 1. TCP_NOTSENT_LOWAT bounds unsent bytes buffered in the kernel send
         // queue before poll/epoll reports writable. This prevents bufferbloat
         // on high-BDP cross-border links (Cloudflare/HTTP2 standard practice: 16 KiB).
-        use std::os::fd::AsRawFd;
         let lowat: libc::c_uint = 16384;
         unsafe {
             let _ = libc::setsockopt(
-                stream.as_raw_fd(),
+                fd,
                 libc::IPPROTO_TCP,
                 libc::TCP_NOTSENT_LOWAT,
                 &lowat as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&lowat) as libc::socklen_t,
             );
         }
+
+        // 2. TCP_CONGESTION: Set BBR congestion control algorithm.
+        // On cross-border/WAN links with random packet loss (1%~3%), loss-based algorithms
+        // like Cubic collapse throughput by repeatedly halving the congestion window,
+        // whereas BBR builds a model of the network to sustain maximum throughput.
+        // Best-effort: if BBR is unavailable in the kernel, setsockopt fails gracefully.
+        let bbr = b"bbr\0";
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                bbr.as_ptr() as *const libc::c_void,
+                bbr.len() as libc::socklen_t,
+            );
+        }
+
+        // 3. TCP_QUICKACK: Suppress delayed ACK timer during stream setup.
+        // Prevents TCP receiver from delaying ACKs up to 40ms during handshake
+        // and initial protocol frame exchange.
+        let quickack: libc::c_int = 1;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &quickack as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&quickack) as libc::socklen_t,
+            );
+        }
+
+        // 4. TCP_USER_TIMEOUT (RFC 5482): Forcefully resets dead connections after
+        // 30 seconds of unacknowledged transmitted data, eliminating 15-minute kernel
+        // retransmission hangs during silent network disconnects.
+        let user_timeout_ms: libc::c_uint = 30000;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &user_timeout_ms as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&user_timeout_ms) as libc::socklen_t,
+            );
+        }
     }
+}
+
+/// Applies kernel-level optimizations to a listening TCP socket.
+///
+/// On Linux:
+/// - TCP_FASTOPEN (RFC 7413): Enables TCP Fast Open on server-side listeners with
+///   a queue depth of 256. This allows clients supporting TFO to send SYN+data,
+///   eliminating 1 RTT of latency during connection establishment.
+pub(crate) fn apply_listener_options(listener: &TcpListener) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let qlen: libc::c_int = 256;
+        unsafe {
+            let _ = libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &qlen as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&qlen) as libc::socklen_t,
+            );
+        }
+    }
+    let _ = listener;
 }
 pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
     apply_socket_options_raw(stream, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
@@ -1087,6 +1157,7 @@ async fn handle_server_udp_parts(
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
         "RushWay server listening on {}:{}",
@@ -1272,5 +1343,22 @@ mod lifecycle_tests {
                 "is_blocked_local_host({a}) should be false"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_apply_socket_and_listener_options() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        apply_listener_options(&listener);
+        let addr = listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            apply_socket_options_raw(&stream, true, 64, true);
+            stream
+        });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        apply_socket_options_raw(&server_stream, true, 64, true);
+        let client_stream = client_task.await.unwrap();
+        drop(client_stream);
+        drop(server_stream);
     }
 }

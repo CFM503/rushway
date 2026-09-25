@@ -13,8 +13,8 @@ use crate::proxy::{
     TargetAddr,
 };
 use crate::runtime::{
-    apply_socket_options, apply_socket_options_raw, drain_join_set, recycle_buf, relay_buf,
-    wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, apply_socket_options_raw, drain_join_set,
+    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::tls;
 use crate::udp_batch::UdpBatchReader;
@@ -621,6 +621,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         maintainer.maintain().await;
     });
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     tracing::info!(
         "RushWay WSS non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
@@ -1235,6 +1236,7 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
     };
     let pool = WssSessionPool::new(wc.clone());
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     let pool_maintainer = pool.clone();
     tokio::spawn(async move {

@@ -327,6 +327,7 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
 async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
     let public_bind = format!("{}:{}", cfg.proxy_host, cfg.proxy_port);
     let listener = TcpListener::bind(&public_bind).await?;
+    runtime::apply_listener_options(&listener);
     let internal_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let internal_port = internal_listener.local_addr()?.port();
     drop(internal_listener);
@@ -351,6 +352,7 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
             }
             res = listener.accept() => {
                 let (stream, peer) = res?;
+                runtime::apply_socket_options(&stream, &cfg);
                 let acceptor = acceptor.clone();
                 set.spawn(async move {
                     let _conn = stats::ConnGuard::new();
@@ -374,6 +376,7 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                         }
                         let mut internal = internal
                             .ok_or_else(|| anyhow!("private WS runtime did not start"))?;
+                        runtime::apply_socket_options(&internal, &cfg);
                         let (request, key) = ws::build_client_handshake_request(
                             &format!("127.0.0.1:{internal_port}"),
                             "/",
