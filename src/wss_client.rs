@@ -754,10 +754,10 @@ impl WssSessionState {
                 tracing::debug!(%error,"WSS physical session reader stopped")
             };
             reader_session.closed.store(true, Ordering::Release);
-            let mut streams = reader_session.streams.write().unwrap();
+            let mut streams = reader_session.streams.write().unwrap_or_else(|e| e.into_inner());
             streams.clear();
             // Unblock upload tasks parked on credit: no WINDOW will arrive.
-            let mut gates = reader_session.gates.lock().unwrap();
+            let mut gates = reader_session.gates.lock().unwrap_or_else(|e| e.into_inner());
             for gate in gates.values() {
                 gate.close();
             }
@@ -814,7 +814,7 @@ impl WssSessionState {
             bail!("WSS physical session is full or closed")
         };
         let (id, rx, gate) = {
-            let mut streams = self.streams.write().unwrap();
+            let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 bail!("WSS physical session closed")
@@ -834,9 +834,9 @@ impl WssSessionState {
             // peer_window so a racing VERSION arm can never miss this
             // stream, and the guard dies before the send awaits.
             let gate = {
-                let mut gates = self.gates.lock().unwrap();
+                let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
                 let gate = CreditGate::new();
-                if let Some(kib) = *self.peer_window.lock().unwrap() {
+                if let Some(kib) = *self.peer_window.lock().unwrap_or_else(|e| e.into_inner()) {
                     gate.enable(i64::from(kib) * 1024);
                 }
                 gates.insert(stream_id, gate.clone());
@@ -865,8 +865,8 @@ impl WssSessionState {
         let syn =
             MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
         if let Err(error) = send_mux(&self.writer, &self.cipher, &syn, self.obfs).await {
-            self.streams.write().unwrap().remove(&id);
-            self.gates.lock().unwrap().remove(&id);
+            self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.active.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
@@ -881,8 +881,8 @@ impl WssSessionState {
             )
             .await
             {
-                self.streams.write().unwrap().remove(&id);
-                self.gates.lock().unwrap().remove(&id);
+                self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 self.active.fetch_sub(1, Ordering::AcqRel);
                 return Err(error);
             }
@@ -963,8 +963,8 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             MuxCommand::Version => {
                 if let Some((version, kib)) = decode_version_payload(frame.payload()) {
                     if version >= 1 {
-                        let gates = session.gates.lock().unwrap();
-                        let mut pw = session.peer_window.lock().unwrap();
+                        let gates = session.gates.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut pw = session.peer_window.lock().unwrap_or_else(|e| e.into_inner());
                         if pw.is_none() {
                             *pw = Some(kib);
                             drop(pw);
@@ -979,7 +979,7 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             }
             MuxCommand::Window => {
                 if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(gate) = session.gates.lock().unwrap().get(&frame.stream_id) {
+                    if let Some(gate) = session.gates.lock().unwrap_or_else(|e| e.into_inner()).get(&frame.stream_id) {
                         gate.release(i64::from(credit));
                     }
                 }
@@ -988,13 +988,13 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             _ => {}
         }
         let id = frame.stream_id;
-        let sender = session.streams.read().unwrap().get(&id).cloned();
+        let sender = session.streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
         if let Some(tx) = sender {
             // Terminal FIN/RST is forwarded; accounting is done once by the
             // stream owner (see handle_connection cleanup below), mirroring
             // mux_pool::client_reader_loop.
             if tx.send(frame).await.is_err() {
-                if session.streams.write().unwrap().remove(&id).is_some() {
+                if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
                     session.active.fetch_sub(1, Ordering::AcqRel);
                 }
             }
@@ -1199,7 +1199,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 write_res?;
                 if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
-                    let negotiated = session.peer_window.lock().unwrap().is_some();
+                    let negotiated = session.peer_window.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(len as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {
@@ -1236,10 +1236,10 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     upload.abort();
     // Conditional decrement: the reader may have already reaped the stream
     // (send failure) or the session may have been torn down (active zeroed).
-    if session.streams.write().unwrap().remove(&stream_id).is_some() {
+    if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id).is_some() {
         session.active.fetch_sub(1, Ordering::AcqRel);
     }
-    if let Some(gate) = session.gates.lock().unwrap().remove(&stream_id) {
+    if let Some(gate) = session.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id) {
         gate.close();
     }
     Ok(())

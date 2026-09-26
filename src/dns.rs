@@ -67,7 +67,7 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     let mut waiter = None;
     let mut tx = None;
     {
-        let mut inflight = in_flight().lock().unwrap();
+        let mut inflight = in_flight().lock().unwrap_or_else(|e| e.into_inner());
         // Double check cache inside lock
         if let Ok(guard) = cache().read() {
             if let Some(&(ip, expires)) = guard.get(&key) {

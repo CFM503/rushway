@@ -240,7 +240,8 @@ async fn read_len_prefixed_udp(
     }
     let len = u16::from_be_bytes(len_buf) as usize;
     if len > buf.capacity() {
-        buf.reserve(len - buf.capacity())
+        // `Vec::reserve` takes *additional* capacity beyond `len`, not a total.
+        buf.reserve(len.saturating_sub(buf.len()))
     }
     buf.resize(len, 0);
     recv.read_exact(buf).await?;

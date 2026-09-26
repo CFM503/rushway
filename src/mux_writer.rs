@@ -246,6 +246,11 @@ impl Scheduler {
         self.total == 0
     }
 
+    #[cfg(test)]
+    fn live_stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
     fn push(&mut self, frame: OutboundFrame) {
         // Termination guard: the deficit caps at DRR_MAX_DEFICIT, so an
         // oversized frame could never afford emission and would wedge the
@@ -323,12 +328,25 @@ impl Scheduler {
             let sid = self.rotation[self.pos];
             self.pos += 1;
             checked += 1;
+            let drained = match self.streams.get(&sid) {
+                Some(q) => q.frames.is_empty(),
+                // Defensive: rotation and map disagree; heal it below.
+                None => true,
+            };
+            if drained {
+                // Drop streams whose queue drained eagerly. Streams closed
+                // without a closing control (RST / abort paths that only
+                // clear the connection table) would otherwise linger in
+                // `rotation` forever, forcing every `next()` to scan them.
+                // `remove_stream` repairs `pos`; the priority-lane yield
+                // check below treats a missing entry as unblocked, so a
+                // pending FIN/RST still fires after its DATA.
+                self.remove_stream(&sid);
+                continue;
+            }
             let Some(q) = self.streams.get_mut(&sid) else {
                 continue;
             };
-            if q.frames.is_empty() {
-                continue;
-            }
             q.deficit = (q.deficit + DRR_QUANTUM).min(DRR_MAX_DEFICIT);
             let affordable = q.frames.front().map(|f| f.len()).unwrap_or(usize::MAX);
             if affordable <= q.deficit {
@@ -888,6 +906,39 @@ mod tests {
         // of its own stream: D1 always comes before FIN. Intra-stream order
         // is what correctness needs; cross-stream order stays fair.
         assert_eq!(order, vec![3, 5, 1, 2]);
+    }
+
+    #[test]
+    fn drr_drained_streams_are_dropped_eagerly() {
+        // Regression (v0.0.36): a stream whose queue drained must leave
+        // `rotation` even while other streams still hold frames. Streams
+        // closed via RST/abort paths never send a closing control through
+        // the scheduler; without eager removal their dead entries would
+        // make every `next()` scan them forever on long-lived sessions.
+        let mut sched = Scheduler::new();
+        sched.push(drr_frame(1, false, 100, 1)); // small: drains in 1 round
+        sched.push(drr_frame(2, false, 400_000, 2)); // big: needs 4 DRR rounds
+        assert_eq!(sched.live_stream_count(), 2);
+
+        // Round 1: stream 1 emits and drains; stream 2 accrues deficit.
+        let f = sched.next().unwrap();
+        assert_eq!(f[0], 1);
+        // Round 2: the scan reaches drained stream 1 again -> it must be
+        // dropped eagerly, not left lingering in `rotation`.
+        assert!(sched.next().is_none());
+        assert_eq!(sched.live_stream_count(), 1);
+
+        // Stream 2 keeps accruing deficit across rounds, then emits.
+        let mut got = false;
+        for _ in 0..8 {
+            if let Some(f) = sched.next() {
+                assert_eq!(f[0], 2);
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "stream 2 must eventually afford its frame");
+        assert!(sched.is_empty());
     }
 
     #[test]

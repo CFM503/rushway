@@ -2800,3 +2800,54 @@ No further edits this session. Resume at Phase 3 or Phase 4 per user direction.
   - Checksums: `SHA256SUMS.txt` uploaded.
   - Release URL: https://github.com/CFM503/rushway/releases/tag/v0.0.35
 - Status: Release v0.0.35 fully validated, tagged, and published to GitHub.
+---
+
+## 2026-09-26 — v0.0.36 fix batch (Astra agent: Arlo)
+
+### Bug
+1. **MUX `Scheduler` leaked dead streams.** `next()` only removed a stream on FIN/RST yield or whole-scheduler drain. Streams closed via RST/abort paths (`mux_pool.rs::close_stream`, `runtime.rs` stream teardown) clear the connection table without pushing a closing control through the scheduler, so their entries stayed in `rotation` forever — every `next()` scanned them, and scheduling cost grew with the number of historically dead streams on long-lived MUX sessions.
+2. **`Vec::reserve` miscalculated** in `runtime.rs::udp_envelope` and `quic.rs`: `reserve(needed - capacity)` treated `reserve` as a total instead of additional-beyond-`len` → under-reserve (often a complete no-op on pooled buffers), forcing a later reallocation.
+3. **66× `.lock()/.read()/.write().unwrap()`** on std locks: a poisoned lock would cascade panics process-wide.
+4. **Misleading `#[allow(dead_code)]`** on `OwnedMuxFrame::from_parts` (it is used by `runtime.rs`); dead `UdpBatchWriter::is_empty`/`len` helpers.
+5. **Fused SIMD correctness silently depended on `ks.len() % 4 == 0`** (the 4-byte WS mask phase restarts at every keystream chunk) with no assert; the 6 unsafe SIMD kernels had no `# Safety` docs.
+
+### Root cause
+- (1): v0.0.29 commit `a0a2f3f` removed the eager `remove_stream` on drained queues from the DRR loop without adding cleanup to the RST/abort close paths; `close_stream` only clears the stream table and the write gate. Verified by code inspection of `mux_writer.rs::Scheduler::next`, `mux_writer.rs::remove_stream`, `mux_pool.rs::close_stream`.
+- (2): `Vec::reserve` takes *additional* capacity beyond `len`; the code passed `needed - capacity`.
+- (3–5): hygiene debt; no functional failure observed.
+
+### Astra review
+- **Concurrency:** the scheduler fix only touches `Scheduler`, which is single-owner (no locks cross it). `remove_stream` already repairs `pos`, wraps safely, and is a no-op on missing keys. Poison-hardening uses `into_inner()` — recovers the guard instead of panicking; all critical sections are tiny and panic-safe (HashMap get/insert, Option copy).
+- **Protocol/state-machine:** the priority-lane yield check treats a missing stream entry as unblocked (`is_some_and` → false), so a pending FIN/RST still fires after its DATA; intra-stream order is preserved and a re-pushed idle stream re-enters `rotation` (pre-v0.0.29 behavior).
+- **Resource ownership:** no allocation-behavior change except the reserve fix (strictly fewer reallocations).
+- **Regression risk:** DRR deficit/quantum semantics untouched. A premature `None` from `next()` (scan ended right after a removal shrank `rotation`) self-corrects on the next call while `total > 0`; the writer task loops on `total`, and `None if sched.is_empty()` is the only break condition.
+
+### Change
+- `src/mux_writer.rs`: eager `remove_stream` on drained queue in `next()`; `#[cfg(test)] live_stream_count` helper; new regression test `drr_drained_streams_are_dropped_eagerly`.
+- `src/runtime.rs`, `src/quic.rs`: `reserve(needed.saturating_sub(len))`.
+- 66 lock sites → `unwrap_or_else(|e| e.into_inner())` (`dns.rs`, `flow.rs`, `mux_pool.rs`, `runtime.rs`, `tls.rs`, `udp_relay.rs`, `wss_client.rs`).
+- `src/protocol.rs`: removed spurious `#[allow(dead_code)]`; `src/udp_batch.rs`: deleted unused `is_empty`/`len`.
+- `src/crypto.rs`: `debug_assert!(ks.len().is_multiple_of(4))` in `apply_fused_xor`; `# Safety` docs on all 6 unsafe SIMD kernels.
+- `src/ws.rs`: scoped `#[allow(clippy::uninit_vec)]` on `read_frame` (pre-existing, SAFETY-documented reserve+set_len+read_exact pattern).
+- `Cargo.toml` → `0.0.36`; `Cargo.lock` refreshed (adds the declared `mimalloc` dep the old lock was missing); `CHANGELOG.md` entry with no performance claims.
+
+### Commit
+- `31ae873` — `fix: v0.0.36 scheduler dead-stream cleanup, reserve, lock poisoning, SIMD safety` (branch `main`)
+
+### Validation
+- `cargo check --all-targets`: **0 errors** (rustc 1.98.1).
+- `cargo clippy --all-targets`: **0 errors** (13 pre-existing warnings only).
+- `cargo test`: **113 passed, 1 failed** — `udp_batch::tests::batch_writer_delivers_in_order` fails identically on the unmodified v0.0.35 tree (sendmmsg → EPERM in this sandbox; environment restriction, not a code regression).
+- New test `drr_drained_streams_are_dropped_eagerly`: **fails on pre-fix scheduler code** (`live_stream_count` stays 2), **passes on fixed code** — executable proof of bug + fix.
+- Existing scheduler tests (`drr_fin_yields_to_own_data` → `[3,5,1,2]`, `drr_syn_never_yields_to_own_data`, deficit/fairness tests) all pass: yield ordering preserved.
+
+### Status
+Fixed and locally validated. Tag `v0.0.36` created locally. Not pushed: no credentials for `github.com/CFM503/rushway` in this environment, so the GitHub release workflow was not triggered.
+
+### Remaining risk
+- `UdpBatchWriter`'s sendmmsg batching still rarely batches in practice (call sites use push + immediate flush); documented in CHANGELOG, not redesigned in this release.
+- Each `XorCipher` materializes a 256 KiB keystream (~512 KiB per UDP association with the per-direction clone). Sharing one cipher per process config is future work.
+- The 1 failing UDP batch test needs a non-sandboxed runner to confirm green.
+
+### Next action
+Push `main` + tag `v0.0.36` to `origin` (requires the repo owner's credentials), then trigger the release workflow and confirm the UDP batch test on a real host.
