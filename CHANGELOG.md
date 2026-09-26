@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.38] - 2026-09-26
+
+### Tunability & Test Hygiene (Risks #7, #10)
+
+- **`SO_BUSY_POLL` is now tunable (`runtime.rs`, risk #7)**:
+  - The 50µs busy-poll value was hardcoded on every TCP stream; on hosts with many mostly-idle connections the kernel spin burns CPU for no gain.
+  - New `RUSHWAY_BUSY_POLL_US` environment override (default 50, unchanged behavior; `0` disables). Negative values are clamped to 0; unparseable values fall back to the default.
+- **UDP batch test skips gracefully on `sendmmsg` EPERM (`udp_batch.rs`, risk #10)**:
+  - `batch_writer_delivers_in_order` no longer fails where seccomp blocks `sendmmsg` (EPERM); it prints a SKIP note and returns. On hosts where `sendmmsg` works the test still exercises the full batch path. Product code untouched.
+- Risk #8 (kernel socket-option variance) needs no change: all `setsockopt` calls are already best-effort (`let _ =`), so unsupported options are silent no-ops.
+
+## [v0.0.37] - 2026-09-26
+
+### Memory: Shared XorCipher Keystream (Risk #6)
+
+- **One 256 KiB keystream per configured key (`crypto.rs`)**:
+  - New `pub(crate) fn shared_cipher(key: &Option<String>) -> Arc<XorCipher>` backed by a process-wide per-key cache. `XorCipher` is immutable after construction (`apply` takes `&self`), so sharing via `Arc` needs no locking on the hot path.
+  - The five per-connection/per-association cipher helpers (`runtime.rs`, `mux_pool.rs`, `nonmux.rs`, `wss_client.rs`, `udp_relay.rs`) now return the shared `Arc` instead of materializing a fresh 256 KiB keystream per connection; the per-direction deep `Clone`s (e.g. UDP send/recv splits) became `Arc` clones.
+  - Owned cipher fields/params (`SessionState.cipher`, `WssSessionState.cipher`, `target_to_mux`, `server_stream_task`) widened to `Arc<XorCipher>`; all `&XorCipher` call sites unchanged.
+  - New regression test `shared_cipher_reuses_one_allocation_per_key`: same key shares one allocation (`Arc::ptr_eq`), different keys stay separate, empty key stays a no-op, output byte-identical to a fresh cipher.
+
 ## [v0.0.36] - 2026-09-26
 
 ### Correctness & Hygiene Fixes (Scheduler, Reserve, Lock Poisoning, SIMD Safety)

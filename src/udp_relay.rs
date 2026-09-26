@@ -1,4 +1,4 @@
-use crate::crypto::XorCipher;
+use crate::crypto::{shared_cipher, XorCipher};
 use crate::dns::{self, resolve_all_ipv4};
 use crate::proxy::{parse_authority_with_default, parse_socks5_udp_datagram, TargetAddr};
 use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
@@ -14,8 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 
-fn cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
+fn cipher(key: &Option<String>) -> Arc<XorCipher> {
+    shared_cipher(key)
 }
 
 fn parse_ws_url(input: &str) -> Result<(String, String)> {

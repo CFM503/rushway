@@ -3,7 +3,7 @@
 //! Secure WebSocket (`wss://`) connections, including Cloudflare FakeHost and Edge
 //! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
 
-use crate::crypto::XorCipher;
+use crate::crypto::{shared_cipher, XorCipher};
 use crate::dns;
 use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
@@ -47,8 +47,8 @@ fn configured_session_count() -> usize {
         .map(|v| v.clamp(1, MAX_SESSION_COUNT))
         .unwrap_or(DEFAULT_SESSION_COUNT)
 }
-fn configured_cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
+fn configured_cipher(key: &Option<String>) -> Arc<XorCipher> {
+    shared_cipher(key)
 }
 
 /// GoWay-compatible Cloudflare edge fallback for plain `ws://`.
@@ -195,7 +195,7 @@ fn parse_upstream(input: &str) -> Result<(String, String)> {
 
 struct SessionState {
     writer: Arc<MuxFrameWriter>,
-    cipher: XorCipher,
+    cipher: Arc<XorCipher>,
     obfs: bool,
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.

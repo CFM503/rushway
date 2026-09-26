@@ -1,6 +1,6 @@
 //! Runtime forwarding paths for the GoWay-compatible transport slice.
 
-use crate::crypto::XorCipher;
+use crate::crypto::{shared_cipher, XorCipher};
 use crate::dns::resolve_socket;
 use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
@@ -79,8 +79,8 @@ enum StreamCommand {
     Fin,
     Reset,
 }
-fn configured_cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
+fn configured_cipher(key: &Option<String>) -> Arc<XorCipher> {
+    shared_cipher(key)
 }
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
     cipher.apply(payload)
@@ -299,9 +299,15 @@ pub(crate) fn apply_socket_options_raw(
         }
 
         // 5. SO_BUSY_POLL: Low-latency socket polling in microseconds (Linux 3.11+).
-        // Polls the device driver receive queue for incoming packets for 50µs before
-        // sleeping, drastically cutting tail latency and context switch overhead on busy servers.
-        let busy_poll_us: libc::c_int = 50;
+        // Polls the device driver receive queue for incoming packets before
+        // sleeping, cutting tail latency and context switch overhead on busy servers.
+        // On hosts with many mostly-idle connections the spin burns CPU for no
+        // gain; override with RUSHWAY_BUSY_POLL_US (0 disables, default 50).
+        let busy_poll_us: libc::c_int = std::env::var("RUSHWAY_BUSY_POLL_US")
+            .ok()
+            .and_then(|v| v.parse::<libc::c_int>().ok())
+            .map(|v| v.max(0))
+            .unwrap_or(50);
         unsafe {
             let _ = libc::setsockopt(
                 fd,
@@ -444,7 +450,7 @@ async fn target_to_mux(
     mut target: ReadHalf<TcpStream>,
     writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
-    cipher: XorCipher,
+    cipher: Arc<XorCipher>,
     obfs: bool,
     gate: Arc<CreditGate>,
 ) {
@@ -504,7 +510,7 @@ async fn server_stream_task(
     mut rx: mpsc::Receiver<StreamCommand>,
     writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
-    cipher: XorCipher,
+    cipher: Arc<XorCipher>,
     obfs: bool,
 ) {
     let (rd, mut wr) = tokio::io::split(target);

@@ -1,6 +1,6 @@
 //! WSS client paths for GoWay-compatible upstreams.
 
-use crate::crypto::XorCipher;
+use crate::crypto::{shared_cipher, XorCipher};
 use crate::dns;
 use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
@@ -85,8 +85,8 @@ impl WssConfig {
         })
     }
 }
-fn cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
+fn cipher(key: &Option<String>) -> Arc<XorCipher> {
+    shared_cipher(key)
 }
 fn configured_session_count() -> usize {
     std::env::var("RUSHWAY_MUX_SESSIONS")
@@ -669,7 +669,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
 
 struct WssSessionState {
     writer: Arc<MuxFrameWriter>,
-    cipher: XorCipher,
+    cipher: Arc<XorCipher>,
     obfs: bool,
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.

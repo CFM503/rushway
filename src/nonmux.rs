@@ -1,6 +1,6 @@
 //! Plain WebSocket 1:1 relay compatibility path.
 
-use crate::crypto::XorCipher;
+use crate::crypto::{shared_cipher, XorCipher};
 use crate::dns::{resolve_all_ipv4, resolve_socket};
 use crate::proxy::{
     parse_authority_with_default, parse_target_authority, read_client_proxy_request,
@@ -23,8 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
-fn cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
+fn cipher(key: &Option<String>) -> Arc<XorCipher> {
+    shared_cipher(key)
 }
 fn parse_ws_url(input: &str) -> Result<(String, String)> {
     let rest = input

@@ -1,9 +1,35 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use ring::digest::{digest, SHA256};
 
 /// GoWay v1.8.4-compatible XOR transform.
 /// Each TransformInPlace call starts at key offset zero. The SHA-256 digest
 /// of the configured key is repeated to 256 KiB and applied to the buffer.
 pub const XOR_KEY_SIZE: usize = 256 * 1024;
+
+/// Process-wide cache of materialized ciphers, one 256 KiB keystream per
+/// configured key. `XorCipher` is immutable after construction (`apply`
+/// takes `&self`), so sharing via `Arc` is thread-safe with no locking on
+/// the hot path; the mutex is only taken on first use of a key.
+static SHARED_CIPHERS: OnceLock<Mutex<HashMap<String, Arc<XorCipher>>>> = OnceLock::new();
+
+/// Returns the shared cipher for a configured key, materializing the
+/// 256 KiB keystream at most once per key per process. Callers must use
+/// this instead of `XorCipher::new` on per-connection paths: a fresh
+/// `new` per connection costs 256 KiB each (x2 where send/recv directions
+/// clone), while this costs one allocation total.
+pub(crate) fn shared_cipher(key: &Option<String>) -> Arc<XorCipher> {
+    let k = key.as_deref().unwrap_or("");
+    let cache = SHARED_CIPHERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cipher) = guard.get(k) {
+        return Arc::clone(cipher);
+    }
+    let cipher = Arc::new(XorCipher::new(k));
+    guard.insert(k.to_owned(), Arc::clone(&cipher));
+    cipher
+}
 
 #[derive(Clone)]
 pub struct XorCipher {
@@ -526,6 +552,31 @@ pub(crate) fn apply_fused_xor_fallback(region: &mut [u8], ks: &[u8], key: [u8; 4
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_cipher_reuses_one_allocation_per_key() {
+        let a = shared_cipher(&Some("shared-key".to_string()));
+        let b = shared_cipher(&Some("shared-key".to_string()));
+        // Same key -> same allocation, not a second 256 KiB copy.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.keystream().len(), XOR_KEY_SIZE);
+
+        let other = shared_cipher(&Some("other-key".to_string()));
+        assert!(!Arc::ptr_eq(&a, &other));
+
+        // Empty key stays a no-op and shares the same empty allocation.
+        let e1 = shared_cipher(&None);
+        let e2 = shared_cipher(&Some(String::new()));
+        assert!(Arc::ptr_eq(&e1, &e2));
+        assert!(e1.keystream().is_empty());
+
+        // Shared cipher encrypts identically to a fresh one.
+        let mut d1 = b"payload data".to_vec();
+        let mut d2 = d1.clone();
+        a.apply(&mut d1);
+        XorCipher::new("shared-key").apply(&mut d2);
+        assert_eq!(d1, d2);
+    }
 
     #[test]
     fn empty_key_is_noop() {
