@@ -111,13 +111,12 @@ fn build_profile_config(profile_index: usize, verify_ssl: bool) -> Arc<ClientCon
 fn profile_config(profile_index: usize, verify_ssl: bool) -> Arc<ClientConfig> {
     static CACHE: OnceLock<ProfileConfigCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(config) = cache.lock().unwrap().get(&(profile_index, verify_ssl)) {
+    if let Some(config) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&(profile_index, verify_ssl)) {
         return config.clone();
     }
     let config = build_profile_config(profile_index, verify_ssl);
     cache
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|e| e.into_inner())
         .insert((profile_index, verify_ssl), config.clone());
     config
 }

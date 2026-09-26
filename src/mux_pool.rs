@@ -294,9 +294,9 @@ impl SessionState {
             }
             reader_state.closed.store(true, Ordering::Release);
             reader_state.active.store(0, Ordering::Release);
-            reader_state.streams.write().unwrap().clear();
+            reader_state.streams.write().unwrap_or_else(|e| e.into_inner()).clear();
             // Unblock upload tasks parked on credit: no WINDOW will arrive.
-            let mut gates = reader_state.gates.lock().unwrap();
+            let mut gates = reader_state.gates.lock().unwrap_or_else(|e| e.into_inner());
             for gate in gates.values() {
                 gate.close();
             }
@@ -361,7 +361,7 @@ impl SessionState {
         .map_err(|e| anyhow!(e.to_string()))?;
 
         let (id, rx, gate) = {
-            let mut streams = self.streams.write().unwrap();
+            let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
 
             if self.closed.load(Ordering::Acquire) {
                 bail!("MUX session is closed")
@@ -397,9 +397,9 @@ impl SessionState {
             // (lock order everywhere: streams -> gates -> peer_window).
             // Scoped block: the guard must be dead before the send awaits.
             let gate = {
-                let mut gates = self.gates.lock().unwrap();
+                let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
                 let gate = CreditGate::new();
-                if let Some(kib) = *self.peer_window.lock().unwrap() {
+                if let Some(kib) = *self.peer_window.lock().unwrap_or_else(|e| e.into_inner()) {
                     gate.enable(i64::from(kib) * 1024);
                 }
                 gates.insert(id, gate.clone());
@@ -419,10 +419,10 @@ impl SessionState {
         )
         .await
         {
-            if self.streams.write().unwrap().remove(&id).is_some() {
+            if self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
                 self.active.fetch_sub(1, Ordering::AcqRel);
             }
-            self.gates.lock().unwrap().remove(&id);
+            self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.closed.store(true, Ordering::Release);
             return Err(e);
         }
@@ -438,10 +438,10 @@ impl SessionState {
             )
             .await
             {
-                if self.streams.write().unwrap().remove(&id).is_some() {
+                if self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
                     self.active.fetch_sub(1, Ordering::AcqRel);
                 }
-                self.gates.lock().unwrap().remove(&id);
+                self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 self.closed.store(true, Ordering::Release);
                 return Err(e);
             }
@@ -450,10 +450,10 @@ impl SessionState {
         Ok((id, rx, gate))
     }
     async fn close_stream(&self, id: u32) {
-        if self.streams.write().unwrap().remove(&id).is_some() {
+        if self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
             self.active.fetch_sub(1, Ordering::AcqRel);
         }
-        if let Some(gate) = self.gates.lock().unwrap().remove(&id) {
+        if let Some(gate) = self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
             gate.close();
         }
     }
@@ -485,8 +485,8 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
             MuxCommand::Version => {
                 if let Some((version, kib)) = decode_version_payload(frame.payload()) {
                     if version >= 1 {
-                        let gates = state.gates.lock().unwrap();
-                        let mut pw = state.peer_window.lock().unwrap();
+                        let gates = state.gates.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut pw = state.peer_window.lock().unwrap_or_else(|e| e.into_inner());
                         if pw.is_none() {
                             *pw = Some(kib);
                             drop(pw);
@@ -502,7 +502,7 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
             }
             MuxCommand::Window => {
                 if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(gate) = state.gates.lock().unwrap().get(&frame.stream_id) {
+                    if let Some(gate) = state.gates.lock().unwrap_or_else(|e| e.into_inner()).get(&frame.stream_id) {
                         gate.release(i64::from(credit));
                     }
                 }
@@ -511,10 +511,10 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
             _ => {}
         }
         let id = frame.stream_id;
-        let tx = state.streams.read().unwrap().get(&id).cloned();
+        let tx = state.streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
         if let Some(tx) = tx {
             if tx.send(frame).await.is_err() {
-                if state.streams.write().unwrap().remove(&id).is_some() {
+                if state.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
                     state.active.fetch_sub(1, Ordering::AcqRel);
                 }
             }
@@ -841,7 +841,7 @@ async fn handle_tcp_proxy(
                 }
                 if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
-                    let negotiated = session.peer_window.lock().unwrap().is_some();
+                    let negotiated = session.peer_window.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(len as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {

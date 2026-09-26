@@ -151,7 +151,7 @@ fn relay_bufs() -> &'static StdMutex<Vec<Vec<u8>>> {
 pub(crate) async fn relay_buf(requested: usize) -> Vec<u8> {
     let size = relay_buffer_size(requested);
     if size <= POOLED_BUF_MAX_SIZE {
-        let mut pool = relay_bufs().lock().unwrap();
+        let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pos) = pool.iter().position(|b| b.len() == size) {
             return pool.swap_remove(pos);
         }
@@ -165,7 +165,7 @@ pub(crate) async fn recycle_buf(buf: Vec<u8>) {
     if buf.len() > POOLED_BUF_MAX_SIZE {
         return;
     }
-    let mut pool = relay_bufs().lock().unwrap();
+    let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
     if pool.len() < POOLED_BUF_MAX_COUNT {
         pool.push(buf);
     }
@@ -562,7 +562,7 @@ async fn maybe_send_window(
     refund_pending: &mut u32,
     consumed: usize,
 ) {
-    let negotiated = peer_window.lock().unwrap().is_some();
+    let negotiated = peer_window.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     if !negotiated {
         *refund_pending = 0;
         return;
@@ -689,14 +689,14 @@ async fn handle_mux_parts(
                 let (tx, mut rx) = mpsc::channel(64);
                 let (cancel, cancelled) = watch::channel(false);
                 let gate = CreditGate::new();
-                if let Some(kib) = *peer_window.lock().unwrap() {
+                if let Some(kib) = *peer_window.lock().unwrap_or_else(|e| e.into_inner()) {
                     gate.enable(i64::from(kib) * 1024);
                 }
 
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
                 let admitted = {
-                    let mut guard = streams.write().unwrap();
+                    let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                     if guard.len() >= 2048 || guard.contains_key(&stream_id) {
                         false
                     } else {
@@ -754,7 +754,7 @@ async fn handle_mux_parts(
                 ) {
                     tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
                     let _ = send_reset_encrypted(writer, cipher, stream_id, obfs).await;
-                    streams.write().unwrap().remove(&stream_id);
+                    streams.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                 }
                 let task = tokio::spawn(async move {
                     let mut cancelled = cancelled;
@@ -780,7 +780,7 @@ async fn handle_mux_parts(
                                             cfg_task.obfs,
                                         )
                                         .await;
-                                        streams_task.write().unwrap().remove(&stream_id);
+                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -789,12 +789,12 @@ async fn handle_mux_parts(
                             changed = cancelled.changed() => {
                                 match changed {
                                     Ok(()) if *cancelled.borrow() => {
-                                        streams_task.write().unwrap().remove(&stream_id);
+                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
                                     Ok(()) => {}
                                     Err(_) => {
-                                        streams_task.write().unwrap().remove(&stream_id);
+                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -824,7 +824,7 @@ async fn handle_mux_parts(
                                     }
                                     Some(StreamCommand::Reset)
                                     | None => {
-                                        streams_task.write().unwrap().remove(&stream_id);
+                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
                                 }
@@ -833,7 +833,7 @@ async fn handle_mux_parts(
                     };
 
                     if *cancelled.borrow() {
-                        streams_task.write().unwrap().remove(&stream_id);
+                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                         return;
                     }
 
@@ -858,7 +858,7 @@ async fn handle_mux_parts(
                             }
                             StreamCommand::Fin => client_fin = true,
                             StreamCommand::Reset => {
-                                streams_task.write().unwrap().remove(&stream_id);
+                                streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                 return;
                             }
                         }
@@ -886,7 +886,7 @@ async fn handle_mux_parts(
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         if write_res.is_err() {
                             reader.abort();
-                            streams_task.write().unwrap().remove(&stream_id);
+                            streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                             return;
                         }
                         crate::stats::add_bytes(len as i64, 0);
@@ -951,7 +951,7 @@ async fn handle_mux_parts(
                         reader.abort();
                     }
 
-                    streams_task.write().unwrap().remove(&stream_id);
+                    streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                 });
 
                 stream_tasks.push(task);
@@ -959,18 +959,17 @@ async fn handle_mux_parts(
 
             MuxCommand::Data => {
                 let id = frame.stream_id;
-                let tx = streams.read().unwrap().get(&id).map(|s| s.tx.clone());
+                let tx = streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|s| s.tx.clone());
                 if let Some(tx) = tx {
                     if tx.send(StreamCommand::Data(frame)).await.is_err() {
-                        streams.write().unwrap().remove(&id);
+                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
                     }
                 }
             }
 
             MuxCommand::Fin => {
                 let tx = streams
-                    .read()
-                    .unwrap()
+                    .read().unwrap_or_else(|e| e.into_inner())
                     .get(&frame.stream_id)
                     .map(|s| s.tx.clone());
                 if let Some(tx) = tx {
@@ -980,8 +979,7 @@ async fn handle_mux_parts(
 
             MuxCommand::Rst => {
                 let target = streams
-                    .read()
-                    .unwrap()
+                    .read().unwrap_or_else(|e| e.into_inner())
                     .get(&frame.stream_id)
                     .map(|s| (s.tx.clone(), s.cancel.clone()));
                 if let Some((tx, cancel)) = target {
@@ -997,7 +995,7 @@ async fn handle_mux_parts(
                 if let Some((version, kib)) = decode_version_payload(frame.payload()) {
                     if version >= 1 {
                         let already = {
-                            let mut pw = peer_window.lock().unwrap();
+                            let mut pw = peer_window.lock().unwrap_or_else(|e| e.into_inner());
                             let seen = pw.is_some();
                             if !seen {
                                 *pw = Some(kib);
@@ -1006,7 +1004,7 @@ async fn handle_mux_parts(
                         };
                         if !already {
                             let window = i64::from(kib) * 1024;
-                            for entry in streams.read().unwrap().values() {
+                            for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values() {
                                 entry.gate.enable(window);
                             }
                             tracing::debug!(kib, "peer VERSION received; send window enabled");
@@ -1017,7 +1015,7 @@ async fn handle_mux_parts(
 
             MuxCommand::Window => {
                 if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(entry) = streams.read().unwrap().get(&frame.stream_id) {
+                    if let Some(entry) = streams.read().unwrap_or_else(|e| e.into_inner()).get(&frame.stream_id) {
                         entry.gate.release(i64::from(credit));
                     }
                 }
@@ -1028,7 +1026,7 @@ async fn handle_mux_parts(
     // Unblock any target_to_mux sender parked on credit: the session is
     // over, so remaining sends must fail at the socket, not on WINDOWs
     // that will never arrive.
-    for entry in streams.read().unwrap().values() {
+    for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values() {
         entry.gate.close();
     }
 
@@ -1036,7 +1034,7 @@ async fn handle_mux_parts(
         task.abort();
     }
 
-    streams.write().unwrap().clear();
+    streams.write().unwrap_or_else(|e| e.into_inner()).clear();
 
     Ok(())
 }
@@ -1125,7 +1123,9 @@ fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut out = crate::mux_writer::acquire_encode_buf();
     let needed = 22 + payload.len();
     if out.capacity() < needed {
-        out.reserve(needed - out.capacity());
+        // `Vec::reserve` takes *additional* capacity beyond `len`, not a total:
+        // `needed - capacity` would under-reserve (often a complete no-op).
+        out.reserve(needed.saturating_sub(out.len()));
     }
     out.extend_from_slice(&[0, 0, 0]);
     match source.ip() {

@@ -40,7 +40,7 @@ impl CreditGate {
     /// first VERSION wins, later ones cannot shrink/grow a live window.
     pub(crate) fn enable(&self, window: i64) {
         let window = window.max(1);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(*state, GateState::Unbounded) {
             *state = GateState::Bounded {
                 available: window,
@@ -58,7 +58,7 @@ impl CreditGate {
         if n <= 0 {
             return;
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let GateState::Bounded {
             ref mut available,
             window,
@@ -72,7 +72,7 @@ impl CreditGate {
 
     /// Unblocks all waiters and switches to pass-through mode.
     pub(crate) fn close(&self) {
-        *self.state.lock().unwrap() = GateState::Closed;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = GateState::Closed;
         self.notify.notify_waiters();
     }
 
@@ -83,7 +83,7 @@ impl CreditGate {
         let n = n as i64;
         loop {
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 match *state {
                     GateState::Unbounded | GateState::Closed => return,
                     GateState::Bounded {

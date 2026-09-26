@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.0.36] - 2026-09-26
+
+### Correctness & Hygiene Fixes (Scheduler, Reserve, Lock Poisoning, SIMD Safety)
+
+- **Scheduler: eagerly drop drained streams (`mux_writer.rs`)**:
+  - `Scheduler::next()` now removes a stream from `rotation` as soon as its queue drains, instead of only on FIN/RST yield or when the whole scheduler empties.
+  - Root cause: streams closed via RST/abort paths clear the connection table without pushing a closing control through the scheduler (e.g. `mux_pool.rs::close_stream`, `runtime.rs` stream teardown). Their entries lingered in `rotation` forever, forcing every `next()` to scan them — scheduling cost degraded with the number of historically dead streams on long-lived MUX sessions.
+  - The priority-lane yield logic is unchanged: a missing stream entry counts as unblocked, so a pending FIN/RST still fires after its DATA.
+- **Fixed `Vec::reserve` miscalculations (`runtime.rs::udp_envelope`, `quic.rs`)**:
+  - `reserve(needed - capacity)` confused `reserve`'s "additional beyond `len`" semantics with a total; it under-reserved (often a complete no-op on pooled buffers), forcing a later reallocation. Now `reserve(needed.saturating_sub(len))`.
+- **Lock poisoning hardening (all std `Mutex`/`RwLock` sites)**:
+  - Replaced `.lock()/.read()/.write().unwrap()` with `.unwrap_or_else(|e| e.into_inner())` so a poisoned lock no longer cascades panics across the process.
+- **Removed misleading `#[allow(dead_code)]` on `OwnedMuxFrame::from_parts` (`protocol.rs`)** — it is used by `runtime.rs`. Deleted unused `UdpBatchWriter::is_empty`/`len` helpers (`udp_batch.rs`).
+- **Fused SIMD: `debug_assert!(ks.len() % 4 == 0)` (`crypto.rs`)** — the 4-byte WS mask phase restarts at every keystream chunk; the assert catches a bad `XOR_KEY_SIZE` in debug builds instead of shipping corrupt frames.
+- **Added `# Safety` docs to all 6 unsafe SIMD kernels (`crypto.rs`)**.
+
+### Known limitations (documented, not changed in this release)
+- `UdpBatchWriter`'s sendmmsg batching rarely batches in practice: all call sites use `send()` (push + immediate flush). The `try_send_to` fast path (v0.0.35) keeps the common case allocation-free.
+- Each `XorCipher` materializes a 256 KiB keystream (the fused-SIMD contiguity tradeoff); UDP relay clones it per direction (~512 KiB per association). Sharing one cipher per process config is future work.
+
 ## [v0.0.35] - 2026-09-25
 
 ### Performance & Peak Throughput (AVX2/NEON Fused SIMD, Zero-Alloc UDP, Mutex Elimination & DNS SingleFlight)

@@ -99,16 +99,6 @@ impl UdpBatchWriter {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.queue.len()
-    }
-
     /// Appends a datagram to the batch. Flushes automatically when reaching [`UDP_BATCH`].
     pub(crate) async fn push(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
         let mut buf = crate::mux_writer::acquire_encode_buf();

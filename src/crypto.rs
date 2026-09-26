@@ -103,6 +103,12 @@ pub(crate) fn has_avx2() -> bool {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+/// The caller must guarantee the CPU supports the matching SIMD extension
+/// (AVX2 / SSE2 / NEON). Every call site dispatches through runtime feature
+/// detection (`has_avx2()`) or a compile-time `#[cfg(target_arch)]` gate.
+/// `chunk` and `key` are ordinary borrowed slices, so all pointer arithmetic
+/// stays within their bounds.
 pub(crate) unsafe fn apply_chunk_avx2(chunk: &mut [u8], key: &[u8]) {
     use std::arch::x86_64::*;
     let len = chunk.len();
@@ -151,6 +157,12 @@ pub(crate) unsafe fn apply_chunk_avx2(chunk: &mut [u8], key: &[u8]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+/// # Safety
+/// The caller must guarantee the CPU supports the matching SIMD extension
+/// (AVX2 / SSE2 / NEON). Every call site dispatches through runtime feature
+/// detection (`has_avx2()`) or a compile-time `#[cfg(target_arch)]` gate.
+/// `chunk` and `key` are ordinary borrowed slices, so all pointer arithmetic
+/// stays within their bounds.
 pub(crate) unsafe fn apply_chunk_sse2(chunk: &mut [u8], key: &[u8]) {
     use std::arch::x86_64::*;
     let len = chunk.len();
@@ -192,6 +204,12 @@ pub(crate) unsafe fn apply_chunk_sse2(chunk: &mut [u8], key: &[u8]) {
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+/// The caller must guarantee the CPU supports the matching SIMD extension
+/// (AVX2 / SSE2 / NEON). Every call site dispatches through runtime feature
+/// detection (`has_avx2()`) or a compile-time `#[cfg(target_arch)]` gate.
+/// `chunk` and `key` are ordinary borrowed slices, so all pointer arithmetic
+/// stays within their bounds.
 pub(crate) unsafe fn apply_chunk_neon(chunk: &mut [u8], key: &[u8]) {
     use std::arch::aarch64::*;
     let len = chunk.len();
@@ -253,6 +271,14 @@ pub(crate) fn apply_fused_xor(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
     if region.is_empty() || ks.is_empty() {
         return;
     }
+    // The 4-byte WebSocket mask phase restarts at every keystream chunk, so
+    // correctness silently depends on the keystream length being a multiple
+    // of 4. Catch a bad `XOR_KEY_SIZE` here instead of shipping corrupt frames.
+    debug_assert!(
+        ks.len().is_multiple_of(4),
+        "fused XOR requires ks.len() % 4 == 0, got {}",
+        ks.len()
+    );
     for chunk in region.chunks_mut(ks.len()) {
         #[cfg(target_arch = "x86_64")]
         {
@@ -275,6 +301,13 @@ pub(crate) fn apply_fused_xor(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+/// The caller must guarantee the CPU supports the matching SIMD extension
+/// (AVX2 / SSE2 / NEON). Every call site dispatches through runtime feature
+/// detection (`has_avx2()`) or a compile-time `#[cfg(target_arch)]` gate.
+/// `region` and `ks` are ordinary borrowed slices, so all pointer arithmetic
+/// stays within their bounds. `ks.len()` is a multiple of 4 (debug-asserted
+/// in `apply_fused_xor`), keeping the 4-byte mask phase aligned per chunk.
 pub(crate) unsafe fn apply_fused_xor_avx2(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
     use std::arch::x86_64::*;
     let len = region.len().min(ks.len());
@@ -344,6 +377,13 @@ pub(crate) unsafe fn apply_fused_xor_avx2(region: &mut [u8], ks: &[u8], key: [u8
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+/// # Safety
+/// The caller must guarantee the CPU supports the matching SIMD extension
+/// (AVX2 / SSE2 / NEON). Every call site dispatches through runtime feature
+/// detection (`has_avx2()`) or a compile-time `#[cfg(target_arch)]` gate.
+/// `region` and `ks` are ordinary borrowed slices, so all pointer arithmetic
+/// stays within their bounds. `ks.len()` is a multiple of 4 (debug-asserted
+/// in `apply_fused_xor`), keeping the 4-byte mask phase aligned per chunk.
 pub(crate) unsafe fn apply_fused_xor_sse2(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
     use std::arch::x86_64::*;
     let len = region.len().min(ks.len());
@@ -402,6 +442,13 @@ pub(crate) unsafe fn apply_fused_xor_sse2(region: &mut [u8], ks: &[u8], key: [u8
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+/// The caller must guarantee the CPU supports the matching SIMD extension
+/// (AVX2 / SSE2 / NEON). Every call site dispatches through runtime feature
+/// detection (`has_avx2()`) or a compile-time `#[cfg(target_arch)]` gate.
+/// `region` and `ks` are ordinary borrowed slices, so all pointer arithmetic
+/// stays within their bounds. `ks.len()` is a multiple of 4 (debug-asserted
+/// in `apply_fused_xor`), keeping the 4-byte mask phase aligned per chunk.
 pub(crate) unsafe fn apply_fused_xor_neon(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
     use std::arch::aarch64::*;
     let len = region.len().min(ks.len());

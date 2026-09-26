@@ -790,6 +790,12 @@ async fn write_frame_parts_vectored<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+// `clippy::uninit_vec` is allowed here: the `reserve` + `set_len` below is
+// intentional — `read_exact` fully initializes `[start, start+chunk)` before
+// any of it is observed, and the buffer is truncated back on error (see the
+// SAFETY comment at the `set_len` site). `resize(.., 0)` was measured ~7% CPU
+// in pprof 2026-09-23, so the zero-fill is deliberately skipped.
+#[allow(clippy::uninit_vec)]
 pub async fn read_frame<R, W>(
     r: &mut R,
     mut reply: Option<&mut W>,
