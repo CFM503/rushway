@@ -2851,3 +2851,89 @@ Fixed and locally validated. Tag `v0.0.36` created locally. Not pushed: no crede
 
 ### Next action
 Push `main` + tag `v0.0.36` to `origin` (requires the repo owner's credentials), then trigger the release workflow and confirm the UDP batch test on a real host.
+
+---
+
+## 2026-09-27 — v0.0.37 security + forwarding-efficiency batch (branch `fix/security-and-perf-batch`)
+
+### Scope
+Four batches from the 26-item static review, taken in the order E6 → A → C → D. Batches B and E (everything except E6) remain unselected and untouched. Nothing outside the selected items was changed.
+
+### What was fixed
+1. **E6 — release artifact required glibc 2.34.** Built on `rust:1.88-bookworm` (glibc 2.36), needing `GLIBC_2.32/2.33/2.34`, so it failed on Debian 11 / Ubuntu 20.04 (≤ 2.31) with `version 'GLIBC_2.34' not found`.
+2. **A1 — QUIC `-k` key travels as a protocol literal.** **Deliberately left unchanged**: `SPEC.md:80` documents `<key> <target>\n` and `SPEC.md:98` requires GoWay↔RushWay interop. Risk is neutralised by A2 (Critical → Low) and recorded as a known limitation.
+3. **A2 — `verify_ssl` defaulted to `false`** for everyone. Now defaults to `true`, with `--no-verify-ssl` as the escape hatch and new `-cert`/`-key` for server mode.
+4. **A3 — `-block-local` only gated client-mode dials.** Server mode (`handle_server`) and several QUIC/WSS branches reached private addresses unconditionally.
+5. **A4 — the policy check only saw the hostname, never the resolved address.** DNS rebinding, decimal/octal short forms (`2130706433`, `0x7f000001`, `127.1`) and any name resolving private walked straight through.
+6. **A5 — the QUIC read task was spawned inside the accept loop body**, so one slow handshake stalled every subsequent connection.
+7. **C1 — all three MUX read loops delivered with `tx.send(frame).await`.** A consumer that stopped draining parked the *session* read loop: unrelated multiplexed streams went silent with no error and no timeout.
+8. **C2 — `read_len_prefixed_udp` returned `Ok(Some(buf.clone()))`**: an allocation plus a full copy per inbound datagram.
+9. **C3 — the encode pool was one global `Mutex`, locked twice per frame by every relay in the process.**
+10. **D1 — `XorCipher` held a `Vec<u8>`** so every `Clone` deep-copied 256 KiB, and `run_server` plus each handler both built the cipher (SHA-256 + 256 KiB expansion **twice per connection**).
+11. **D2 — nothing capped the sum of per-stream pre-dial `pending`.** 8 MiB × 2048 streams ≈ 16 GiB theoretical peak per session; with `panic = "abort"` a failed allocation ends the process.
+12. **D3 — two detached-task leaks plus unbounded `JoinHandle` growth.**
+13. **D4 — `run_wss_server` was the only accept loop with no semaphore and no handshake timeout.**
+
+### Root cause
+- (1) toolchain image choice in `release.yml`, not a code problem.
+- (3–6) the security checks were written against the client-mode path and never propagated to the server/QUIC/WSS paths; the hostname-only check predates DNS being considered attacker-influenced.
+- (7–9) throughput work that assumed every consumer keeps up; C3 in particular optimised a single-threaded assumption.
+- (10–12) copy-and-rebuild habits plus tasks spawned without ownership of their teardown.
+- (13) `run_wss_server` was written separately from the other accept loops and never given the `Semaphore` they all have.
+
+### Decision record
+- **A1: do not change.** Changing the wire format breaks GoWay interop and is out of scope until `SPEC.md` changes.
+- **A2 verification roots are `webpki_roots` (bundled Mozilla set), not the OS trust store** — corrected from an initial "system roots" wording in `--help`, README and CHANGELOG.
+- **D2 = 512 MiB, and hitting it resets that stream** (user-selected). A "wait for budget instead" design was rejected because C1's `try_send` resets a stream anyway once its 64-frame channel fills, so waiting would only move the reset while complicating the `select!` loop.
+- `is_blocked_local_ip` deliberately excludes RFC6598 (`100.64/10`) and `198.18/15` — intentional, blocking them breaks legitimate deployments.
+- C3 keeps the total encode-buffer ceiling at 32 (~2.5 MiB); B5 (`fmt --check` + clippy) was **not** part of this batch.
+
+### Change
+- `.github/workflows/release.yml` — `debian12-x64` → `linux-x64-musl` via `houseabsolute/actions-rust-cross@v1`, plus a GLIBC-symbol check and a `-V` smoke test; `kwrt-armv7` → `armv7-unknown-linux-musleabihf`. New `target_ref` and `publish` inputs for manual runs, `target_commitish` so a manual run tags the ref it actually built, and a `check` job (`cargo check --all-targets --all-features`) that `publish` now depends on.
+- `.github/workflows/ci.yml` — new `musl-static` job.
+- `src/crypto.rs` — `key: Vec<u8>` → `Arc<[u8]>`.
+- `src/tls.rs`, `src/main.rs` — A2: `SERVER_IDENTITY`, `configure_server_identity`, hand-rolled RFC 7468 PEM reader, `verify_ssl` default true, `--no-verify-ssl`, `-cert`/`-key`, red banner lines, `LEGACY_LONG_FLAGS` repaired.
+- `src/runtime.rs` — A3/A4 (`check_target_policy`, `resolve_target`, `is_blocked_local_host`, `is_blocked_local_ip`), D1 (cipher passed into the three handlers), D2 (`PendingBytes` + `MAX_SESSION_PENDING_BYTES = 512 MiB`), D3 (`stream_tasks` → `JoinSet`, both loop-wrapped abort guards).
+- `src/quic.rs` — A5 spawn fix, A3 gate removals, C2 length-return, `server_config()` identity.
+- `src/mux_pool.rs`, `src/wss_client.rs`, `src/nonmux.rs` — A3 wiring + C1 `try_send`.
+- `src/mux_writer.rs` — C3 sharded `ENCODE_POOL`.
+- `CHANGELOG.md` — `## [v0.0.37] - 2026-09-27`.
+- `Cargo.toml` / `Cargo.lock` → `0.0.37`.
+- New test: `runtime.rs::lifecycle_tests::pending_budget_reserves_releases_and_returns_on_drop`.
+
+### Commits
+- `aa51888` — E6 + A3 + A4 + A5
+- `79d26dd` — C2 + C3
+- `770a830` — C1
+- `6fcd0cc` — A2 + docs
+- `8676636` — D1
+- `b8dd1c5` — D2 + D3
+- `258d866` — D4
+- `39faa61` — D batch CHANGELOG
+- plus the `0.0.37` version / handoff / workflow commit
+
+### Validation — READ THIS BEFORE TRUSTING THE BUILD
+- **`cargo` is not installed on the authoring machine** (`.cargo\bin` has no `cargo.exe`). There is no `cargo check`, no `cargo test`, no `cargo fmt`, no clippy for this entire batch. **Every change is static analysis only and has never been compiled.**
+- No interleaved paired A/B was run for C1, C2, C3 or D1, so **the performance claim is withheld** — the standing forward-only rule requires recorded numbers, and none exist.
+- API surface was checked against the local registry sources instead of guessed: `tokio-1.53.1` (`JoinSet::try_join_next` returns `None` when nothing is complete, so the reap loop terminates), `rustls-pki-types-1.15.1`, `rustls-0.23.31`. `#[global_allocator] mimalloc` is cfg-gated identically to `Cargo.toml`, so it applies on `x86_64-unknown-linux-musl` and musl's weaker malloc is bypassed.
+- First executable validation is GitHub Actions: CI (`cargo check/test/build`) plus the release workflow's new `check` job.
+
+### Status
+Local only. Branch `fix/security-and-perf-batch` is a **strict descendant of `origin/main`** (main has no extra commits), so landing it is a fast-forward. Tag `v0.0.37` prepared against it.
+
+### Remaining risk
+- **C1 is the one item that can be a reverse change**: for an un-negotiated peer (`peer_window: None`) a legitimately slow consumer now gets RST instead of backpressured. Needs a real multi-stream transfer with one deliberately slow consumer, with and without `-credit-control`.
+- C1/C2/C3/D1 speedups are **hypothesised, not measured**.
+- **D2 is per session, not per process** — `sessions × 512 MiB` is still reachable. It closes the reported 8 MiB × 2048 per-session peak only.
+- **D2 and C1 are in tension**: any global bound surfaces as a reset through C1's `try_send`.
+- **Behaviour changes requiring release notes**: A2 breaks self-signed upstreams without `--no-verify-ssl`; D4 rejects WSS connections beyond `-max-connections` (default 1500); D2 resets streams past 512 MiB of pre-dial buffering.
+- Version drift untouched: `PROGRESS.md` still says v0.0.3, `SPEC.md` says v0.0.2.
+- `udp_batch::tests::batch_writer_delivers_in_order` (sendmmsg → EPERM) still needs a non-sandboxed runner.
+- CI `push:` triggers only on `main`, so this branch needs a PR or a manual dispatch before CI runs.
+
+### Next action
+1. Push the branch, open a PR (or dispatch CI via its `workflow_dispatch` button) and let `cargo check --all-targets --all-features`, `cargo test` and `cargo build --release` be the first real compile. A2 (`tls.rs` PEM loader, `main.rs` clap args), C3 (`mux_writer.rs` sharding) and D3 (`async {}` wraps around `?`) are the least-verified changes.
+2. If green, fast-forward `main`, tag `v0.0.37`, push the tag — that triggers `RushWay Release Artifacts`, whose new `check` job now gates the publish step.
+3. Run a real multi-stream transfer with one slow consumer to confirm C1 only resets where flow control cannot prevent it.
+4. Run the interleaved paired A/B (n=10 setup + n=10 steady, exact sign test) for C2/C3/D1 before any speed claim is written down.
+5. Select the remaining B / D / E items (E6 is done).
