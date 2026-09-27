@@ -513,9 +513,28 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
         let id = frame.stream_id;
         let tx = state.streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
         if let Some(tx) = tx {
-            if tx.send(frame).await.is_err() {
-                if state.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
-                    state.active.fetch_sub(1, Ordering::AcqRel);
+            // Same non-blocking rule as the server read loop: a local client
+            // that stops reading must not stall downloads for every other
+            // stream on this session. `close_stream` also drops the
+            // per-stream credit gate, which the previous inline teardown
+            // forgot — leaking one `state.gates` entry per closed stream.
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
+                    let _ = send_mux_parts(
+                        &state.writer,
+                        &state.cipher,
+                        id,
+                        MuxCommand::Rst,
+                        &[],
+                        state.obfs,
+                    )
+                    .await;
+                    state.close_stream(id).await;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    state.close_stream(id).await;
                 }
             }
         }

@@ -1014,9 +1014,31 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             // Terminal FIN/RST is forwarded; accounting is done once by the
             // stream owner (see handle_connection cleanup below), mirroring
             // mux_pool::client_reader_loop.
-            if tx.send(frame).await.is_err() {
-                if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
-                    session.active.fetch_sub(1, Ordering::AcqRel);
+            //
+            // Non-blocking, like the other two read loops: one local client
+            // that stops reading must not stall downloads for every other
+            // stream multiplexed on this session.
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
+                    let _ = send_mux_parts(
+                        &session.writer,
+                        &session.cipher,
+                        id,
+                        MuxCommand::Rst,
+                        &[],
+                        session.obfs,
+                    )
+                    .await;
+                    if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
+                        session.active.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
+                        session.active.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
             }
         }

@@ -1029,19 +1029,42 @@ async fn handle_mux_parts(
                 let id = frame.stream_id;
                 let tx = streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|s| s.tx.clone());
                 if let Some(tx) = tx {
-                    if tx.send(StreamCommand::Data(frame)).await.is_err() {
-                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    // Never park the session read loop on one stream's
+                    // backpressure. `send().await` here meant a single target
+                    // that stopped reading (with 64 frames already queued)
+                    // froze uploads for *every* stream multiplexed on this
+                    // session — no error, no timeout, no recovery until that
+                    // target drained. A full queue means this frame cannot be
+                    // delivered, so reset that stream and keep the session
+                    // moving; the blast radius stays on the one stalled flow.
+                    match tx.try_send(StreamCommand::Data(frame)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
+                            let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
+                            streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                        }
                     }
                 }
             }
 
             MuxCommand::Fin => {
+                let id = frame.stream_id;
                 let tx = streams
                     .read().unwrap_or_else(|e| e.into_inner())
-                    .get(&frame.stream_id)
+                    .get(&id)
                     .map(|s| s.tx.clone());
                 if let Some(tx) = tx {
-                    let _ = tx.send(StreamCommand::Fin).await;
+                    // Same non-blocking rule as DATA: a FIN addressed to an
+                    // already-backed-up stream must not stall the read loop.
+                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(StreamCommand::Fin) {
+                        tracing::warn!(stream_id = id, "mux RST: queue full at FIN; resetting stalled stream");
+                        let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
+                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    }
                 }
             }
 
@@ -1051,7 +1074,11 @@ async fn handle_mux_parts(
                     .get(&frame.stream_id)
                     .map(|s| (s.tx.clone(), s.cancel.clone()));
                 if let Some((tx, cancel)) = target {
-                    let _ = tx.send(StreamCommand::Reset).await;
+                    // Best-effort: the data queue may already be full, and
+                    // `cancel` is an out-of-band watch channel, so the stream
+                    // task is signalled either way without blocking the read
+                    // loop on a stalled consumer.
+                    let _ = tx.try_send(StreamCommand::Reset);
                     let _ = cancel.send(true);
                 }
             }
