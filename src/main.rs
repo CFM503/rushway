@@ -17,13 +17,15 @@ mod udp_relay;
 mod ws;
 mod wss_client;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use runtime::RuntimeConfig;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{copy_bidirectional, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, Duration};
+use tokio::sync::Semaphore;
+use tokio::time::{sleep, timeout, Duration};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -385,6 +387,10 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
 
     let acceptor = tls::standalone_server_acceptor()?;
     tracing::info!("RushWay WSS server listening on {public_bind}");
+    // This listener used to be the only one without a connection ceiling, so
+    // `-max-connections` never applied to WSS and peers that completed TCP
+    // but never spoke TLS parked a task forever.
+    let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     let mut set = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -394,13 +400,31 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
             }
             res = listener.accept() => {
                 let (stream, peer) = res?;
+                // Fail fast at capacity instead of stalling the accept loop
+                // and letting the TCP backlog fill up.
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(%peer, "maximum WSS connections reached");
+                        continue;
+                    }
+                };
                 runtime::apply_socket_options(&stream, &cfg);
                 let acceptor = acceptor.clone();
                 let cfg2 = cfg.clone();
                 set.spawn(async move {
+                    let _permit = permit;
                     let _conn = stats::ConnGuard::new();
                     let result = async {
-                        let mut tls_stream = acceptor.accept(stream).await?;
+                        // Bound the TLS handshake: a peer that connects and
+                        // then stalls mid-handshake otherwise holds its
+                        // semaphore permit and its task indefinitely.
+                        let mut tls_stream = timeout(
+                            Duration::from_secs(cfg2.connection_timeout.max(1)),
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        .context("TLS handshake timeout")??;
                         let request = ws::read_http_headers(&mut tls_stream).await?;
                         let key = ws::validate_server_handshake(&request)?;
                         tls_stream
