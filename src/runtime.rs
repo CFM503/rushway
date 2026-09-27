@@ -18,6 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -651,6 +652,69 @@ async fn maybe_send_window(
     .await;
 }
 
+/// Session-wide accounting for bytes parked in pre-dial `pending` queues.
+///
+/// Each stream task holds one of these for as long as its frames sit in
+/// `pending`: bytes are reserved when a frame is pulled out of the stream
+/// channel and returned once it has been handed to the target socket.
+/// `Drop` returns whatever is still held, so no early `return` on any error
+/// path can leak budget.
+///
+/// Per stream the ceiling stays at `MAX_PENDING_BYTES` (8 MiB, goway's
+/// `muxServerStreamBufferLimit`); summed over a session's 2048 streams that
+/// is a ~16 GiB theoretical peak, which under `panic = "abort"` means a
+/// failed allocation takes the whole process down. The session-wide ceiling
+/// bounds that peak instead, at the cost of resetting an individual stream
+/// when it is hit.
+struct PendingBytes {
+    total: Arc<AtomicUsize>,
+    held: usize,
+}
+
+impl PendingBytes {
+    fn new(total: Arc<AtomicUsize>) -> Self {
+        Self { total, held: 0 }
+    }
+
+    /// Bytes this task currently holds against the session budget; doubles
+    /// as the per-stream `pending` byte count.
+    fn held_bytes(&self) -> usize {
+        self.held
+    }
+
+    /// Reserve `len` bytes against the session budget, or leave it untouched
+    /// and return `false` when the reservation would exceed `max`.
+    fn try_reserve(&mut self, len: usize, max: usize) -> bool {
+        // Optimistic add-then-check: a racing task can push the counter past
+        // `max` for the width of this call, but the overshoot is bounded by a
+        // single frame and is rolled back below.
+        let prev = self.total.fetch_add(len, Ordering::Relaxed);
+        if prev.saturating_add(len) > max {
+            self.total.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        self.held = self.held.saturating_add(len);
+        true
+    }
+
+    /// Return `len` bytes (clamped to what this task actually holds).
+    fn release(&mut self, len: usize) {
+        let len = len.min(self.held);
+        if len == 0 {
+            return;
+        }
+        self.total.fetch_sub(len, Ordering::Relaxed);
+        self.held -= len;
+    }
+}
+
+impl Drop for PendingBytes {
+    fn drop(&mut self) {
+        let held = self.held;
+        self.release(held);
+    }
+}
+
 async fn handle_mux_parts(
     mut rd: ReadHalf<TcpStream>,
     wr: WriteHalf<TcpStream>,
@@ -692,7 +756,13 @@ async fn handle_mux_parts(
     // RwLock: concurrent lookups, exclusive insert/remove.
     let streams: Arc<std::sync::RwLock<HashMap<u32, StreamEntry>>> =
         Arc::new(std::sync::RwLock::new(HashMap::new()));
-    let mut stream_tasks = Vec::new();
+    // Session-wide ceiling on bytes parked in pre-dial `pending` queues
+    // across every stream multiplexed here (see `PendingBytes`).
+    const MAX_SESSION_PENDING_BYTES: usize = 512 * 1024 * 1024;
+    let pending_bytes_total = Arc::new(AtomicUsize::new(0));
+    // JoinSet, not Vec<JoinHandle>: a long-lived session used to push one
+    // handle per stream it ever opened and only released them at session end.
+    let mut stream_tasks = tokio::task::JoinSet::new();
     let mut frame_buf = Vec::with_capacity(64 * 1024);
 
     loop {
@@ -804,6 +874,7 @@ async fn handle_mux_parts(
                 let cfg_task = cfg.clone();
                 let gate_task = gate;
                 let peer_window_task = peer_window.clone();
+                let pending_total_task = pending_bytes_total.clone();
 
                 // Bound pre-dial buffering: a malicious/buggy client could
                 // otherwise spray DATA frames while dial_target is in flight
@@ -824,10 +895,10 @@ async fn handle_mux_parts(
                     let _ = send_reset_encrypted(writer, cipher, stream_id, obfs).await;
                     streams.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                 }
-                let task = tokio::spawn(async move {
+                stream_tasks.spawn(async move {
                     let mut cancelled = cancelled;
                     let mut pending = Vec::new();
-                    let mut pending_bytes: usize = 0;
+                    let mut pending_budget = PendingBytes::new(pending_total_task);
                     let mut client_fin = false;
 
                     let target_stream = loop {
@@ -871,9 +942,15 @@ async fn handle_mux_parts(
                             command = rx.recv() => {
                                 match command {
                                     Some(StreamCommand::Data(frame)) => {
-                                        pending_bytes += frame.payload().len();
+                                        let len = frame.payload().len();
+                                        // Per-stream ceiling first so no
+                                        // reservation is made when it trips,
+                                        // then the session-wide budget.
                                         if pending.len() >= MAX_PENDING_FRAMES
-                                            || pending_bytes > MAX_PENDING_BYTES
+                                            || pending_budget.held_bytes().saturating_add(len)
+                                                > MAX_PENDING_BYTES
+                                            || !pending_budget
+                                                .try_reserve(len, MAX_SESSION_PENDING_BYTES)
                                         {
                                             reject_pending_overflow(
                                                 &writer_task,
@@ -908,9 +985,12 @@ async fn handle_mux_parts(
                     while let Ok(command) = rx.try_recv() {
                         match command {
                             StreamCommand::Data(frame) => {
-                                pending_bytes += frame.payload().len();
+                                let len = frame.payload().len();
                                 if pending.len() >= MAX_PENDING_FRAMES
-                                    || pending_bytes > MAX_PENDING_BYTES
+                                    || pending_budget.held_bytes().saturating_add(len)
+                                        > MAX_PENDING_BYTES
+                                    || !pending_budget
+                                        .try_reserve(len, MAX_SESSION_PENDING_BYTES)
                                 {
                                     reject_pending_overflow(
                                         &writer_task,
@@ -949,9 +1029,12 @@ async fn handle_mux_parts(
                     let mut refund_pending: u32 = 0;
 
                     for frame in pending {
-                        let write_res = wr_target.write_all(frame.payload()).await;
                         let len = frame.payload().len();
+                        let write_res = wr_target.write_all(frame.payload()).await;
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                        // The frame has left `pending` whether or not the
+                        // write succeeded, so return the budget either way.
+                        pending_budget.release(len);
                         if write_res.is_err() {
                             reader.abort();
                             streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
@@ -976,9 +1059,10 @@ async fn handle_mux_parts(
                         while let Some(command) = rx.recv().await {
                             match command {
                                 StreamCommand::Data(frame) => {
-                                    let write_res = wr_target.write_all(frame.payload()).await;
                                     let len = frame.payload().len();
+                                    let write_res = wr_target.write_all(frame.payload()).await;
                                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                    pending_budget.release(len);
                                     if write_res.is_err() {
                                         break;
                                     }
@@ -1022,7 +1106,9 @@ async fn handle_mux_parts(
                     streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                 });
 
-                stream_tasks.push(task);
+                // Reclaim streams that already finished instead of holding
+                // their handle around until the session ends.
+                while stream_tasks.try_join_next().is_some() {}
             }
 
             MuxCommand::Data => {
@@ -1125,9 +1211,7 @@ async fn handle_mux_parts(
         entry.gate.close();
     }
 
-    for task in stream_tasks {
-        task.abort();
-    }
+    stream_tasks.abort_all();
 
     streams.write().unwrap_or_else(|e| e.into_inner()).clear();
 
@@ -1180,37 +1264,45 @@ async fn handle_server_tcp_parts(
         Result::<()>::Ok(())
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
-    loop {
-        tokio::select! {
-            _ = &mut download => break,
-            res = read_frame(
-                &mut rd,
-                Option::<&mut WriteHalf<TcpStream>>::None,
-                &mut frame_buf,
-            ) => {
-                let Some((opcode, payload)) = res? else {
-                    break;
-                };
-                if opcode == 8 {
+    // Run the upload loop as its own future: the old loop carried `?` on
+    // `read_frame`, so a read error returned straight out of this function
+    // and skipped `download.abort()`, leaving the download task detached
+    // and holding the target socket for the rest of the process.
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = &mut download => break,
+                res = read_frame(
+                    &mut rd,
+                    Option::<&mut WriteHalf<TcpStream>>::None,
+                    &mut frame_buf,
+                ) => {
+                    let Some((opcode, payload)) = res? else {
+                        break;
+                    };
+                    if opcode == 8 {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        break;
+                    }
+                    if opcode != 2 {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        continue;
+                    }
+                    if target_wr.write_all(&payload).await.is_err() {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        break;
+                    }
+                    crate::stats::add_bytes(payload.len() as i64, 0);
                     crate::mux_writer::recycle_encode_buf(payload);
-                    break;
                 }
-                if opcode != 2 {
-                    crate::mux_writer::recycle_encode_buf(payload);
-                    continue;
-                }
-                if target_wr.write_all(&payload).await.is_err() {
-                    crate::mux_writer::recycle_encode_buf(payload);
-                    break;
-                }
-                crate::stats::add_bytes(payload.len() as i64, 0);
-                crate::mux_writer::recycle_encode_buf(payload);
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
     let _ = target_wr.shutdown().await;
     download.abort();
-    Ok(())
+    result
 }
 async fn resolve_udp_target(block_local: bool, target: &TargetAddr) -> Result<SocketAddr> {
     resolve_target(block_local, &target.host, target.port).await
@@ -1279,46 +1371,54 @@ async fn handle_server_udp_parts(
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
-    loop {
-        let Some((opcode, mut packet)) = read_frame(
-            &mut rd,
-            Option::<&mut WriteHalf<TcpStream>>::None,
-            &mut frame_buf,
-        )
-        .await?
-        else {
-            break;
-        };
-        if opcode != 2 {
-            crate::mux_writer::recycle_encode_buf(packet);
-            continue;
-        }
-        cipher.apply(&mut packet);
-        let (target, payload) = match parse_socks5_udp_datagram(&packet) {
-            Ok(res) => res,
-            Err(e) => {
-                crate::mux_writer::recycle_encode_buf(packet);
-                return Err(anyhow!(e.to_string()));
-            }
-        };
-        if cfg.block_local && is_blocked_local_host(&target.host) {
-            crate::mux_writer::recycle_encode_buf(packet);
-            continue;
-        }
-        let addr = match resolve_udp_target(cfg.block_local, &target).await {
-            Ok(v) => v,
-            Err(_) => {
+    // Same guard as handle_server_tcp_parts below: the loop carried both a
+    // `?` on `read_frame` and an early `return` on a bad datagram, and either
+    // one skipped `send_task.abort()`, detaching a task that owns the UDP
+    // socket and the session write half for the rest of the process.
+    let result = async {
+        loop {
+            let Some((opcode, mut packet)) = read_frame(
+                &mut rd,
+                Option::<&mut WriteHalf<TcpStream>>::None,
+                &mut frame_buf,
+            )
+            .await?
+            else {
+                break;
+            };
+            if opcode != 2 {
                 crate::mux_writer::recycle_encode_buf(packet);
                 continue;
             }
-        };
-        crate::stats::add_bytes(payload.len() as i64, 0);
-        let _ = batch_writer.send(payload, addr).await;
-        crate::mux_writer::recycle_encode_buf(packet);
+            cipher.apply(&mut packet);
+            let (target, payload) = match parse_socks5_udp_datagram(&packet) {
+                Ok(res) => res,
+                Err(e) => {
+                    crate::mux_writer::recycle_encode_buf(packet);
+                    return Err(anyhow!(e.to_string()));
+                }
+            };
+            if cfg.block_local && is_blocked_local_host(&target.host) {
+                crate::mux_writer::recycle_encode_buf(packet);
+                continue;
+            }
+            let addr = match resolve_udp_target(cfg.block_local, &target).await {
+                Ok(v) => v,
+                Err(_) => {
+                    crate::mux_writer::recycle_encode_buf(packet);
+                    continue;
+                }
+            };
+            crate::stats::add_bytes(payload.len() as i64, 0);
+            let _ = batch_writer.send(payload, addr).await;
+            crate::mux_writer::recycle_encode_buf(packet);
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
     let _ = batch_writer.flush().await;
     send_task.abort();
-    Ok(())
+    result
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
@@ -1402,6 +1502,43 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
 mod lifecycle_tests {
     use super::*;
     use tokio::time::{timeout, Instant};
+
+    /// The session-wide pre-dial budget must survive a holder that returns
+    /// early: `PendingBytes::drop` is what puts the bytes back on every error
+    /// path in the stream task.
+    #[test]
+    fn pending_budget_reserves_releases_and_returns_on_drop() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let mut a = PendingBytes::new(total.clone());
+        assert!(a.try_reserve(400, 1000));
+        assert_eq!(a.held_bytes(), 400);
+        assert_eq!(total.load(Ordering::Relaxed), 400);
+
+        // A second holder fits exactly; a third byte does not, and the failed
+        // reservation must leave the counter untouched.
+        let mut b = PendingBytes::new(total.clone());
+        assert!(b.try_reserve(600, 1000));
+        assert!(!a.try_reserve(1, 1000));
+        assert_eq!(total.load(Ordering::Relaxed), 1000);
+
+        // Releasing on drain makes room again.
+        a.release(400);
+        assert_eq!(total.load(Ordering::Relaxed), 600);
+        assert!(a.try_reserve(1, 1000));
+
+        // Dropping a holder returns exactly what it still holds.
+        drop(b);
+        assert_eq!(total.load(Ordering::Relaxed), 1);
+        drop(a);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+
+        // Over-releasing past what this holder owns is clamped.
+        let mut c = PendingBytes::new(total.clone());
+        assert!(c.try_reserve(10, 1000));
+        c.release(1_000_000);
+        assert_eq!(c.held_bytes(), 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test]
     async fn dialing_cancel_signal_wakes_immediately() {
