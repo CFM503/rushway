@@ -4,9 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release Tag to build and publish (leave empty for current version)'
+        description: 'Release Tag to publish (leave empty to derive it from Cargo.toml)'
         required: false
         default: ''
+      target_ref:
+        description: 'Branch, tag or SHA to build (leave empty = the ref picked in the branch dropdown)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish a GitHub Release (uncheck for a build-only dry run)'
+        type: boolean
+        required: false
+        default: true
       draft:
         description: 'Publish as draft release'
         type: boolean
@@ -25,13 +34,29 @@ permissions:
   contents: write
 
 jobs:
+  # Compilation gate. This workflow is also the only thing that compiles a
+  # release, so a change that does not type-check has to block the publish
+  # step rather than ship binaries built from a broken tree.
+  check:
+    name: Compile check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_ref || github.event.inputs.tag_name || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: cargo check
+        run: cargo check --all-targets --all-features
+
   windows-x64:
     name: Build Windows x64
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag_name || github.ref }}
+          ref: ${{ github.event.inputs.target_ref || github.event.inputs.tag_name || github.ref }}
       - name: Install MinGW toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - uses: dtolnay/rust-toolchain@stable
@@ -58,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag_name || github.ref }}
+          ref: ${{ github.event.inputs.target_ref || github.event.inputs.tag_name || github.ref }}
       - name: Build static x86_64 musl binary with cross-rs
         uses: houseabsolute/actions-rust-cross@v1
         with:
@@ -99,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag_name || github.ref }}
+          ref: ${{ github.event.inputs.target_ref || github.event.inputs.tag_name || github.ref }}
       - name: Build ARMv7 musl binary with cross-rs
         uses: houseabsolute/actions-rust-cross@v1
         with:
@@ -117,8 +142,12 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # The `publish != 'false'` half only bites on a manual run with the box
+    # unticked: on a tag push there are no inputs, so it reads empty and the
+    # release still fires.
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && github.event.inputs.publish != 'false'
     needs:
+      - check
       - windows-x64
       - linux-x64-musl
       - kwrt-armv7
@@ -126,7 +155,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag_name || github.ref }}
+          ref: ${{ github.event.inputs.target_ref || github.event.inputs.tag_name || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -151,6 +180,10 @@ jobs:
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: Release ${{ steps.vars.outputs.tag }}
+          # Without this, a manual run against a non-tag ref creates the tag
+          # on the default branch instead of on the ref that was actually
+          # built.
+          target_commitish: ${{ github.event.inputs.target_ref || github.sha }}
           generate_release_notes: true
           draft: ${{ github.event.inputs.draft == 'true' }}
           prerelease: ${{ github.event.inputs.prerelease == 'true' }}
