@@ -17,7 +17,7 @@ use std::future::poll_fn;
 use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -40,6 +40,17 @@ const ENCODE_POOL_MAX_COUNT: usize = 32;
 /// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
 /// ~80 KiB so a rare huge frame cannot pin memory.
 const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
+/// Shards for the encode-buffer pool.
+///
+/// One global mutex made every relay's encode/recycle pair serialise against
+/// every other relay in the process, which caps packets-per-second scaling
+/// once frames get small. Sharding spreads that across [`ENCODE_POOL_SHARDS`]
+/// locks while keeping the *total* retained ceiling at
+/// [`ENCODE_POOL_MAX_COUNT`] buffers: the per-shard cap is `MAX / SHARDS`,
+/// because the first A/B measured a larger pool as a setup-mode RSS
+/// regression and sharding deliberately must not grow it.
+const ENCODE_POOL_SHARDS: usize = 4;
+const ENCODE_POOL_SHARD_MAX_COUNT: usize = ENCODE_POOL_MAX_COUNT / ENCODE_POOL_SHARDS;
 /// Per-stream byte credit added each deficit round (GoWay parity).
 /// Set to 128KB so that even maximum-size MUX frames (~67KB) can be
 /// dispatched in a single round without deficit underflow stall.
@@ -47,62 +58,105 @@ const DRR_QUANTUM: usize = 128 * 1024;
 /// Cap accumulated credit so a long-idle stream cannot hog the link.
 const DRR_MAX_DEFICIT: usize = 512 * 1024;
 
-static ENCODE_POOL: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
+static ENCODE_POOL: OnceLock<Vec<StdMutex<Vec<Vec<u8>>>>> = OnceLock::new();
+static ENCODE_POOL_NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 
-fn encode_pool() -> &'static StdMutex<Vec<Vec<u8>>> {
-    ENCODE_POOL.get_or_init(|| StdMutex::new(Vec::new()))
+thread_local! {
+    /// Shard index for this thread, assigned on first use.
+    ///
+    /// A per-thread index (rather than a shared round-robin counter) keeps the
+    /// frame hot path free of any contended cache line after init, and
+    /// guarantees a buffer acquired and recycled on the same thread lands in
+    /// the same shard — which is what `encode_pool_reuses_capacity` relies on.
+    static ENCODE_POOL_SHARD: usize =
+        ENCODE_POOL_NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % ENCODE_POOL_SHARDS;
+}
+
+fn pool_shard() -> usize {
+    ENCODE_POOL_SHARD.with(|s| *s)
+}
+
+fn encode_pool() -> &'static [StdMutex<Vec<Vec<u8>>>] {
+    ENCODE_POOL.get_or_init(|| {
+        (0..ENCODE_POOL_SHARDS)
+            .map(|_| StdMutex::new(Vec::new()))
+            .collect()
+    })
+}
+
+fn shard_locked(idx: usize) -> std::sync::MutexGuard<'static, Vec<Vec<u8>>> {
+    // Bind first: indexing `encode_pool()` inline would tie the guard to the
+    // temporary holding the slice reference rather than to its `'static`
+    // pointee.
+    let pool: &'static [StdMutex<Vec<Vec<u8>>>] = encode_pool();
+    pool[idx].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Takes a pooled encode buffer (cleared, capacity retained) or a fresh
-/// empty `Vec` when the pool is empty. The writer returns written frames
+/// empty `Vec` when every shard is empty. The writer returns written frames
 /// via [`recycle_encode_bufs`].
+///
+/// Starts at this thread's own shard and only scans outwards on a miss, so
+/// the common case is still exactly one lock acquisition.
 pub(crate) fn acquire_encode_buf() -> Vec<u8> {
-    let mut pool = encode_pool()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match pool.pop() {
-        Some(mut buf) => {
+    let start = pool_shard();
+    for offset in 0..ENCODE_POOL_SHARDS {
+        let mut pool = shard_locked((start + offset) % ENCODE_POOL_SHARDS);
+        if let Some(mut buf) = pool.pop() {
             buf.clear();
-            buf
+            return buf;
         }
-        None => Vec::new(),
     }
+    Vec::new()
 }
 
 /// Returns a post-write frame buffer to the pool (best-effort: zero-cap or
-/// oversized buffers are dropped).
+/// oversized buffers are dropped, as are buffers when every shard is full).
 #[allow(dead_code)]
 pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
     if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
         return;
     }
     buf.clear();
-    let mut pool = encode_pool()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if pool.len() < ENCODE_POOL_MAX_COUNT {
-        pool.push(buf);
+    let start = pool_shard();
+    for offset in 0..ENCODE_POOL_SHARDS {
+        let idx = (start + offset) % ENCODE_POOL_SHARDS;
+        let mut pool = shard_locked(idx);
+        if pool.len() < ENCODE_POOL_SHARD_MAX_COUNT {
+            pool.push(buf);
+            return;
+        }
     }
 }
 
-/// Returns a batch of post-write frame buffers to the pool under a single
-/// mutex acquisition, with zero allocation.
+/// Returns a batch of post-write frame buffers to the pool, taking at most
+/// one lock per shard (zero allocation).
+///
+/// Shards are walked from this thread's own index and each is filled before
+/// moving on. That matters because a full [`BATCH_MAX_FRAMES`] batch is
+/// larger than a single shard: bailing out of the starting shard would throw
+/// the remaining frames away and reintroduce the per-frame malloc this pool
+/// exists to avoid. Buffers past the *total* capacity are freed, which is the
+/// same behaviour the old single-pool version had when it was full.
 pub(crate) fn recycle_encode_bufs<I>(bufs: I)
 where
     I: IntoIterator<Item = Vec<u8>>,
 {
-    let mut pool = encode_pool()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for mut buf in bufs {
-        if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
-            continue;
-        }
-        if pool.len() < ENCODE_POOL_MAX_COUNT {
-            buf.clear();
-            pool.push(buf);
-        } else {
-            break;
+    let mut iter = bufs.into_iter();
+    let start = pool_shard();
+    for offset in 0..ENCODE_POOL_SHARDS {
+        let mut pool = shard_locked((start + offset) % ENCODE_POOL_SHARDS);
+        while pool.len() < ENCODE_POOL_SHARD_MAX_COUNT {
+            match iter.next() {
+                Some(mut buf) => {
+                    if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
+                        continue;
+                    }
+                    buf.clear();
+                    pool.push(buf);
+                }
+                None => return,
+            }
         }
     }
 }

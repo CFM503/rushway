@@ -229,10 +229,16 @@ async fn read_quic_line(recv: &mut RecvStream, limit: usize) -> Result<String> {
     }
     bail!("QUIC header too large")
 }
+/// Reads one length-prefixed datagram into `buf` and returns its length.
+///
+/// Returns `Ok(None)` on a clean end of stream. Callers slice `&buf[..n]`
+/// afterwards — the previous `Ok(Some(buf.clone()))` cost a heap allocation
+/// plus a full copy on every inbound datagram, which is pure overhead on the
+/// UDP hot path since `buf` is reused for the next read anyway.
 async fn read_len_prefixed_udp(
     recv: &mut RecvStream,
     buf: &mut Vec<u8>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<usize>> {
     let mut len_buf = [0u8; 2];
     match recv.read_exact(&mut len_buf).await {
         Ok(()) => {}
@@ -245,7 +251,7 @@ async fn read_len_prefixed_udp(
     }
     buf.resize(len, 0);
     recv.read_exact(buf).await?;
-    Ok(Some(buf.clone()))
+    Ok(Some(len))
 }
 async fn write_len_prefixed_udp(send: &mut SendStream, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_QUIC_UDP_PACKET {
@@ -445,17 +451,20 @@ async fn relay_quic_udp(
         _ = control.read(&mut dummy) => {}
         _ = async {
             loop {
-                let Some(packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? else {
+                let Some(packet_len) =
+                    read_len_prefixed_udp(&mut recv, &mut frame_buf).await?
+                else {
                     break;
                 };
+                let packet = &frame_buf[..packet_len];
                 let (target, _payload) =
-                    parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+                    parse_socks5_udp_datagram(packet).map_err(|e| anyhow!(e.to_string()))?;
                 if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
                 if let Some(peer) = *latest.lock().await {
-                    let _ = batch_writer.send(&packet, peer).await;
-                    crate::stats::add_bytes(0, packet.len() as i64);
+                    let _ = batch_writer.send(packet, peer).await;
+                    crate::stats::add_bytes(0, packet_len as i64);
                 }
             }
             let _ = batch_writer.flush().await;
@@ -754,9 +763,12 @@ async fn handle_server_udp_stream(
     tokio::select! {
         _ = &mut sender => {}
         _ = async {
-            while let Some(packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? {
+            while let Some(packet_len) =
+                read_len_prefixed_udp(&mut recv, &mut frame_buf).await?
+            {
+                let packet = &frame_buf[..packet_len];
                 let (target, payload) =
-                    parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
+                    parse_socks5_udp_datagram(packet).map_err(|e| anyhow!(e.to_string()))?;
                 if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
