@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.37] - 2026-09-27
+
 ### Security: TLS verification now on by default (A2, A3, A4, A5)
 
 - **`--verify-ssl` defaults to `true`** — upstream certificate verification was previously opt-in and therefore off for everyone. New opt-out flag: `--no-verify-ssl`. The legacy `-verify-ssl=false` spelling normalizes onto it (and previously produced an unrecognized `--no-verify-ssl`; that latent path is now a real flag). Verification uses the bundled webpki (Mozilla) root set rather than the OS trust store, so private- or self-signed upstreams need `--no-verify-ssl`.
