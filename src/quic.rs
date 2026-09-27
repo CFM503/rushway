@@ -126,13 +126,23 @@ fn client_config(verify_ssl: bool) -> Result<ClientConfig> {
     Ok(cfg)
 }
 fn server_config() -> Result<ServerConfig> {
-    let cert = generate_simple_self_signed(vec!["localhost".into()])
-        .context("generate QUIC certificate")?;
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
-    let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+    // `--cert`/`--key` identity when configured, else the historical
+    // self-signed fallback (which only clients running `--no-verify-ssl`
+    // will accept).
+    let (certs, key) = match crate::tls::server_identity() {
+        Some(identity) => identity,
+        None => {
+            let cert = generate_simple_self_signed(vec!["localhost".into()])
+                .context("generate QUIC certificate")?;
+            let key =
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+            let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+            (vec![cert_der], key)
+        }
+    };
     let mut rustls = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key)
+        .with_single_cert(certs, key)
         .context("build QUIC server TLS")?;
     rustls.alpn_protocols = ALPN.iter().map(|v| v.to_vec()).collect();
     let crypto = QuicServerConfig::try_from(rustls).context("build QUIC server crypto")?;

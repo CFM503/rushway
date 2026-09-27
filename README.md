@@ -46,6 +46,7 @@ rushway.exe -k a6835181 -up wss://172.64.229.105:443/pyway -fakehost colo.446710
 - `-block-local`: Block LAN/loopback target addresses on the client policy boundary.
 - `-dns <IP>`: Remote DNS server IP used for target hostname resolution (e.g. `8.8.8.8`).
 - `-mux-sessions <N>`: Number of parallel physical MUX sessions to open to the upstream (default `4`, recommended `8` to `64` for heavy loads).
+- `-verify-ssl` / `--no-verify-ssl`: Upstream TLS certificate verification is **on by default**. Verification uses the bundled webpki (Mozilla) root set — not the OS trust store — so a private- or self-signed upstream requires `--no-verify-ssl`. With verification off, anyone on path can impersonate the upstream and read the `-k` key.
 - `-tui`: Flag accepted for CLI compatibility.
 
 ---
@@ -78,10 +79,25 @@ Or for open testing server without auth:
 rushway -p :8080 --allow-open
 ```
 
+#### Serving a certificate clients can verify
+
+Without extra flags the server generates a self-signed certificate at startup,
+which verifying clients reject. Supply a real certificate and key to make
+server mode usable with verification left on:
+
+```bash
+rushway -p :443 -k mypassword --cert fullchain.pem --key privkey.pem
+```
+
+Both flags must be given together; a missing partner is a startup error rather
+than a silent fall back to self-signed. Accepted key formats: `PRIVATE KEY`
+(PKCS#8), `EC PRIVATE KEY` (SEC1) and `RSA PRIVATE KEY` (PKCS#1).
+
 ---
 
 ## Compatibility Notes
 
 - **Separation of Destination and Identity**: Using `-up wss://<ip>:443/<path>` with `-fakehost <domain>` guarantees that TCP packets travel to `<ip>`, while TLS certificates and HTTP Host headers match `<domain>`.
+- **TLS verification default**: upstream certificate verification is on by default (it was opt-in before). Documented setups — `-up wss://<ip>:443/...` plus `-fakehost <domain>` — keep working, because the edge presents a valid certificate for `<domain>`. Setups that previously relied on the implicit opt-out must now pass `--no-verify-ssl` explicitly.
 - **Default Max Connections**: Standardized to `1500`. Custom limits can be specified via `-max-conn <N>`.
 - **Operating Systems**: Official automated releases are built for Windows x64, Linux x64 (static `musl`, no glibc dependency — runs on Debian 10+, Ubuntu 18.04+, Alpine and other musl/glibc distributions alike), and OpenWrt / KWRT ARMv7 (musl).

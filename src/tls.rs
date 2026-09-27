@@ -1,13 +1,18 @@
 //! TLS primitives for GoWay-compatible WSS.
 
 use crate::ws::{pick_browser_profile_index, BROWSER_PROFILES};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rcgen::generate_simple_self_signed;
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    ServerName,
+};
 use rustls::version::{TLS12, TLS13};
 use rustls::{CipherSuite, ClientConfig, NamedGroup, RootCertStore, ServerConfig};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 type ProfileConfigCache = Mutex<HashMap<(usize, bool), Arc<ClientConfig>>>;
@@ -155,15 +160,158 @@ pub async fn connect_with_profile(
         .context("TLS handshake failed")
 }
 
-/// Build a self-signed HTTP/1.1 TLS acceptor for standalone WSS server mode.
+/// Server identity supplied with `--cert` / `--key`.
+///
+/// Server modes otherwise generate a self-signed certificate at startup, which
+/// no verifying client will accept. Holding it behind one `OnceLock` lets the
+/// WSS acceptor and the QUIC server config share it without threading a new
+/// parameter through every call site.
+static SERVER_IDENTITY: OnceLock<Option<ServerIdentity>> = OnceLock::new();
+
+struct ServerIdentity {
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+/// Load the PEM certificate chain and private key used by server modes.
+///
+/// Both paths must be supplied together: a half-configured identity is a
+/// startup error rather than a silent fall back to self-signed, because a
+/// silent fall back would leave the operator believing they had pinned a
+/// certificate when they had not.
+pub fn configure_server_identity(
+    cert_path: Option<PathBuf>,
+    key_path: Option<PathBuf>,
+) -> Result<()> {
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (None, None) => return Ok(()),
+        (Some(cert), Some(key)) => (cert, key),
+        _ => bail!("--cert and --key must be given together"),
+    };
+    let identity = ServerIdentity {
+        certs: load_certs(&cert_path)?,
+        key: load_key(&key_path)?,
+    };
+    SERVER_IDENTITY
+        .set(Some(identity))
+        .map_err(|_| anyhow!("server certificate configured twice"))?;
+    tracing::info!(
+        cert = %cert_path.display(),
+        key = %key_path.display(),
+        "loaded server certificate (self-signed generation disabled)"
+    );
+    Ok(())
+}
+
+/// The configured server identity, or `None` when `--cert`/`--key` were not
+/// given and server mode should generate a self-signed certificate.
+///
+/// Returns freshly cloned material because both the WSS acceptor and the QUIC
+/// server config consume it independently.
+pub fn server_identity() -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let identity = SERVER_IDENTITY.get_or_init(|| None).as_ref()?;
+    Some((identity.certs.clone(), identity.key.clone_key()))
+}
+
+/// Minimal RFC 7468 reader: split on `-----BEGIN <label>-----` /
+/// `-----END <label>-----` and base64-decode the body.
+///
+/// Hand-rolled rather than pulled in as a dependency for two files read once
+/// at startup; the crate already depends on `base64`, and the body lines are
+/// concatenated back together (PEM wraps at a multiple of four characters, so
+/// the concatenation stays valid) with missing padding restored.
+fn pem_blocks(pem: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut blocks = Vec::new();
+    let mut label: Option<String> = None;
+    let mut body = String::new();
+    for line in pem.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+            if let Some(name) = rest.strip_suffix("-----") {
+                label = Some(name.to_string());
+                body.clear();
+            }
+        } else if line.starts_with("-----END ") {
+            if let Some(name) = label.take() {
+                let mut encoded = body.replace(' ', "");
+                while encoded.len() % 4 != 0 {
+                    encoded.push('=');
+                }
+                let der = STANDARD
+                    .decode(encoded)
+                    .with_context(|| format!("decode base64 body of the {name:?} PEM block"))?;
+                if der.is_empty() {
+                    bail!("the {name:?} PEM block is empty");
+                }
+                blocks.push((name, der));
+            }
+            body.clear();
+        } else if label.is_some() {
+            body.push_str(line);
+        }
+    }
+    Ok(blocks)
+}
+
+const CERT_LABELS: &[&str] = &["CERTIFICATE", "X509 CERTIFICATE", "TRUSTED CERTIFICATE"];
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read certificate file {}", path.display()))?;
+    let certs: Vec<CertificateDer<'static>> = pem_blocks(&text)?
+        .into_iter()
+        .filter(|(label, _)| CERT_LABELS.contains(&label.as_str()))
+        .map(|(_, der)| CertificateDer::from(der))
+        .collect();
+    if certs.is_empty() {
+        bail!("{} contains no CERTIFICATE PEM block", path.display());
+    }
+    Ok(certs)
+}
+
+fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read private key file {}", path.display()))?;
+    for (label, der) in pem_blocks(&text)? {
+        match label.as_str() {
+            "PRIVATE KEY" => return Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der))),
+            "EC PRIVATE KEY" => return Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der))),
+            "RSA PRIVATE KEY" => return Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der))),
+            _ if CERT_LABELS.contains(&label.as_str()) => {}
+            other => bail!(
+                "{}: unsupported private key PEM label {other:?}; expected PRIVATE KEY, \
+                 EC PRIVATE KEY or RSA PRIVATE KEY (re-encode with \
+                 `openssl pkcs8 -topk8 -nocrypt`)",
+                path.display()
+            ),
+        }
+    }
+    bail!(
+        "{} contains no private key PEM block (expected PRIVATE KEY, EC PRIVATE KEY or RSA PRIVATE KEY)",
+        path.display()
+    )
+}
+
+/// Build the HTTP/1.1 TLS acceptor for standalone WSS server mode.
+///
+/// Uses the `--cert`/`--key` identity when one was configured, otherwise falls
+/// back to a freshly generated self-signed certificate — which only works if
+/// the client runs with `--no-verify-ssl`.
 pub fn standalone_server_acceptor() -> Result<TlsAcceptor> {
-    let cert = generate_simple_self_signed(vec!["localhost".into()])
-        .context("generate WSS server certificate")?;
-    let cert_der: CertificateDer<'static> = cert.cert.der().clone();
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let (certs, key) = match server_identity() {
+        Some(identity) => identity,
+        None => {
+            let cert = generate_simple_self_signed(vec!["localhost".into()])
+                .context("generate WSS server certificate")?;
+            let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+            let key =
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+            (vec![cert_der], key)
+        }
+    };
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key)
+        .with_single_cert(certs, key)
         .context("build WSS server TLS config")?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
@@ -225,6 +373,61 @@ mod tests {
     #[test]
     fn root_store_is_constructible() {
         let _ = roots();
+    }
+
+    #[test]
+    fn pem_blocks_decodes_wrapped_and_unpadded_bodies() {
+        // Windows line endings plus a body wrapped across two lines: the
+        // reader has to concatenate the base64 back into one stream.
+        let wrapped = concat!(
+            "-----BEGIN CERTIFICATE-----\r\n",
+            "YWJj\r\n",
+            "ZA==\r\n",
+            "-----END CERTIFICATE-----\r\n",
+            "-----BEGIN PRIVATE KEY-----\n",
+            "c2VjcmV0\n",
+            "-----END PRIVATE KEY-----\n",
+        );
+        let blocks = pem_blocks(wrapped).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "CERTIFICATE");
+        assert_eq!(&blocks[0].1[..], &b"abcd"[..]);
+        assert_eq!(blocks[1].0, "PRIVATE KEY");
+        assert_eq!(&blocks[1].1[..], &b"secret"[..]);
+
+        // Six base64 characters: the missing "==" padding is restored.
+        let unpadded = "-----BEGIN CERTIFICATE-----\nYWJjZA\n-----END CERTIFICATE-----\n";
+        let blocks = pem_blocks(unpadded).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(&blocks[0].1[..], &b"abcd"[..]);
+    }
+
+    #[test]
+    fn loads_cert_and_key_from_disk_and_reports_bad_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let bad_path = dir.path().join("bad.pem");
+
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nYWJjZA==\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &key_path,
+            "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        std::fs::write(&bad_path, "this is not a PEM file").unwrap();
+
+        let certs = load_certs(&cert_path).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), &b"abcd"[..]);
+        assert!(matches!(load_key(&key_path), Ok(PrivateKeyDer::Pkcs8(_))));
+
+        let err = load_certs(&bad_path).unwrap_err().to_string();
+        assert!(err.contains("no CERTIFICATE PEM block"), "{err}");
     }
 
     #[test]

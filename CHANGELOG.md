@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security: TLS verification now on by default (A2, A3, A4, A5)
+
+- **`--verify-ssl` defaults to `true`** — upstream certificate verification was previously opt-in and therefore off for everyone. New opt-out flag: `--no-verify-ssl`. The legacy `-verify-ssl=false` spelling normalizes onto it (and previously produced an unrecognized `--no-verify-ssl`; that latent path is now a real flag). Verification uses the bundled webpki (Mozilla) root set rather than the OS trust store, so private- or self-signed upstreams need `--no-verify-ssl`.
+  - **Behaviour change**: setups that relied on implicit non-verification must now pass `--no-verify-ssl` explicitly. Documented setups (`-up wss://<ip>:443/<path>` + `-fakehost <domain>`) are unaffected: the edge presents a valid certificate for `<domain>`.
+  - When verification is off **and** an upstream is configured, the startup banner prints two red `[!]` lines and a `tracing::warn!` records it in the log.
+- **New `--cert <PEM>` / `--key <PEM>` for server mode** (`tls.rs`, used by both the WSS acceptor and the QUIC server config). Without them server mode keeps generating a self-signed certificate, which no verifying client accepts. Both must be supplied together — a half-configured identity is a startup error, not a silent fall back, so an operator can never believe they pinned a certificate when they had not. Accepts `PRIVATE KEY` (PKCS#8), `EC PRIVATE KEY` (SEC1) and `RSA PRIVATE KEY` (PKCS#1); read by a small hand-rolled RFC 7468 reader over the existing `base64` dependency rather than a new crate.
+- **`block-local` is now enforced on every dial path (`runtime.rs`, `nonmux.rs`, `quic.rs`, `wss_client.rs`)** — it previously gated only client-mode dials, so server mode (`handle_server`) and several QUIC/WSS branches reached private addresses unconditionally. The policy check is now shared (`check_target_policy`) and applied at SYN admission, at SOCKS5/HTTP target selection, and per UDP datagram.
+- **Post-DNS re-resolution check (`runtime.rs::resolve_target`)** — the pre-dial check validated the *hostname*, but resolution is attacker-influenceable: a public name resolving to `127.0.0.1`/`10.0.0.0/8`/RFC1918 walked straight through. `resolve_target` re-checks the resulting `SocketAddr` before dialling and is wired into TCP dial, server TCP relay, and both UDP resolution sites. Upstream/edge resolution is deliberately untouched. RFC6598 (CGNAT `100.64/10`) and `198.18/15` remain excluded on purpose — blocking them breaks legitimate deployments.
+- **`*.localhost` and trailing-dot names blocked (`runtime.rs::is_blocked_local_host`)** — RFC6761 says `localhost` (and any `*.localhost`) never resolves to a public address; the check now trims trailing dots so `localhost.` cannot slip past a string comparison.
+- **QUIC accept loop no longer accepts serially (`quic.rs`)** — the connection read task was spawned *inside* the accept loop body, so one slow handshake stalled every subsequent connection. It now spawns before the next `accept()`.
+
+### Performance (C1, C2, C3)
+
+- **One stalled stream no longer freezes its whole mux session (`runtime.rs`, `mux_pool.rs`, `wss_client.rs`)** — all three MUX read loops delivered per-stream data with `tx.send(frame).await`. Because each per-stream queue is bounded (64 frames server-side, 32 client-side), a consumer that stopped draining parked the *session* read loop: unrelated multiplexed streams stopped receiving anything, with no error and no timeout. The loops now use `try_send`; on `Full` the offending stream is reset (RST) and unregistered, so the blast radius stays on the stalled flow.
+  - This only fires where flow control cannot prevent it: with a negotiated `CreditGate`, refunds track drain progress and the queue does not fill. It matters for v1/un-negotiated peers (`peer_window: None` ⇒ unbounded sends), where the only previous defense was stalling the entire session.
+  - Incidental fix: `mux_pool::client_reader_loop` now goes through `close_stream()`, which also drops the per-stream credit gate — the inline teardown leaked one `state.gates` entry per closed stream.
+- **QUIC inbound UDP datagrams no longer copied per packet (`quic.rs`)** — `read_len_prefixed_udp` returned `Ok(Some(buf.clone()))`, costing an allocation plus a full copy for every datagram. It now returns the length and callers slice the reused scratch buffer.
+- **Encode-buffer pool sharded (`mux_writer.rs`)** — the pool was a single global `Mutex` locked twice per frame by every relay in the process, which serialises the proxy under many concurrent streams with small frames. It is split across `ENCODE_POOL_SHARDS` with a stable per-thread shard (`thread_local`, assigned once), so the hot path touches no shared cache line after init. The per-shard cap is `MAX / SHARDS`: the total retained ceiling stays at 32 × ~80 KiB ≈ 2.5 MiB, because the first A/B measured a larger pool as a setup-mode RSS regression.
+
+### Build (E6)
+
+- **Release artifact is now a static `x86_64-unknown-linux-musl` binary** (replacing the Debian 12/glibc build). The previous artifact was built on `rust:1.88-bookworm` (glibc 2.36) and needed `GLIBC_2.32/2.33/2.34`, which fails on Debian 11 / Ubuntu 20.04 (≤ 2.31) with `version 'GLIBC_2.34' not found`. The new target links statically — no glibc dependency — and CI verifies that plus a `-V` smoke test. `armv7-linux` was switched to `musleabihf` to match release.
+
+### Known limitations (documented, not changed)
+
+- **The QUIC `-k` key travels as a protocol literal (`quic.rs`)**, per `SPEC.md` (`<key> <target>\n`) and the GoWay↔RushWay interop requirement. It rides inside the QUIC/TLS transport encryption, so a passive observer never sees it — what A2 closes is *active* impersonation: with verification off by default, a man-in-the-middle could terminate the handshake and capture the key. Verification now defaults to on, so an attacker must break TLS first. Severity therefore drops from Critical to Low. Changing the wire format would break GoWay interop and is out of scope until SPEC.md changes.
+- `UdpBatchWriter`'s `sendmmsg` batching rarely batches in practice: all call sites use `send()` (push + immediate flush).
+- Each `XorCipher` materializes a 256 KiB keystream; the UDP relay clones it per direction (~512 KiB per association).
+
 ## [v0.0.36] - 2026-09-26
 
 ### Correctness & Hygiene Fixes (Scheduler, Reserve, Lock Poisoning, SIMD Safety)

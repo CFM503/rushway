@@ -71,8 +71,28 @@ struct Args {
     obfs: bool,
     #[arg(long = "allow-open", default_value_t = false)]
     allow_open: bool,
-    #[arg(long = "verify-ssl", default_value_t = false)]
+    #[arg(
+        long = "verify-ssl",
+        default_value_t = true,
+        help = "Verify the upstream TLS certificate against the bundled webpki (Mozilla) root set [default: on]"
+    )]
     verify_ssl: bool,
+    #[arg(
+        long = "no-verify-ssl",
+        default_value_t = false,
+        help = "Skip upstream TLS certificate verification. The connection is then unauthenticated: anyone on path can impersonate the upstream and read the -k key."
+    )]
+    no_verify_ssl: bool,
+    #[arg(
+        long = "cert",
+        help = "PEM certificate chain for server mode. Must be given together with --key; without it server mode keeps generating a self-signed certificate that no verifying client will accept."
+    )]
+    cert: Option<PathBuf>,
+    #[arg(
+        long = "key",
+        help = "PEM private key for server mode (PKCS#8, SEC1 or PKCS#1). Must be given together with --cert."
+    )]
+    key_file: Option<PathBuf>,
     #[arg(long = "wss-server", default_value_t = false)]
     wss_server: bool,
     #[arg(short = 'W')]
@@ -109,6 +129,17 @@ struct Args {
     cpu_profile_duration: Option<u64>,
 }
 
+impl Args {
+    /// Effective upstream certificate verification setting.
+    ///
+    /// Verification defaults to **on**; `--no-verify-ssl` is the documented
+    /// escape hatch for self-signed or IP-only upstreams and wins when both
+    /// flags are given.
+    fn verify_ssl_effective(&self) -> bool {
+        self.verify_ssl && !self.no_verify_ssl
+    }
+}
+
 const LEGACY_LONG_FLAGS: &[&str] = &[
     "up",
     "fakehost",
@@ -118,6 +149,9 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "obfs",
     "allow-open",
     "verify-ssl",
+    "no-verify-ssl",
+    "cert",
+    "key",
     "socket-buffer",
     "no-tcp-nodelay",
     "no-tcp-keepalive",
@@ -165,13 +199,18 @@ where
                                     format!("--no-{name}")
                                 };
                             }
-                            "no-mux" | "no-block-local" | "no-tcp-nodelay" | "no-tcp-keepalive" => {
+                            "no-mux"
+                            | "no-block-local"
+                            | "no-tcp-nodelay"
+                            | "no-tcp-keepalive"
+                            | "no-verify-ssl" => {
                                 if value {
                                     return format!("--{name}");
                                 }
                                 return match *name {
                                     "no-mux" => "--mux".to_string(),
                                     "no-block-local" => "--block-local".to_string(),
+                                    "no-verify-ssl" => "--verify-ssl".to_string(),
                                     _ => String::new(),
                                 };
                             }
@@ -407,8 +446,9 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
 
 /// Startup banner mirroring GoWay's dashboard header: always printed,
 /// even at `--log ERROR`, so the version and effective mode are visible.
-fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str) {
+fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str, verify_ssl: bool) {
     const CYAN: &str = "\x1b[36m";
+    const RED: &str = "\x1b[31;1m";
     const RESET: &str = "\x1b[0m";
     let (mode, mux) = match cfg.upstream.as_deref() {
         None => ("Server".to_string(), "Enabled (server)".to_string()),
@@ -445,6 +485,14 @@ fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str) {
     println!(" [+] Auth:        {auth}");
     println!(" [+] Buffer:      {} KB", cfg.buffer_size / 1024);
     println!(" [+] Max Conns:   {}", cfg.max_connections);
+    if cfg.upstream.is_some() && !verify_ssl {
+        println!(
+            "{RED} [!] TLS certificate verification is DISABLED (--no-verify-ssl).{RESET}"
+        );
+        println!(
+            "{RED} [!] The upstream is unauthenticated; a man-in-the-middle can read the -k key.{RESET}"
+        );
+    }
     println!("{CYAN}------------------------------------------------------------{RESET}");
 }
 
@@ -557,7 +605,17 @@ async fn main() -> Result<()> {
         dns::configure(Some(v)).await?;
     }
     std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
-    print_banner(&cfg, args.mux_sessions, &dns_display);
+    // Fail fast on a bad --cert/--key before any listener comes up; running
+    // after tracing init so the "loaded server certificate" line is visible.
+    tls::configure_server_identity(args.cert.clone(), args.key_file.clone())?;
+    let verify_ssl = args.verify_ssl_effective();
+    if cfg.upstream.is_some() && !verify_ssl {
+        tracing::warn!(
+            "TLS certificate verification is disabled (--no-verify-ssl): the upstream is \
+             unauthenticated and the -k key can be read by anyone on path"
+        );
+    }
+    print_banner(&cfg, args.mux_sessions, &dns_display, verify_ssl);
 
     // GoWay `monitorStats`: 3 s `[STATS]` line (1 s cadence feeds the TUI).
     let level_up = args.log_level.trim().to_ascii_uppercase();
@@ -568,7 +626,7 @@ async fn main() -> Result<()> {
             &cfg,
             args.mux_sessions,
             &dns_display,
-            args.verify_ssl,
+            verify_ssl,
             &args.log_level,
         );
         tui::spawn_refresh_loop(tui_cfg);
@@ -590,15 +648,16 @@ async fn main() -> Result<()> {
 }
 
 async fn run_forwarding(cfg: RuntimeConfig, args: &Args) -> Result<()> {
+    let verify_ssl = args.verify_ssl_effective();
     if let Some(upstream) = cfg.upstream.as_deref() {
         if upstream.starts_with("wss://") {
             if cfg.mux {
-                return wss_client::run_client_from_config(cfg, args.verify_ssl).await;
+                return wss_client::run_client_from_config(cfg, verify_ssl).await;
             }
-            return wss_client::run_non_mux_from_config(cfg, args.verify_ssl).await;
+            return wss_client::run_non_mux_from_config(cfg, verify_ssl).await;
         }
         if upstream.starts_with("quic://") || upstream.starts_with("quic+tls://") {
-            return quic::run_client(cfg, args.verify_ssl).await;
+            return quic::run_client(cfg, verify_ssl).await;
         }
         if cfg.mux {
             return mux_pool::run_client(cfg).await;
@@ -702,6 +761,61 @@ mod tests {
     fn parses_verify_ssl() {
         let args = Args::parse_from(["rushway", "--up", "wss://example.com/ws", "--verify-ssl"]);
         assert!(args.verify_ssl);
+        assert!(args.verify_ssl_effective());
+    }
+    #[test]
+    fn verify_ssl_defaults_on_and_no_verify_ssl_disables_it() {
+        let default_args = Args::parse_from(["rushway", "--up", "wss://example.com/ws"]);
+        assert!(default_args.verify_ssl);
+        assert!(default_args.verify_ssl_effective());
+
+        let off = Args::parse_from([
+            "rushway",
+            "--up",
+            "wss://example.com/ws",
+            "--no-verify-ssl",
+        ]);
+        assert!(!off.verify_ssl_effective());
+
+        // GoWay spelling with an explicit value still normalizes, and the
+        // legacy `-verify-ssl=false` maps onto the new opt-out flag.
+        let normalized =
+            normalize_legacy_args(["rushway", "--up", "wss://example.com/ws", "-verify-ssl=false"]);
+        let off = Args::parse_from(&normalized);
+        assert!(!off.verify_ssl_effective());
+
+        // --no-verify-ssl wins when both are given: opting out is the
+        // deliberate act, opting in on the same command line is not.
+        let both = Args::parse_from([
+            "rushway",
+            "--up",
+            "wss://example.com/ws",
+            "--verify-ssl",
+            "--no-verify-ssl",
+        ]);
+        assert!(!both.verify_ssl_effective());
+    }
+    #[test]
+    fn server_identity_flags_are_parsed_together_or_not_at_all() {
+        let args = Args::parse_from([
+            "rushway",
+            "--cert",
+            "fullchain.pem",
+            "--key",
+            "privkey.pem",
+        ]);
+        assert_eq!(args.cert.as_deref(), Some(std::path::Path::new("fullchain.pem")));
+        assert_eq!(
+            args.key_file.as_deref(),
+            Some(std::path::Path::new("privkey.pem"))
+        );
+
+        let err = crate::tls::configure_server_identity(
+            Some(std::path::PathBuf::from("fullchain.pem")),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--cert and --key"));
     }
     #[test]
     fn parses_listen_forms() {
