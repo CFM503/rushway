@@ -1371,7 +1371,7 @@ async fn handle_server_udp_parts(
     });
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
-    // Same guard as handle_server_tcp_parts below: the loop carried both a
+    // Same guard as handle_server_tcp_parts above: the loop carried both a
     // `?` on `read_frame` and an early `return` on a bad datagram, and either
     // one skipped `send_task.abort()`, detaching a task that owns the UDP
     // socket and the session write half for the rest of the process.
