@@ -1,4 +1,5 @@
 use ring::digest::{digest, SHA256};
+use std::sync::Arc;
 
 /// GoWay v1.8.4-compatible XOR transform.
 /// Each TransformInPlace call starts at key offset zero. The SHA-256 digest
@@ -7,13 +8,16 @@ pub const XOR_KEY_SIZE: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct XorCipher {
-    key: Vec<u8>,
+    /// Shared keystream. `Arc<[u8]>` keeps `Clone` O(1): the expansion is
+    /// built once per `XorCipher::new` and never mutated afterwards, so
+    /// handing a cipher to a task or session no longer copies 256 KiB.
+    key: Arc<[u8]>,
 }
 
 impl XorCipher {
     pub fn new(key: &str) -> Self {
         if key.is_empty() {
-            return Self { key: Vec::new() };
+            return Self { key: Vec::new().into() };
         }
         let digest = digest(&SHA256, key.as_bytes());
         let digest = digest.as_ref();
@@ -22,7 +26,7 @@ impl XorCipher {
             let take = (XOR_KEY_SIZE - expanded.len()).min(digest.len());
             expanded.extend_from_slice(&digest[..take]);
         }
-        Self { key: expanded }
+        Self { key: expanded.into() }
     }
 
     #[allow(dead_code)]
@@ -48,7 +52,7 @@ impl XorCipher {
         if self.key.is_empty() || data.is_empty() {
             return;
         }
-        let key = &self.key;
+        let key: &[u8] = &self.key;
         #[cfg(target_arch = "x86_64")]
         {
             if has_avx2() {

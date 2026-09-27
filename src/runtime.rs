@@ -655,9 +655,9 @@ async fn handle_mux_parts(
     mut rd: ReadHalf<TcpStream>,
     wr: WriteHalf<TcpStream>,
     cfg: RuntimeConfig,
+    cipher: XorCipher,
     first_payload: Vec<u8>,
 ) -> Result<()> {
-    let cipher = configured_cipher(&cfg.key);
     let mut hello = first_payload;
     transform_payload(&cipher, &mut hello);
     if hello != b"MUX\n" {
@@ -1140,9 +1140,9 @@ async fn handle_server_tcp_parts(
     mut rd: ReadHalf<TcpStream>,
     mut wr: WriteHalf<TcpStream>,
     cfg: RuntimeConfig,
+    cipher: XorCipher,
     first: Vec<u8>,
 ) -> Result<()> {
-    let cipher = configured_cipher(&cfg.key);
     let mut target_frame = first;
     transform_payload(&cipher, &mut target_frame);
     let target_text =
@@ -1242,9 +1242,9 @@ async fn handle_server_udp_parts(
     mut rd: ReadHalf<TcpStream>,
     mut wr: WriteHalf<TcpStream>,
     cfg: RuntimeConfig,
+    cipher: XorCipher,
     first_payload: Vec<u8>,
 ) -> Result<()> {
-    let cipher = configured_cipher(&cfg.key);
     let mut hello = first_payload;
     transform_payload(&cipher, &mut hello);
     if hello != b"UDP\n" {
@@ -1370,17 +1370,21 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                             bail!("invalid transport handshake opcode")
                         };
                         let mut plain = first.clone();
+                        // Built exactly once per connection here and handed to
+                        // whichever transport handler runs below; it used to be
+                        // rebuilt inside each handler, costing a second
+                        // SHA-256 + 256 KiB keystream expansion per connection.
                         let cipher = configured_cipher(&cfg2.key);
                         transform_payload(&cipher, &mut plain);
                         if plain == b"UDP\n" {
-                            return handle_server_udp_parts(rd, wr, cfg2, first).await;
+                            return handle_server_udp_parts(rd, wr, cfg2, cipher, first).await;
                         }
                         if plain == b"MUX\n" {
-                            return handle_mux_parts(rd, wr, cfg2, first).await;
+                            return handle_mux_parts(rd, wr, cfg2, cipher, first).await;
                         }
                         // Anything else is a plain non-MUX target ("host:port\n"),
                         // exactly like goway.go handleServer's fallthrough branch.
-                        handle_server_tcp_parts(rd, wr, cfg2, first).await
+                        handle_server_tcp_parts(rd, wr, cfg2, cipher, first).await
                     }
                     .await;
                     if let Err(e) = result {
