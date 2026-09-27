@@ -8,7 +8,7 @@ use crate::proxy::{
 };
 use crate::runtime::{
     apply_listener_options, apply_socket_options, drain_join_set, enforce_target_policy,
-    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    recycle_buf, relay_buf, resolve_target, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use anyhow::{anyhow, bail, Context, Result};
@@ -512,19 +512,32 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                         continue;
                     }
                 };
-                let req = match read_client_proxy_request(&mut stream).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        drop(permit);
-                        tracing::debug!(%peer,error=%e,"QUIC proxy request rejected");
-                        continue;
-                    }
-                };
                 let cfg2 = cfg.clone();
                 let pool2 = pool.clone();
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
+                    // The SOCKS/HTTP request must be read inside the spawned
+                    // task. Doing it on the accept loop meant a client that
+                    // connected and then sent nothing stalled `listener.accept()`
+                    // forever, freezing every other QUIC connection while it
+                    // held a semaphore permit.
+                    let req = match timeout(
+                        Duration::from_secs(cfg2.connection_timeout.max(1)),
+                        read_client_proxy_request(&mut stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            tracing::debug!(%peer, error = %e, "QUIC proxy request rejected");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%peer, "QUIC proxy request timed out");
+                            return;
+                        }
+                    };
                     match req.command {
                         SocksCommand::UdpAssociate => {
                             if let Err(e) = relay_quic_udp(stream, cfg2, pool2).await {
@@ -634,12 +647,12 @@ async fn handle_server_stream(
             bail!("invalid QUIC target");
         }
     };
-    if cfg.upstream.is_some() && enforce_target_policy(&cfg, &target_addr).is_err() {
+    if enforce_target_policy(&cfg, &target_addr).is_err() {
         send.write_all(b"ERR: DIAL_FAILED\n").await?;
         let _ = send.finish();
         return Ok(());
     }
-    let target_socket = dns::resolve_socket(&target_addr.host, target_addr.port).await?;
+    let target_socket = resolve_target(cfg.block_local, &target_addr.host, target_addr.port).await?;
     let target_stream = match timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
         TcpStream::connect(target_socket),
@@ -744,10 +757,10 @@ async fn handle_server_udp_stream(
             while let Some(packet) = read_len_prefixed_udp(&mut recv, &mut frame_buf).await? {
                 let (target, payload) =
                     parse_socks5_udp_datagram(&packet).map_err(|e| anyhow!(e.to_string()))?;
-                if cfg.upstream.is_some() && enforce_target_policy(&cfg, &target).is_err() {
+                if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
-                let addr = dns::resolve_socket(&target.host, target.port).await?;
+                let addr = resolve_target(cfg.block_local, &target.host, target.port).await?;
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
             }

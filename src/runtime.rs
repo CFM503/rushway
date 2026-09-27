@@ -85,35 +85,58 @@ fn configured_cipher(key: &Option<String>) -> XorCipher {
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
     cipher.apply(payload)
 }
+/// Blocks a target from its *literal* hostname, before DNS runs.
+///
+/// This is only a fast pre-filter: it cannot see what the name resolves to,
+/// so `resolve_target` re-checks the actual address afterwards.
 pub(crate) fn is_blocked_local_host(host: &str) -> bool {
-    let clean = host.trim().trim_matches(|c| c == '[' || c == ']');
-    if clean.eq_ignore_ascii_case("localhost") {
+    // `getaddrinfo("localhost.")` resolves to loopback and the DNS cache
+    // normalizes trailing dots, so the dotted root form (and RFC 6761's
+    // `*.localhost` zone) has to be blocked too. An exact `== "localhost"`
+    // comparison let both through.
+    let clean = host.trim().trim_matches(|c| c == '[' || c == ']').trim_end_matches('.');
+    let is_localhost = match clean.rsplit_once('.') {
+        Some((_, tld)) => tld.eq_ignore_ascii_case("localhost"),
+        None => clean.eq_ignore_ascii_case("localhost"),
+    };
+    if is_localhost {
         return true;
     }
-    if let Ok(ip) = clean.parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4() {
-                    if v4.is_loopback()
-                        || v4.is_private()
-                        || v4.is_link_local()
-                        || v4.is_unspecified()
-                    {
-                        return true;
-                    }
-                }
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                    || v6.is_unicast_link_local()
-                    || ((v6.segments()[0] & 0xff00) == 0xff00 && (v6.segments()[0] & 0x000f) <= 2)
-            }
-        };
+    match clean.parse::<IpAddr>() {
+        Ok(ip) => is_blocked_local_ip(ip),
+        Err(_) => false,
     }
-    false
+}
+
+/// Blocks a resolved address: IPv4 loopback / RFC1918 / link-local /
+/// unspecified, plus IPv6 loopback / unspecified / ULA / link-local /
+/// site-local multicast and anything IPv4-mapped onto those.
+///
+/// Deliberately mirrors the address set GoWay blocks. RFC6598 CGNAT
+/// (100.64/10) and 198.18/15 are *not* included: some deployments run
+/// targets inside carrier-grade NAT, and widening the range would break them.
+pub(crate) fn is_blocked_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4() {
+                if v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                {
+                    return true;
+                }
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || ((v6.segments()[0] & 0xff00) == 0xff00 && (v6.segments()[0] & 0x000f) <= 2)
+        }
+    }
 }
 /// GoWay-aligned relay read size: honors `-W` up to a 12 MiB ceiling
 /// (GoWay BufPool scales with the configured buffer up to 12 MiB + frame
@@ -209,14 +232,59 @@ pub(crate) async fn drain_join_set<T: Send + 'static>(set: &mut tokio::task::Joi
         }
     }
 }
+/// Target policy shared by every dial path.
+///
+/// Previously gated on `cfg.upstream.is_some()`, which meant the check was
+/// silently skipped in **server** mode even though `-block-local` defaults to
+/// `true` and the banner/TUI report it as enabled. Server mode is exactly
+/// where it matters: an authenticated (or `--allow-open`) peer could make the
+/// server dial `127.0.0.1`, RFC1918 hosts or the cloud metadata address
+/// `169.254.169.254`. Operators who legitimately need to proxy to LAN hosts
+/// from a server pass `-no-block-local`.
 pub(crate) fn enforce_target_policy(cfg: &RuntimeConfig, target: &TargetAddr) -> Result<()> {
-    if cfg.upstream.is_some() && cfg.block_local && is_blocked_local_host(&target.host) {
-        bail!("local/LAN target blocked by client policy")
+    check_target_policy(cfg.block_local, target)
+}
+
+/// Shared target-policy check: rejects loopback/RFC1918/link-local hostnames
+/// and zero ports before any dial is attempted.
+///
+/// This is only the *pre*-DNS filter — see `resolve_target`, which re-checks
+/// the address that is actually dialed.
+pub(crate) fn check_target_policy(block_local: bool, target: &TargetAddr) -> Result<()> {
+    if block_local && is_blocked_local_host(&target.host) {
+        bail!("local/LAN target blocked by target policy")
     }
     if target.port == 0 {
         bail!("target port must be non-zero")
     }
     Ok(())
+}
+
+/// Resolves a *target* hostname and re-checks the address that will actually
+/// be dialed.
+///
+/// The literal-hostname check runs before DNS and therefore cannot see what
+/// the name resolves to. Three concrete bypasses existed:
+///   * DNS rebinding — `evil.attacker.com -> 127.0.0.1`, amplified by the
+///     5-minute positive cache so one successful poison lasts;
+///   * decimal/octal short forms — `2130706433`, `0x7f000001`, `127.1` are
+///     rejected by Rust's strict `IpAddr::parse` but accepted by
+///     `getaddrinfo`, which resolves them to loopback;
+///   * any hostname whose resolved record is private.
+///
+/// Checking here — on the exact `SocketAddr` handed to `TcpStream::connect`
+/// — is the only place the decision can be made correctly. Upstream/edge
+/// resolution deliberately does *not* go through this function.
+pub(crate) async fn resolve_target(
+    block_local: bool,
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr> {
+    let addr = resolve_socket(host, port).await?;
+    if block_local && is_blocked_local_ip(addr.ip()) {
+        bail!("local/LAN address blocked by target policy: {}", addr.ip());
+    }
+    Ok(addr)
 }
 pub(crate) fn apply_socket_options_raw(
     stream: &TcpStream,
@@ -359,7 +427,7 @@ async fn dial_target(
     cfg: &RuntimeConfig,
 ) -> Result<TcpStream> {
     let stream = timeout(Duration::from_secs(timeout_secs.max(1)), async {
-        let addr = resolve_socket(&target.host, target.port)
+        let addr = resolve_target(cfg.block_local, &target.host, target.port)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         TcpStream::connect(addr).await
@@ -1053,7 +1121,8 @@ async fn handle_server_tcp_parts(
     let target_text =
         String::from_utf8(target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
     let target = parse_target_authority(target_text.trim()).map_err(|e| anyhow!(e.to_string()))?;
-    let resolved = resolve_socket(&target.host, target.port).await?;
+    enforce_target_policy(&cfg, &target)?;
+    let resolved = resolve_target(cfg.block_local, &target.host, target.port).await?;
     let target_stream = timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
         TcpStream::connect(resolved),
@@ -1116,8 +1185,8 @@ async fn handle_server_tcp_parts(
     download.abort();
     Ok(())
 }
-async fn resolve_udp_target(target: &TargetAddr) -> Result<SocketAddr> {
-    resolve_socket(&target.host, target.port).await
+async fn resolve_udp_target(block_local: bool, target: &TargetAddr) -> Result<SocketAddr> {
+    resolve_target(block_local, &target.host, target.port).await
 }
 fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut out = crate::mux_writer::acquire_encode_buf();
@@ -1209,7 +1278,7 @@ async fn handle_server_udp_parts(
             crate::mux_writer::recycle_encode_buf(packet);
             continue;
         }
-        let addr = match resolve_udp_target(&target).await {
+        let addr = match resolve_udp_target(cfg.block_local, &target).await {
             Ok(v) => v,
             Err(_) => {
                 crate::mux_writer::recycle_encode_buf(packet);
@@ -1409,6 +1478,73 @@ mod lifecycle_tests {
                 "is_blocked_local_host({a}) should be false"
             );
         }
+    }
+
+    #[test]
+    fn localhost_root_and_subdomains_are_blocked() {
+        // The old check was an exact `eq_ignore_ascii_case("localhost")`.
+        // `getaddrinfo` accepts `localhost.` (trailing root) and RFC 6761
+        // reserves `*.localhost` — both resolve to loopback, neither matched.
+        for host in [
+            "localhost",
+            "localhost.",
+            "LOCALHOST.",
+            "foo.localhost",
+            "api.localhost.",
+            "  localhost  ",
+        ] {
+            assert!(is_blocked_local_host(host), "{host:?} should be blocked");
+        }
+        // `localhost.com` is a real public domain and must stay reachable.
+        for host in ["localhostx", "mylocalhost", "localhost.com", "example.org"] {
+            assert!(
+                !is_blocked_local_host(host),
+                "{host:?} should NOT be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn target_policy_applies_in_server_mode() {
+        // `-block-local` defaults to true but used to be gated on
+        // `upstream.is_some()`, so server mode silently skipped it while the
+        // banner and TUI reported it as enabled.
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.upstream.is_none(), "default config is server mode");
+        assert!(cfg.block_local);
+
+        let loopback = TargetAddr {
+            host: "127.0.0.1".into(),
+            port: 8080,
+        };
+        assert!(enforce_target_policy(&cfg, &loopback).is_err());
+
+        let metadata = TargetAddr {
+            host: "169.254.169.254".into(),
+            port: 80,
+        };
+        assert!(enforce_target_policy(&cfg, &metadata).is_err());
+
+        cfg.block_local = false;
+        assert!(enforce_target_policy(&cfg, &loopback).is_ok());
+
+        // Port 0 is rejected regardless of the block_local setting.
+        let zero_port = TargetAddr {
+            host: "example.com".into(),
+            port: 0,
+        };
+        assert!(enforce_target_policy(&cfg, &zero_port).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_target_rechecks_after_resolution() {
+        // IP literals short-circuit inside `resolve_host`, so these run
+        // without touching the network.
+        assert!(resolve_target(true, "127.0.0.1", 8080).await.is_err());
+        assert!(resolve_target(true, "10.0.0.5", 8080).await.is_err());
+        assert!(resolve_target(true, "169.254.169.254", 80).await.is_err());
+        // With the policy off the same address dials normally.
+        assert!(resolve_target(false, "127.0.0.1", 8080).await.is_ok());
     }
 
     #[tokio::test]

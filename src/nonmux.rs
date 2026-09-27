@@ -7,7 +7,8 @@ use crate::proxy::{
     socks5_success_response, ClientProxyRequest, SocksCommand,
 };
 use crate::runtime::{
-    drain_join_set, enforce_target_policy, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    drain_join_set, enforce_target_policy, recycle_buf, relay_buf, resolve_target, wait_shutdown,
+    RuntimeConfig,
 };
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
@@ -457,7 +458,11 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         .trim()
         .to_string();
     let target_addr = parse_target_authority(&target).map_err(|e| anyhow!(e.to_string()))?;
-    let resolved = resolve_socket(&target_addr.host, target_addr.port).await?;
+    // Server-side non-MUX had no target policy at all: `-block-local`
+    // defaulted to true yet any authenticated peer could make this process
+    // dial loopback / RFC1918 / link-local addresses.
+    enforce_target_policy(&cfg, &target_addr)?;
+    let resolved = resolve_target(cfg.block_local, &target_addr.host, target_addr.port).await?;
     let target_stream = timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
         TcpStream::connect(resolved),

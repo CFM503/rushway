@@ -84,4 +84,4 @@ rushway -p :8080 --allow-open
 
 - **Separation of Destination and Identity**: Using `-up wss://<ip>:443/<path>` with `-fakehost <domain>` guarantees that TCP packets travel to `<ip>`, while TLS certificates and HTTP Host headers match `<domain>`.
 - **Default Max Connections**: Standardized to `1500`. Custom limits can be specified via `-max-conn <N>`.
-- **Operating Systems**: Official automated releases are built for Windows x64, Debian 12 (Bookworm) x64, and OpenWrt / KWRT ARMv7 (musl).
+- **Operating Systems**: Official automated releases are built for Windows x64, Linux x64 (static `musl`, no glibc dependency — runs on Debian 10+, Ubuntu 18.04+, Alpine and other musl/glibc distributions alike), and OpenWrt / KWRT ARMv7 (musl).

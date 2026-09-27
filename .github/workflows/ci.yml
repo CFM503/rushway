@@ -173,6 +173,32 @@ jobs:
         if: env.WAY_READ_TOKEN != ''
         run: bash scripts/repeat_proxy_bench.sh goway "$GITHUB_WORKSPACE/goway-v1.8.4" 5 target/release/proxy_bench steady_state
 
+  # Mirrors the release artifact target so a musl build break is caught on
+  # every PR instead of at release time, and proves the binary runs without
+  # any glibc dependency.
+  musl-static:
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build static x86_64 musl binary with cross-rs
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: x86_64-unknown-linux-musl
+          args: --release
+          toolchain: 1.88.0
+      - name: Verify static linkage and smoke test
+        run: |
+          TARGET=target/x86_64-unknown-linux-musl/release/rushway
+          file "$TARGET"
+          if strings "$TARGET" | grep -q 'GLIBC_2\.'; then
+            echo "::error::musl binary still references GLIBC_2 symbols"
+            exit 1
+          fi
+          chmod +x "$TARGET"
+          "$TARGET" -V
+
   windows-x64:
     runs-on: ubuntu-22.04
     needs: test
@@ -217,19 +243,18 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-      - name: Install ARMv7 cross compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
-      - uses: dtolnay/rust-toolchain@stable
+      # Matches the release artifact (release.yml builds musleabihf); the
+      # previous gnueabihf target meant CI never compiled the shipped target.
+      - name: Build ARMv7 musl Linux
+        uses: houseabsolute/actions-rust-cross@v1
         with:
+          command: build
+          target: armv7-unknown-linux-musleabihf
+          args: --release
           toolchain: 1.88.0
-          targets: armv7-unknown-linux-gnueabihf
-      - name: Build ARMv7 Linux
-        env:
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
-        run: cargo build --release --target armv7-unknown-linux-gnueabihf
       - name: Upload ARMv7 Linux release artifact
         uses: actions/upload-artifact@v4
         with:
           name: rushway-armv7-linux
-          path: target/armv7-unknown-linux-gnueabihf/release/rushway
+          path: target/armv7-unknown-linux-musleabihf/release/rushway
           if-no-files-found: error

@@ -9,12 +9,12 @@ use crate::protocol::{
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
 };
 use crate::proxy::{
-    parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
-    TargetAddr,
+    parse_authority_with_default, parse_socks5_udp_datagram, read_client_proxy_request,
+    socks5_success_response, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
-    apply_listener_options, apply_socket_options, apply_socket_options_raw, drain_join_set,
-    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, apply_socket_options_raw, check_target_policy,
+    drain_join_set, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::tls;
 use crate::udp_batch::UdpBatchReader;
@@ -60,6 +60,11 @@ pub(crate) struct WssConfig {
     pub(crate) socket_buffer: usize,
     pub(crate) obfs: bool,
     pub(crate) max_connections: usize,
+    /// Mirrors `RuntimeConfig::block_local`. The WSS client paths had no
+    /// target policy at all, so `-block-local` was silently ignored whenever
+    /// the upstream was `wss://` — the only transport where the flag matters
+    /// most for a client behind a CDN.
+    pub(crate) block_local: bool,
 }
 impl WssConfig {
     #[allow(dead_code)]
@@ -82,6 +87,7 @@ impl WssConfig {
             socket_buffer: cfg.socket_buffer,
             obfs: cfg.obfs,
             max_connections: cfg.max_connections,
+            block_local: cfg.block_local,
         })
     }
 }
@@ -345,6 +351,7 @@ async fn handle_udp_proxy(
         bail!("WSS upstream rejected UDP handshake")
     };
     let latest_client = Arc::new(Mutex::new(None::<SocketAddr>));
+    let block_local = cfg.block_local;
     let udp_send = udp.clone();
     let writer_send = writer.clone();
     let cipher_send = c.clone();
@@ -358,6 +365,16 @@ async fn handle_udp_proxy(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
+                // The local leg is a plaintext SOCKS5 UDP request (the XOR
+                // below happens on the way out), so the destination is still
+                // readable here. The WSS client used to forward every
+                // datagram unchecked; enforce `-block-local` per packet.
+                if let Ok((target, _)) = parse_socks5_udp_datagram(pkt) {
+                    if let Err(e) = check_target_policy(block_local, &target) {
+                        tracing::debug!(error = %e, "WSS UDP datagram dropped by target policy");
+                        continue;
+                    }
+                }
                 *latest_send.lock().await = Some(peer);
                 let mut packet = pkt.to_vec();
                 cipher_send.apply(&mut packet);
@@ -506,6 +523,9 @@ async fn handle_non_mux_connection(
     if req.command != SocksCommand::Connect {
         bail!("WSS non-MUX supports CONNECT or UDP ASSOCIATE only")
     };
+    // WSS client paths had no target policy; enforce `-block-local` here so
+    // the flag behaves the same as on the plain-WS and QUIC clients.
+    check_target_policy(cfg.block_local, &req.target)?;
     let (mut rd, writer) = pool.get_or_dial().await?;
     let c = cipher(&cfg.key);
     let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
@@ -614,6 +634,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
         socket_buffer: cfg.socket_buffer,
         obfs: cfg.obfs,
         max_connections: cfg.max_connections,
+        block_local: cfg.block_local,
     };
     let pool = NonMuxWssPool::new(wc.clone());
     let maintainer = pool.clone();
@@ -1137,6 +1158,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     if req.command != SocksCommand::Connect {
         bail!("WSS path only supports CONNECT or UDP ASSOCIATE")
     };
+    check_target_policy(pool.cfg.block_local, &req.target)?;
     let initial_data = req.initial_payload.unwrap_or_default();
     let (session, stream_id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
     let writer = session.writer.clone();
@@ -1264,6 +1286,7 @@ pub async fn run_client_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Res
         socket_buffer: cfg.socket_buffer,
         obfs: cfg.obfs,
         max_connections: cfg.max_connections,
+        block_local: cfg.block_local,
     };
     let pool = WssSessionPool::new(wc.clone());
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
@@ -1503,6 +1526,7 @@ mod tests {
             socket_buffer: 0,
             obfs: false,
             max_connections: 16,
+            block_local: false,
         };
 
         let session = WssSessionState::connect(&cfg).await.unwrap();
@@ -1551,6 +1575,7 @@ mod tests {
             socket_buffer: 0,
             obfs: false,
             max_connections: 16,
+            block_local: false,
         };
 
         let res = probe_wss_handshake(&cfg).await.unwrap();
