@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.38] - 2026-09-29
+
+### Performance & GoWay Parity (High-Bandwidth Download)
+
+- **GoWay-parity MUX per-stream channel capacity (768 frames)** (`protocol.rs`, `wss_client.rs`, `mux_pool.rs`, `runtime.rs`) — per-stream ingress queues were previously 64 frames (and 32 in `mux_pool.rs`), causing high-bandwidth bursts (such as Cloudflare speed tests under an 8 MiB window) to overflow the queue and trigger `TrySendError::Full` and premature stream resets. Channel capacity is now unified at 768 (`MUX_STREAM_QUEUE_CAP`), matching GoWay's `muxStreamIngressQueue = 768`.
+- **Default MUX sessions updated to 8** (`main.rs`, `wss_client.rs`, `mux_pool.rs`) — `-mux-sessions` now defaults to 8 (matching GoWay v1.8.13+), spreading high-concurrency downloads across 8 concurrent TCP/TLS sessions by default.
+- **Fast physical session warm-up and on-demand replenishment** (`wss_client.rs`, `mux_pool.rs`) — session maintenance loop now dials with a 10ms fast delay until target session count is achieved (down from 500ms serial pause per connection), and stream acquisition triggers background replenishment when sessions are below target, eliminating stream bunching on session 0 during test startup.
+- **Lock-free atomic window state on hot download path** (`wss_client.rs`, `mux_pool.rs`, `runtime.rs`) — replaced per-frame `StdMutex<Option<u16>>` lock acquisition for peer-window negotiation checks with atomic `AtomicU32` (`peer_window_kib.load(Ordering::Relaxed) > 0`), removing lock contention on high-throughput data relays.
+
 ## [v0.0.37] - 2026-09-27
 
 ### Security: TLS verification now on by default (A2, A3, A4, A5)
