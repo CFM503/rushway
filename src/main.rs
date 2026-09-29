@@ -63,7 +63,7 @@ struct Args {
     mux: bool,
     #[arg(long = "no-mux", default_value_t = false)]
     no_mux: bool,
-    #[arg(long = "mux-sessions", default_value_t = 4, value_parser = clap::value_parser!(usize))]
+    #[arg(long = "mux-sessions", default_value_t = 8, value_parser = clap::value_parser!(usize))]
     mux_sessions: usize,
     #[arg(
         long = "obfs",
@@ -763,7 +763,7 @@ mod tests {
         ]);
         assert_eq!(args.port.as_deref(), Some(":9192"));
         assert_eq!(args.upstream.as_deref(), Some("ws://127.0.0.1:8080/ws"));
-        assert_eq!(args.mux_sessions, 4);
+        assert_eq!(args.mux_sessions, 8);
         assert_eq!(args.log_level, "ERROR");
     }
     #[test]

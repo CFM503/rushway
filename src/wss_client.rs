@@ -41,7 +41,7 @@ pub(crate) type BoxTransport = Box<dyn Transport>;
 pub(crate) type BoxReader = tokio::io::ReadHalf<BoxTransport>;
 pub(crate) type BoxWriter = tokio::io::WriteHalf<BoxTransport>;
 
-const DEFAULT_SESSION_COUNT: usize = 4;
+const DEFAULT_SESSION_COUNT: usize = 8;
 const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 2048;
 
@@ -696,8 +696,8 @@ struct WssSessionState {
     // RwLock: concurrent lookups, exclusive insert/remove.
     streams: Arc<std::sync::RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
     /// Peer-advertised receive window in KiB once its VERSION arrived
-    /// (None => un-negotiated: v1 unbounded sends, no WINDOW refunds).
-    peer_window: StdMutex<Option<u16>>,
+    /// (0 => un-negotiated: v1 unbounded sends, no WINDOW refunds).
+    peer_window_kib: AtomicU32,
     /// Per-stream upload credit gates (populated in open_stream).
     gates: StdMutex<HashMap<u32, Arc<CreditGate>>>,
     next_id: AtomicU32,
@@ -751,7 +751,7 @@ impl WssSessionState {
             cipher: c.clone(),
             obfs: cfg.obfs,
             streams: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            peer_window: StdMutex::new(None),
+            peer_window_kib: AtomicU32::new(0),
             gates: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
@@ -850,14 +850,13 @@ impl WssSessionState {
                     break;
                 }
             }
-            let (tx, rx) = mpsc::channel(64);
-            // Scoped gate registration: lock order streams -> gates ->
-            // peer_window so a racing VERSION arm can never miss this
-            // stream, and the guard dies before the send awaits.
+            let (tx, rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
+            // Scoped gate registration: gates guard dies before the send awaits.
             let gate = {
                 let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
                 let gate = CreditGate::new();
-                if let Some(kib) = *self.peer_window.lock().unwrap_or_else(|e| e.into_inner()) {
+                let kib = self.peer_window_kib.load(Ordering::Acquire);
+                if kib > 0 {
                     gate.enable(i64::from(kib) * 1024);
                 }
                 gates.insert(stream_id, gate.clone());
@@ -984,11 +983,9 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             MuxCommand::Version => {
                 if let Some((version, kib)) = decode_version_payload(frame.payload()) {
                     if version >= 1 {
-                        let gates = session.gates.lock().unwrap_or_else(|e| e.into_inner());
-                        let mut pw = session.peer_window.lock().unwrap_or_else(|e| e.into_inner());
-                        if pw.is_none() {
-                            *pw = Some(kib);
-                            drop(pw);
+                        let prev = session.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
+                        if prev == 0 {
+                            let gates = session.gates.lock().unwrap_or_else(|e| e.into_inner());
                             let window = i64::from(kib) * 1024;
                             for gate in gates.values() {
                                 gate.enable(window);
@@ -1060,7 +1057,7 @@ impl WssSessionPool {
             consecutive_failures: AtomicU32::new(0),
         })
     }
-    async fn replenish(self: &Arc<Self>) {
+    async fn replenish(self: &Arc<Self>) -> bool {
         let target = configured_session_count();
         let _guard = self.session_creation.lock().await;
         let need_new = {
@@ -1070,12 +1067,14 @@ impl WssSessionPool {
         };
         if !need_new {
             self.consecutive_failures.store(0, Ordering::Release);
-            return;
+            return false;
         }
         match WssSessionState::connect(&self.cfg).await {
             Ok(s) => {
-                self.sessions.lock().await.push(s);
+                let mut sessions = self.sessions.lock().await;
+                sessions.push(s);
                 self.consecutive_failures.store(0, Ordering::Release);
+                sessions.len() < target
             }
             Err(error) => {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1097,12 +1096,17 @@ impl WssSessionPool {
                     failures,
                     "WSS physical session creation failed; will retry with backoff"
                 );
+                false
             }
         }
     }
     async fn maintain(self: &Arc<Self>) {
         loop {
-            self.replenish().await;
+            let more_needed = self.replenish().await;
+            if more_needed {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
             let failures = self.consecutive_failures.load(Ordering::Acquire);
             let backoff = (failures.saturating_mul(500)).min(5000);
             tokio::time::sleep(Duration::from_millis(500 + backoff as u64)).await;
@@ -1133,6 +1137,14 @@ impl WssSessionPool {
                 continue;
             }
             if let Ok((id, rx, gate)) = session.open_stream(target, initial_data.clone()).await {
+                let limit = configured_session_count();
+                let current_len = self.sessions.lock().await.len();
+                if current_len < limit {
+                    let pool = self.clone();
+                    tokio::spawn(async move {
+                        pool.replenish().await;
+                    });
+                }
                 return Ok((session, id, rx, gate));
             }
         }
@@ -1243,7 +1255,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 write_res?;
                 if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
-                    let negotiated = session.peer_window.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                    let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(len as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {

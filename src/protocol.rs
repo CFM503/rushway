@@ -35,6 +35,12 @@ pub const MUX_WINDOW_REFRESH: usize = 1024 * 1024;
 /// can never starve the sender (frames are at most 64 KiB).
 #[allow(dead_code)]
 pub const MUX_WINDOW_MIN_KIB: u16 = 64;
+/// Capacity for per-stream MUX data channel (GoWay parity).
+/// Sized to 768 frames so that an entire 8 MiB window burst
+/// (up to ~512-768 frames of 10-16 KiB each) can be absorbed in-flight
+/// without hitting `TrySendError::Full` and triggering premature stream resets.
+#[allow(dead_code)]
+pub const MUX_STREAM_QUEUE_CAP: usize = 768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxCommand {

@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -627,11 +627,11 @@ async fn maybe_send_window(
     cipher: &XorCipher,
     stream_id: u32,
     obfs: bool,
-    peer_window: &StdMutex<Option<u16>>,
+    peer_window: &AtomicU32,
     refund_pending: &mut u32,
     consumed: usize,
 ) {
-    let negotiated = peer_window.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let negotiated = peer_window.load(Ordering::Relaxed) > 0;
     if !negotiated {
         *refund_pending = 0;
         return;
@@ -740,7 +740,7 @@ async fn handle_mux_parts(
     // W3 version negotiation: advertise our protocol version + initial
     // receive window right after the session handshake. Old clients skip
     // the unknown command; new clients answer with their own VERSION.
-    let peer_window: Arc<StdMutex<Option<u16>>> = Arc::new(StdMutex::new(None));
+    let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
     send_mux_parts_encrypted(
         &writer,
@@ -824,10 +824,11 @@ async fn handle_mux_parts(
                     continue;
                 }
 
-                let (tx, mut rx) = mpsc::channel(64);
+                let (tx, mut rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
                 let (cancel, cancelled) = watch::channel(false);
                 let gate = CreditGate::new();
-                if let Some(kib) = *peer_window.lock().unwrap_or_else(|e| e.into_inner()) {
+                let kib = peer_window.load(Ordering::Acquire);
+                if kib > 0 {
                     gate.enable(i64::from(kib) * 1024);
                 }
 
@@ -1175,15 +1176,8 @@ async fn handle_mux_parts(
                 // admission time).
                 if let Some((version, kib)) = decode_version_payload(frame.payload()) {
                     if version >= 1 {
-                        let already = {
-                            let mut pw = peer_window.lock().unwrap_or_else(|e| e.into_inner());
-                            let seen = pw.is_some();
-                            if !seen {
-                                *pw = Some(kib);
-                            }
-                            seen
-                        };
-                        if !already {
+                        let prev = peer_window.swap(kib as u32, Ordering::AcqRel);
+                        if prev == 0 {
                             let window = i64::from(kib) * 1024;
                             for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values() {
                                 entry.gate.enable(window);

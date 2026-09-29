@@ -36,7 +36,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
-const DEFAULT_SESSION_COUNT: usize = 4;
+const DEFAULT_SESSION_COUNT: usize = 8;
 const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 2048;
 
@@ -201,8 +201,8 @@ struct SessionState {
     // RwLock: concurrent lookups, exclusive insert/remove.
     streams: Arc<std::sync::RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
     /// Peer-advertised receive window in KiB once its VERSION arrived
-    /// (None => un-negotiated: v1 unbounded sends, no WINDOW refunds).
-    peer_window: StdMutex<Option<u16>>,
+    /// (0 => un-negotiated: v1 unbounded sends, no WINDOW refunds).
+    peer_window_kib: AtomicU32,
     /// Per-stream upload credit gates (populated in open_stream).
     gates: StdMutex<HashMap<u32, Arc<CreditGate>>>,
     next_id: AtomicU32,
@@ -281,7 +281,7 @@ impl SessionState {
             cipher: cipher.clone(),
             obfs: cfg.obfs,
             streams: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            peer_window: StdMutex::new(None),
+            peer_window_kib: AtomicU32::new(0),
             gates: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
@@ -391,15 +391,13 @@ impl SessionState {
                     break;
                 }
             }
-            let (tx, rx) = mpsc::channel(32);
-            // Gates lock nests inside streams lock and guards the peer_window
-            // check so a racing VERSION arm can never miss this stream
-            // (lock order everywhere: streams -> gates -> peer_window).
-            // Scoped block: the guard must be dead before the send awaits.
+            let (tx, rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
+            // Scoped gate registration: gates guard dies before the send awaits.
             let gate = {
                 let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
                 let gate = CreditGate::new();
-                if let Some(kib) = *self.peer_window.lock().unwrap_or_else(|e| e.into_inner()) {
+                let kib = self.peer_window_kib.load(Ordering::Acquire);
+                if kib > 0 {
                     gate.enable(i64::from(kib) * 1024);
                 }
                 gates.insert(id, gate.clone());
@@ -485,11 +483,9 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
             MuxCommand::Version => {
                 if let Some((version, kib)) = decode_version_payload(frame.payload()) {
                     if version >= 1 {
-                        let gates = state.gates.lock().unwrap_or_else(|e| e.into_inner());
-                        let mut pw = state.peer_window.lock().unwrap_or_else(|e| e.into_inner());
-                        if pw.is_none() {
-                            *pw = Some(kib);
-                            drop(pw);
+                        let prev = state.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
+                        if prev == 0 {
+                            let gates = state.gates.lock().unwrap_or_else(|e| e.into_inner());
                             let window = i64::from(kib) * 1024;
                             for gate in gates.values() {
                                 gate.enable(window);
@@ -556,7 +552,7 @@ impl MuxSessionPool {
             consecutive_failures: std::sync::atomic::AtomicU32::new(0),
         })
     }
-    async fn replenish(self: &Arc<Self>) {
+    async fn replenish(self: &Arc<Self>) -> bool {
         let target = configured_session_count();
         let _guard = self.session_creation.lock().await;
         let need_new = {
@@ -566,22 +562,29 @@ impl MuxSessionPool {
         };
         if !need_new {
             self.consecutive_failures.store(0, Ordering::Release);
-            return;
+            return false;
         }
         match SessionState::connect(&self.cfg).await {
             Ok(s) => {
-                self.sessions.lock().await.push(s);
+                let mut sessions = self.sessions.lock().await;
+                sessions.push(s);
                 self.consecutive_failures.store(0, Ordering::Release);
+                sessions.len() < target
             }
             Err(error) => {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 tracing::warn!(error=%error, failures, "MUX physical session creation failed; will retry with backoff");
+                false
             }
         }
     }
     async fn maintain(self: &Arc<Self>) {
         loop {
-            self.replenish().await;
+            let more_needed = self.replenish().await;
+            if more_needed {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
             // Base 100ms; +500ms per consecutive failure, capped at ~5s.
             // Prevents DNS/TCP hammering while the upstream is down.
             let failures = self.consecutive_failures.load(Ordering::Acquire);
@@ -607,7 +610,16 @@ impl MuxSessionPool {
             if let Some((_active, s)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
                 drop(sessions);
                 match s.open_stream(target, initial_data.clone()).await {
-                    Ok(r) => return Ok((s, r.0, r.1, r.2)),
+                    Ok(r) => {
+                        let current_len = self.sessions.lock().await.len();
+                        if current_len < n {
+                            let pool = self.clone();
+                            tokio::spawn(async move {
+                                pool.replenish().await;
+                            });
+                        }
+                        return Ok((s, r.0, r.1, r.2));
+                    }
                     Err(_) => continue,
                 }
             }
@@ -860,7 +872,7 @@ async fn handle_tcp_proxy(
                 }
                 if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
-                    let negotiated = session.peer_window.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                    let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(len as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {
