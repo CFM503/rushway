@@ -9,3 +9,5 @@ dist/
 tools/
 # Scratch space for baseline exports / A-B staging.
 tmp/
+# ZCode workspace metadata (workflow drafts/runs).
+.zcode/
