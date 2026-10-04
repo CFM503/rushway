@@ -1,5 +1,10 @@
 # RushWay v0.0.2 — GoWay v1.8.4 Compatibility Specification
 
+> **Status note (2026-10-04):** this specification reflects the project as of v0.0.2 and is retained
+> for history only; wire-level behavior has since evolved through v0.0.38 and the current
+> `fix/security-and-perf-batch` branch. The authoritative, up-to-date record of shipped behavior is
+> `CHANGELOG.md`; the sections below still describe v0.0.2-era scope.
+
 ## Purpose
 
 RushWay targets protocol-compatible behavior with GoWay v1.8.4 at `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.

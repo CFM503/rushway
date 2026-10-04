@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Behavior changes (call out in release notes)
+
+- **QUIC first-line auth now sends the SHA-256 hex digest of the key instead of the plaintext key** (`quic.rs`) — the server accepts the digest or the legacy inline plaintext (WARN on the legacy path); a client facing a plaintext-only upstream falls back to the legacy line once, only on an explicit auth-shaped rejection, and latches that per process. A legacy server that rejects without an "AUTH"-shaped response will not interop.
+- **Server UDP relay is now locked to dialed sources** (`runtime.rs`) — datagrams whose source address this session never dialed are dropped (DEBUG log), so a third party that learns the relay port can no longer inject forged-source packets into the client's downstream. All three client UDP paths use a single local socket and stay compatible.
+
+### Added
+
+- **Real CI format and lint gates** (`.github/workflows/ci.yml`) — `cargo fmt --all -- --check` (the old `cargo fmt --all` reformatted and always passed) plus a new `cargo clippy --all-targets --all-features` step; `-D warnings` is deliberately deferred until the tree is green.
+- **`src/common.rs` shared transport module** — one `configured_cipher`, WS-URL parsing, Cloudflare edge fallback, MUX send helpers, a generic non-MUX pool and one unified non-MUX relay loop, replacing copy-paste sites across `nonmux.rs`, `wss_client.rs`, `mux_pool.rs` and `udp_relay.rs` (equivalence-focused refactor; QUIC keeps its own relay).
+- **15 `src/quic.rs` unit tests** — upstream URL parsing, SHA-256 digest vectors, digest/legacy/empty-key auth matching, auth-rejection detection, length-prefixed UDP framing edges (paper-verified only; no local toolchain).
+
+### Fixed
+
+- **WS ping heartbeat condition inverted** (`mux_pool.rs`, `wss_client.rs`) — ping now goes out every 25 s while the session is open instead of only when no stream is active; active-but-idle sessions (suspended SSH) no longer die to NAT/CDN idle timeouts.
+- **Saturated MUX acquire no longer busy-polls every 2 ms** (`mux_pool.rs`) — parks on a `Notify` with a bounded 500 ms wait as the lost-wakeup backstop.
+- **Transient accept errors no longer kill the proxy** (`runtime.rs`, `mux_pool.rs`, `nonmux.rs`, `quic.rs`, `wss_client.rs`, `main.rs`) — all eight TCP accept loops log a warning, sleep 100 ms and retry; shutdown paths unchanged.
+- **MUX session writes are bounded by a 30 s timeout** (`mux_writer.rs`) — a silently dead peer tears the session down through the normal write-failure path instead of parking the writer forever.
+- **DNS replies are validated** (`dns.rs`) — responses must come from the queried resolver and echo the Question section (case-insensitive name, qtype/qclass), with pointer-bounded name decoding.
+- **DNS caches are bounded** (`dns.rs`) — both resolver caches cap at 4096 entries (clear-on-full trade-off, see code comment).
+- **`zeroize` is now actually used** (`quic.rs`) — key copies on the QUIC auth path are wrapped in `Zeroizing` (the dependency was declared in `Cargo.toml` but never referenced).
+- **UDP hot-path allocations and locks removed** (`mux_pool.rs`, `wss_client.rs`, `runtime.rs`) — plain-WS UDP datagrams now build into pooled encode buffers (recycled after send) instead of a per-datagram `to_vec`; the per-association latest-peer state moved from a tokio `Mutex` (two `.lock().await` per datagram) to a poison-recovering `StdMutex`; the server UDP downlink writes a borrowed single-pass envelope from a pooled buffer.
+- **`RUSHWAY_MUX_SESSIONS` is resolved once at startup** (`main.rs`) — instead of `std::env::var` on every MUX acquire.
+- **Two ordering/policy nits in the pooled client** (`mux_pool.rs`) — a failed WINDOW-refund send no longer skips the stream cleanup, and the plain-WS UDP client path now enforces the same target policy as the other client paths.
+
+### Docs & housekeeping
+
+- Pre-v0.0.31 handoff history archived verbatim to the new `AI_HANDOFF_ARCHIVE.md`; `AI_HANDOFF.md` keeps the standing rules, the v0.0.31+ entries and a new batch entry.
+- `PROGRESS.md` and `SPEC.md` carry a status banner: their bodies describe v0.0.3 / v0.0.2 and `CHANGELOG.md` is the authoritative record.
+- Stale `CI_TRIGGER.md`, `FORMAT_TRIGGER.md` and `REFACTOR_TRIGGER.md` removed (their missions were complete; backup in git history).
+
+### Known limitations (documented, not changed)
+
+- No local Rust toolchain: nothing in this section has been compiled or run; GitHub Actions is the first build.
+
 ## [v0.0.38] - 2026-09-29
 
 ### Performance & GoWay Parity (High-Bandwidth Download)
