@@ -20,14 +20,22 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
+use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 const WRITER_QUEUE: usize = 256;
 const FEED_CAP: usize = 256;
 const BATCH_MAX_FRAMES: usize = 32;
 const BATCH_MAX_BYTES: usize = 1024 * 1024;
+/// Wall-clock bound for one batch write. A peer that silently stops reading
+/// (dead NAT/CDN path, black-holed connection) would otherwise park the
+/// writer task forever and stall every stream multiplexed on the session.
+/// Past this bound the write surfaces as a regular io error, so the session
+/// tears down through the normal write-failure path.
+const WRITE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Encode-buffer pool: outbound frames are pre-encoded into an owned `Vec`
 /// that the writer task only reads, then drops. Recycling those buffers
 /// after a successful write removes the per-frame malloc/free that showed
@@ -615,6 +623,19 @@ where
 }
 
 async fn write_batch<W>(w: &mut W, batch: &[Vec<u8>]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match timeout(WRITE_BATCH_TIMEOUT, write_batch_inner(w, batch)).await {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "mux writer batch write timed out",
+        )),
+    }
+}
+
+async fn write_batch_inner<W>(w: &mut W, batch: &[Vec<u8>]) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {

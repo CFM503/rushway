@@ -101,3 +101,12 @@ than a silent fall back to self-signed. Accepted key formats: `PRIVATE KEY`
 - **TLS verification default**: upstream certificate verification is on by default (it was opt-in before). Documented setups — `-up wss://<ip>:443/...` plus `-fakehost <domain>` — keep working, because the edge presents a valid certificate for `<domain>`. Setups that previously relied on the implicit opt-out must now pass `--no-verify-ssl` explicitly.
 - **Default Max Connections**: Standardized to `1500`. Custom limits can be specified via `-max-conn <N>`.
 - **Operating Systems**: Official automated releases are built for Windows x64, Linux x64 (static `musl`, no glibc dependency — runs on Debian 10+, Ubuntu 18.04+, Alpine and other musl/glibc distributions alike), and OpenWrt / KWRT ARMv7 (musl).
+
+---
+
+## Security Notes
+
+- **XorCipher (`-k`) is obfuscation, not encryption**: the `-k` XOR cipher exists for GoWay v1.8.4 wire compatibility. It applies a fixed keystream derived from the key, with no nonce and no message authentication, so authenticated frames can be replayed. Do not expect it to protect against an active attacker.
+- **Confidentiality depends on the transport, not the proxy protocol**: real confidentiality comes from the `wss://` / `quic://` transport-layer TLS with certificate verification left on (the default). With `--no-verify-ssl`, anyone on the path can impersonate the upstream and steal the `-k` key.
+- **QUIC authentication line sends a key digest (behavior change)**: in QUIC mode the authentication line now carries the SHA-256 digest of the key instead of the key itself. The server still accepts the legacy plaintext format and logs a WARN when it receives one.
+- **Server UDP relay locks onto one peer (behavior change)**: the server-mode UDP relay now pins the source peer of the first legitimate datagram it accepts; later datagrams from other sources are dropped.

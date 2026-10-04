@@ -1,5 +1,10 @@
 # RushWay v0.0.3 — Continuous Handoff Progress
 
+> **Status note (2026-10-04):** this document describes the project as of v0.0.3 (2026-09-15) and is
+> retained for history only. It does not track the v0.0.6–v0.0.38 releases or the current
+> `fix/security-and-perf-batch` work. The authoritative, up-to-date record of what changed and why
+> is `CHANGELOG.md` (with `AI_HANDOFF.md` for engineering context).
+
 > Compatibility baseline: GoWay v1.8.4 at `538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc`.
 
 ## Current checkpoint — 2026-09-15

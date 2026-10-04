@@ -3,6 +3,10 @@
 //! Secure WebSocket (`wss://`) connections, including Cloudflare FakeHost and Edge
 //! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
 
+use crate::common::{
+    configured_cipher, parse_ws_url_with_port, send_mux_parts, send_mux_parts_reuse,
+    socks5_udp_associate_reply, try_cloudflare_edges, HTTP_200_CONNECTION_ESTABLISHED,
+};
 use crate::crypto::XorCipher;
 use crate::dns;
 use crate::flow::CreditGate;
@@ -12,12 +16,12 @@ use crate::protocol::{
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
 };
 use crate::proxy::{
-    parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
-    TargetAddr,
+    parse_authority_with_default, parse_socks5_udp_datagram, read_client_proxy_request,
+    socks5_success_response, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
-    apply_listener_options, apply_socket_options, drain_join_set, enforce_target_policy,
-    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, check_target_policy, drain_join_set,
+    enforce_target_policy, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
@@ -26,30 +30,18 @@ use crate::ws::{
 };
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 
-const DEFAULT_SESSION_COUNT: usize = 8;
 const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 2048;
-
-fn configured_session_count() -> usize {
-    std::env::var("RUSHWAY_MUX_SESSIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.clamp(1, MAX_SESSION_COUNT))
-        .unwrap_or(DEFAULT_SESSION_COUNT)
-}
-fn configured_cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
-}
 
 /// GoWay-compatible Cloudflare edge fallback for plain `ws://`.
 /// If the upstream host is a literal IP and the primary TCP dial fails,
@@ -75,26 +67,10 @@ async fn connect_with_fallback(
             }
             let sni = sni.unwrap();
             tracing::warn!(%primary, error=%primary_err, "[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost");
-            let edges = dns::resolve_all_ipv4(sni).await?;
-            for edge in edges {
-                if std::net::IpAddr::V4(edge) == primary.ip() {
-                    continue;
-                }
-                let candidate = SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
-                tracing::info!(
-                    "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
-                    candidate,
-                    sni
-                );
-                match timeout(conn_timeout, TcpStream::connect(candidate)).await {
-                    Ok(Ok(socket)) => return Ok(socket),
-                    Ok(Err(e)) => {
-                        tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed");
-                    }
-                    Err(_) => {
-                        tracing::debug!(%candidate, "[WS] Fallback edge dial timed out");
-                    }
-                }
+            if let Some(socket) =
+                try_cloudflare_edges(sni, primary.ip(), target_port, conn_timeout).await?
+            {
+                return Ok(socket);
             }
             Err(anyhow!("primary {primary} unreachable and all Cloudflare fallback edges failed for fakehost: {sni}"))
         }
@@ -109,88 +85,21 @@ async fn connect_with_fallback(
             }
             let sni = sni.unwrap();
             tracing::warn!(%primary, "[WS] Primary upstream timed out; trying Cloudflare fallback edges via fakehost");
-            let edges = dns::resolve_all_ipv4(sni).await?;
-            for edge in edges {
-                if std::net::IpAddr::V4(edge) == primary.ip() {
-                    continue;
-                }
-                let candidate = SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
-                tracing::info!(
-                    "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
-                    candidate,
-                    sni
-                );
-                match timeout(conn_timeout, TcpStream::connect(candidate)).await {
-                    Ok(Ok(socket)) => return Ok(socket),
-                    Ok(Err(e)) => {
-                        tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed");
-                    }
-                    Err(_) => {
-                        tracing::debug!(%candidate, "[WS] Fallback edge dial timed out");
-                    }
-                }
+            if let Some(socket) =
+                try_cloudflare_edges(sni, primary.ip(), target_port, conn_timeout).await?
+            {
+                return Ok(socket);
             }
             bail!("primary {primary} timed out and all Cloudflare fallback edges failed for fakehost: {sni}")
         }
     }
 }
 
-async fn send_mux_parts_reuse(
-    writer: &Arc<MuxFrameWriter>,
-    cipher: &XorCipher,
-    stream_id: u32,
-    command: MuxCommand,
-    payload: &[u8],
-    scratch: &mut Vec<u8>,
-    obfs: bool,
-) -> Result<()> {
-    // Prefer the caller's local scratch only while it still owns capacity
-    // (first frame); after `mem::take` the pool supplies the next buffer
-    // so the encoder's exact `reserve` hits existing capacity.
-    if scratch.capacity() == 0 {
-        *scratch = crate::mux_writer::acquire_encode_buf();
-    }
-    crate::mux_writer::encode_mux_ws_frame(
-        scratch, stream_id, command, payload, cipher, true, obfs,
-    )
-    .map_err(|e| anyhow!(e.to_string()))?;
-    writer
-        .send_mux(stream_id, command, std::mem::take(scratch))
-        .await
-}
-async fn send_mux_parts(
-    writer: &Arc<MuxFrameWriter>,
-    cipher: &XorCipher,
-    stream_id: u32,
-    command: MuxCommand,
-    payload: &[u8],
-    obfs: bool,
-) -> Result<()> {
-    // Start from the encode pool (or an empty Vec when cold) so the
-    // encoder's one exact `reserve` is a no-op on a warm pool.
-    let mut bytes = crate::mux_writer::acquire_encode_buf();
-    send_mux_parts_reuse(
-        writer, cipher, stream_id, command, payload, &mut bytes, obfs,
-    )
-    .await
-}
 fn parse_upstream(input: &str) -> Result<(String, String)> {
     if input.starts_with("wss://") {
         bail!("pooled client in mux_pool requires ws:// upstream; use wss_client for wss://");
     }
-    let rest = input
-        .strip_prefix("ws://")
-        .ok_or_else(|| anyhow!("pooled client requires ws:// upstream"))?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a.to_string(), format!("/{}", p)),
-        None => (rest.to_string(), "/".to_string()),
-    };
-    let authority = if authority.contains(':') {
-        authority
-    } else {
-        format!("{}:80", authority)
-    };
-    Ok((authority, path))
+    parse_ws_url_with_port(input, "pooled client requires ws:// upstream")
 }
 
 struct SessionState {
@@ -208,9 +117,12 @@ struct SessionState {
     next_id: AtomicU32,
     active: AtomicUsize,
     closed: AtomicBool,
+    /// Pool-shared notifier: stream release and session close wake up
+    /// `acquire` waiters parked on session capacity.
+    capacity_notify: Arc<Notify>,
 }
 impl SessionState {
-    async fn connect(cfg: &RuntimeConfig) -> Result<Arc<Self>> {
+    async fn connect(cfg: &RuntimeConfig, capacity_notify: Arc<Notify>) -> Result<Arc<Self>> {
         let upstream = cfg
             .upstream
             .as_deref()
@@ -286,6 +198,7 @@ impl SessionState {
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            capacity_notify,
         });
         let reader_state = state.clone();
         tokio::spawn(async move {
@@ -301,6 +214,8 @@ impl SessionState {
                 gate.close();
             }
             gates.clear();
+            // Wake capacity waiters: this session just left the pool.
+            reader_state.capacity_notify.notify_waiters();
         });
         let heartbeat_state = state.clone();
         tokio::spawn(async move {
@@ -311,18 +226,20 @@ impl SessionState {
                 if heartbeat_state.closed.load(Ordering::Acquire) {
                     break;
                 }
-                if heartbeat_state.active.load(Ordering::Acquire) == 0 {
-                    let ping = match encode_ws_frame(&[], 9, true) {
-                        Ok(frame) => frame,
-                        Err(_) => {
-                            heartbeat_state.closed.store(true, Ordering::Release);
-                            break;
-                        }
-                    };
-                    if heartbeat_state.writer.send(ping).await.is_err() {
+                // Ping unconditionally: active-but-idle streams (a suspended
+                // SSH session, for instance) carry no traffic, so waiting for
+                // a fully idle session lets NAT/CDN idle timeouts reset the
+                // link and every stream riding on it.
+                let ping = match encode_ws_frame(&[], 9, true) {
+                    Ok(frame) => frame,
+                    Err(_) => {
                         heartbeat_state.closed.store(true, Ordering::Release);
                         break;
                     }
+                };
+                if heartbeat_state.writer.send(ping).await.is_err() {
+                    heartbeat_state.closed.store(true, Ordering::Release);
+                    break;
                 }
             }
         });
@@ -422,6 +339,7 @@ impl SessionState {
             }
             self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.closed.store(true, Ordering::Release);
+            self.capacity_notify.notify_waiters();
             return Err(e);
         }
 
@@ -441,6 +359,7 @@ impl SessionState {
                 }
                 self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 self.closed.store(true, Ordering::Release);
+                self.capacity_notify.notify_waiters();
                 return Err(e);
             }
         }
@@ -450,6 +369,7 @@ impl SessionState {
     async fn close_stream(&self, id: u32) {
         if self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
             self.active.fetch_sub(1, Ordering::AcqRel);
+            self.capacity_notify.notify_waiters();
         }
         if let Some(gate) = self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
             gate.close();
@@ -539,21 +459,30 @@ async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState
 }
 struct MuxSessionPool {
     cfg: RuntimeConfig,
+    /// Target physical session count, resolved once at startup (see
+    /// `run_client`); re-read per acquire would touch the environment on
+    /// every stream open.
+    session_count: usize,
     sessions: Mutex<Vec<Arc<SessionState>>>,
     session_creation: Mutex<()>,
     consecutive_failures: std::sync::atomic::AtomicU32,
+    /// Signalled whenever session capacity may have appeared: a stream was
+    /// released, a session closed, or a replenished session joined the pool.
+    capacity_notify: Arc<Notify>,
 }
 impl MuxSessionPool {
-    fn new(cfg: RuntimeConfig) -> Arc<Self> {
+    fn new(cfg: RuntimeConfig, session_count: usize) -> Arc<Self> {
         Arc::new(Self {
             cfg,
+            session_count: session_count.clamp(1, MAX_SESSION_COUNT),
             sessions: Mutex::new(Vec::new()),
             session_creation: Mutex::new(()),
             consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            capacity_notify: Arc::new(Notify::new()),
         })
     }
     async fn replenish(self: &Arc<Self>) -> bool {
-        let target = configured_session_count();
+        let target = self.session_count;
         let _guard = self.session_creation.lock().await;
         let need_new = {
             let mut sessions = self.sessions.lock().await;
@@ -564,11 +493,12 @@ impl MuxSessionPool {
             self.consecutive_failures.store(0, Ordering::Release);
             return false;
         }
-        match SessionState::connect(&self.cfg).await {
+        match SessionState::connect(&self.cfg, self.capacity_notify.clone()).await {
             Ok(s) => {
                 let mut sessions = self.sessions.lock().await;
                 sessions.push(s);
                 self.consecutive_failures.store(0, Ordering::Release);
+                self.capacity_notify.notify_waiters();
                 sessions.len() < target
             }
             Err(error) => {
@@ -598,7 +528,7 @@ impl MuxSessionPool {
         initial_data: Vec<u8>,
     ) -> Result<(Arc<SessionState>, u32, mpsc::Receiver<OwnedMuxFrame>, Arc<CreditGate>)> {
         enforce_target_policy(&self.cfg, target)?;
-        let n = configured_session_count();
+        let n = self.session_count;
         loop {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
@@ -626,7 +556,13 @@ impl MuxSessionPool {
             let need_new = sessions.len() < n;
             drop(sessions);
             if !need_new {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                // Every session is at capacity: park until a stream release,
+                // a session close, or a replenished session signals spare
+                // capacity. The bounded wait is also the lost-wakeup backstop
+                // for `notify_waiters` races (a waiter registers on first
+                // poll, so a signal between the scan and the poll is lost).
+                let notified = self.capacity_notify.notified();
+                let _ = timeout(Duration::from_millis(500), notified).await;
                 continue;
             }
 
@@ -638,9 +574,10 @@ impl MuxSessionPool {
             }
             drop(sessions);
 
-            let s = SessionState::connect(&self.cfg).await?;
+            let s = SessionState::connect(&self.cfg, self.capacity_notify.clone()).await?;
             let r = s.open_stream(target, initial_data.clone()).await?;
             self.sessions.lock().await.push(s.clone());
+            self.capacity_notify.notify_waiters();
             return Ok((s, r.0, r.1, r.2));
         }
     }
@@ -659,15 +596,7 @@ async fn handle_udp_proxy(
     };
     let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
     let bound = udp.local_addr()?;
-    let mut resp = [0u8; 10];
-    resp[0] = 5;
-    resp[1] = 0;
-    resp[2] = 0;
-    resp[3] = 1;
-    if let IpAddr::V4(ip) = bound.ip() {
-        resp[4..8].copy_from_slice(&ip.octets())
-    }
-    resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
+    let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
     let upstream = cfg
         .upstream
@@ -727,7 +656,8 @@ async fn handle_udp_proxy(
     if ok != b"OK\n" {
         bail!("upstream rejected UDP handshake")
     };
-    let latest = Arc::new(Mutex::new(None::<SocketAddr>));
+    let latest = Arc::new(StdMutex::new(None::<SocketAddr>));
+    let block_local = cfg.block_local;
     let udp_send = udp.clone();
     let writer_send = writer.clone();
     let c_send = cipher.clone();
@@ -741,12 +671,25 @@ async fn handle_udp_proxy(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                *latest_send.lock().await = Some(peer);
-                let mut data = pkt.to_vec();
+                // The local leg is a plaintext SOCKS5 UDP request (the XOR
+                // below happens on the way out), so the destination is still
+                // readable here; enforce `-block-local` per datagram like the
+                // WSS client does.
+                if let Ok((target, _)) = parse_socks5_udp_datagram(pkt) {
+                    if let Err(e) = check_target_policy(block_local, &target) {
+                        tracing::debug!(error = %e, "WS UDP datagram dropped by target policy");
+                        continue;
+                    }
+                }
+                *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
+                let mut data = crate::mux_writer::acquire_encode_buf();
+                data.extend_from_slice(pkt);
                 c_send.apply(&mut data);
                 crate::stats::add_bytes(data.len() as i64, 0);
                 let mut w = writer_send.lock().await;
-                if write_frame(&mut *w, &data, 2, true).await.is_err() {
+                let res = write_frame(&mut *w, &data, 2, true).await;
+                crate::mux_writer::recycle_encode_buf(data);
+                if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -771,7 +714,10 @@ async fn handle_udp_proxy(
                     continue;
                 }
                 cipher.apply(&mut packet);
-                if let Some(peer) = *latest.lock().await {
+                // Copy the peer out first: a std Mutex guard must never be
+                // held across the await below.
+                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(peer) = peer_opt {
                     let _ = udp.send_to(&packet, peer).await;
                     crate::stats::add_bytes(0, packet.len() as i64);
                 }
@@ -801,9 +747,7 @@ async fn handle_tcp_proxy(
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else if req.is_connect {
-        local
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
+        local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     }
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
     let writer = session.writer.clone();
@@ -877,7 +821,10 @@ async fn handle_tcp_proxy(
                         refund_pending = refund_pending.saturating_add(len as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {
                             let credit = std::mem::take(&mut refund_pending);
-                            send_mux_parts(
+                            // A failed refund must not skip the stream
+                            // teardown below: record the error and exit
+                            // through the shared cleanup path instead of `?`.
+                            if let Err(e) = send_mux_parts(
                                 &session.writer,
                                 &session.cipher,
                                 id,
@@ -885,7 +832,11 @@ async fn handle_tcp_proxy(
                                 &encode_window_payload(credit),
                                 session.obfs,
                             )
-                            .await?;
+                            .await
+                            {
+                                result = Err(e);
+                                break;
+                            }
                         }
                     } else {
                         refund_pending = 0;
@@ -925,8 +876,8 @@ async fn handle_tcp_proxy(
     result
 }
 
-pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
-    let pool = MuxSessionPool::new(cfg.clone());
+pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> {
+    let pool = MuxSessionPool::new(cfg.clone(), session_count);
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
     apply_listener_options(&listener);
     let pool_maintainer = pool.clone();
@@ -934,8 +885,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
         pool_maintainer.maintain().await;
     });
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
-    let session_count = configured_session_count();
-    tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,session_count,MAX_STREAMS_PER_SESSION);
+    tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,pool.session_count,MAX_STREAMS_PER_SESSION);
     let mut set = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -944,7 +894,16 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                let (stream, peer) = res?;
+                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
+                // kill the whole proxy: log, back off briefly, and retry.
+                let (stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "pooled client listener accept failed; retrying in 100ms");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 // Fail fast at capacity so shutdown is never stuck behind
                 // a permit wait.
                 let permit = match semaphore.clone().try_acquire_owned() {
