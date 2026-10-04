@@ -1,5 +1,6 @@
 //! Runtime forwarding paths for the GoWay-compatible transport slice.
 
+use crate::common::configured_cipher;
 use crate::crypto::XorCipher;
 use crate::dns::resolve_socket;
 use crate::flow::CreditGate;
@@ -16,7 +17,7 @@ use crate::ws::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -79,9 +80,6 @@ enum StreamCommand {
     Data(OwnedMuxFrame),
     Fin,
     Reset,
-}
-fn configured_cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
 }
 fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
     cipher.apply(payload)
@@ -1340,7 +1338,14 @@ async fn handle_server_udp_parts(
     transform_payload(&cipher, &mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    // The relay socket is unconnected, so only datagrams whose source is an
+    // address this session actually dialed may reach the client's downstream:
+    // anyone who merely learns the port must not be able to inject packets
+    // (or a forged source address) into the client's UDP leg. Target replies
+    // always originate from the dialed address; everything else is dropped.
+    let known_targets: Arc<StdMutex<HashSet<SocketAddr>>> = Arc::new(StdMutex::new(HashSet::new()));
     let udp_send = udp.clone();
+    let known_send = known_targets.clone();
     let cipher_send = cipher.clone();
     let send_task = tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
@@ -1351,10 +1356,20 @@ async fn handle_server_udp_parts(
             };
             for i in 0..count {
                 let (pkt, source) = batch.packet(i);
+                if !known_send
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&source)
+                {
+                    tracing::debug!(%source, "UDP relay dropped a datagram from an undialed source");
+                    continue;
+                }
                 crate::stats::add_bytes(0, pkt.len() as i64);
                 let mut packet = udp_envelope(source, pkt);
                 cipher_send.apply(&mut packet);
-                let res = write_frame(&mut wr, &packet, 2, false).await;
+                // Borrowed write: the envelope goes out via a vectored write
+                // straight from this buffer, with no intermediate frame copy.
+                let res = write_frame_borrowed(&mut wr, &mut packet, 2, false).await;
                 crate::mux_writer::recycle_encode_buf(packet);
                 if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
@@ -1403,6 +1418,12 @@ async fn handle_server_udp_parts(
                     continue;
                 }
             };
+            // Recorded before the first payload leaves, so a reply can never
+            // arrive ahead of its target joining the known set.
+            known_targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr);
             crate::stats::add_bytes(payload.len() as i64, 0);
             let _ = batch_writer.send(payload, addr).await;
             crate::mux_writer::recycle_encode_buf(packet);
@@ -1432,7 +1453,16 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                let (stream, peer) = res?;
+                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
+                // kill the whole proxy: log, back off briefly, and retry.
+                let (stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "server listener accept failed; retrying in 100ms");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 // Fail fast at capacity instead of stalling the accept loop and
                 // letting the TCP backlog fill up.
                 let permit = match semaphore.clone().try_acquire_owned() {

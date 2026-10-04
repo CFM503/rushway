@@ -1,10 +1,13 @@
 //! Plain WebSocket 1:1 relay compatibility path.
 
-use crate::crypto::XorCipher;
-use crate::dns::{resolve_all_ipv4, resolve_socket};
+use crate::common::{
+    configured_cipher, relay_non_mux_ws, split_ws_url, try_cloudflare_edges, NonMuxOkRejection,
+    NonMuxPool, NonMuxRelaySpec, NON_MUX_POOL_SIZE,
+};
+use crate::dns::resolve_socket;
 use crate::proxy::{
     parse_authority_with_default, parse_target_authority, read_client_proxy_request,
-    socks5_success_response, ClientProxyRequest, SocksCommand,
+    ClientProxyRequest, SocksCommand,
 };
 use crate::runtime::{
     drain_join_set, enforce_target_policy, recycle_buf, relay_buf, resolve_target, wait_shutdown,
@@ -17,24 +20,16 @@ use crate::ws::{
     write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Result};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 
-fn cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
-}
 fn parse_ws_url(input: &str) -> Result<(String, String)> {
-    let rest = input
-        .strip_prefix("ws://")
-        .ok_or_else(|| anyhow!("non-MUX plain client requires ws:// upstream"))?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a.to_string(), format!("/{}", p)),
-        None => (rest.to_string(), "/".to_string()),
-    };
+    let (authority, path) = split_ws_url(input, "non-MUX plain client requires ws:// upstream")?;
     let authority = if authority.starts_with('[') || authority.matches(':').count() == 1 {
         authority
     } else {
@@ -64,23 +59,10 @@ async fn connect_ws_with_fallback(
             .map(|s| s.split(':').next().unwrap_or(s))
             .unwrap();
         tracing::warn!(%primary, error=%failed, "[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost");
-        for edge in resolve_all_ipv4(sni).await? {
-            let candidate = std::net::SocketAddr::new(std::net::IpAddr::V4(edge), target_port);
-            if candidate.ip() == primary.ip() {
-                continue;
-            }
-            tracing::info!(
-                "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
-                candidate,
-                sni
-            );
-            match timeout(conn_timeout, TcpStream::connect(candidate)).await {
-                Ok(Ok(socket)) => return Ok(socket),
-                Ok(Err(e)) => {
-                    tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed")
-                }
-                Err(_) => tracing::debug!(%candidate, "[WS] Fallback edge dial timed out"),
-            }
+        if let Some(socket) =
+            try_cloudflare_edges(sni, primary.ip(), target_port, conn_timeout).await?
+        {
+            return Ok(socket);
         }
         bail!("primary {primary} unreachable and all Cloudflare fallback edges failed for fakehost: {sni}");
     }
@@ -132,209 +114,62 @@ async fn open_upstream(
     Ok((rd, wr))
 }
 
-/// Pre-warmed non-MUX upstream pool, mirroring GoWay `ConnPool`.
-///
-/// Each pooled transport has completed TCP and the WebSocket upgrade
-/// handshake but has NOT sent the target frame yet. Transports are
-/// single-use: a grabbed transport is relayed once and then closed, while
-/// a background task refills the pool (GoWay parity: the pool is a
-/// pre-warmed dial cache, not a reuse pool).
-struct PooledUpstream {
-    rd: tokio::io::ReadHalf<TcpStream>,
-    wr: tokio::io::WriteHalf<TcpStream>,
-    created: Instant,
-    last_used: Instant,
+type PlainNonMuxPool = NonMuxPool<
+    RuntimeConfig,
+    tokio::io::ReadHalf<TcpStream>,
+    tokio::io::WriteHalf<TcpStream>,
+>;
+
+/// Boxed adapter so the shared [`NonMuxPool`] can dial the plain-WS opener.
+fn dial_pooled_plain(
+    cfg: &RuntimeConfig,
+) -> Pin<
+    Box<
+        dyn Future<
+                Output = Result<(
+                    tokio::io::ReadHalf<TcpStream>,
+                    tokio::io::WriteHalf<TcpStream>,
+                )>,
+            > + Send
+            + '_,
+    >,
+> {
+    Box::pin(open_upstream(cfg))
 }
 
-const NON_MUX_POOL_SIZE: usize = 4;
-const NON_MUX_MAX_AGE: Duration = Duration::from_secs(5 * 60);
-const NON_MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const NON_MUX_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5);
-
-fn pooled_usable(created: Instant, last_used: Instant, now: Instant) -> bool {
-    now.duration_since(created) <= NON_MUX_MAX_AGE
-        && now.duration_since(last_used) <= NON_MUX_IDLE_TIMEOUT
-}
-
-struct NonMuxPool {
-    cfg: RuntimeConfig,
-    conns: Mutex<Vec<PooledUpstream>>,
-    creation: Mutex<()>,
-}
-
-impl NonMuxPool {
-    fn new(cfg: RuntimeConfig) -> Arc<Self> {
-        Arc::new(Self {
-            cfg,
-            conns: Mutex::new(Vec::new()),
-            creation: Mutex::new(()),
-        })
-    }
-
-    async fn dial_pooled(cfg: &RuntimeConfig) -> Result<PooledUpstream> {
-        let (rd, wr) = open_upstream(cfg).await?;
-        let now = Instant::now();
-        Ok(PooledUpstream {
-            rd,
-            wr,
-            created: now,
-            last_used: now,
-        })
-    }
-
-    /// Pops the freshest usable pre-warmed transport, or dials a fresh one
-    /// when the pool is empty (all failures propagate to the caller).
-    async fn get_or_dial(
-        self: &Arc<Self>,
-    ) -> Result<(
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
-    )> {
-        let pooled = {
-            let mut conns = self.conns.lock().await;
-            let now = Instant::now();
-            conns.retain(|c| pooled_usable(c.created, c.last_used, now));
-            conns.pop()
-        };
-        if let Some(mut c) = pooled {
-            c.last_used = Instant::now();
-            tracing::debug!("[non-MUX] using pre-warmed upstream connection");
-            return Ok((c.rd, c.wr));
-        }
-        let c = Self::dial_pooled(&self.cfg).await?;
-        Ok((c.rd, c.wr))
-    }
-
-    async fn replenish(self: &Arc<Self>) {
-        let _guard = self.creation.lock().await;
-        loop {
-            let need = {
-                let mut conns = self.conns.lock().await;
-                conns.retain(|c| pooled_usable(c.created, c.last_used, Instant::now()));
-                NON_MUX_POOL_SIZE.saturating_sub(conns.len())
-            };
-            if need == 0 {
-                return;
-            }
-            match Self::dial_pooled(&self.cfg).await {
-                Ok(c) => self.conns.lock().await.push(c),
-                // GoWay parity: stop refilling for this tick on first
-                // failure instead of hammering a downed upstream.
-                Err(error) => {
-                    tracing::debug!(error=%error, "[non-MUX] pre-warm dial failed; will retry next tick");
-                    return;
-                }
-            }
-        }
-    }
-
-    async fn maintain(self: Arc<Self>) {
-        loop {
-            self.replenish().await;
-            tokio::time::sleep(NON_MUX_MAINTAIN_INTERVAL).await;
-        }
-    }
-}
+const PLAIN_NON_MUX_RELAY: NonMuxRelaySpec = NonMuxRelaySpec {
+    closed_error: "upstream closed before non-MUX OK",
+    bad_opcode_error: "invalid non-MUX handshake opcode",
+    ok_rejection: NonMuxOkRejection::Propagate("upstream rejected non-MUX target"),
+    recycle_downstream_payloads: true,
+};
 
 async fn relay_client(
-    mut local: TcpStream,
+    local: TcpStream,
     cfg: RuntimeConfig,
     req: ClientProxyRequest,
-    pool: Arc<NonMuxPool>,
+    pool: Arc<PlainNonMuxPool>,
 ) -> Result<()> {
     enforce_target_policy(&cfg, &req.target)?;
-    let (mut rd, mut wr) = pool.get_or_dial().await?;
-    let c = cipher(&cfg.key);
-    let mut hello = format!("{}:{}\n", req.target.host, req.target.port).into_bytes();
-    c.apply(&mut hello);
-    write_frame(&mut wr, &hello, 2, true).await?;
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
-    let Some((opcode, mut ok)) = read_frame(
-        &mut rd,
-        Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
-        &mut frame_buf,
+    let (rd, wr) = pool.get_or_dial().await?;
+    relay_non_mux_ws(
+        local,
+        &req.target,
+        req.is_socks5,
+        req.is_connect,
+        req.initial_payload,
+        &cfg.key,
+        cfg.buffer_size,
+        rd,
+        wr,
+        PLAIN_NON_MUX_RELAY,
     )
-    .await?
-    else {
-        bail!("upstream closed before non-MUX OK")
-    };
-    if opcode != 2 {
-        bail!("invalid non-MUX handshake opcode")
-    };
-    c.apply(&mut ok);
-    if ok != b"OK\n" {
-        bail!("upstream rejected non-MUX target")
-    };
-    if req.is_socks5 {
-        local.write_all(&socks5_success_response()).await?
-    } else if req.is_connect {
-        local
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?
-    };
-    let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    // GoWay v1.8.5 non-MUX TCP: only the target handshake ("host:port\n")
-    // and "OK\n" are XOR-encrypted. All subsequent data frames are plaintext.
-    if let Some(initial) = req.initial_payload {
-        let payload = initial;
-        write_frame(&mut wr, &payload, 2, true).await?;
-    }
-    let mut upload = tokio::spawn(async move {
-        let mut buf = relay_buf(cfg.buffer_size).await;
-        loop {
-            let n = local_rd.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            crate::stats::add_bytes(n as i64, 0);
-            write_frame_borrowed(&mut wr, &mut buf[..n], 2, true).await?
-        }
-        recycle_buf(buf).await;
-        Result::<()>::Ok(())
-    });
-    tokio::select! {
-        _ = &mut upload => {}
-        _ = async {
-            loop {
-                let Some((opcode, payload)) = read_frame(
-                    &mut rd,
-                    Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
-                    &mut frame_buf,
-                )
-                .await?
-                else {
-                    break;
-                };
-                match opcode {
-                    2 => {
-                        // Non-MUX data frames are plaintext per GoWay server.
-                        let len = payload.len();
-                        let write_res = local_wr.write_all(&payload).await;
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        if write_res.is_err() {
-                            break;
-                        }
-                        crate::stats::add_bytes(0, len as i64);
-                    }
-                    8 => {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        break;
-                    }
-                    _ => {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                    }
-                }
-            }
-            Result::<()>::Ok(())
-        } => {}
-    }
-    upload.abort();
-    Ok(())
+    .await
 }
 async fn handle_client_connection(
     mut local: TcpStream,
     cfg: RuntimeConfig,
-    pool: Arc<NonMuxPool>,
+    pool: Arc<PlainNonMuxPool>,
 ) -> Result<()> {
     let req = read_client_proxy_request(&mut local).await?;
     if req.command == SocksCommand::UdpAssociate {
@@ -346,7 +181,7 @@ async fn handle_client_connection(
     relay_client(local, cfg, req, pool).await
 }
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
-    let pool = NonMuxPool::new(cfg.clone());
+    let pool = NonMuxPool::new(cfg.clone(), Box::new(dial_pooled_plain), "[non-MUX]");
     let maintainer = pool.clone();
     tokio::spawn(async move {
         maintainer.maintain().await;
@@ -368,7 +203,16 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                let (stream, peer) = res?;
+                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
+                // kill the whole proxy: log, back off briefly, and retry.
+                let (stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "non-MUX client listener accept failed; retrying in 100ms");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
                     Err(_) => {
@@ -409,7 +253,16 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                let (stream, peer) = res?;
+                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
+                // kill the whole proxy: log, back off briefly, and retry.
+                let (stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "non-MUX server listener accept failed; retrying in 100ms");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
                     Err(_) => {
@@ -451,7 +304,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     if opcode != 2 {
         bail!("invalid non-MUX target opcode")
     };
-    let c = cipher(&cfg.key);
+    let c = configured_cipher(&cfg.key);
     c.apply(&mut target_frame);
     let target = String::from_utf8(target_frame)
         .map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?
@@ -523,28 +376,4 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let _ = target_wr.shutdown().await;
     download.abort();
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pooled_transports_expire_by_age_and_idleness() {
-        let now = Instant::now();
-        // Fresh transport is usable.
-        assert!(pooled_usable(now, now, now));
-        // Idle past 30 s is reaped even when young.
-        assert!(!pooled_usable(
-            now,
-            now - NON_MUX_IDLE_TIMEOUT - Duration::from_secs(1),
-            now
-        ));
-        // Old transport is reaped even when recently used.
-        assert!(!pooled_usable(
-            now - NON_MUX_MAX_AGE - Duration::from_secs(1),
-            now,
-            now
-        ));
-    }
 }

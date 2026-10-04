@@ -1,5 +1,7 @@
-use crate::crypto::XorCipher;
-use crate::dns::{self, resolve_all_ipv4};
+use crate::common::{
+    configured_cipher, parse_ws_url_with_port, socks5_udp_associate_reply, try_cloudflare_edges,
+};
+use crate::dns;
 use crate::proxy::{parse_authority_with_default, parse_socks5_udp_datagram, TargetAddr};
 use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
@@ -8,31 +10,11 @@ use crate::ws::{
     validate_client_handshake_response, write_frame,
 };
 use anyhow::{anyhow, bail, Result};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
-
-fn cipher(key: &Option<String>) -> XorCipher {
-    XorCipher::new(key.as_deref().unwrap_or(""))
-}
-
-fn parse_ws_url(input: &str) -> Result<(String, String)> {
-    let rest = input
-        .strip_prefix("ws://")
-        .ok_or_else(|| anyhow!("UDP relay requires ws:// upstream"))?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a.to_string(), format!("/{}", p)),
-        None => (rest.to_string(), "/".into()),
-    };
-    let authority = if authority.contains(':') {
-        authority
-    } else {
-        format!("{}:80", authority)
-    };
-    Ok((authority, path))
-}
 
 pub async fn handle_local_udp_proxy(
     mut control: TcpStream,
@@ -46,21 +28,14 @@ pub async fn handle_local_udp_proxy(
     };
     let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
     let bound = udp.local_addr()?;
-    let mut resp = [0u8; 10];
-    resp[0] = 5;
-    resp[1] = 0;
-    resp[2] = 0;
-    resp[3] = 1;
-    if let IpAddr::V4(ip) = bound.ip() {
-        resp[4..8].copy_from_slice(&ip.octets())
-    }
-    resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
+    let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
     let upstream = cfg
         .upstream
         .clone()
         .ok_or_else(|| anyhow!("client mode requires upstream"))?;
-    let (authority, path) = parse_ws_url(&upstream)?;
+    let (authority, path) =
+        parse_ws_url_with_port(&upstream, "UDP relay requires ws:// upstream")?;
     let actual_host = cfg.fakehost.clone().unwrap_or_else(|| authority.clone());
     let target =
         parse_authority_with_default(&authority, 80).map_err(|e| anyhow!(e.to_string()))?;
@@ -76,32 +51,14 @@ pub async fn handle_local_udp_proxy(
                     .map(|s| s.split(':').next().unwrap_or(s))
                     .unwrap();
                 tracing::warn!("[WS] Primary upstream unreachable; trying Cloudflare fallback edges via fakehost: {res:?}");
-                let mut fallback: Option<TcpStream> = None;
-                for edge in resolve_all_ipv4(sni).await? {
-                    let candidate =
-                        std::net::SocketAddr::new(std::net::IpAddr::V4(edge), target.port);
-                    if candidate.ip() == primary.ip() {
-                        continue;
-                    }
-                    tracing::info!(
-                        "[DNS] Trying fallback Cloudflare edge: {} (fakehost: {})",
-                        candidate,
-                        sni
-                    );
-                    match timeout(conn_timeout, TcpStream::connect(candidate)).await {
-                        Ok(Ok(s)) => {
-                            fallback = Some(s);
-                            break;
-                        }
-                        Ok(Err(e)) => {
-                            tracing::debug!(%candidate, error=%e, "[WS] Fallback edge dial failed")
-                        }
-                        Err(_) => tracing::debug!(%candidate, "[WS] Fallback edge dial timed out"),
+                match try_cloudflare_edges(sni, primary.ip(), target.port, conn_timeout).await? {
+                    Some(s) => s,
+                    None => {
+                        return Err(anyhow!(
+                            "primary {primary} unreachable and all fallback edges failed"
+                        ))
                     }
                 }
-                fallback.ok_or_else(|| {
-                    anyhow!("primary {primary} unreachable and all fallback edges failed")
-                })?
             } else {
                 return Err(anyhow!("upstream connection failed to {primary}"));
             }
@@ -131,7 +88,7 @@ pub async fn handle_local_udp_proxy(
     wr.flush().await?;
     let response = read_http_headers(&mut rd).await?;
     validate_client_handshake_response(&response, &key)?;
-    let c = cipher(&cfg.key);
+    let c = configured_cipher(&cfg.key);
     let mut hello = b"UDP\n".to_vec();
     c.apply(&mut hello);
     write_frame(&mut wr, &hello, 2, true).await?;

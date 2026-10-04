@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
+const CACHE_MAX_ENTRIES: usize = 4096;
 
 static SERVER: RwLock<Option<IpAddr>> = RwLock::new(None);
 static CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::new();
@@ -33,6 +35,17 @@ fn all_v4_cache() -> &'static RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>> 
 
 fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<IpAddr>>>> {
     IN_FLIGHT.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Insert into a bounded cache map: once the entry cap is reached the whole
+/// table is cleared before inserting. Clearing everything instead of evicting
+/// per-entry trades cache hit-rate for simplicity and a hard bound on memory
+/// growth.
+fn bounded_insert<K: Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: V) {
+    if map.len() >= CACHE_MAX_ENTRIES {
+        map.clear();
+    }
+    map.insert(key, value);
 }
 
 pub(crate) async fn configure(server: Option<String>) -> Result<()> {
@@ -138,10 +151,8 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
 
     match query_result {
         Ok(resolved) => {
-            cache()
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, (resolved, Instant::now() + CACHE_TTL));
+            let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
+            bounded_insert(&mut guard, key, (resolved, Instant::now() + CACHE_TTL));
             if let Some(sender) = tx {
                 let _ = sender.send(Some(resolved));
             }
@@ -221,10 +232,8 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
     if unique.is_empty() {
         bail!("no IPv4 addresses resolved for {host}");
     }
-    all_v4_cache()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (unique.clone(), Instant::now() + CACHE_TTL));
+    let mut guard = all_v4_cache().write().unwrap_or_else(|e| e.into_inner());
+    bounded_insert(&mut guard, key, (unique.clone(), Instant::now() + CACHE_TTL));
     Ok(unique)
 }
 
@@ -252,20 +261,16 @@ async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<I
     .await?;
     socket.send_to(&request, server_addr).await?;
     let mut buf = vec![0u8; MAX_PACKET];
-    let (size, _) = match timeout(RESOLVE_TIMEOUT, socket.recv_from(&mut buf)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => return Err(anyhow!("remote DNS UDP timeout")),
-    };
+    let size = recv_from_expected(&socket, &mut buf, server_addr).await?;
     buf.truncate(size);
     validate_transaction_id(&buf, expected_id)?;
-    let (ip, truncated) = parse_response(&buf, qtype)?;
+    let (ip, truncated) = parse_response(&buf, qtype, host)?;
     if !truncated {
         return Ok(ip);
     }
     let response = dns_tcp_query(server_addr, &request).await?;
     validate_transaction_id(&response, expected_id)?;
-    Ok(parse_response(&response, qtype)?.0)
+    Ok(parse_response(&response, qtype, host)?.0)
 }
 
 async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Addr>> {
@@ -280,20 +285,43 @@ async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Add
     .await?;
     socket.send_to(&request, server_addr).await?;
     let mut buf = vec![0u8; MAX_PACKET];
-    let (size, _) = match timeout(RESOLVE_TIMEOUT, socket.recv_from(&mut buf)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => return Err(anyhow!("remote DNS UDP timeout")),
-    };
+    let size = recv_from_expected(&socket, &mut buf, server_addr).await?;
     buf.truncate(size);
     validate_transaction_id(&buf, expected_id)?;
-    let (ips, truncated) = parse_all_ipv4_from_response(&buf)?;
+    let (ips, truncated) = parse_all_ipv4_from_response(&buf, host)?;
     if !truncated && !ips.is_empty() {
         return Ok(ips);
     }
     let response = dns_tcp_query(server_addr, &request).await?;
     validate_transaction_id(&response, expected_id)?;
-    Ok(parse_all_ipv4_from_response(&response)?.0)
+    Ok(parse_all_ipv4_from_response(&response, host)?.0)
+}
+
+/// Receive one datagram, discarding (with a DEBUG log) any datagram whose
+/// source does not exactly match the resolver address the query was sent to,
+/// until the resolver timeout expires. Basic anti-spoofing: never accept a
+/// DNS reply that did not come from the queried server.
+async fn recv_from_expected(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    server_addr: SocketAddr,
+) -> Result<usize> {
+    let (size, _) = timeout(
+        RESOLVE_TIMEOUT,
+        async {
+            loop {
+                let (size, peer) = socket.recv_from(buf).await?;
+                if peer != server_addr {
+                    tracing::debug!(peer=%peer, expected=%server_addr, "discarded DNS reply from unexpected source");
+                    continue;
+                }
+                return Ok::<(usize, SocketAddr), std::io::Error>((size, peer));
+            }
+        },
+    )
+    .await
+    .map_err(|_| anyhow!("remote DNS UDP timeout"))??;
+    Ok(size)
 }
 
 async fn dns_tcp_query(server: SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
@@ -351,7 +379,7 @@ fn build_query(host: &str, qtype: u16) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn parse_response(buf: &[u8], qtype: u16) -> Result<(Option<IpAddr>, bool)> {
+fn parse_response(buf: &[u8], qtype: u16, host: &str) -> Result<(Option<IpAddr>, bool)> {
     if buf.len() < 12 {
         bail!("DNS response too short");
     }
@@ -364,13 +392,7 @@ fn parse_response(buf: &[u8], qtype: u16) -> Result<(Option<IpAddr>, bool)> {
     let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
     let mut offset = 12usize;
-    for _ in 0..qd {
-        skip_name(buf, &mut offset)?;
-        if offset + 4 > buf.len() {
-            bail!("truncated DNS question");
-        }
-        offset += 4;
-    }
+    validate_question_section(buf, &mut offset, qd, host, qtype)?;
     for _ in 0..an {
         skip_name(buf, &mut offset)?;
         if offset + 10 > buf.len() {
@@ -409,7 +431,7 @@ fn parse_response(buf: &[u8], qtype: u16) -> Result<(Option<IpAddr>, bool)> {
     Ok((None, truncated))
 }
 
-fn parse_all_ipv4_from_response(buf: &[u8]) -> Result<(Vec<Ipv4Addr>, bool)> {
+fn parse_all_ipv4_from_response(buf: &[u8], host: &str) -> Result<(Vec<Ipv4Addr>, bool)> {
     if buf.len() < 12 {
         bail!("DNS response too short");
     }
@@ -422,13 +444,7 @@ fn parse_all_ipv4_from_response(buf: &[u8]) -> Result<(Vec<Ipv4Addr>, bool)> {
     let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
     let mut offset = 12usize;
-    for _ in 0..qd {
-        skip_name(buf, &mut offset)?;
-        if offset + 4 > buf.len() {
-            bail!("truncated DNS question");
-        }
-        offset += 4;
-    }
+    validate_question_section(buf, &mut offset, qd, host, 1)?;
     let mut ips = Vec::new();
     for _ in 0..an {
         skip_name(buf, &mut offset)?;
@@ -493,6 +509,97 @@ fn skip_name(buf: &[u8], offset: &mut usize) -> Result<()> {
     Ok(())
 }
 
+/// Decode a DNS name starting at `start` into its textual form (labels joined
+/// by '.'), following compression pointers. Only backward references are
+/// accepted and the jump count is bounded, so a crafted name cannot loop.
+/// Returns the name and the offset just past the name on the wire.
+fn decode_name(buf: &[u8], start: usize) -> Result<(String, usize)> {
+    let mut out = String::new();
+    let mut pos = start;
+    let mut end = start;
+    let mut jumps = 0usize;
+    let mut labels = 0usize;
+    loop {
+        if pos >= buf.len() {
+            bail!("truncated DNS name");
+        }
+        let len = buf[pos];
+        if len & 0xc0 == 0xc0 {
+            if pos + 1 >= buf.len() {
+                bail!("truncated DNS name pointer");
+            }
+            if jumps == 0 {
+                end = pos + 2;
+            }
+            jumps += 1;
+            if jumps > 64 {
+                bail!("too many DNS name pointers");
+            }
+            let target = (((len & 0x3f) as usize) << 8) | buf[pos + 1] as usize;
+            if target >= pos {
+                bail!("invalid DNS name pointer");
+            }
+            pos = target;
+            continue;
+        }
+        if len == 0 {
+            if jumps == 0 {
+                end = pos + 1;
+            }
+            break;
+        }
+        if len & 0xc0 != 0 || len > 63 {
+            bail!("invalid DNS label");
+        }
+        if labels >= 128 {
+            bail!("DNS name too deep");
+        }
+        let l = len as usize;
+        if pos + 1 + l > buf.len() {
+            bail!("truncated DNS label");
+        }
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(&buf[pos + 1..pos + 1 + l]));
+        labels += 1;
+        pos += 1 + l;
+    }
+    Ok((out, end))
+}
+
+/// Validate that the response echoes the question we asked: same name
+/// (case-insensitive), same qtype and the IN qclass. A response whose question
+/// section does not match the pending query is discarded (error) so it can
+/// never be used to answer it. On success `offset` is positioned after the
+/// question section.
+fn validate_question_section(
+    buf: &[u8],
+    offset: &mut usize,
+    count: usize,
+    host: &str,
+    qtype: u16,
+) -> Result<()> {
+    let mut seen = false;
+    for _ in 0..count {
+        let (name, end) = decode_name(buf, *offset)?;
+        if end + 4 > buf.len() {
+            bail!("truncated DNS question");
+        }
+        let rq_type = u16::from_be_bytes([buf[end], buf[end + 1]]);
+        let rq_class = u16::from_be_bytes([buf[end + 2], buf[end + 3]]);
+        if !name.eq_ignore_ascii_case(host) || rq_type != qtype || rq_class != 1 {
+            bail!("DNS question section mismatch");
+        }
+        seen = true;
+        *offset = end + 4;
+    }
+    if !seen {
+        bail!("DNS response without question section");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,9 +623,22 @@ mod tests {
             0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 1, 2, 3,
             4,
         ];
-        let (ip, truncated) = parse_response(&response, 1).unwrap();
+        let (ip, truncated) = parse_response(&response, 1, "example.com").unwrap();
         assert!(!truncated);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+    }
+    #[test]
+    fn question_name_mismatch_is_rejected() {
+        let response = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'o', b'r', b'g', 0x00, 0x00, 0x01, 0x00,
+            0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 1, 2, 3,
+            4,
+        ];
+        // Different question name: the response must be discarded.
+        assert!(parse_response(&response, 1, "example.com").is_err());
+        // Same name in a different case must still match (case-insensitive).
+        assert!(parse_response(&response, 1, "EXAMPLE.ORG").is_ok());
     }
     #[test]
     fn parses_multiple_ipv4_answers() {
@@ -529,7 +649,7 @@ mod tests {
             50, 1, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 172, 67,
             180, 2,
         ];
-        let (ips, truncated) = parse_all_ipv4_from_response(&response).unwrap();
+        let (ips, truncated) = parse_all_ipv4_from_response(&response, "example.com").unwrap();
         assert!(!truncated);
         assert_eq!(
             ips,

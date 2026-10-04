@@ -1,5 +1,8 @@
 //! GoWay v1.8.4-compatible QUIC transport.
 
+use crate::common::{
+    socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED, HTTP_502_BAD_GATEWAY,
+};
 use crate::dns;
 use crate::proxy::{
     parse_authority_with_default, parse_socks5_udp_datagram, parse_target_authority,
@@ -21,12 +24,14 @@ use rcgen::generate_simple_self_signed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
+use zeroize::Zeroizing;
 
 const ALPN: &[&[u8]] = &[b"goway-quic", b"h3"];
 const MAX_QUIC_UDP_PACKET: usize = u16::MAX as usize;
@@ -239,6 +244,53 @@ async fn read_quic_line(recv: &mut RecvStream, limit: usize) -> Result<String> {
     }
     bail!("QUIC header too large")
 }
+/// SHA-256 of `key` as lowercase hex: the only key form a client puts on the
+/// wire, so a plaintext key never traverses an untrusted hop.
+fn key_digest_hex(key: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+    let mut hex = String::with_capacity(2 * digest.as_ref().len());
+    for byte in digest.as_ref() {
+        let _ = write!(hex, "{:02x}", byte);
+    }
+    hex
+}
+/// Byte-wise XOR-fold equality for the auth line (std-only; the fold avoids
+/// memcmp's early-exit on key material).
+fn line_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+/// First-line QUIC auth: the SHA-256 hex digest of the configured key is the
+/// primary form; the legacy inline plaintext key stays accepted for
+/// plaintext-only peers (GoWay interop).
+fn quic_auth_matches(presented: &str, configured: &Zeroizing<String>) -> bool {
+    if line_eq(presented, &key_digest_hex(configured)) {
+        return true;
+    }
+    if line_eq(presented, configured.as_str()) {
+        tracing::warn!("QUIC peer authenticated with a legacy inline plaintext key");
+        true
+    } else {
+        false
+    }
+}
+/// True when a first-line response reads as an auth rejection ("...AUTH...")
+/// rather than a downstream failure (dial, target policy): only this shape
+/// justifies re-sending the key in legacy plaintext form.
+fn is_auth_rejection(response: &str) -> bool {
+    response.to_ascii_uppercase().contains("AUTH")
+}
+
+/// Writes the failure response to the local proxy client and closes it.
+async fn quic_reject_local(local: &mut TcpStream, is_socks5: bool) -> Result<()> {
+    if is_socks5 {
+        local.write_all(&socks5_failure_response()).await?
+    } else {
+        local.write_all(HTTP_502_BAD_GATEWAY).await?
+    }
+    local.shutdown().await.ok();
+    Ok(())
+}
 /// Reads one length-prefixed datagram into `buf` and returns its length.
 ///
 /// Returns `Ok(None)` on a clean end of stream. Callers slice `&buf[..n]`
@@ -279,6 +331,10 @@ struct QuicClientPool {
     server_name: String,
     connection: Arc<Mutex<Option<Connection>>>,
     timeout_secs: u64,
+    /// Latched once an upstream explicitly rejects the key digest with an
+    /// auth error: later connections start on the legacy inline key so the
+    /// failed digest handshake is paid once per process, not per connection.
+    needs_plaintext: Arc<StdMutex<bool>>,
 }
 impl QuicClientPool {
     fn new(
@@ -293,6 +349,7 @@ impl QuicClientPool {
             server_name,
             connection: Arc::new(Mutex::new(None)),
             timeout_secs,
+            needs_plaintext: Arc::new(StdMutex::new(false)),
         })
     }
     async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
@@ -318,6 +375,21 @@ impl QuicClientPool {
         }
         bail!("QUIC pooled connection unavailable")
     }
+    /// Whether an earlier connection learned (via an explicit auth rejection
+    /// of the key digest) that this upstream is plaintext-only.
+    fn plaintext_needed(&self) -> bool {
+        *self
+            .needs_plaintext
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+    /// Latches the plaintext-only marker (idempotent).
+    fn mark_plaintext_needed(&self) {
+        *self
+            .needs_plaintext
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+    }
 }
 fn format_target(target: &TargetAddr) -> String {
     format!("{}:{}", target.host, target.port)
@@ -332,41 +404,67 @@ async fn relay_quic(
     let (mut send, mut recv) = match pool.open_bi().await {
         Ok(v) => v,
         Err(error) => {
-            if req.is_socks5 {
-                local.write_all(&socks5_failure_response()).await?
-            } else {
-                local.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?
-            }
-            local.shutdown().await.ok();
+            quic_reject_local(&mut local, req.is_socks5).await?;
             return Err(error);
         }
     };
-    let header = if let Some(key) = cfg.key.as_deref() {
-        format!("{} {}\n", key, format_target(&req.target))
-    } else {
-        format!("{}\n", format_target(&req.target))
-    };
-    send.write_all(header.as_bytes()).await?;
-    let response = read_quic_line(&mut recv, 8192).await?;
-    if response != "OK" {
-        if req.is_socks5 {
-            local.write_all(&socks5_failure_response()).await?
-        } else {
-            local
-                .write_all(
-                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await?
+    // The key crosses the wire as SHA-256(key) hex so a plaintext key never
+    // traverses an untrusted (--no-verify-ssl) hop. Plaintext-only upstreams
+    // (GoWay) reject the digest line: fall back to the legacy inline key
+    // exactly once, on a fresh stream — but only on an auth-shaped rejection
+    // or a stream closed before any response. A downstream failure after an
+    // accepted digest (dial, target policy) must never re-send the key.
+    let key = cfg.key.as_ref().map(|k| Zeroizing::new(k.clone()));
+    let target = format_target(&req.target);
+    let mut response = String::new();
+    let mut retried = pool.plaintext_needed();
+    loop {
+        let header = match key.as_deref() {
+            Some(k) if retried => format!("{} {}\n", k, target),
+            Some(k) => format!("{} {}\n", key_digest_hex(k), target),
+            None => format!("{}\n", target),
+        };
+        send.write_all(header.as_bytes()).await?;
+        let mut no_response = false;
+        match read_quic_line(&mut recv, 8192).await {
+            Ok(line) => response = line,
+            Err(error) => {
+                if key.is_none() || retried {
+                    return Err(error);
+                }
+                no_response = true;
+            }
         }
-        local.shutdown().await.ok();
+        if response == "OK" || key.is_none() || retried {
+            break;
+        }
+        if !no_response && !is_auth_rejection(&response) {
+            break;
+        }
+        tracing::warn!("QUIC upstream rejected the key digest; retrying once with the legacy inline key");
+        retried = true;
+        if !no_response {
+            // An explicit auth rejection is deterministic evidence of a
+            // plaintext-only upstream; a closed stream is not, so it stays
+            // per-connection and cannot latch the pool on a transient error.
+            pool.mark_plaintext_needed();
+        }
+        (send, recv) = match pool.open_bi().await {
+            Ok(v) => v,
+            Err(error) => {
+                quic_reject_local(&mut local, req.is_socks5).await?;
+                return Err(error);
+            }
+        };
+    }
+    if response != "OK" {
+        quic_reject_local(&mut local, req.is_socks5).await?;
         bail!("QUIC upstream rejected target: {}", response)
     }
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?
     } else if req.is_connect {
-        local
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?
+        local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?
     }
     if let Some(initial) = req.initial_payload {
         send.write_all(&initial).await?;
@@ -411,24 +509,49 @@ async fn relay_quic_udp(
 ) -> Result<()> {
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let bound = udp.local_addr()?;
-    let mut resp = [0u8; 10];
-    resp[0] = 5;
-    resp[1] = 0;
-    resp[2] = 0;
-    resp[3] = 1;
-    if let std::net::IpAddr::V4(ip) = bound.ip() {
-        resp[4..8].copy_from_slice(&ip.octets())
-    }
-    resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
+    let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
     let (mut send, mut recv) = pool.open_bi().await?;
-    let header = if let Some(key) = cfg.key.as_deref() {
-        format!("{} UDP\n", key)
-    } else {
-        "UDP\n".to_string()
-    };
-    send.write_all(header.as_bytes()).await?;
-    let ok = read_quic_line(&mut recv, 8192).await?;
+    // Same digest-first handshake as the TCP relay: the plaintext key only
+    // goes on the wire when a plaintext-only upstream rejects the digest —
+    // and only on an auth-shaped rejection or a stream closed before any
+    // response, never after the digest was accepted and a downstream error
+    // came back.
+    let key = cfg.key.as_ref().map(|k| Zeroizing::new(k.clone()));
+    let mut ok = String::new();
+    let mut retried = pool.plaintext_needed();
+    loop {
+        let header = match key.as_deref() {
+            Some(k) if retried => format!("{} UDP\n", k),
+            Some(k) => format!("{} UDP\n", key_digest_hex(k)),
+            None => "UDP\n".to_string(),
+        };
+        send.write_all(header.as_bytes()).await?;
+        let mut no_response = false;
+        match read_quic_line(&mut recv, 8192).await {
+            Ok(line) => ok = line,
+            Err(error) => {
+                if key.is_none() || retried {
+                    return Err(error);
+                }
+                no_response = true;
+            }
+        }
+        if ok == "OK" || key.is_none() || retried {
+            break;
+        }
+        if !no_response && !is_auth_rejection(&ok) {
+            break;
+        }
+        tracing::warn!("QUIC UDP upstream rejected the key digest; retrying once with the legacy inline key");
+        retried = true;
+        if !no_response {
+            // Same latch rule as the TCP relay: only an explicit auth
+            // rejection marks the upstream plaintext-only.
+            pool.mark_plaintext_needed();
+        }
+        (send, recv) = pool.open_bi().await?;
+    }
     if ok != "OK" {
         bail!("QUIC UDP upstream rejected: {}", ok)
     }
@@ -522,7 +645,16 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                let (mut stream, peer) = res?;
+                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
+                // kill the whole proxy: log, back off briefly, and retry.
+                let (mut stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "QUIC client listener accept failed; retrying in 100ms");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 apply_socket_options(&stream, &cfg);
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
@@ -641,11 +773,11 @@ async fn handle_server_stream(
     cfg: RuntimeConfig,
 ) -> Result<()> {
     let line = read_quic_line(&mut recv, 8192).await?;
-    let target_str = if let Some(key) = cfg.key.as_deref() {
+    let target_str = if let Some(key) = cfg.key.as_ref().map(|k| Zeroizing::new(k.clone())) {
         let mut parts = line.splitn(2, ' ');
         let k = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
-        if k != key {
+        if !quic_auth_matches(k, &key) {
             send.write_all(b"ERR: AUTH_FAILED\n").await?;
             let _ = send.finish();
             bail!("QUIC authentication failed");
@@ -736,7 +868,13 @@ async fn handle_server_udp_stream(
 ) -> Result<()> {
     send.write_all(b"OK\n").await?;
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    // Same gate as the WS UDP relay: the socket is unconnected, so only
+    // datagrams whose source is an address this session actually dialed may
+    // reach the client's downstream; anything else is dropped as untrusted.
+    let known_targets: Arc<StdMutex<HashSet<std::net::SocketAddr>>> =
+        Arc::new(StdMutex::new(HashSet::new()));
     let udp_send = udp.clone();
+    let known_send = known_targets.clone();
     let mut sender = tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
         loop {
@@ -746,6 +884,14 @@ async fn handle_server_udp_stream(
             };
             for i in 0..count {
                 let (pkt, src) = batch.packet(i);
+                if !known_send
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&src)
+                {
+                    tracing::debug!(%src, "QUIC UDP relay dropped a datagram from an undialed source");
+                    continue;
+                }
                 crate::stats::add_bytes(0, pkt.len() as i64);
                 let mut packet = Vec::with_capacity(22 + pkt.len());
                 packet.extend_from_slice(&[0, 0, 0]);
@@ -783,6 +929,12 @@ async fn handle_server_udp_stream(
                     continue;
                 }
                 let addr = resolve_target(cfg.block_local, &target.host, target.port).await?;
+                // Recorded before the first payload leaves, so a reply can
+                // never arrive ahead of its target joining the known set.
+                known_targets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(addr);
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
             }
@@ -792,4 +944,236 @@ async fn handle_server_udp_stream(
     }
     sender.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_KEY: &str = "rushway-quic-test-key";
+
+    /// An in-process QUIC connection with one open bidirectional stream per
+    /// side, built from the production endpoint and config builders
+    /// (self-signed server identity, non-verifying client). The endpoints and
+    /// connections are parked in the struct so the streams outlive setup.
+    struct QuicPair {
+        _server_ep: Endpoint,
+        _client_ep: Endpoint,
+        _client_conn: Connection,
+        _server_conn: Connection,
+        client: (SendStream, RecvStream),
+        server: (SendStream, RecvStream),
+    }
+
+    async fn open_quic_pair() -> Result<QuicPair> {
+        let server_sock = bound_udp_socket("127.0.0.1:0".parse().unwrap(), 1 << 20)?;
+        let server_addr = server_sock.local_addr()?;
+        let server_ep = Endpoint::new(
+            Default::default(),
+            Some(server_config()?),
+            server_sock,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        let client_sock = bound_udp_socket("127.0.0.1:0".parse().unwrap(), 1 << 20)?;
+        let mut client_ep = Endpoint::new(
+            Default::default(),
+            None,
+            client_sock,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        client_ep.set_default_client_config(client_config(false)?);
+        let handshake = timeout(Duration::from_secs(5), async {
+            let conn = client_ep.connect(server_addr, "localhost")?.await?;
+            let client = conn.open_bi().await?;
+            let Some(incoming) = server_ep.accept().await else {
+                bail!("test QUIC server endpoint closed");
+            };
+            let server_conn = incoming.await?;
+            let server = server_conn.accept_bi().await?;
+            Ok((conn, client, server_conn, server))
+        });
+        let (client_conn, client, server_conn, server) = handshake
+            .await
+            .expect("QUIC test handshake timed out")?;
+        Ok(QuicPair {
+            _server_ep: server_ep,
+            _client_ep: client_ep,
+            _client_conn: client_conn,
+            _server_conn: server_conn,
+            client,
+            server,
+        })
+    }
+
+    #[test]
+    fn parse_upstream_appends_default_port() {
+        assert_eq!(parse_upstream("quic://example.com").unwrap(), "example.com:443");
+        assert_eq!(parse_upstream("quic://example.com/path").unwrap(), "example.com:443");
+    }
+
+    #[test]
+    fn parse_upstream_keeps_explicit_port() {
+        assert_eq!(parse_upstream("quic://example.com:8443").unwrap(), "example.com:8443");
+        assert_eq!(
+            parse_upstream("quic://example.com:8443/abc").unwrap(),
+            "example.com:8443"
+        );
+    }
+
+    #[test]
+    fn parse_upstream_accepts_quic_tls_scheme() {
+        assert_eq!(parse_upstream("quic+tls://example.com").unwrap(), "example.com:443");
+        assert_eq!(parse_upstream("quic+tls://example.com:8443").unwrap(), "example.com:8443");
+    }
+
+    #[test]
+    fn parse_upstream_keeps_bracketed_ipv6() {
+        assert_eq!(parse_upstream("quic://[2001:db8::1]").unwrap(), "[2001:db8::1]");
+        assert_eq!(parse_upstream("quic://[2001:db8::1]:443").unwrap(), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn parse_upstream_rejects_non_quic_and_empty_authority() {
+        for bad in [
+            "",
+            "example.com:443",
+            "http://example.com",
+            "QUIC://example.com",
+            "quic://",
+            "quic:///path",
+            "quic+tls://",
+        ] {
+            assert!(parse_upstream(bad).is_err(), "expected rejection for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_digest_hex_matches_sha256_vectors() {
+        // Standard SHA-256 vectors: the empty string and "abc".
+        assert_eq!(
+            key_digest_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            key_digest_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        for key in ["", "abc", TEST_KEY] {
+            let digest = key_digest_hex(key);
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(!digest.bytes().any(|b| b.is_ascii_uppercase()));
+        }
+    }
+
+    #[test]
+    fn quic_auth_matches_digest_form() {
+        let key = Zeroizing::new(TEST_KEY.to_string());
+        assert!(quic_auth_matches(&key_digest_hex(TEST_KEY), &key));
+        assert!(!quic_auth_matches(&key_digest_hex("other-key"), &key));
+        // Hex is compared byte-wise: an uppercased digest is neither the
+        // configured digest nor the plaintext key.
+        let upper = key_digest_hex(TEST_KEY).to_ascii_uppercase();
+        assert!(!quic_auth_matches(&upper, &key));
+    }
+
+    #[test]
+    fn quic_auth_matches_legacy_plaintext() {
+        // The legacy inline key stays accepted for plaintext-only peers
+        // (GoWay interop); near-misses on either side must not authenticate.
+        let key = Zeroizing::new("legacy-inline-key".to_string());
+        assert!(quic_auth_matches("legacy-inline-key", &key));
+        assert!(!quic_auth_matches("legacy-inline-ke", &key));
+        assert!(!quic_auth_matches("legacy-inline-keyx", &key));
+    }
+
+    #[test]
+    fn quic_auth_matches_empty_key_boundaries() {
+        // Empty configured key: the digest form is the primary match, and the
+        // legacy path also accepts an empty presented line.
+        let empty = Zeroizing::new(String::new());
+        assert!(quic_auth_matches(&key_digest_hex(""), &empty));
+        assert!(quic_auth_matches("", &empty));
+        // An empty presented line against a non-empty key must not pass.
+        let key = Zeroizing::new(TEST_KEY.to_string());
+        assert!(!quic_auth_matches("", &key));
+    }
+
+    #[test]
+    fn line_eq_is_length_gated_and_exact() {
+        assert!(line_eq("", ""));
+        assert!(line_eq("OK", "OK"));
+        assert!(!line_eq("OK", "ok"));
+        assert!(!line_eq("ab", "abc"));
+        assert!(!line_eq("abc", "ab"));
+    }
+
+    #[test]
+    fn is_auth_rejection_matches_auth_shaped_lines() {
+        assert!(is_auth_rejection("ERR: AUTH_FAILED"));
+        assert!(is_auth_rejection("err: auth_failed"));
+        assert!(!is_auth_rejection("ERR: DIAL_FAILED"));
+        assert!(!is_auth_rejection("OK"));
+        assert!(!is_auth_rejection(""));
+    }
+
+    #[tokio::test]
+    async fn len_prefixed_round_trip_preserves_payload_and_framing() {
+        let mut pair = open_quic_pair().await.unwrap();
+        let payload: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+        write_len_prefixed_udp(&mut pair.client.0, &payload).await.unwrap();
+        let mut buf = Vec::with_capacity(8192);
+        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        assert_eq!(n, 5000);
+        assert_eq!(&buf[..n], &payload[..]);
+        // A second frame right behind the first: the length prefix must not
+        // drift, and stale bytes beyond `n` must stay out of the slice.
+        write_len_prefixed_udp(&mut pair.client.0, b"tail").await.unwrap();
+        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..n], &b"tail"[..]);
+    }
+
+    #[tokio::test]
+    async fn len_prefixed_zero_length_frame_then_eof_reads_none() {
+        let mut pair = open_quic_pair().await.unwrap();
+        // A zero-length datagram is a legal frame: the prefix says 0 and the
+        // payload read is a no-op.
+        write_len_prefixed_udp(&mut pair.client.0, b"").await.unwrap();
+        let _ = pair.client.0.finish();
+        let mut buf = Vec::with_capacity(1024);
+        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+        // After the last frame, a clean end of stream reads as Ok(None).
+        let eof = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap();
+        assert!(eof.is_none());
+    }
+
+    #[tokio::test]
+    async fn len_prefixed_max_payload_round_trips() {
+        let mut pair = open_quic_pair().await.unwrap();
+        // Exactly MAX_QUIC_UDP_PACKET bytes: the largest value the u16 prefix
+        // can express and the write-side guard still accepts.
+        let payload = vec![0xA5u8; MAX_QUIC_UDP_PACKET];
+        write_len_prefixed_udp(&mut pair.client.0, &payload).await.unwrap();
+        let mut buf = Vec::with_capacity(MAX_QUIC_UDP_PACKET);
+        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        assert_eq!(n, MAX_QUIC_UDP_PACKET);
+        assert!(buf[..n].iter().all(|&b| b == 0xA5));
+    }
+
+    #[tokio::test]
+    async fn len_prefixed_oversize_payload_is_rejected_without_writes() {
+        let mut pair = open_quic_pair().await.unwrap();
+        let too_big = vec![0u8; MAX_QUIC_UDP_PACKET + 1];
+        assert!(write_len_prefixed_udp(&mut pair.client.0, &too_big).await.is_err());
+        // The size guard fires before any byte is written, so the stream is
+        // still usable for a well-sized frame afterwards.
+        write_len_prefixed_udp(&mut pair.client.0, b"ok").await.unwrap();
+        let mut buf = Vec::with_capacity(1024);
+        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..n], &b"ok"[..]);
+    }
 }

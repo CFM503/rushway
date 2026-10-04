@@ -1,3 +1,4 @@
+mod common;
 mod crypto;
 mod dns;
 mod flow;
@@ -399,7 +400,16 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                let (stream, peer) = res?;
+                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
+                // kill the whole proxy: log, back off briefly, and retry.
+                let (stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "WSS server listener accept failed; retrying in 100ms");
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 // Fail fast at capacity instead of stalling the accept loop
                 // and letting the TCP backlog fill up.
                 let permit = match semaphore.clone().try_acquire_owned() {
@@ -628,7 +638,15 @@ async fn main() -> Result<()> {
     if let Some(v) = dns_opt {
         dns::configure(Some(v)).await?;
     }
-    std::env::set_var("RUSHWAY_MUX_SESSIONS", args.mux_sessions.to_string());
+    // Resolve the MUX session count once at startup: RUSHWAY_MUX_SESSIONS
+    // stays honored for external configuration, otherwise --mux-sessions
+    // applies. The resolved value is handed straight to the session-pool
+    // constructors, so nothing re-reads the environment on the hot path.
+    let mux_sessions = std::env::var("RUSHWAY_MUX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 64))
+        .unwrap_or(args.mux_sessions);
     // Fail fast on a bad --cert/--key before any listener comes up; running
     // after tracing init so the "loaded server certificate" line is visible.
     tls::configure_server_identity(args.cert.clone(), args.key_file.clone())?;
@@ -639,7 +657,7 @@ async fn main() -> Result<()> {
              unauthenticated and the -k key can be read by anyone on path"
         );
     }
-    print_banner(&cfg, args.mux_sessions, &dns_display, verify_ssl);
+    print_banner(&cfg, mux_sessions, &dns_display, verify_ssl);
 
     // GoWay `monitorStats`: 3 s `[STATS]` line (1 s cadence feeds the TUI).
     let level_up = args.log_level.trim().to_ascii_uppercase();
@@ -648,7 +666,7 @@ async fn main() -> Result<()> {
     if tui_active {
         let tui_cfg = tui::TuiConfig::from_runtime(
             &cfg,
-            args.mux_sessions,
+            mux_sessions,
             &dns_display,
             verify_ssl,
             &args.log_level,
@@ -656,7 +674,7 @@ async fn main() -> Result<()> {
         tui::spawn_refresh_loop(tui_cfg);
     }
 
-    let result = run_forwarding(cfg, &args).await;
+    let result = run_forwarding(cfg, &args, mux_sessions).await;
 
     // Shutdown hygiene: flush `-log-file` ring and stop `-cpuprofile` sampler.
     tui::save_log_file();
@@ -671,12 +689,12 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run_forwarding(cfg: RuntimeConfig, args: &Args) -> Result<()> {
+async fn run_forwarding(cfg: RuntimeConfig, args: &Args, mux_sessions: usize) -> Result<()> {
     let verify_ssl = args.verify_ssl_effective();
     if let Some(upstream) = cfg.upstream.as_deref() {
         if upstream.starts_with("wss://") {
             if cfg.mux {
-                return wss_client::run_client_from_config(cfg, verify_ssl).await;
+                return wss_client::run_client_from_config(cfg, verify_ssl, mux_sessions).await;
             }
             return wss_client::run_non_mux_from_config(cfg, verify_ssl).await;
         }
@@ -684,7 +702,7 @@ async fn run_forwarding(cfg: RuntimeConfig, args: &Args) -> Result<()> {
             return quic::run_client(cfg, verify_ssl).await;
         }
         if cfg.mux {
-            return mux_pool::run_client(cfg).await;
+            return mux_pool::run_client(cfg, mux_sessions).await;
         }
         return nonmux::run_client(cfg).await;
     }
