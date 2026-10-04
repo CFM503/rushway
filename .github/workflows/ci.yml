@@ -21,11 +21,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
-          components: rustfmt
+          components: clippy, rustfmt
       - name: Rust format check
-        run: cargo fmt --all
+        run: cargo fmt --all -- --check
       - name: Rust check
         run: cargo check --all-targets --all-features
+      # Not enforcing -D warnings yet; flip to -D warnings once green.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
       - name: Test
         run: cargo test --all-targets --all-features
       - name: Release build
