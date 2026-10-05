@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.39] - 2026-10-05
+
 ### Behavior changes (call out in release notes)
 
 - **QUIC first-line auth now sends the SHA-256 hex digest of the key instead of the plaintext key** (`quic.rs`) — the server accepts the digest or the legacy inline plaintext (WARN on the legacy path); a client facing a plaintext-only upstream falls back to the legacy line once, only on an explicit auth-shaped rejection, and latches that per process. A legacy server that rejects without an "AUTH"-shaped response will not interop.
