@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.40] - 2026-10-11
+
 ### Fixed
 
 - **WSS physical connection resilience on frame decode failure** (`wss_client.rs`) — decode errors on unknown or corrupted frames now `continue` instead of returning `?`, preventing physical connection teardown and multi-stream collapse (aligned with `mux_pool.rs`).
