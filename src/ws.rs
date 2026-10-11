@@ -11,7 +11,7 @@ use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_WS_FRAME_SIZE: usize = 64 * 1024 * 1024;
+pub const MAX_WS_FRAME_SIZE: usize = 12 * 1024 * 1024 + 64;
 pub const MAX_HTTP_HEADER_SIZE: usize = 8192;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const BROWSER_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";

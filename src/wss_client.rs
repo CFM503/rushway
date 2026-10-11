@@ -39,7 +39,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 
 pub(crate) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -562,9 +562,10 @@ struct WssSessionState {
     next_id: AtomicU32,
     active: AtomicUsize,
     closed: AtomicBool,
+    capacity_notify: Arc<Notify>,
 }
 impl WssSessionState {
-    async fn connect(cfg: &WssConfig) -> Result<Arc<Self>> {
+    async fn connect(cfg: &WssConfig, capacity_notify: Arc<Notify>) -> Result<Arc<Self>> {
         let (mut rd, writer) = open_upstream(cfg).await?;
         let c = configured_cipher(&cfg.key);
         let mut hello = b"MUX\n".to_vec();
@@ -615,6 +616,7 @@ impl WssSessionState {
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            capacity_notify,
         });
         // W3 version negotiation: advertise our version + initial receive
         // window right after the session handshake (mirrors mux_pool).
@@ -642,7 +644,8 @@ impl WssSessionState {
                 gate.close();
             }
             gates.clear();
-            reader_session.active.store(0, Ordering::Release)
+            reader_session.active.store(0, Ordering::Release);
+            reader_session.capacity_notify.notify_waiters();
         });
         let heartbeat_session = session.clone();
         tokio::spawn(async move {
@@ -746,9 +749,7 @@ impl WssSessionState {
         let syn =
             MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
         if let Err(error) = send_mux(&self.writer, &self.cipher, &syn, self.obfs).await {
-            self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            self.active.fetch_sub(1, Ordering::AcqRel);
+            self.close_stream(id).await;
             return Err(error);
         }
         if !remaining_initial.is_empty() {
@@ -762,13 +763,20 @@ impl WssSessionState {
             )
             .await
             {
-                self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                self.active.fetch_sub(1, Ordering::AcqRel);
+                self.close_stream(id).await;
                 return Err(error);
             }
         }
         Ok((id, rx, gate))
+    }
+    async fn close_stream(&self, id: u32) {
+        if self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            self.capacity_notify.notify_waiters();
+        }
+        if let Some(gate) = self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+            gate.close();
+        }
     }
 }
 async fn send_mux(
@@ -804,7 +812,10 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             continue;
         }
         session.cipher.apply(&mut payload);
-        let frame = MuxFrame::decode_owned(payload).map_err(|e| anyhow!(e.to_string()))?;
+        let frame = match MuxFrame::decode_owned(payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         // W3 control frames are session/stream-level: handle them here
         // instead of routing into per-stream channels (VERSION uses
         // stream id 0 and would otherwise be dropped silently).
@@ -857,14 +868,10 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
                         session.obfs,
                     )
                     .await;
-                    if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
-                        session.active.fetch_sub(1, Ordering::AcqRel);
-                    }
+                    session.close_stream(id).await;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
-                        session.active.fetch_sub(1, Ordering::AcqRel);
-                    }
+                    session.close_stream(id).await;
                 }
             }
         }
@@ -880,6 +887,9 @@ struct WssSessionPool {
     sessions: Mutex<Vec<Arc<WssSessionState>>>,
     session_creation: Mutex<()>,
     consecutive_failures: AtomicU32,
+    /// Signalled whenever session capacity may have appeared: a stream was
+    /// released, a session closed, or a replenished session joined the pool.
+    capacity_notify: Arc<Notify>,
 }
 impl WssSessionPool {
     fn new(cfg: WssConfig, session_count: usize) -> Arc<Self> {
@@ -889,6 +899,7 @@ impl WssSessionPool {
             sessions: Mutex::new(Vec::new()),
             session_creation: Mutex::new(()),
             consecutive_failures: AtomicU32::new(0),
+            capacity_notify: Arc::new(Notify::new()),
         })
     }
     async fn replenish(self: &Arc<Self>) -> bool {
@@ -903,11 +914,12 @@ impl WssSessionPool {
             self.consecutive_failures.store(0, Ordering::Release);
             return false;
         }
-        match WssSessionState::connect(&self.cfg).await {
+        match WssSessionState::connect(&self.cfg, self.capacity_notify.clone()).await {
             Ok(s) => {
                 let mut sessions = self.sessions.lock().await;
                 sessions.push(s);
                 self.consecutive_failures.store(0, Ordering::Release);
+                self.capacity_notify.notify_waiters();
                 sessions.len() < target
             }
             Err(error) => {
@@ -956,41 +968,52 @@ impl WssSessionPool {
         mpsc::Receiver<OwnedMuxFrame>,
         Arc<CreditGate>,
     )> {
-        let snapshot = {
+        let n = self.session_count;
+        loop {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            sessions.clone()
-        };
-        let mut ordered = snapshot
-            .into_iter()
-            .map(|session| (session.active.load(Ordering::Acquire), session))
-            .collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|(active, _)| *active);
-        for (_active, session) in ordered {
-            if !session.available() {
+            let snapshot = sessions
+                .iter()
+                .filter(|s| s.available())
+                .map(|s| (s.active.load(Ordering::Acquire), s.clone()))
+                .collect::<Vec<_>>();
+            if let Some((_active, session)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
+                drop(sessions);
+                match session.open_stream(target, initial_data.clone()).await {
+                    Ok(opened) => {
+                        let current_len = self.sessions.lock().await.len();
+                        if current_len < n {
+                            let pool = self.clone();
+                            tokio::spawn(async move {
+                                pool.replenish().await;
+                            });
+                        }
+                        return Ok((session, opened.0, opened.1, opened.2));
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let need_new = sessions.len() < n;
+            drop(sessions);
+            if !need_new {
+                // Every session is at capacity: park until a stream release,
+                // a session close, or a replenished session signals spare
+                // capacity. The bounded wait is also the lost-wakeup backstop
+                // for `notify_waiters` races.
+                let notified = self.capacity_notify.notified();
+                let _ = timeout(Duration::from_millis(500), notified).await;
                 continue;
             }
-            if let Ok((id, rx, gate)) = session.open_stream(target, initial_data.clone()).await {
-                let limit = self.session_count;
-                let current_len = self.sessions.lock().await.len();
-                if current_len < limit {
-                    let pool = self.clone();
-                    tokio::spawn(async move {
-                        pool.replenish().await;
-                    });
-                }
-                return Ok((session, id, rx, gate));
-            }
-        }
-        let limit = self.session_count;
-        let _guard = self.session_creation.lock().await;
-        let can_create = {
+
+            let _creation_guard = self.session_creation.lock().await;
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            sessions.len() < limit
-        };
-        if can_create {
-            let session = WssSessionState::connect(&self.cfg).await.map_err(|e| {
+            if sessions.len() >= n {
+                continue;
+            }
+            drop(sessions);
+
+            let session = WssSessionState::connect(&self.cfg, self.capacity_notify.clone()).await.map_err(|e| {
                 let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
                 let sni = self
                     .cfg
@@ -1010,11 +1033,11 @@ impl WssSessionPool {
                 );
                 e
             })?;
-            let opened = session.open_stream(target, initial_data).await?;
+            let opened = session.open_stream(target, initial_data.clone()).await?;
             self.sessions.lock().await.push(session.clone());
+            self.capacity_notify.notify_waiters();
             return Ok((session, opened.0, opened.1, opened.2));
         }
-        bail!("all WSS physical MUX sessions are full or unavailable")
     }
 }
 
@@ -1073,6 +1096,8 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     });
     // W3 receive-side refund accumulator (client -> server WINDOW).
     let mut refund_pending: u32 = 0;
+    let mut result = Result::<()>::Ok(());
+    let mut remote_fin = false;
     while let Some(frame) = rx.recv().await {
         match frame.command {
             MuxCommand::Data => {
@@ -1084,7 +1109,10 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                     Ok(())
                 };
                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                write_res?;
+                if let Err(e) = write_res {
+                    result = Err(e.into());
+                    break;
+                }
                 if !payload_empty {
                     crate::stats::add_bytes(0, len as i64);
                     let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
@@ -1092,7 +1120,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                         refund_pending = refund_pending.saturating_add(len as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {
                             let credit = std::mem::take(&mut refund_pending);
-                            send_mux_parts(
+                            if let Err(e) = send_mux_parts(
                                 &session.writer,
                                 &session.cipher,
                                 stream_id,
@@ -1100,7 +1128,11 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                                 &encode_window_payload(credit),
                                 session.obfs,
                             )
-                            .await?;
+                            .await
+                            {
+                                result = Err(e);
+                                break;
+                            }
                         }
                     } else {
                         refund_pending = 0;
@@ -1109,11 +1141,13 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             }
             MuxCommand::Fin => {
                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                local_wr.shutdown().await?;
+                let _ = local_wr.shutdown().await;
+                remote_fin = true;
                 break;
             }
             MuxCommand::Rst => {
                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                result = Err(anyhow!("upstream reset after CONNECT established"));
                 break;
             }
             MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
@@ -1122,15 +1156,30 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         }
     }
     upload.abort();
-    // Conditional decrement: the reader may have already reaped the stream
-    // (send failure) or the session may have been torn down (active zeroed).
-    if session.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id).is_some() {
-        session.active.fetch_sub(1, Ordering::AcqRel);
+    if remote_fin {
+        let _ = send_mux_parts(
+            &session.writer,
+            &session.cipher,
+            stream_id,
+            MuxCommand::Fin,
+            &[],
+            session.obfs,
+        )
+        .await;
+    } else if result.is_err() {
+        let _ = send_mux_parts(
+            &session.writer,
+            &session.cipher,
+            stream_id,
+            MuxCommand::Rst,
+            &[],
+            session.obfs,
+        )
+        .await;
     }
-    if let Some(gate) = session.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id) {
-        gate.close();
-    }
-    Ok(())
+
+    session.close_stream(stream_id).await;
+    result
 }
 
 pub async fn run_client_from_config(
@@ -1392,7 +1441,7 @@ mod tests {
             block_local: false,
         };
 
-        let session = WssSessionState::connect(&cfg).await.unwrap();
+        let session = WssSessionState::connect(&cfg, Arc::new(Notify::new())).await.unwrap();
         assert_eq!(session.active.load(Ordering::Acquire), 0);
         assert!(!session.closed.load(Ordering::Acquire));
 

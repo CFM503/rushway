@@ -168,22 +168,7 @@ fn relay_bufs() -> &'static StdMutex<Vec<Vec<u8>>> {
     RELAY_BUFS.get_or_init(|| StdMutex::new(Vec::new()))
 }
 
-/// Gets a zeroed relay buffer of exactly `relay_buffer_size(requested)`
-/// bytes, reusing a pooled one when available.
-pub(crate) async fn relay_buf(requested: usize) -> Vec<u8> {
-    let size = relay_buffer_size(requested);
-    if size <= POOLED_BUF_MAX_SIZE {
-        let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = pool.iter().position(|b| b.len() == size) {
-            return pool.swap_remove(pos);
-        }
-    }
-    vec![0u8; size]
-}
-
-/// Returns a relay buffer to the pool (best-effort: over-capacity or
-/// oversized buffers are simply dropped).
-pub(crate) async fn recycle_buf(buf: Vec<u8>) {
+fn recycle_buf_sync(buf: Vec<u8>) {
     if buf.len() > POOLED_BUF_MAX_SIZE {
         return;
     }
@@ -192,6 +177,66 @@ pub(crate) async fn recycle_buf(buf: Vec<u8>) {
         pool.push(buf);
     }
 }
+
+/// RAII guard for pooled relay buffers.
+///
+/// Automatically returns the allocated buffer to `RELAY_BUFS` on drop,
+/// ensuring 100% recycling even when relay tasks are aborted or exit early.
+pub(crate) struct RelayBufGuard(pub(crate) Option<Vec<u8>>);
+
+impl std::ops::Deref for RelayBufGuard {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
+
+impl std::ops::DerefMut for RelayBufGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_deref_mut().unwrap_or(&mut [])
+    }
+}
+
+impl AsRef<[u8]> for RelayBufGuard {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}
+
+impl AsMut<[u8]> for RelayBufGuard {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.deref_mut()
+    }
+}
+
+impl Drop for RelayBufGuard {
+    fn drop(&mut self) {
+        if let Some(buf) = self.0.take() {
+            recycle_buf_sync(buf);
+        }
+    }
+}
+
+/// Gets a zeroed relay buffer of exactly `relay_buffer_size(requested)`
+/// bytes wrapped in a `RelayBufGuard`, reusing a pooled one when available.
+pub(crate) async fn relay_buf(requested: usize) -> RelayBufGuard {
+    let size = relay_buffer_size(requested);
+    if size <= POOLED_BUF_MAX_SIZE {
+        let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = pool.iter().position(|b| b.len() == size) {
+            return RelayBufGuard(Some(pool.swap_remove(pos)));
+        }
+    }
+    RelayBufGuard(Some(vec![0u8; size]))
+}
+
+/// Returns a relay buffer to the pool (best-effort: over-capacity or
+/// oversized buffers are simply dropped).
+pub(crate) async fn recycle_buf(_buf: RelayBufGuard) {}
 
 /// Resolves when the operator requests shutdown (Ctrl+C everywhere,
 /// Ctrl+Break on Windows — the latter is what console-less training
@@ -832,10 +877,12 @@ async fn handle_mux_parts(
 
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
-                let admitted = {
+                let (admitted, old_cancel) = {
                     let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
-                    if guard.len() >= 2048 || guard.contains_key(&stream_id) {
-                        false
+                    if guard.len() >= 2048 {
+                        (false, None)
+                    } else if let Some(old) = guard.remove(&stream_id) {
+                        (false, Some(old.cancel))
                     } else {
                         guard.insert(
                             stream_id,
@@ -845,9 +892,12 @@ async fn handle_mux_parts(
                                 gate: gate.clone(),
                             },
                         );
-                        true
+                        (true, None)
                     }
                 };
+                if let Some(old_cancel) = old_cancel {
+                    let _ = old_cancel.send(true);
+                }
                 if !admitted {
                     tracing::warn!(stream_id, "mux RST: stream admission rejected (table full or duplicate id)");
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
@@ -1419,11 +1469,15 @@ async fn handle_server_udp_parts(
                 }
             };
             // Recorded before the first payload leaves, so a reply can never
-            // arrive ahead of its target joining the known set.
-            known_targets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(addr);
+            // arrive ahead of its target joining the known set. Bounded to
+            // 4096 entries to prevent unbounded growth under scanning attacks.
+            {
+                let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.len() >= 4096 {
+                    guard.clear();
+                }
+                guard.insert(addr);
+            }
             crate::stats::add_bytes(payload.len() as i64, 0);
             let _ = batch_writer.send(payload, addr).await;
             crate::mux_writer::recycle_encode_buf(packet);

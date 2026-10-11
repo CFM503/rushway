@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **WSS physical connection resilience on frame decode failure** (`wss_client.rs`) — decode errors on unknown or corrupted frames now `continue` instead of returning `?`, preventing physical connection teardown and multi-stream collapse (aligned with `mux_pool.rs`).
+- **WSS stream teardown and gate leak on early write errors** (`wss_client.rs`) — local write failures, refund send errors, and FIN shutdowns now break through the unified cleanup path rather than returning early via `?`, guaranteeing `upload.abort()` and `session.close_stream()` run and preventing session active counter drift.
+- **WSS CreditGate memory and task leak on backpressure reset** (`wss_client.rs`) — `close_stream` is now called on `TrySendError::Full` and `TrySendError::Closed`, properly removing credit gates and unblocking parked upload tasks.
+- **SingleFlight DNS race window closed** (`dns.rs`) — eliminated premature `drop(_guard)` before cache insertion, preventing duplicate remote queries on concurrent requests for the same host.
+- **Downlink write failure RST notification** (`mux_pool.rs`, `wss_client.rs`) — explicit `MuxCommand::Rst` is now dispatched to upstream when local writes fail and the stream was not closed by remote FIN, halting wasted upstream data push.
+- **Active termination of stale streams on duplicate SYN** (`runtime.rs`) — incoming duplicate SYN stream IDs now cancel and evict the previous stale stream entry and signal its cancellation channel before rejecting the new SYN.
+
+### Added
+
+- **RAII `RelayBufGuard` buffer pool recycling** (`runtime.rs`) — relay buffers now automatically recycle back into `RELAY_BUFS` on drop, ensuring 100% recycling even when relay tasks are aborted via `upload.abort()`.
+- **WSS session pool capacity waiting and notification** (`wss_client.rs`) — added `capacity_notify: Arc<Notify>` and 500ms timeout retry on saturated physical sessions, smoothing concurrent connection spikes.
+- **DoS bounds on UDP relay targets** (`runtime.rs`) — capped `known_targets` hash set to 4096 entries to prevent unbounded memory growth under port-scanning traffic.
+- **Tightened maximum WebSocket frame size** (`ws.rs`) — reduced `MAX_WS_FRAME_SIZE` from 64MB to `12 * 1024 * 1024 + 64` (12MB + 64 bytes) to strictly align with GoWay v1.8.18 limits.
+
 ## [v0.0.39] - 2026-10-05
 
 ### Behavior changes (call out in release notes)

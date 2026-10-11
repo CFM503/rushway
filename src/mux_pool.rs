@@ -870,6 +870,16 @@ async fn handle_tcp_proxy(
             session.obfs,
         )
         .await;
+    } else if result.is_err() {
+        let _ = send_mux_parts(
+            &session.writer,
+            &session.cipher,
+            id,
+            MuxCommand::Rst,
+            &[],
+            session.obfs,
+        )
+        .await;
     }
 
     session.close_stream(id).await;

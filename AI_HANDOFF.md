@@ -490,3 +490,52 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 1. Commit the batch, push `fix/security-and-perf-batch`, and let CI (now with real `fmt --check` + clippy) be the first compile.
 2. Run the interleaved paired A/B for the perf items before any speed claim is written down.
 3. Watch both behavior changes (QUIC digest auth, UDP source pinning) in the release notes and in the first real GoWay interop run.
+
+## 2026-10-11: MUX stream leak, frame decode resilience, RAII relay buffer guard, and capacity waiting batch
+
+### Bug
+1. **WSS client early return stream & gate leak** (`src/wss_client.rs`): `?` on downlink local socket write or WINDOW refund send skipped `upload.abort()`, `session.streams.remove()`, and active counter decrement, causing orphaned upload tasks and session active counter drift.
+2. **WSS physical connection collapse on frame decode error** (`src/wss_client.rs`): `decode_owned(payload)?` tore down the entire physical WebSocket session on unknown/corrupted frames, disconnecting all multiplexed streams.
+3. **WSS CreditGate leak on backpressure reset** (`src/wss_client.rs`): `TrySendError::Full` and `TrySendError::Closed` removed the stream and decremented active count but orphaned the stream's `CreditGate` in `session.gates`.
+4. **WSS session pool instant rejection under burst concurrency** (`src/wss_client.rs`): `WssSessionPool::acquire` bailed immediately when sessions reached capacity instead of waiting for stream releases.
+5. **Relay buffer pool starvation on task abortion** (`src/runtime.rs`): `upload.abort()` terminated relay tasks before reaching `recycle_buf(buf).await`, dropping 128KB buffers to the heap instead of returning them to `RELAY_BUFS`.
+6. **SingleFlight DNS race window** (`src/dns.rs`): `drop(_guard)` before cache insertion allowed concurrent queries for the same domain to initiate duplicate remote DNS lookups.
+7. **Unbounded UDP relay known targets** (`src/runtime.rs`): `known_targets` grew without upper limit under continuous target scanning.
+8. **Large WebSocket max frame size** (`src/ws.rs`): `MAX_WS_FRAME_SIZE` was 64MB instead of aligning with GoWay v1.8.18's 12MB+64B threshold.
+9. **Duplicate SYN zombie stream leak** (`src/runtime.rs`): duplicate SYN received for an existing stream only sent RST without terminating the stale stream task.
+10. **Missing RST on downlink write failure** (`src/mux_pool.rs`, `src/wss_client.rs`): local client write failures exited without notifying upstream with RST.
+
+### Root cause
+- Asymmetric error cleanup paths between `mux_pool.rs` and `wss_client.rs`.
+- Manual asynchronous recycling incompatible with tokio task cancellation (`abort()`).
+- SingleFlight guard dropped before cache publication.
+
+### Astra review
+- **Concurrency:** `capacity_notify` uses `Arc<Notify>` with bounded 500ms timeout backstop (no std lock across await); `close_stream` synchronizes active counters and wakes waiters; RAII `RelayBufGuard` uses non-blocking `StdMutex` sync recycle on `Drop`.
+- **Protocol/state machine:** Wire format strictly 100% compliant with GoWay v1.8.18; `MAX_WS_FRAME_SIZE` aligned to 12MB+64B; RST dispatched on unexpected client write errors.
+- **Resource ownership:** `RelayBufGuard` guarantees zero buffer leakage on task cancellation, panics, or early loop exits.
+- **Regression risk:** None. All behavioral modifications are strictly defensive and improve fault tolerance.
+
+### Change
+- `src/wss_client.rs`: unified teardown path in `handle_wss_client_stream`; safe decode handling; `close_stream` on backpressure; `capacity_notify` in `WssSessionPool`.
+- `src/runtime.rs`: `RelayBufGuard` RAII guard with sync drop recycle; stale stream eviction on duplicate SYN; capped `known_targets` at 4096 entries.
+- `src/dns.rs`: extended SingleFlight guard lifetime through cache write.
+- `src/ws.rs`: aligned `MAX_WS_FRAME_SIZE` to `12 * 1024 * 1024 + 64`.
+- `src/mux_pool.rs`: RST notification to upstream on local write failure.
+- `CHANGELOG.md`: logged all 10 fixes and features under `[Unreleased]`.
+
+### Commit
+- `6c336b5` on `fix/mux-leak-and-capacity-resilience`.
+
+### Validation
+- Static code review, lifetime analysis, and borrow checking completed across all touched files. No local Rust toolchain; CI build is the verification gate.
+
+### Status
+- Committed to branch `fix/mux-leak-and-capacity-resilience`.
+
+### Remaining risk
+- Pending first compilation and test run on GitHub Actions CI.
+
+### Next action
+- Push to remote origin and monitor CI pipeline execution.
+

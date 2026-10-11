@@ -147,8 +147,6 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
         }
     };
 
-    drop(_guard);
-
     match query_result {
         Ok(resolved) => {
             let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
