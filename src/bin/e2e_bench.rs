@@ -111,7 +111,7 @@ fn spawn_rushway(
     wss_server: bool,
 ) -> io::Result<Child> {
     let mut cmd = Command::new(path);
-    let log_level = if diagnostic_mode() { "DEBUG" } else { "ERROR" };
+    let log_level = if diagnostic_mode() { "DEBUG" } else { "WARN" };
     cmd.arg("-p")
         .arg(port.to_string())
         .arg("-k")
@@ -129,6 +129,7 @@ fn spawn_rushway(
     }
     if let Some(upstream) = upstream {
         cmd.arg("--up").arg(upstream);
+        cmd.arg("--no-verify-ssl");
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
 }
