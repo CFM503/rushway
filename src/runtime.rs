@@ -202,14 +202,14 @@ impl std::ops::DerefMut for RelayBufGuard {
 impl AsRef<[u8]> for RelayBufGuard {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        self.deref()
+        self.0.as_deref().unwrap_or(&[])
     }
 }
 
 impl AsMut<[u8]> for RelayBufGuard {
     #[inline]
     fn as_mut(&mut self) -> &mut [u8] {
-        self.deref_mut()
+        self.0.as_deref_mut().unwrap_or(&mut [])
     }
 }
 

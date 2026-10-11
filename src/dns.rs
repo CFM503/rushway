@@ -150,7 +150,7 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     match query_result {
         Ok(resolved) => {
             let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
-            bounded_insert(&mut guard, key, (resolved, Instant::now() + CACHE_TTL));
+            bounded_insert(&mut guard, key.clone(), (resolved, Instant::now() + CACHE_TTL));
             if let Some(sender) = tx {
                 let _ = sender.send(Some(resolved));
             }
