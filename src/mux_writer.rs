@@ -754,9 +754,10 @@ mod tests {
             let mut out = Vec::new();
             encode_mux_ws_frame(&mut out, 9, MuxCommand::Data, &payload, &cipher, true, true)
                 .unwrap();
-            let base = mux_ws_len(100, true);
-            assert!((base..=base + OBFS_PAD_MAX).contains(&out.len()));
-            if out.len() > base {
+            let min_len = mux_ws_len(100, true);
+            let max_len = mux_ws_len(100 + OBFS_PAD_MAX, true);
+            assert!((min_len..=max_len).contains(&out.len()));
+            if out.len() > min_len {
                 seen_pad = true;
             }
             // Strip the WS layer using the header's own length field

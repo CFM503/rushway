@@ -960,9 +960,17 @@ mod tests {
         _server_ep: Endpoint,
         _client_ep: Endpoint,
         _client_conn: Connection,
-        _server_conn: Connection,
+        server_conn: Connection,
         client: (SendStream, RecvStream),
-        server: (SendStream, RecvStream),
+    }
+
+    impl QuicPair {
+        async fn accept_server(&self) -> Result<(SendStream, RecvStream)> {
+            self.server_conn
+                .accept_bi()
+                .await
+                .context("accept server bidirectional stream")
+        }
     }
 
     async fn open_quic_pair() -> Result<QuicPair> {
@@ -983,25 +991,31 @@ mod tests {
         )?;
         client_ep.set_default_client_config(client_config(false)?);
         let handshake = timeout(Duration::from_secs(5), async {
-            let conn = client_ep.connect(server_addr, "localhost")?.await?;
-            let client = conn.open_bi().await?;
-            let Some(incoming) = server_ep.accept().await else {
-                bail!("test QUIC server endpoint closed");
+            let connect_fut = async {
+                let conn = client_ep.connect(server_addr, "localhost")?.await?;
+                let client = conn.open_bi().await?;
+                Ok::<_, anyhow::Error>((conn, client))
             };
-            let server_conn = incoming.await?;
-            let server = server_conn.accept_bi().await?;
-            Ok((conn, client, server_conn, server))
+            let accept_fut = async {
+                let incoming = server_ep
+                    .accept()
+                    .await
+                    .ok_or_else(|| anyhow!("test QUIC server endpoint closed"))?;
+                let server_conn = incoming.await?;
+                Ok::<_, anyhow::Error>(server_conn)
+            };
+            let ((client_conn, client), server_conn) = tokio::try_join!(connect_fut, accept_fut)?;
+            Ok((client_conn, client, server_conn))
         });
-        let (client_conn, client, server_conn, server) = handshake
+        let (client_conn, client, server_conn) = handshake
             .await
             .expect("QUIC test handshake timed out")?;
         Ok(QuicPair {
             _server_ep: server_ep,
             _client_ep: client_ep,
             _client_conn: client_conn,
-            _server_conn: server_conn,
+            server_conn,
             client,
-            server,
         })
     }
 
@@ -1122,14 +1136,15 @@ mod tests {
         let mut pair = open_quic_pair().await.unwrap();
         let payload: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
         write_len_prefixed_udp(&mut pair.client.0, &payload).await.unwrap();
+        let mut server = pair.accept_server().await.unwrap();
         let mut buf = Vec::with_capacity(8192);
-        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        let n = read_len_prefixed_udp(&mut server.1, &mut buf).await.unwrap().unwrap();
         assert_eq!(n, 5000);
         assert_eq!(&buf[..n], &payload[..]);
         // A second frame right behind the first: the length prefix must not
         // drift, and stale bytes beyond `n` must stay out of the slice.
         write_len_prefixed_udp(&mut pair.client.0, b"tail").await.unwrap();
-        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        let n = read_len_prefixed_udp(&mut server.1, &mut buf).await.unwrap().unwrap();
         assert_eq!(n, 4);
         assert_eq!(&buf[..n], &b"tail"[..]);
     }
@@ -1141,12 +1156,13 @@ mod tests {
         // payload read is a no-op.
         write_len_prefixed_udp(&mut pair.client.0, b"").await.unwrap();
         let _ = pair.client.0.finish();
+        let mut server = pair.accept_server().await.unwrap();
         let mut buf = Vec::with_capacity(1024);
-        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        let n = read_len_prefixed_udp(&mut server.1, &mut buf).await.unwrap().unwrap();
         assert_eq!(n, 0);
         assert!(buf.is_empty());
         // After the last frame, a clean end of stream reads as Ok(None).
-        let eof = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap();
+        let eof = read_len_prefixed_udp(&mut server.1, &mut buf).await.unwrap();
         assert!(eof.is_none());
     }
 
@@ -1157,8 +1173,9 @@ mod tests {
         // can express and the write-side guard still accepts.
         let payload = vec![0xA5u8; MAX_QUIC_UDP_PACKET];
         write_len_prefixed_udp(&mut pair.client.0, &payload).await.unwrap();
+        let mut server = pair.accept_server().await.unwrap();
         let mut buf = Vec::with_capacity(MAX_QUIC_UDP_PACKET);
-        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        let n = read_len_prefixed_udp(&mut server.1, &mut buf).await.unwrap().unwrap();
         assert_eq!(n, MAX_QUIC_UDP_PACKET);
         assert!(buf[..n].iter().all(|&b| b == 0xA5));
     }
@@ -1171,8 +1188,9 @@ mod tests {
         // The size guard fires before any byte is written, so the stream is
         // still usable for a well-sized frame afterwards.
         write_len_prefixed_udp(&mut pair.client.0, b"ok").await.unwrap();
+        let mut server = pair.accept_server().await.unwrap();
         let mut buf = Vec::with_capacity(1024);
-        let n = read_len_prefixed_udp(&mut pair.server.1, &mut buf).await.unwrap().unwrap();
+        let n = read_len_prefixed_udp(&mut server.1, &mut buf).await.unwrap().unwrap();
         assert_eq!(n, 2);
         assert_eq!(&buf[..n], &b"ok"[..]);
     }
