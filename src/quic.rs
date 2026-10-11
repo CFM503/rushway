@@ -990,25 +990,26 @@ mod tests {
             Arc::new(quinn::TokioRuntime),
         )?;
         client_ep.set_default_client_config(client_config(false)?);
-        let handshake = timeout(Duration::from_secs(5), async {
-            let connect_fut = async {
-                let conn = client_ep.connect(server_addr, "localhost")?.await?;
-                let client = conn.open_bi().await?;
-                Ok::<_, anyhow::Error>((conn, client))
-            };
-            let accept_fut = async {
-                let incoming = server_ep
-                    .accept()
-                    .await
-                    .ok_or_else(|| anyhow!("test QUIC server endpoint closed"))?;
-                let server_conn = incoming.await?;
-                Ok::<_, anyhow::Error>(server_conn)
-            };
-            let ((client_conn, client), server_conn) = tokio::try_join!(connect_fut, accept_fut)?;
-            Ok((client_conn, client, server_conn))
-        });
+        let handshake: Result<Result<(Connection, (SendStream, RecvStream), Connection), anyhow::Error>, _> =
+            timeout(Duration::from_secs(5), async {
+                let connect_fut = async {
+                    let conn = client_ep.connect(server_addr, "localhost")?.await?;
+                    let client = conn.open_bi().await?;
+                    Ok::<_, anyhow::Error>((conn, client))
+                };
+                let accept_fut = async {
+                    let incoming = server_ep
+                        .accept()
+                        .await
+                        .ok_or_else(|| anyhow!("test QUIC server endpoint closed"))?;
+                    let server_conn = incoming.await?;
+                    Ok::<_, anyhow::Error>(server_conn)
+                };
+                let ((client_conn, client), server_conn) = tokio::try_join!(connect_fut, accept_fut)?;
+                Ok((client_conn, client, server_conn))
+            })
+            .await;
         let (client_conn, client, server_conn) = handshake
-            .await
             .expect("QUIC test handshake timed out")?;
         Ok(QuicPair {
             _server_ep: server_ep,
