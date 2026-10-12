@@ -24,7 +24,7 @@ use crate::runtime::{
 use crate::tls;
 use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
-    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_owned,
+    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_with_cipher,
     read_http_headers_timeout, redact_handshake_request, validate_client_handshake_response,
     write_frame,
 };
@@ -73,7 +73,6 @@ pub(crate) struct WssConfig {
     pub(crate) block_local: bool,
 }
 impl WssConfig {
-    #[allow(dead_code)]
     pub(crate) fn from_runtime_config(cfg: &RuntimeConfig, verify_ssl: bool) -> Result<Self> {
         let upstream = cfg
             .upstream
@@ -295,7 +294,7 @@ pub(crate) async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mut
 }
 
 /// Probe helper to test standalone WSS TCP -> TLS -> HTTP Upgrade -> 101 without entering MUX.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn probe_wss_handshake(cfg: &WssConfig) -> Result<String> {
     let (rd, wr) = connect_wss_upstream(cfg).await?;
     drop(rd);
@@ -325,17 +324,20 @@ async fn handle_udp_proxy(
         let mut w = writer.lock().await;
         write_frame(&mut *w, &hello, 2, true).await?
     };
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let Some((opcode, mut ok)) =
         read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
     else {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("WSS upstream closed during UDP handshake")
     };
     if opcode != 2 {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("invalid WSS UDP handshake response opcode")
     };
     c.apply(&mut ok);
     if ok != b"OK\n" {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("WSS upstream rejected UDP handshake")
     };
     let latest_client = Arc::new(StdMutex::new(None::<SocketAddr>));
@@ -383,15 +385,20 @@ async fn handle_udp_proxy(
         _ = control.read(&mut dummy) => {}
         _ = async {
             loop {
-                let Some((opcode, mut packet)) =
-                    read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
+                let Some((opcode, packet)) = read_frame_with_cipher(
+                    &mut rd,
+                    Option::<&mut BoxWriter>::None,
+                    &mut frame_buf,
+                    Some(&c),
+                )
+                .await?
                 else {
                     break;
                 };
                 if opcode != 2 {
+                    crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                c.apply(&mut packet);
                 // Copy the peer out first: a std Mutex guard must never be
                 // held across the await below.
                 let peer_opt = *latest_client.lock().unwrap_or_else(|e| e.into_inner());
@@ -399,10 +406,12 @@ async fn handle_udp_proxy(
                     let _ = udp.send_to(&packet, peer).await;
                     crate::stats::add_bytes(0, packet.len() as i64);
                 }
+                crate::mux_writer::recycle_encode_buf(packet);
             }
             Ok::<(), anyhow::Error>(())
         } => {}
     }
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     upload.abort();
     let _ = control.shutdown().await;
     Ok(())
@@ -431,7 +440,6 @@ const WSS_NON_MUX_RELAY: NonMuxRelaySpec = NonMuxRelaySpec {
     ok_rejection: NonMuxOkRejection::RespondLocal {
         socks5_failure: [5, 1, 0, 1, 0, 0, 0, 0, 0, 0],
     },
-    recycle_downstream_payloads: false,
 };
 
 async fn handle_non_mux_connection(
@@ -466,26 +474,7 @@ async fn handle_non_mux_connection(
 }
 
 pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
-    let upstream = cfg
-        .upstream
-        .clone()
-        .ok_or_else(|| anyhow!("WSS client requires upstream"))?;
-    let wc = WssConfig {
-        proxy_host: cfg.proxy_host,
-        proxy_port: cfg.proxy_port,
-        upstream,
-        key: cfg.key,
-        fakehost: cfg.fakehost,
-        buffer_size: cfg.buffer_size,
-        connection_timeout: cfg.connection_timeout,
-        verify_ssl,
-        tcp_nodelay: cfg.tcp_nodelay,
-        tcp_keepalive: cfg.tcp_keepalive,
-        socket_buffer: cfg.socket_buffer,
-        obfs: cfg.obfs,
-        max_connections: cfg.max_connections,
-        block_local: cfg.block_local,
-    };
+    let wc = WssConfig::from_runtime_config(&cfg, verify_ssl)?;
     let pool = NonMuxPool::new(wc.clone(), Box::new(dial_pooled_wss), "[WSS non-MUX]");
     let maintainer = pool.clone();
     tokio::spawn(async move {
@@ -693,7 +682,7 @@ impl WssSessionState {
     async fn open_stream(
         self: &Arc<Self>,
         target: &TargetAddr,
-        initial_data: Vec<u8>,
+        initial_data: &[u8],
     ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>, Arc<CreditGate>)> {
         if !self.try_reserve() {
             bail!("WSS physical session is full or closed")
@@ -729,26 +718,39 @@ impl WssSessionState {
             streams.insert(stream_id, tx);
             (stream_id, rx, gate)
         };
-        let target_bytes = format!("{}:{}", target.host, target.port).into_bytes();
-        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_bytes.len());
-        let (syn_initial, remaining_initial) = if initial_data.len() > max_syn_initial {
-            (
-                initial_data[..max_syn_initial].to_vec(),
-                &initial_data[max_syn_initial..],
-            )
+        let port_digits = if target.port >= 10000 {
+            5
+        } else if target.port >= 1000 {
+            4
+        } else if target.port >= 100 {
+            3
+        } else if target.port >= 10 {
+            2
         } else {
-            (initial_data, &[][..])
+            1
         };
+        let target_len = target.host.len() + 1 + port_digits;
+        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
+        let (syn_initial, remaining_initial) =
+            initial_data.split_at(initial_data.len().min(max_syn_initial));
 
-        let syn_payload = SynPayload {
-            target: target_bytes,
-            initial_data: syn_initial,
-        }
-        .encode()
-        .map_err(|e| anyhow!(e.to_string()))?;
-        let syn =
-            MuxFrame::new(id, MuxCommand::Syn, syn_payload).map_err(|e| anyhow!(e.to_string()))?;
-        if let Err(error) = send_mux(&self.writer, &self.cipher, &syn, self.obfs).await {
+        let syn_payload = match SynPayload::encode_parts(&target.host, target.port, syn_initial) {
+            Ok(v) => v,
+            Err(e) => {
+                self.close_stream(id).await;
+                return Err(anyhow!(e.to_string()));
+            }
+        };
+        if let Err(error) = send_mux_parts(
+            &self.writer,
+            &self.cipher,
+            id,
+            MuxCommand::Syn,
+            &syn_payload,
+            self.obfs,
+        )
+        .await
+        {
             self.close_stream(id).await;
             return Err(error);
         }
@@ -779,103 +781,114 @@ impl WssSessionState {
         }
     }
 }
-async fn send_mux(
-    writer: &Arc<MuxFrameWriter>,
-    cipher: &XorCipher,
-    frame: &MuxFrame,
-    obfs: bool,
-) -> Result<()> {
-    // Exact sizing happens inside `encode_mux_ws_frame`; start from the
-    // encode pool so the reserve is a no-op on a warm pool.
-    let mut data = crate::mux_writer::acquire_encode_buf();
-    crate::mux_writer::encode_mux_ws_frame(
-        &mut data,
-        frame.stream_id,
-        frame.command,
-        &frame.payload,
-        cipher,
-        true,
-        obfs,
-    )
-    .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send_mux(frame.stream_id, frame.command, data).await
-}
 async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
-    loop {
-        let Some((opcode, mut payload)) =
-            read_frame_owned(rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
-        else {
-            return Ok(());
-        };
-        if opcode != 2 {
-            continue;
-        }
-        session.cipher.apply(&mut payload);
-        let frame = match MuxFrame::decode_owned(payload) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // W3 control frames are session/stream-level: handle them here
-        // instead of routing into per-stream channels (VERSION uses
-        // stream id 0 and would otherwise be dropped silently).
-        match frame.command {
-            MuxCommand::Version => {
-                if let Some((version, kib)) = decode_version_payload(frame.payload()) {
-                    if version >= 1 {
-                        let prev = session.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
-                        if prev == 0 {
-                            let gates = session.gates.lock().unwrap_or_else(|e| e.into_inner());
-                            let window = i64::from(kib) * 1024;
-                            for gate in gates.values() {
-                                gate.enable(window);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
+    let res = async {
+        loop {
+            let Some((opcode, payload)) = read_frame_with_cipher(
+                rd,
+                Option::<&mut BoxWriter>::None,
+                &mut frame_buf,
+                Some(&session.cipher),
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            if opcode != 2 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                continue;
+            }
+            let frame = match MuxFrame::decode_owned(payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // W3 control frames are session/stream-level: handle them here
+            // instead of routing into per-stream channels (VERSION uses
+            // stream id 0 and would otherwise be dropped silently).
+            match frame.command {
+                MuxCommand::Version => {
+                    let decoded = decode_version_payload(frame.payload());
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if let Some((version, kib)) = decoded {
+                        if version >= 1 {
+                            let prev = session.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
+                            if prev == 0 {
+                                let gates = session.gates.lock().unwrap_or_else(|e| e.into_inner());
+                                let window = i64::from(kib) * 1024;
+                                for gate in gates.values() {
+                                    gate.enable(window);
+                                }
                             }
                         }
                     }
+                    continue;
                 }
-                continue;
+                MuxCommand::Window => {
+                    let stream_id = frame.stream_id;
+                    let decoded = decode_window_payload(frame.payload());
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if let Some(credit) = decoded {
+                        if let Some(gate) = session
+                            .gates
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&stream_id)
+                        {
+                            gate.release(i64::from(credit));
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            MuxCommand::Window => {
-                if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(gate) = session.gates.lock().unwrap_or_else(|e| e.into_inner()).get(&frame.stream_id) {
-                        gate.release(i64::from(credit));
+            let id = frame.stream_id;
+            let sender = session
+                .streams
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
+            if let Some(tx) = sender {
+                // Terminal FIN/RST is forwarded; accounting is done once by the
+                // stream owner (see handle_connection cleanup below), mirroring
+                // mux_pool::client_reader_loop.
+                //
+                // Non-blocking, like the other two read loops: one local client
+                // that stops reading must not stall downloads for every other
+                // stream multiplexed on this session.
+                match tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(f)) => {
+                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        tracing::warn!(
+                            stream_id = id,
+                            "mux RST: stream queue full; resetting stalled stream"
+                        );
+                        let _ = send_mux_parts(
+                            &session.writer,
+                            &session.cipher,
+                            id,
+                            MuxCommand::Rst,
+                            &[],
+                            session.obfs,
+                        )
+                        .await;
+                        session.close_stream(id).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(f)) => {
+                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        session.close_stream(id).await;
                     }
                 }
-                continue;
-            }
-            _ => {}
-        }
-        let id = frame.stream_id;
-        let sender = session.streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
-        if let Some(tx) = sender {
-            // Terminal FIN/RST is forwarded; accounting is done once by the
-            // stream owner (see handle_connection cleanup below), mirroring
-            // mux_pool::client_reader_loop.
-            //
-            // Non-blocking, like the other two read loops: one local client
-            // that stops reading must not stall downloads for every other
-            // stream multiplexed on this session.
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
-                    let _ = send_mux_parts(
-                        &session.writer,
-                        &session.cipher,
-                        id,
-                        MuxCommand::Rst,
-                        &[],
-                        session.obfs,
-                    )
-                    .await;
-                    session.close_stream(id).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    session.close_stream(id).await;
-                }
+            } else {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
             }
         }
     }
+    .await;
+    crate::mux_writer::recycle_encode_buf(frame_buf);
+    res
 }
 
 struct WssSessionPool {
@@ -979,7 +992,7 @@ impl WssSessionPool {
                 .collect::<Vec<_>>();
             if let Some((_active, session)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
                 drop(sessions);
-                match session.open_stream(target, initial_data.clone()).await {
+                match session.open_stream(target, &initial_data).await {
                     Ok(opened) => {
                         let current_len = self.sessions.lock().await.len();
                         if current_len < n {
@@ -1033,7 +1046,7 @@ impl WssSessionPool {
                 );
                 e
             })?;
-            let opened = session.open_stream(target, initial_data.clone()).await?;
+            let opened = session.open_stream(target, &initial_data).await?;
             self.sessions.lock().await.push(session.clone());
             self.capacity_notify.notify_waiters();
             return Ok((session, opened.0, opened.1, opened.2));
@@ -1065,34 +1078,47 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     let upload = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         let mut frame_scratch = crate::mux_writer::acquire_encode_buf();
-        loop {
-            let n = local_rd.read(&mut buf).await?;
-            if n == 0 {
-                let _ =
-                    send_mux_parts_reuse(&writer, &cipher, stream_id, MuxCommand::Fin, &[], &mut frame_scratch, obfs).await;
-                break;
+        let res = async {
+            loop {
+                let n = local_rd.read(&mut buf).await?;
+                if n == 0 {
+                    let _ = send_mux_parts_reuse(
+                        &writer,
+                        &cipher,
+                        stream_id,
+                        MuxCommand::Fin,
+                        &[],
+                        &mut frame_scratch,
+                        obfs,
+                    )
+                    .await;
+                    break;
+                }
+                crate::stats::add_bytes(n as i64, 0);
+                let mut off = 0;
+                while off < n {
+                    let end = (off + u16::MAX as usize).min(n);
+                    // W3 upload gate: bounded once the server's VERSION is in.
+                    gate.acquire(end - off).await;
+                    send_mux_parts_reuse(
+                        &writer,
+                        &cipher,
+                        stream_id,
+                        MuxCommand::Data,
+                        &buf[off..end],
+                        &mut frame_scratch,
+                        obfs,
+                    )
+                    .await?;
+                    off = end
+                }
             }
-            crate::stats::add_bytes(n as i64, 0);
-            let mut off = 0;
-            while off < n {
-                let end = (off + u16::MAX as usize).min(n);
-                // W3 upload gate: bounded once the server's VERSION is in.
-                gate.acquire(end - off).await;
-                send_mux_parts_reuse(
-                    &writer,
-                    &cipher,
-                    stream_id,
-                    MuxCommand::Data,
-                    &buf[off..end],
-                    &mut frame_scratch,
-                    obfs,
-                )
-                .await?;
-                off = end
-            }
+            Result::<()>::Ok(())
         }
+        .await;
+        crate::mux_writer::recycle_encode_buf(frame_scratch);
         recycle_buf(buf).await;
-        Result::<()>::Ok(())
+        res
     });
     // W3 receive-side refund accumulator (client -> server WINDOW).
     let mut refund_pending: u32 = 0;
@@ -1187,26 +1213,7 @@ pub async fn run_client_from_config(
     verify_ssl: bool,
     session_count: usize,
 ) -> Result<()> {
-    let upstream = cfg
-        .upstream
-        .clone()
-        .ok_or_else(|| anyhow!("WSS client requires upstream"))?;
-    let wc = WssConfig {
-        proxy_host: cfg.proxy_host,
-        proxy_port: cfg.proxy_port,
-        upstream,
-        key: cfg.key,
-        fakehost: cfg.fakehost,
-        buffer_size: cfg.buffer_size,
-        connection_timeout: cfg.connection_timeout,
-        verify_ssl,
-        tcp_nodelay: cfg.tcp_nodelay,
-        tcp_keepalive: cfg.tcp_keepalive,
-        socket_buffer: cfg.socket_buffer,
-        obfs: cfg.obfs,
-        max_connections: cfg.max_connections,
-        block_local: cfg.block_local,
-    };
+    let wc = WssConfig::from_runtime_config(&cfg, verify_ssl)?;
     let pool = WssSessionPool::new(wc.clone(), session_count);
     let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
     apply_listener_options(&listener);

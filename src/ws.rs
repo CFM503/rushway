@@ -790,25 +790,37 @@ async fn write_frame_parts_vectored<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-// `clippy::uninit_vec` is allowed here: the `reserve` + `set_len` below is
-// intentional — `read_exact` fully initializes `[start, start+chunk)` before
-// any of it is observed, and the buffer is truncated back on error (see the
-// SAFETY comment at the `set_len` site). `resize(.., 0)` was measured ~7% CPU
-// in pprof 2026-09-23, so the zero-fill is deliberately skipped.
-#[allow(clippy::uninit_vec)]
 pub async fn read_frame<R, W>(
     r: &mut R,
-    mut reply: Option<&mut W>,
+    reply: Option<&mut W>,
     buf: &mut Vec<u8>,
 ) -> Result<Option<(u8, Vec<u8>)>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    read_frame_with_cipher(r, reply, buf, None).await
+}
+
+// `clippy::uninit_vec` is allowed here: the `reserve` + `set_len` below is
+// intentional — `read_exact` fully initializes `[start, start+chunk)` before
+// any of it is observed, and the buffer is truncated back on error (see the
+// SAFETY comment at the `set_len` site). `resize(.., 0)` was measured ~7% CPU
+// in pprof 2026-09-23, so the zero-fill is deliberately skipped.
+#[allow(clippy::uninit_vec)]
+pub async fn read_frame_with_cipher<R, W>(
+    r: &mut R,
+    mut reply: Option<&mut W>,
+    buf: &mut Vec<u8>,
+    cipher: Option<&crate::crypto::XorCipher>,
+) -> Result<Option<(u8, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
-        // Header batched into at most 3 reads (was up to 5): the 2-byte
-        // base, then extended-length + mask key in one go. Matters most
-        // for small-frame traffic (tens of thousands of frames/s).
+        // Header batched into at most 2 reads: the 2-byte base, then
+        // extended-length + mask key in one go.
         let mut head = [0u8; 2];
         match r.read(&mut head).await {
             Ok(0) => return Ok(None),
@@ -854,25 +866,27 @@ where
         if masked {
             key.copy_from_slice(&rest[ext_len..ext_len + 4]);
         }
-        // Grow incrementally in 64 KiB segments instead of a single
-        // `resize(len)`: a bogus 64 MB length prefix no longer causes an
-        // instant OOM —the peer must actually send the bytes (and hit the
-        // read timeout) to consume memory.
-        const READ_SEGMENT: usize = 64 * 1024;
+        // Match ENCODE_POOL_MAX_CAP (80 KiB) so a full 64 KiB MUX frame
+        // (65535 + 7 = 65542 bytes, or up to 66942 bytes with obfs) is read
+        // in a single `read_exact` call and never triggers `grow_amortized`
+        // to 128 KiB (which would exceed the pool cap and force reallocs).
+        const READ_SEGMENT: usize = 80 * 1024;
         buf.clear();
         let total = len as usize;
-        // 64 KiB-capped reserve keeps the original guard against a bogus
-        // frame length (Vec::reserve failure = process abort, uncatchable);
-        // an exact whole-frame `reserve(total)` was tried and regressed c32
-        // in paired A/B (allocator churn at high concurrency). Per-chunk
-        // `set_len` instead of `resize(.., 0)` skips the zero-fill that
-        // `read_exact` immediately overwrites (~7% CPU in pprof 2026-09-23).
-        buf.reserve(total.min(READ_SEGMENT));
+        if total > buf.capacity() {
+            if total > 4096 && total <= READ_SEGMENT {
+                buf.reserve_exact(READ_SEGMENT);
+            } else {
+                buf.reserve(total.min(READ_SEGMENT));
+            }
+        }
         let mut read: usize = 0;
         while read < total {
             let chunk = (total - read).min(READ_SEGMENT);
             let start = buf.len();
-            buf.reserve(chunk);
+            if buf.capacity() - start < chunk {
+                buf.reserve(chunk);
+            }
             // SAFETY: `set_len` exposes `[start, start+chunk)`, which the
             // `read_exact` below fully initializes before any of it is
             // observed; on error we `truncate` back to `start` first.
@@ -883,17 +897,29 @@ where
             }
             read += chunk;
         }
-        if masked {
-            apply_ws_mask(buf, key);
-        }
         match opcode {
             1 | 2 => {
+                match (masked, cipher) {
+                    (true, Some(c)) if c.is_enabled() => {
+                        crate::crypto::apply_fused_xor(buf, c.keystream(), key);
+                    }
+                    (true, _) => {
+                        apply_ws_mask(buf, key);
+                    }
+                    (false, Some(c)) => {
+                        c.apply(buf);
+                    }
+                    (false, None) => {}
+                }
                 let owned = std::mem::take(buf);
                 *buf = crate::mux_writer::acquire_encode_buf();
                 return Ok(Some((opcode, owned)));
             }
             8 => return Ok(None),
             9 => {
+                if masked {
+                    apply_ws_mask(buf, key);
+                }
                 if let Some(w) = reply.as_deref_mut() {
                     write_frame(w, buf, 0xA, !masked).await?;
                 }
@@ -904,18 +930,6 @@ where
             _ => return Err(anyhow!("reserved websocket opcode {}", opcode)),
         }
     }
-}
-
-pub async fn read_frame_owned<R, W>(
-    r: &mut R,
-    reply: Option<&mut W>,
-    buf: &mut Vec<u8>,
-) -> Result<Option<(u8, Vec<u8>)>>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    read_frame(r, reply, buf).await
 }
 
 #[cfg(test)]
@@ -1122,7 +1136,7 @@ mod tests {
         let data = vec![23u8; 70000];
         let writer = tokio::spawn(async move { write_frame(&mut a, &data, 2, false).await });
         let mut buf = Vec::with_capacity(70000);
-        let (opcode, owned) = read_frame_owned(
+        let (opcode, owned) = read_frame(
             &mut b,
             Option::<&mut tokio::io::DuplexStream>::None,
             &mut buf,

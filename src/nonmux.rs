@@ -10,14 +10,14 @@ use crate::proxy::{
     ClientProxyRequest, SocksCommand,
 };
 use crate::runtime::{
-    drain_join_set, enforce_target_policy, recycle_buf, relay_buf, resolve_target, wait_shutdown,
-    RuntimeConfig,
+    apply_socket_options, drain_join_set, enforce_target_policy, recycle_buf, relay_buf,
+    resolve_target, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
-    build_client_handshake_request, build_server_handshake_response, read_frame, read_http_headers,
-    validate_client_handshake_response, validate_server_handshake, write_frame,
-    write_frame_borrowed,
+    build_client_handshake_request, build_server_handshake_response, read_frame,
+    read_frame_with_cipher, read_http_headers, validate_client_handshake_response,
+    validate_server_handshake, write_frame, write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Result};
 use std::future::Future;
@@ -67,14 +67,6 @@ async fn connect_ws_with_fallback(
         bail!("primary {primary} unreachable and all Cloudflare fallback edges failed for fakehost: {sni}");
     }
     Err(failed)
-}
-fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
-    crate::runtime::apply_socket_options_raw(
-        stream,
-        cfg.tcp_nodelay,
-        cfg.socket_buffer,
-        cfg.tcp_keepalive,
-    );
 }
 
 async fn open_upstream(
@@ -141,7 +133,6 @@ const PLAIN_NON_MUX_RELAY: NonMuxRelaySpec = NonMuxRelaySpec {
     closed_error: "upstream closed before non-MUX OK",
     bad_opcode_error: "invalid non-MUX handshake opcode",
     ok_rejection: NonMuxOkRejection::Propagate("upstream rejected non-MUX target"),
-    recycle_downstream_payloads: true,
 };
 
 async fn relay_client(
@@ -291,40 +282,78 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let key = validate_server_handshake(&request)?;
     wr.write_all(&build_server_handshake_response(&key)).await?;
     wr.flush().await?;
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
-    let Some((opcode, mut target_frame)) = read_frame(
+    let c = configured_cipher(&cfg.key);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
+    let Some((opcode, target_frame)) = read_frame_with_cipher(
         &mut rd,
         Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
         &mut frame_buf,
+        Some(&c),
     )
     .await?
     else {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("missing non-MUX target")
     };
     if opcode != 2 {
+        crate::mux_writer::recycle_encode_buf(target_frame);
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("invalid non-MUX target opcode")
     };
-    let c = configured_cipher(&cfg.key);
-    c.apply(&mut target_frame);
-    let target = String::from_utf8(target_frame)
-        .map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?
-        .trim()
-        .to_string();
-    let target_addr = parse_target_authority(&target).map_err(|e| anyhow!(e.to_string()))?;
+    let target_addr = match std::str::from_utf8(&target_frame) {
+        Ok(text) => match parse_target_authority(text.trim()) {
+            Ok(addr) => addr,
+            Err(e) => {
+                crate::mux_writer::recycle_encode_buf(target_frame);
+                crate::mux_writer::recycle_encode_buf(frame_buf);
+                return Err(anyhow!(e.to_string()));
+            }
+        },
+        Err(_) => {
+            crate::mux_writer::recycle_encode_buf(target_frame);
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            bail!("invalid non-MUX target UTF-8")
+        }
+    };
+    crate::mux_writer::recycle_encode_buf(target_frame);
     // Server-side non-MUX had no target policy at all: `-block-local`
     // defaulted to true yet any authenticated peer could make this process
     // dial loopback / RFC1918 / link-local addresses.
-    enforce_target_policy(&cfg, &target_addr)?;
-    let resolved = resolve_target(cfg.block_local, &target_addr.host, target_addr.port).await?;
-    let target_stream = timeout(
+    if let Err(e) = enforce_target_policy(&cfg, &target_addr) {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
+        return Err(e);
+    }
+    let resolved = match resolve_target(cfg.block_local, &target_addr.host, target_addr.port).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            return Err(e);
+        }
+    };
+    let target_stream = match timeout(
         Duration::from_secs(cfg.connection_timeout.max(1)),
         TcpStream::connect(resolved),
     )
-    .await??;
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            return Err(e.into());
+        }
+        Err(e) => {
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            return Err(e.into());
+        }
+    };
     apply_socket_options(&target_stream, &cfg);
     let mut ok = b"OK\n".to_vec();
     c.apply(&mut ok);
-    write_frame(&mut wr, &ok, 2, false).await?;
+    if let Err(e) = write_frame(&mut wr, &ok, 2, false).await {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
+        return Err(e.into());
+    }
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
@@ -341,39 +370,44 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
-    loop {
-        tokio::select! {
-            _ = &mut download => {
-                break;
-            }
-            res = read_frame(
-                &mut rd,
-                Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
-                &mut frame_buf,
-            ) => {
-                let Some((opcode, payload)) = res? else {
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = &mut download => {
                     break;
-                };
-                if opcode == 8 {
+                }
+                res = read_frame(
+                    &mut rd,
+                    Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
+                    &mut frame_buf,
+                ) => {
+                    let Some((opcode, payload)) = res? else {
+                        break;
+                    };
+                    if opcode == 8 {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        break;
+                    }
+                    if opcode != 2 {
+                        crate::mux_writer::recycle_encode_buf(payload);
+                        continue;
+                    }
+                    // Non-MUX data frames are plaintext per GoWay server.
+                    let len = payload.len();
+                    let write_res = target_wr.write_all(&payload).await;
                     crate::mux_writer::recycle_encode_buf(payload);
-                    break;
+                    if write_res.is_err() {
+                        break;
+                    }
+                    crate::stats::add_bytes(len as i64, 0);
                 }
-                if opcode != 2 {
-                    crate::mux_writer::recycle_encode_buf(payload);
-                    continue;
-                }
-                // Non-MUX data frames are plaintext per GoWay server.
-                let len = payload.len();
-                let write_res = target_wr.write_all(&payload).await;
-                crate::mux_writer::recycle_encode_buf(payload);
-                if write_res.is_err() {
-                    break;
-                }
-                crate::stats::add_bytes(len as i64, 0);
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     let _ = target_wr.shutdown().await;
     download.abort();
-    Ok(())
+    result
 }

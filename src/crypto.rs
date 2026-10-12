@@ -29,7 +29,7 @@ impl XorCipher {
         Self { key: expanded.into() }
     }
 
-    #[allow(dead_code)]
+    #[inline]
     pub fn is_enabled(&self) -> bool {
         !self.key.is_empty()
     }
@@ -283,21 +283,29 @@ pub(crate) fn apply_fused_xor(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
         "fused XOR requires ks.len() % 4 == 0, got {}",
         ks.len()
     );
-    for chunk in region.chunks_mut(ks.len()) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if has_avx2() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            for chunk in region.chunks_mut(ks.len()) {
                 unsafe { apply_fused_xor_avx2(chunk, ks, key) };
-            } else {
+            }
+        } else {
+            for chunk in region.chunks_mut(ks.len()) {
                 unsafe { apply_fused_xor_sse2(chunk, ks, key) };
             }
         }
-        #[cfg(target_arch = "aarch64")]
-        {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for chunk in region.chunks_mut(ks.len()) {
             unsafe { apply_fused_xor_neon(chunk, ks, key) };
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
+        return;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        for chunk in region.chunks_mut(ks.len()) {
             apply_fused_xor_fallback(chunk, ks, key);
         }
     }

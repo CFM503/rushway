@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.41] - 2026-10-12
+
+### Performance & Forwarding Speed Breakthroughs
+
+- **Direct zero-loopback TLS/WSS server dispatch** (`main.rs`, `runtime.rs`) — eliminated the internal loopback TCP listener, redundant second WebSocket handshake, and bidirectional socket copy in `run_wss_server`. TLS connections now dispatch directly into `runtime::dispatch_server_ws_parts` via generic `AsyncRead`/`AsyncWrite` streams, cutting per-connection memory, file descriptors, and context switches in half.
+- **Single-syscall `80 KiB` WebSocket frame read and 100% `ENCODE_POOL` retention** (`ws.rs`, `mux_writer.rs`) — raised `READ_SEGMENT` from `64 KiB` to `80 KiB` with `reserve_exact(READ_SEGMENT)` so full-size MUX `Data` frames (`65,542` bytes, or up to `66,942` bytes with `-obfs`) complete in a single `read_exact` call and retain capacity `<= 80 KiB`, fixing the `Vec` capacity doubling to `128 KiB` that previously caused every full-size ingress buffer to be rejected by `recycle_encode_buf`.
+- **Single-pass SIMD fused WebSocket unmasking + XOR cipher decryption** (`ws.rs`, `crypto.rs`) — replaced two-pass memory traversal (`apply_ws_mask` followed by `cipher.apply`) across `runtime.rs`, `mux_pool.rs`, `wss_client.rs`, `udp_relay.rs`, and `common.rs` with `read_frame_with_cipher` (`apply_fused_xor`), and hoisted the `has_avx2()` atomic check outside the inner `chunks_mut` loop.
+- **Lock-free `AtomicU64` per-stream flow control (`CreditGate`)** (`flow.rs`) — replaced `std::sync::Mutex<GateState>` in `CreditGate` with a single lock-free `AtomicU64` packing `(window: u32, available: u32)`, eliminating mutex lock/unlock overhead on every `Data` frame send and `Window` update.
+- **Cache-line aligned (`#[repr(align(64))]`) `ENCODE_POOL` shards with atomic fast-skip and zero-syscall `-obfs` PRNG** (`mux_writer.rs`) — eliminated false sharing across the 16 buffer pool shards, added an `AtomicUsize` length pre-check to skip empty/full shards without locking, and replaced `rand::thread_rng().fill_bytes` with the thread-local xorshift64 PRNG (`next_mask()`) for `-obfs` random padding.
+- **Zero-copy `SYN` payload encoding and slice decoding** (`protocol.rs`, `runtime.rs`, `mux_pool.rs`, `wss_client.rs`) — added `SynPayload::encode_parts` to serialize directly into a single pooled buffer without intermediate `Vec<u8>` allocations, and `SynPayload::decode_slices` to parse `SYN` targets as borrowed `&str` slices on the server.
+- **100% control-frame and non-MUX buffer recycling** (`runtime.rs`, `mux_pool.rs`, `wss_client.rs`, `udp_relay.rs`, `common.rs`) — recycled all non-`Data` control frame buffers (`Window`, `Fin`, `Rst`, `Syn`, `UdpAssoc`, `Ping`, `Pong`) and non-MUX relay buffers back into `ENCODE_POOL`.
+
+### Codebase & Repository Cleanup
+
+- **Deduplicated UDP proxy and WSS configuration helpers** (`mux_pool.rs`, `udp_relay.rs`, `nonmux.rs`, `wss_client.rs`) — unified duplicate SOCKS5 UDP associate loops into `udp_relay::handle_local_udp_proxy` and consolidated `WssConfig::from_runtime_config`.
+- **Removed dead code** (`runtime.rs`, `ws.rs`, `wss_client.rs`, `crypto.rs`) — removed unused `server_stream_task`, `send_frame_encrypted`, `transform_payload`, `read_frame_owned`, and `send_mux`, and gated `probe_wss_handshake` under `#[cfg(test)]`.
+- **Repository hygiene** (`.gitignore`) — cleaned up obsolete benchmark logs, temporary directories (`tmp/`, `.zcode/`, `bench/`), retired one-off scripts in `scripts/`, and outdated archive documents.
+
 ## [v0.0.40] - 2026-10-11
 
 ### Fixed

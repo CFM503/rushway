@@ -279,9 +279,8 @@ pub(crate) enum NonMuxOkRejection {
     RespondLocal { socks5_failure: [u8; 10] },
 }
 
-/// Call-site specifics of [`relay_non_mux_ws`]: error texts plus the two
-/// behaviors that are not identical between the plain-WS and WSS relays
-/// (rejection handling and downstream payload recycling).
+/// Call-site specifics of [`relay_non_mux_ws`]: error texts plus the
+/// rejection handling that differs between the plain-WS and WSS relays.
 pub(crate) struct NonMuxRelaySpec {
     /// Error when the upstream closes before answering the target frame.
     pub(crate) closed_error: &'static str,
@@ -289,9 +288,6 @@ pub(crate) struct NonMuxRelaySpec {
     pub(crate) bad_opcode_error: &'static str,
     /// Reaction to an upstream rejection of the target frame.
     pub(crate) ok_rejection: NonMuxOkRejection,
-    /// Whether downstream payloads are returned to the encode pool after the
-    /// local write (plain-WS recycles them; WSS drops them).
-    pub(crate) recycle_downstream_payloads: bool,
 }
 
 /// Shared non-MUX client relay: XOR-encrypted target hello and OK handshake
@@ -316,16 +312,22 @@ where
     let mut hello = format!("{}:{}\n", target.host, target.port).into_bytes();
     c.apply(&mut hello);
     write_frame(&mut wr, &hello, 2, true).await?;
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let Some((opcode, mut ok)) = read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf).await?
     else {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!(spec.closed_error)
     };
     if opcode != 2 {
+        crate::mux_writer::recycle_encode_buf(ok);
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!(spec.bad_opcode_error)
     };
     c.apply(&mut ok);
-    if ok != b"OK\n" {
+    let is_ok = ok == b"OK\n";
+    crate::mux_writer::recycle_encode_buf(ok);
+    if !is_ok {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         match spec.ok_rejection {
             NonMuxOkRejection::Propagate(error) => bail!(error),
             NonMuxOkRejection::RespondLocal { socks5_failure } => {
@@ -377,30 +379,25 @@ where
                         // Non-MUX data frames are plaintext per GoWay server.
                         let len = payload.len();
                         let write_res = local_wr.write_all(&payload).await;
-                        if spec.recycle_downstream_payloads {
-                            crate::mux_writer::recycle_encode_buf(payload);
-                        }
+                        crate::mux_writer::recycle_encode_buf(payload);
                         if write_res.is_err() {
                             break;
                         }
                         crate::stats::add_bytes(0, len as i64);
                     }
                     8 => {
-                        if spec.recycle_downstream_payloads {
-                            crate::mux_writer::recycle_encode_buf(payload);
-                        }
+                        crate::mux_writer::recycle_encode_buf(payload);
                         break;
                     }
                     _ => {
-                        if spec.recycle_downstream_payloads {
-                            crate::mux_writer::recycle_encode_buf(payload);
-                        }
+                        crate::mux_writer::recycle_encode_buf(payload);
                     }
                 }
             }
             Result::<()>::Ok(())
         } => {}
     }
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     upload.abort();
     Ok(())
 }

@@ -5,7 +5,7 @@
 
 use crate::common::{
     configured_cipher, parse_ws_url_with_port, send_mux_parts, send_mux_parts_reuse,
-    socks5_udp_associate_reply, try_cloudflare_edges, HTTP_200_CONNECTION_ESTABLISHED,
+    try_cloudflare_edges, HTTP_200_CONNECTION_ESTABLISHED,
 };
 use crate::crypto::XorCipher;
 use crate::dns;
@@ -16,27 +16,26 @@ use crate::protocol::{
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
 };
 use crate::proxy::{
-    parse_authority_with_default, parse_socks5_udp_datagram, read_client_proxy_request,
-    socks5_success_response, SocksCommand, TargetAddr,
+    parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
+    TargetAddr,
 };
 use crate::runtime::{
-    apply_listener_options, apply_socket_options, check_target_policy, drain_join_set,
-    enforce_target_policy, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, drain_join_set, enforce_target_policy,
+    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
-use crate::udp_batch::UdpBatchReader;
+use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
-    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_owned,
-    read_http_headers, validate_client_handshake_response, write_frame,
+    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_with_cipher,
+    read_http_headers, validate_client_handshake_response,
 };
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 
@@ -253,29 +252,30 @@ impl SessionState {
     async fn open_stream(
         self: &Arc<Self>,
         target: &TargetAddr,
-        initial_data: Vec<u8>,
+        initial_data: &[u8],
     ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>, Arc<CreditGate>)> {
         if self.closed.load(Ordering::Acquire) {
             bail!("MUX session is closed")
         }
 
-        let target_bytes = format!("{}:{}", target.host, target.port).into_bytes();
-        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_bytes.len());
-        let (syn_initial, remaining_initial) = if initial_data.len() > max_syn_initial {
-            (
-                initial_data[..max_syn_initial].to_vec(),
-                &initial_data[max_syn_initial..],
-            )
+        let port_digits = if target.port >= 10000 {
+            5
+        } else if target.port >= 1000 {
+            4
+        } else if target.port >= 100 {
+            3
+        } else if target.port >= 10 {
+            2
         } else {
-            (initial_data, &[][..])
+            1
         };
+        let target_len = target.host.len() + 1 + port_digits;
+        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
+        let (syn_initial, remaining_initial) =
+            initial_data.split_at(initial_data.len().min(max_syn_initial));
 
-        let syn_payload = SynPayload {
-            target: target_bytes,
-            initial_data: syn_initial,
-        }
-        .encode()
-        .map_err(|e| anyhow!(e.to_string()))?;
+        let syn_payload = SynPayload::encode_parts(&target.host, target.port, syn_initial)
+            .map_err(|e| anyhow!(e.to_string()))?;
 
         let (id, rx, gate) = {
             let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
@@ -377,85 +377,113 @@ impl SessionState {
     }
 }
 async fn client_reader_loop(mut rd: ReadHalf<TcpStream>, state: Arc<SessionState>) -> Result<()> {
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
-    loop {
-        let Some((opcode, mut payload)) = read_frame_owned(
-            &mut rd,
-            Option::<&mut WriteHalf<TcpStream>>::None,
-            &mut frame_buf,
-        )
-        .await?
-        else {
-            break;
-        };
-        if opcode != 2 {
-            continue;
-        }
-        state.cipher.apply(&mut payload);
-        let frame = match MuxFrame::decode_owned(payload) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // W3 control frames are session/stream-level: handle them here
-        // instead of routing into per-stream channels (VERSION uses
-        // stream id 0 and would otherwise be dropped silently).
-        match frame.command {
-            MuxCommand::Version => {
-                if let Some((version, kib)) = decode_version_payload(frame.payload()) {
-                    if version >= 1 {
-                        let prev = state.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
-                        if prev == 0 {
-                            let gates = state.gates.lock().unwrap_or_else(|e| e.into_inner());
-                            let window = i64::from(kib) * 1024;
-                            for gate in gates.values() {
-                                gate.enable(window);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
+    let res = async {
+        loop {
+            let Some((opcode, payload)) = read_frame_with_cipher(
+                &mut rd,
+                Option::<&mut WriteHalf<TcpStream>>::None,
+                &mut frame_buf,
+                Some(&state.cipher),
+            )
+            .await?
+            else {
+                break;
+            };
+            if opcode != 2 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                continue;
+            }
+            let frame = match MuxFrame::decode_owned(payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // W3 control frames are session/stream-level: handle them here
+            // instead of routing into per-stream channels (VERSION uses
+            // stream id 0 and would otherwise be dropped silently).
+            match frame.command {
+                MuxCommand::Version => {
+                    let decoded = decode_version_payload(frame.payload());
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if let Some((version, kib)) = decoded {
+                        if version >= 1 {
+                            let prev = state.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
+                            if prev == 0 {
+                                let gates = state.gates.lock().unwrap_or_else(|e| e.into_inner());
+                                let window = i64::from(kib) * 1024;
+                                for gate in gates.values() {
+                                    gate.enable(window);
+                                }
+                                tracing::debug!(kib, "peer VERSION received; send window enabled");
                             }
-                            tracing::debug!(kib, "peer VERSION received; send window enabled");
                         }
                     }
+                    continue;
                 }
-                continue;
+                MuxCommand::Window => {
+                    let stream_id = frame.stream_id;
+                    let decoded = decode_window_payload(frame.payload());
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if let Some(credit) = decoded {
+                        if let Some(gate) = state
+                            .gates
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&stream_id)
+                        {
+                            gate.release(i64::from(credit));
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            MuxCommand::Window => {
-                if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(gate) = state.gates.lock().unwrap_or_else(|e| e.into_inner()).get(&frame.stream_id) {
-                        gate.release(i64::from(credit));
+            let id = frame.stream_id;
+            let tx = state
+                .streams
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
+            if let Some(tx) = tx {
+                // Same non-blocking rule as the server read loop: a local client
+                // that stops reading must not stall downloads for every other
+                // stream on this session. `close_stream` also drops the
+                // per-stream credit gate, which the previous inline teardown
+                // forgot — leaking one `state.gates` entry per closed stream.
+                match tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(f)) => {
+                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        tracing::warn!(
+                            stream_id = id,
+                            "mux RST: stream queue full; resetting stalled stream"
+                        );
+                        let _ = send_mux_parts(
+                            &state.writer,
+                            &state.cipher,
+                            id,
+                            MuxCommand::Rst,
+                            &[],
+                            state.obfs,
+                        )
+                        .await;
+                        state.close_stream(id).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(f)) => {
+                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        state.close_stream(id).await;
                     }
                 }
-                continue;
-            }
-            _ => {}
-        }
-        let id = frame.stream_id;
-        let tx = state.streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
-        if let Some(tx) = tx {
-            // Same non-blocking rule as the server read loop: a local client
-            // that stops reading must not stall downloads for every other
-            // stream on this session. `close_stream` also drops the
-            // per-stream credit gate, which the previous inline teardown
-            // forgot — leaking one `state.gates` entry per closed stream.
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
-                    let _ = send_mux_parts(
-                        &state.writer,
-                        &state.cipher,
-                        id,
-                        MuxCommand::Rst,
-                        &[],
-                        state.obfs,
-                    )
-                    .await;
-                    state.close_stream(id).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    state.close_stream(id).await;
-                }
+            } else {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
-    Ok(())
+    .await;
+    crate::mux_writer::recycle_encode_buf(frame_buf);
+    res
 }
 struct MuxSessionPool {
     cfg: RuntimeConfig,
@@ -539,7 +567,7 @@ impl MuxSessionPool {
                 .collect::<Vec<_>>();
             if let Some((_active, s)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
                 drop(sessions);
-                match s.open_stream(target, initial_data.clone()).await {
+                match s.open_stream(target, &initial_data).await {
                     Ok(r) => {
                         let current_len = self.sessions.lock().await.len();
                         if current_len < n {
@@ -575,159 +603,12 @@ impl MuxSessionPool {
             drop(sessions);
 
             let s = SessionState::connect(&self.cfg, self.capacity_notify.clone()).await?;
-            let r = s.open_stream(target, initial_data.clone()).await?;
+            let r = s.open_stream(target, &initial_data).await?;
             self.sessions.lock().await.push(s.clone());
             self.capacity_notify.notify_waiters();
             return Ok((s, r.0, r.1, r.2));
         }
     }
-}
-
-async fn handle_udp_proxy(
-    mut control: TcpStream,
-    cfg: RuntimeConfig,
-    bind_hint: TargetAddr,
-) -> Result<()> {
-    let _ = enforce_target_policy(&cfg, &bind_hint);
-    let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host.is_empty() {
-        "0.0.0.0"
-    } else {
-        bind_hint.host.as_str()
-    };
-    let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
-    let bound = udp.local_addr()?;
-    let resp = socks5_udp_associate_reply(bound);
-    control.write_all(&resp).await?;
-    let upstream = cfg
-        .upstream
-        .clone()
-        .ok_or_else(|| anyhow!("client mode requires upstream"))?;
-    let (authority, path) = parse_upstream(&upstream)?;
-    let actual_host = cfg.fakehost.clone().unwrap_or_else(|| authority.clone());
-    let target =
-        parse_authority_with_default(&authority, 80).map_err(|e| anyhow!(e.to_string()))?;
-    let socket = connect_with_fallback(&cfg, &target.host, target.port).await?;
-    apply_socket_options(&socket, &cfg);
-    let (mut rd, mut wr) = tokio::io::split(socket);
-    let sni_base = cfg
-        .fakehost
-        .as_deref()
-        .map(|s| s.split(':').next().unwrap_or(s))
-        .unwrap_or(&target.host);
-    let header_base = actual_host.split(':').next().unwrap_or(&actual_host);
-    let origin = Some(format!("http://{}", sni_base));
-    let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
-        "same-origin"
-    } else {
-        "cross-site"
-    };
-    let (request, key) = build_client_handshake_request(
-        &actual_host,
-        &path,
-        origin.as_deref(),
-        Some(sec_fetch_site),
-    );
-    wr.write_all(&request).await?;
-    wr.flush().await?;
-    let response = read_http_headers(&mut rd).await?;
-    validate_client_handshake_response(&response, &key)?;
-    let writer = Arc::new(Mutex::new(wr));
-    let cipher = configured_cipher(&cfg.key);
-    let mut hello = b"UDP\n".to_vec();
-    cipher.apply(&mut hello);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &hello, 2, true).await?
-    };
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
-    let Some((opcode, mut ok)) = read_frame(
-        &mut rd,
-        Option::<&mut WriteHalf<TcpStream>>::None,
-        &mut frame_buf,
-    )
-    .await?
-    else {
-        bail!("upstream closed during UDP handshake")
-    };
-    if opcode != 2 {
-        bail!("invalid UDP handshake response opcode")
-    };
-    cipher.apply(&mut ok);
-    if ok != b"OK\n" {
-        bail!("upstream rejected UDP handshake")
-    };
-    let latest = Arc::new(StdMutex::new(None::<SocketAddr>));
-    let block_local = cfg.block_local;
-    let udp_send = udp.clone();
-    let writer_send = writer.clone();
-    let c_send = cipher.clone();
-    let latest_send = latest.clone();
-    let upload = tokio::spawn(async move {
-        let mut batch = UdpBatchReader::new(udp_send);
-        loop {
-            let count = match batch.recv().await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            for i in 0..count {
-                let (pkt, peer) = batch.packet(i);
-                // The local leg is a plaintext SOCKS5 UDP request (the XOR
-                // below happens on the way out), so the destination is still
-                // readable here; enforce `-block-local` per datagram like the
-                // WSS client does.
-                if let Ok((target, _)) = parse_socks5_udp_datagram(pkt) {
-                    if let Err(e) = check_target_policy(block_local, &target) {
-                        tracing::debug!(error = %e, "WS UDP datagram dropped by target policy");
-                        continue;
-                    }
-                }
-                *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
-                let mut data = crate::mux_writer::acquire_encode_buf();
-                data.extend_from_slice(pkt);
-                c_send.apply(&mut data);
-                crate::stats::add_bytes(data.len() as i64, 0);
-                let mut w = writer_send.lock().await;
-                let res = write_frame(&mut *w, &data, 2, true).await;
-                crate::mux_writer::recycle_encode_buf(data);
-                if res.is_err() {
-                    return Ok::<(), anyhow::Error>(());
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-    let mut dummy = [0u8; 1];
-    tokio::select! {
-        _ = control.read(&mut dummy) => {}
-        _ = async {
-            loop {
-                let Some((opcode, mut packet)) = read_frame(
-                    &mut rd,
-                    Option::<&mut WriteHalf<TcpStream>>::None,
-                    &mut frame_buf,
-                )
-                .await?
-                else {
-                    break;
-                };
-                if opcode != 2 {
-                    continue;
-                }
-                cipher.apply(&mut packet);
-                // Copy the peer out first: a std Mutex guard must never be
-                // held across the await below.
-                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(peer) = peer_opt {
-                    let _ = udp.send_to(&packet, peer).await;
-                    crate::stats::add_bytes(0, packet.len() as i64);
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        } => {}
-    }
-    upload.abort();
-    let _ = control.shutdown().await;
-    Ok(())
 }
 
 async fn handle_tcp_proxy(
@@ -737,7 +618,7 @@ async fn handle_tcp_proxy(
 ) -> Result<()> {
     let req = read_client_proxy_request(&mut local).await?;
     if req.command == SocksCommand::UdpAssociate {
-        return handle_udp_proxy(local, cfg, req.target).await;
+        return handle_local_udp_proxy(local, cfg, req.target).await;
     }
     if req.command != SocksCommand::Connect {
         bail!("MUX client supports CONNECT or UDP ASSOCIATE only")
@@ -758,42 +639,47 @@ async fn handle_tcp_proxy(
         // Local first-frame scratch; after each `mem::take` the next
         // buffer comes from the writer-side encode pool (capacity reused).
         let mut frame_scratch = crate::mux_writer::acquire_encode_buf();
-        loop {
-            let n = local_rd.read(&mut buf).await?;
-            if n == 0 {
-                let _ = send_mux_parts_reuse(
-                    &writer,
-                    &cipher,
-                    id,
-                    MuxCommand::Fin,
-                    &[],
-                    &mut frame_scratch,
-                    obfs,
-                )
-                .await;
-                break;
+        let res = async {
+            loop {
+                let n = local_rd.read(&mut buf).await?;
+                if n == 0 {
+                    let _ = send_mux_parts_reuse(
+                        &writer,
+                        &cipher,
+                        id,
+                        MuxCommand::Fin,
+                        &[],
+                        &mut frame_scratch,
+                        obfs,
+                    )
+                    .await;
+                    break;
+                }
+                crate::stats::add_bytes(n as i64, 0);
+                let mut off = 0;
+                while off < n {
+                    let end = (off + u16::MAX as usize).min(n);
+                    // W3 upload gate: bounded once the server's VERSION is in.
+                    gate.acquire(end - off).await;
+                    send_mux_parts_reuse(
+                        &writer,
+                        &cipher,
+                        id,
+                        MuxCommand::Data,
+                        &buf[off..end],
+                        &mut frame_scratch,
+                        obfs,
+                    )
+                    .await?;
+                    off = end
+                }
             }
-            crate::stats::add_bytes(n as i64, 0);
-            let mut off = 0;
-            while off < n {
-                let end = (off + u16::MAX as usize).min(n);
-                // W3 upload gate: bounded once the server's VERSION is in.
-                gate.acquire(end - off).await;
-                send_mux_parts_reuse(
-                    &writer,
-                    &cipher,
-                    id,
-                    MuxCommand::Data,
-                    &buf[off..end],
-                    &mut frame_scratch,
-                    obfs,
-                )
-                .await?;
-                off = end
-            }
+            Result::<()>::Ok(())
         }
+        .await;
+        crate::mux_writer::recycle_encode_buf(frame_scratch);
         recycle_buf(buf).await;
-        Result::<()>::Ok(())
+        res
     });
     let mut result = Result::<()>::Ok(());
     let mut remote_fin = false;

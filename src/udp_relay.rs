@@ -3,10 +3,12 @@ use crate::common::{
 };
 use crate::dns;
 use crate::proxy::{parse_authority_with_default, parse_socks5_udp_datagram, TargetAddr};
-use crate::runtime::{apply_socket_options, enforce_target_policy, RuntimeConfig};
+use crate::runtime::{
+    apply_socket_options, check_target_policy, enforce_target_policy, RuntimeConfig,
+};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
-    build_client_handshake_request, read_frame, read_http_headers,
+    build_client_handshake_request, read_frame, read_frame_with_cipher, read_http_headers,
     validate_client_handshake_response, write_frame,
 };
 use anyhow::{anyhow, bail, Result};
@@ -21,6 +23,7 @@ pub async fn handle_local_udp_proxy(
     cfg: RuntimeConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
+    let _ = enforce_target_policy(&cfg, &bind_hint);
     let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host.is_empty() {
         "0.0.0.0"
     } else {
@@ -92,7 +95,7 @@ pub async fn handle_local_udp_proxy(
     let mut hello = b"UDP\n".to_vec();
     c.apply(&mut hello);
     write_frame(&mut wr, &hello, 2, true).await?;
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let Some((opcode, mut ok)) = read_frame(
         &mut rd,
         Option::<&mut WriteHalf<TcpStream>>::None,
@@ -100,19 +103,23 @@ pub async fn handle_local_udp_proxy(
     )
     .await?
     else {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("upstream closed during UDP handshake")
     };
     if opcode != 2 {
         crate::mux_writer::recycle_encode_buf(ok);
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("invalid UDP handshake response opcode")
     }
     c.apply(&mut ok);
     if ok != b"OK\n" {
         crate::mux_writer::recycle_encode_buf(ok);
+        crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("upstream rejected UDP handshake")
     }
     crate::mux_writer::recycle_encode_buf(ok);
     let latest = Arc::new(StdMutex::new(None::<SocketAddr>));
+    let block_local = cfg.block_local;
     let udp_send = udp.clone();
     let c_send = c.clone();
     let latest_send = latest.clone();
@@ -125,6 +132,12 @@ pub async fn handle_local_udp_proxy(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
+                if let Ok((target, _)) = parse_socks5_udp_datagram(pkt) {
+                    if let Err(e) = check_target_policy(block_local, &target) {
+                        tracing::debug!(error = %e, "WS UDP datagram dropped by target policy");
+                        continue;
+                    }
+                }
                 *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 let mut packet = crate::mux_writer::acquire_encode_buf();
                 packet.extend_from_slice(pkt);
@@ -145,10 +158,11 @@ pub async fn handle_local_udp_proxy(
         _ = control.read(&mut dummy) => {}
         _ = async {
             loop {
-                let Some((opcode, mut packet)) = read_frame(
+                let Some((opcode, packet)) = read_frame_with_cipher(
                     &mut rd,
                     Option::<&mut WriteHalf<TcpStream>>::None,
                     &mut frame_buf,
+                    Some(&c),
                 )
                 .await?
                 else {
@@ -158,7 +172,6 @@ pub async fn handle_local_udp_proxy(
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                c.apply(&mut packet);
                 let (target, _payload) = match parse_socks5_udp_datagram(&packet) {
                     Ok(res) => res,
                     Err(e) => {
@@ -182,6 +195,7 @@ pub async fn handle_local_udp_proxy(
             Ok::<(), anyhow::Error>(())
         } => {}
     }
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     upload.abort();
     let _ = control.shutdown().await;
     Ok(())

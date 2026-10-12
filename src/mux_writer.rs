@@ -66,7 +66,13 @@ const DRR_QUANTUM: usize = 128 * 1024;
 /// Cap accumulated credit so a long-idle stream cannot hog the link.
 const DRR_MAX_DEFICIT: usize = 512 * 1024;
 
-static ENCODE_POOL: OnceLock<Vec<StdMutex<Vec<Vec<u8>>>>> = OnceLock::new();
+#[repr(align(64))]
+struct PoolShard {
+    len: AtomicUsize,
+    bufs: StdMutex<Vec<Vec<u8>>>,
+}
+
+static ENCODE_POOL: OnceLock<[PoolShard; ENCODE_POOL_SHARDS]> = OnceLock::new();
 static ENCODE_POOL_NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -80,80 +86,91 @@ thread_local! {
         ENCODE_POOL_NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % ENCODE_POOL_SHARDS;
 }
 
+#[inline(always)]
 fn pool_shard() -> usize {
     ENCODE_POOL_SHARD.with(|s| *s)
 }
 
-fn encode_pool() -> &'static [StdMutex<Vec<Vec<u8>>>] {
+#[inline(always)]
+fn encode_pool() -> &'static [PoolShard; ENCODE_POOL_SHARDS] {
     ENCODE_POOL.get_or_init(|| {
-        (0..ENCODE_POOL_SHARDS)
-            .map(|_| StdMutex::new(Vec::new()))
-            .collect()
+        std::array::from_fn(|_| PoolShard {
+            len: AtomicUsize::new(0),
+            bufs: StdMutex::new(Vec::with_capacity(ENCODE_POOL_SHARD_MAX_COUNT)),
+        })
     })
-}
-
-fn shard_locked(idx: usize) -> std::sync::MutexGuard<'static, Vec<Vec<u8>>> {
-    // Bind first: indexing `encode_pool()` inline would tie the guard to the
-    // temporary holding the slice reference rather than to its `'static`
-    // pointee.
-    let pool: &'static [StdMutex<Vec<Vec<u8>>>] = encode_pool();
-    pool[idx].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Takes a pooled encode buffer (cleared, capacity retained) or a fresh
 /// empty `Vec` when every shard is empty. The writer returns written frames
 /// via [`recycle_encode_bufs`].
 ///
-/// Starts at this thread's own shard and only scans outwards on a miss, so
-/// the common case is still exactly one lock acquisition.
+/// Starts at this thread's own shard and only scans outwards on a miss,
+/// using a relaxed atomic length check to skip empty shards without locking.
 pub(crate) fn acquire_encode_buf() -> Vec<u8> {
+    let shards = encode_pool();
     let start = pool_shard();
     for offset in 0..ENCODE_POOL_SHARDS {
-        let mut pool = shard_locked((start + offset) % ENCODE_POOL_SHARDS);
+        let shard = &shards[(start + offset) % ENCODE_POOL_SHARDS];
+        if shard.len.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let mut pool = shard.bufs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut buf) = pool.pop() {
+            shard.len.store(pool.len(), Ordering::Relaxed);
+            drop(pool);
             buf.clear();
             return buf;
         }
+        shard.len.store(0, Ordering::Relaxed);
     }
     Vec::new()
 }
 
 /// Returns a post-write frame buffer to the pool (best-effort: zero-cap or
 /// oversized buffers are dropped, as are buffers when every shard is full).
-#[allow(dead_code)]
 pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
     if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
         return;
     }
     buf.clear();
+    let shards = encode_pool();
     let start = pool_shard();
     for offset in 0..ENCODE_POOL_SHARDS {
-        let idx = (start + offset) % ENCODE_POOL_SHARDS;
-        let mut pool = shard_locked(idx);
+        let shard = &shards[(start + offset) % ENCODE_POOL_SHARDS];
+        if shard.len.load(Ordering::Relaxed) >= ENCODE_POOL_SHARD_MAX_COUNT {
+            continue;
+        }
+        let mut pool = shard.bufs.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < ENCODE_POOL_SHARD_MAX_COUNT {
             pool.push(buf);
+            shard.len.store(pool.len(), Ordering::Relaxed);
             return;
         }
     }
 }
 
 /// Returns a batch of post-write frame buffers to the pool, taking at most
-/// one lock per shard (zero allocation).
-///
-/// Shards are walked from this thread's own index and each is filled before
-/// moving on. That matters because a full [`BATCH_MAX_FRAMES`] batch is
-/// larger than a single shard: bailing out of the starting shard would throw
-/// the remaining frames away and reintroduce the per-frame malloc this pool
-/// exists to avoid. Buffers past the *total* capacity are freed, which is the
-/// same behaviour the old single-pool version had when it was full.
+/// one lock per non-full shard (zero allocation).
 pub(crate) fn recycle_encode_bufs<I>(bufs: I)
 where
     I: IntoIterator<Item = Vec<u8>>,
 {
-    let mut iter = bufs.into_iter();
+    let mut iter = bufs.into_iter().peekable();
+    if iter.peek().is_none() {
+        return;
+    }
+    let shards = encode_pool();
     let start = pool_shard();
     for offset in 0..ENCODE_POOL_SHARDS {
-        let mut pool = shard_locked((start + offset) % ENCODE_POOL_SHARDS);
+        if iter.peek().is_none() {
+            return;
+        }
+        let shard = &shards[(start + offset) % ENCODE_POOL_SHARDS];
+        if shard.len.load(Ordering::Relaxed) >= ENCODE_POOL_SHARD_MAX_COUNT {
+            continue;
+        }
+        let mut pool = shard.bufs.lock().unwrap_or_else(|e| e.into_inner());
         while pool.len() < ENCODE_POOL_SHARD_MAX_COUNT {
             match iter.next() {
                 Some(mut buf) => {
@@ -163,9 +180,13 @@ where
                     buf.clear();
                     pool.push(buf);
                 }
-                None => return,
+                None => {
+                    shard.len.store(pool.len(), Ordering::Relaxed);
+                    return;
+                }
             }
         }
+        shard.len.store(pool.len(), Ordering::Relaxed);
     }
 }
 
@@ -469,9 +490,8 @@ pub(crate) fn encode_mux_ws_frame(
     // would leave pad bytes in the stream and desync the next frame.
     // Receivers slice by the declared MUX length, so the tail is ignored
     // by old and new peers alike. DATA only — control frames stay exact.
-    use rand::RngCore;
     let pad_len = if obfs && command == MuxCommand::Data {
-        (rand::thread_rng().next_u32() as usize) % (OBFS_PAD_MAX + 1)
+        (u32::from_ne_bytes(next_mask()) as usize) % (OBFS_PAD_MAX + 1)
     } else {
         0
     };
@@ -480,7 +500,14 @@ pub(crate) fn encode_mux_ws_frame(
     let ws_header_len = ws_header_into(&mut ws_header, total, 0x2, masked);
     let mask_len = if masked { 4 } else { 0 };
     out.clear();
-    out.reserve(ws_header_len + mask_len + total);
+    let needed = ws_header_len + mask_len + total;
+    if needed > out.capacity() {
+        if needed > 4096 && needed <= ENCODE_POOL_MAX_CAP {
+            out.reserve_exact(ENCODE_POOL_MAX_CAP);
+        } else {
+            out.reserve(needed);
+        }
+    }
     out.extend_from_slice(&ws_header[..ws_header_len]);
     let mask_key = if masked {
         let key = next_mask();
@@ -502,7 +529,10 @@ pub(crate) fn encode_mux_ws_frame(
     if pad_len > 0 {
         let start = out.len();
         out.resize(start + pad_len, 0);
-        rand::thread_rng().fill_bytes(&mut out[start..]);
+        for chunk in out[start..].chunks_mut(4) {
+            let m = next_mask();
+            chunk.copy_from_slice(&m[..chunk.len()]);
+        }
     }
     // Single pass over the payload: cipher keystream XOR WS mask.
     // Offsets are region-relative (key byte `i` maps to
@@ -647,9 +677,9 @@ where
     let mut off = 0usize;
     while idx < batch.len() {
         let n = poll_fn(|cx| {
-            const MAX: usize = 64;
-            let count = (batch.len() - idx).min(MAX);
-            let mut slices: [IoSlice<'_>; MAX] = [IoSlice::new(&[]); MAX];
+            let count = (batch.len() - idx).min(BATCH_MAX_FRAMES);
+            let mut slices: [IoSlice<'_>; BATCH_MAX_FRAMES] =
+                [IoSlice::new(&[]); BATCH_MAX_FRAMES];
             slices[0] = IoSlice::new(&batch[idx][off..]);
             for (i, buf) in batch[idx + 1..idx + count].iter().enumerate() {
                 slices[i + 1] = IoSlice::new(buf);

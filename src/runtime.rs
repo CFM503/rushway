@@ -12,7 +12,7 @@ use crate::protocol::{
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
-    build_server_handshake_response, encode_ws_frame, read_frame, read_frame_owned,
+    build_server_handshake_response, encode_ws_frame, read_frame, read_frame_with_cipher,
     read_http_headers, validate_server_handshake, write_frame, write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::{timeout, Duration};
@@ -80,9 +80,6 @@ enum StreamCommand {
     Data(OwnedMuxFrame),
     Fin,
     Reset,
-}
-fn transform_payload(cipher: &XorCipher, payload: &mut [u8]) {
-    cipher.apply(payload)
 }
 /// Blocks a target from its *literal* hostname, before DNS runs.
 ///
@@ -481,27 +478,6 @@ async fn dial_target(
     apply_socket_options(&stream, cfg);
     Ok(stream)
 }
-async fn send_frame_encrypted(
-    writer: &Arc<MuxFrameWriter>,
-    cipher: &XorCipher,
-    frame: &MuxFrame,
-    obfs: bool,
-) -> Result<()> {
-    // Exact sizing happens inside `encode_mux_ws_frame` (one reserve);
-    // start from a pooled buffer when available so the reserve is a no-op.
-    let mut bytes = crate::mux_writer::acquire_encode_buf();
-    crate::mux_writer::encode_mux_ws_frame(
-        &mut bytes,
-        frame.stream_id,
-        frame.command,
-        &frame.payload,
-        cipher,
-        false,
-        obfs,
-    )
-    .map_err(|e| anyhow!(e.to_string()))?;
-    writer.send_mux(frame.stream_id, frame.command, bytes).await
-}
 async fn send_mux_parts_encrypted_reuse(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
@@ -543,13 +519,7 @@ async fn send_reset_encrypted(
     id: u32,
     obfs: bool,
 ) -> Result<()> {
-    send_frame_encrypted(
-        writer,
-        cipher,
-        &MuxFrame::new(id, MuxCommand::Rst, Vec::new()).map_err(|e| anyhow!(e.to_string()))?,
-        obfs,
-    )
-    .await
+    send_mux_parts_encrypted(writer, cipher, id, MuxCommand::Rst, &[], obfs).await
 }
 async fn target_to_mux(
     id: u32,
@@ -595,6 +565,7 @@ async fn target_to_mux(
                     .await
                     .is_err()
                     {
+                        crate::mux_writer::recycle_encode_buf(frame_scratch);
                         recycle_buf(buf).await;
                         return;
                     }
@@ -607,60 +578,8 @@ async fn target_to_mux(
             }
         }
     }
+    crate::mux_writer::recycle_encode_buf(frame_scratch);
     recycle_buf(buf).await;
-}
-#[allow(dead_code)]
-async fn server_stream_task(
-    id: u32,
-    target: TcpStream,
-    mut rx: mpsc::Receiver<StreamCommand>,
-    writer: Arc<MuxFrameWriter>,
-    buffer_size: usize,
-    cipher: XorCipher,
-    obfs: bool,
-) {
-    let (rd, mut wr) = tokio::io::split(target);
-    let mut reader = tokio::spawn(target_to_mux(
-        id,
-        rd,
-        writer.clone(),
-        buffer_size,
-        cipher.clone(),
-        obfs,
-        CreditGate::new(),
-    ));
-    let mut is_fin = false;
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            StreamCommand::Data(frame) => {
-                let write_res = wr.write_all(frame.payload()).await;
-                crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                if write_res.is_err() {
-                    break;
-                }
-            }
-            StreamCommand::Fin => {
-                let _ = wr.shutdown().await;
-                is_fin = true;
-                break;
-            }
-            StreamCommand::Reset => break,
-        }
-    }
-    if is_fin {
-        tokio::select! {
-            _ = &mut reader => {}
-            cmd = rx.recv() => {
-                if let Some(StreamCommand::Reset) = cmd {
-                    reader.abort();
-                } else {
-                    let _ = reader.await;
-                }
-            }
-        }
-    } else {
-        reader.abort();
-    }
 }
 /// Accumulates consumed bytes per stream and emits a WINDOW refund once
 /// the refresh threshold is reached. Refund accounting only runs after the
@@ -758,24 +677,21 @@ impl Drop for PendingBytes {
     }
 }
 
-async fn handle_mux_parts(
-    mut rd: ReadHalf<TcpStream>,
-    wr: WriteHalf<TcpStream>,
+async fn handle_mux_parts<R, W>(
+    mut rd: R,
+    wr: W,
     cfg: RuntimeConfig,
     cipher: XorCipher,
-    first_payload: Vec<u8>,
-) -> Result<()> {
-    let mut hello = first_payload;
-    transform_payload(&cipher, &mut hello);
-    if hello != b"MUX\n" {
-        bail!("invalid MUX handshake")
-    }
-
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     // Hand the write half to the dedicated writer task; all MUX frames on
     // this session go through its serialized, coalescing queue.
     let (writer, _writer_task) = MuxFrameWriter::spawn(wr);
     let mut ok = b"OK\n".to_vec();
-    transform_payload(&cipher, &mut ok);
+    cipher.apply(&mut ok);
     writer
         .send(encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?)
         .await?;
@@ -806,13 +722,14 @@ async fn handle_mux_parts(
     // JoinSet, not Vec<JoinHandle>: a long-lived session used to push one
     // handle per stream it ever opened and only released them at session end.
     let mut stream_tasks = tokio::task::JoinSet::new();
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
 
     loop {
-        let Some((opcode, mut payload)) = read_frame_owned(
+        let Some((opcode, payload)) = read_frame_with_cipher(
             &mut rd,
-            Option::<&mut WriteHalf<TcpStream>>::None,
+            Option::<&mut W>::None,
             &mut frame_buf,
+            Some(&cipher),
         )
         .await?
         else {
@@ -820,10 +737,9 @@ async fn handle_mux_parts(
         };
 
         if opcode != 2 {
+            crate::mux_writer::recycle_encode_buf(payload);
             continue;
         }
-
-        transform_payload(&cipher, &mut payload);
 
         let frame = match MuxFrame::decode_owned(payload) {
             Ok(f) => f,
@@ -834,27 +750,31 @@ async fn handle_mux_parts(
             MuxCommand::Syn => {
                 let stream_id = frame.stream_id;
 
-                let syn = match SynPayload::decode(frame.payload()) {
+                let (target_bytes, initial_data) = match SynPayload::decode_slices(frame.payload())
+                {
                     Ok(v) => v,
                     Err(_) => {
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         tracing::warn!(stream_id, "mux RST: bad syn payload");
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
                 };
 
-                let target_text = match String::from_utf8(syn.target) {
+                let target_text = match std::str::from_utf8(target_bytes) {
                     Ok(v) => v,
                     Err(_) => {
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         tracing::warn!(stream_id, "mux RST: target not utf-8");
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
                     }
                 };
 
-                let target = match parse_target_authority(&target_text) {
+                let target = match parse_target_authority(target_text) {
                     Ok(v) => v,
                     Err(_) => {
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         tracing::warn!(stream_id, "mux RST: bad target authority");
                         let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                         continue;
@@ -862,6 +782,7 @@ async fn handle_mux_parts(
                 };
 
                 if let Err(e) = enforce_target_policy(&cfg, &target) {
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     tracing::warn!(stream_id, error=%e, "mux RST: target policy");
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                     continue;
@@ -899,22 +820,26 @@ async fn handle_mux_parts(
                     let _ = old_cancel.send(true);
                 }
                 if !admitted {
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     tracing::warn!(stream_id, "mux RST: stream admission rejected (table full or duplicate id)");
                     let _ = send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs).await;
                     continue;
                 }
 
-                if !syn.initial_data.is_empty() {
+                if !initial_data.is_empty() {
                     let owned = OwnedMuxFrame::from_parts(
                         stream_id,
                         MuxCommand::Data,
-                        &syn.initial_data,
+                        initial_data,
                     )
                     .map_err(|e| anyhow!(e.to_string()))?;
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
 
                     tx.send(StreamCommand::Data(owned))
                         .await
                         .map_err(|_| anyhow!("stream task exited before initial data"))?;
+                } else {
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 }
 
                 let streams_task = streams.clone();
@@ -1162,7 +1087,11 @@ async fn handle_mux_parts(
 
             MuxCommand::Data => {
                 let id = frame.stream_id;
-                let tx = streams.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|s| s.tx.clone());
+                let tx = streams
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&id)
+                    .map(|s| s.tx.clone());
                 if let Some(tx) = tx {
                     // Never park the session read loop on one stream's
                     // backpressure. `send().await` here meant a single target
@@ -1174,28 +1103,36 @@ async fn handle_mux_parts(
                     // moving; the blast radius stays on the one stalled flow.
                     match tx.try_send(StreamCommand::Data(frame)) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                        Err(mpsc::error::TrySendError::Full(StreamCommand::Data(f))) => {
+                            crate::mux_writer::recycle_encode_buf(f.into_storage());
                             tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
                             let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
                             streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Err(mpsc::error::TrySendError::Closed(StreamCommand::Data(f))) => {
+                            crate::mux_writer::recycle_encode_buf(f.into_storage());
                             streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
                         }
+                        Err(_) => {}
                     }
+                } else {
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 }
             }
 
             MuxCommand::Fin => {
                 let id = frame.stream_id;
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 let tx = streams
-                    .read().unwrap_or_else(|e| e.into_inner())
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&id)
                     .map(|s| s.tx.clone());
                 if let Some(tx) = tx {
                     // Same non-blocking rule as DATA: a FIN addressed to an
                     // already-backed-up stream must not stall the read loop.
-                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(StreamCommand::Fin) {
+                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(StreamCommand::Fin)
+                    {
                         tracing::warn!(stream_id = id, "mux RST: queue full at FIN; resetting stalled stream");
                         let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
                         streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1204,9 +1141,12 @@ async fn handle_mux_parts(
             }
 
             MuxCommand::Rst => {
+                let stream_id = frame.stream_id;
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
                 let target = streams
-                    .read().unwrap_or_else(|e| e.into_inner())
-                    .get(&frame.stream_id)
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&stream_id)
                     .map(|s| (s.tx.clone(), s.cancel.clone()));
                 if let Some((tx, cancel)) = target {
                     // Best-effort: the data queue may already be full, and
@@ -1222,12 +1162,15 @@ async fn handle_mux_parts(
                 // W3 negotiation: first VERSION wins; enable send credit on
                 // every registered stream (streams created later enable at
                 // admission time).
-                if let Some((version, kib)) = decode_version_payload(frame.payload()) {
+                let decoded = decode_version_payload(frame.payload());
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                if let Some((version, kib)) = decoded {
                     if version >= 1 {
                         let prev = peer_window.swap(kib as u32, Ordering::AcqRel);
                         if prev == 0 {
                             let window = i64::from(kib) * 1024;
-                            for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values() {
+                            for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values()
+                            {
                                 entry.gate.enable(window);
                             }
                             tracing::debug!(kib, "peer VERSION received; send window enabled");
@@ -1237,14 +1180,22 @@ async fn handle_mux_parts(
             }
 
             MuxCommand::Window => {
-                if let Some(credit) = decode_window_payload(frame.payload()) {
-                    if let Some(entry) = streams.read().unwrap_or_else(|e| e.into_inner()).get(&frame.stream_id) {
+                let stream_id = frame.stream_id;
+                let decoded = decode_window_payload(frame.payload());
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                if let Some(credit) = decoded {
+                    if let Some(entry) = streams
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&stream_id)
+                    {
                         entry.gate.release(i64::from(credit));
                     }
                 }
             }
         }
     }
+    crate::mux_writer::recycle_encode_buf(frame_buf);
 
     // Unblock any target_to_mux sender parked on credit: the session is
     // over, so remaining sends must fail at the socket, not on WINDOWs
@@ -1262,18 +1213,21 @@ async fn handle_mux_parts(
 /// Plain non-MUX TCP relay, mirroring goway.go `handleServer`:
 /// only the target hello (`host:port\n`) and `OK\n` are XOR-encrypted,
 /// all subsequent data frames are plaintext.
-async fn handle_server_tcp_parts(
-    mut rd: ReadHalf<TcpStream>,
-    mut wr: WriteHalf<TcpStream>,
+async fn handle_server_tcp_parts<R, W>(
+    mut rd: R,
+    mut wr: W,
     cfg: RuntimeConfig,
     cipher: XorCipher,
-    first: Vec<u8>,
-) -> Result<()> {
-    let mut target_frame = first;
-    transform_payload(&cipher, &mut target_frame);
+    target_frame: Vec<u8>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let target_text =
-        String::from_utf8(target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
+        std::str::from_utf8(&target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
     let target = parse_target_authority(target_text.trim()).map_err(|e| anyhow!(e.to_string()))?;
+    crate::mux_writer::recycle_encode_buf(target_frame);
     enforce_target_policy(&cfg, &target)?;
     let resolved = resolve_target(cfg.block_local, &target.host, target.port).await?;
     let target_stream = timeout(
@@ -1284,7 +1238,7 @@ async fn handle_server_tcp_parts(
     .context("target connection timeout")??;
     apply_socket_options(&target_stream, &cfg);
     let mut ok = b"OK\n".to_vec();
-    transform_payload(&cipher, &mut ok);
+    cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
     let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
     let buffer_size = cfg.buffer_size;
@@ -1305,7 +1259,7 @@ async fn handle_server_tcp_parts(
         recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     // Run the upload loop as its own future: the old loop carried `?` on
     // `read_frame`, so a read error returned straight out of this function
     // and skipped `download.abort()`, leaving the download task detached
@@ -1316,7 +1270,7 @@ async fn handle_server_tcp_parts(
                 _ = &mut download => break,
                 res = read_frame(
                     &mut rd,
-                    Option::<&mut WriteHalf<TcpStream>>::None,
+                    Option::<&mut W>::None,
                     &mut frame_buf,
                 ) => {
                     let Some((opcode, payload)) = res? else {
@@ -1342,6 +1296,7 @@ async fn handle_server_tcp_parts(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     let _ = target_wr.shutdown().await;
     download.abort();
     result
@@ -1372,20 +1327,18 @@ fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
-async fn handle_server_udp_parts(
-    mut rd: ReadHalf<TcpStream>,
-    mut wr: WriteHalf<TcpStream>,
+async fn handle_server_udp_parts<R, W>(
+    mut rd: R,
+    mut wr: W,
     cfg: RuntimeConfig,
     cipher: XorCipher,
-    first_payload: Vec<u8>,
-) -> Result<()> {
-    let mut hello = first_payload;
-    transform_payload(&cipher, &mut hello);
-    if hello != b"UDP\n" {
-        bail!("invalid UDP handshake")
-    };
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let mut ok = b"OK\n".to_vec();
-    transform_payload(&cipher, &mut ok);
+    cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
     let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     // The relay socket is unconnected, so only datagrams whose source is an
@@ -1428,7 +1381,7 @@ async fn handle_server_udp_parts(
         }
         Ok::<(), anyhow::Error>(())
     });
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
     // Same guard as handle_server_tcp_parts above: the loop carried both a
     // `?` on `read_frame` and an early `return` on a bad datagram, and either
@@ -1436,10 +1389,11 @@ async fn handle_server_udp_parts(
     // socket and the session write half for the rest of the process.
     let result = async {
         loop {
-            let Some((opcode, mut packet)) = read_frame(
+            let Some((opcode, packet)) = read_frame_with_cipher(
                 &mut rd,
-                Option::<&mut WriteHalf<TcpStream>>::None,
+                Option::<&mut W>::None,
                 &mut frame_buf,
+                Some(&cipher),
             )
             .await?
             else {
@@ -1449,7 +1403,6 @@ async fn handle_server_udp_parts(
                 crate::mux_writer::recycle_encode_buf(packet);
                 continue;
             }
-            cipher.apply(&mut packet);
             let (target, payload) = match parse_socks5_udp_datagram(&packet) {
                 Ok(res) => res,
                 Err(e) => {
@@ -1485,9 +1438,52 @@ async fn handle_server_udp_parts(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     let _ = batch_writer.flush().await;
     send_task.abort();
     result
+}
+
+/// Completes the server-side WebSocket HTTP upgrade and dispatches the
+/// connection directly into the MUX, UDP, or non-MUX TCP handler without
+/// any intermediate loopback hop.
+pub(crate) async fn dispatch_server_ws_parts<R, W>(
+    mut rd: R,
+    mut wr: W,
+    cfg: RuntimeConfig,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let request = read_http_headers(&mut rd).await?;
+    let key = validate_server_handshake(&request)?;
+    wr.write_all(&build_server_handshake_response(&key)).await?;
+    wr.flush().await?;
+    // Built once per connection and fused into the first frame read so
+    // the hello is unmasked and decrypted in a single pass with zero clones.
+    let cipher = configured_cipher(&cfg.key);
+    let mut buf = crate::mux_writer::acquire_encode_buf();
+    let first_res = read_frame_with_cipher(&mut rd, Option::<&mut W>::None, &mut buf, Some(&cipher)).await;
+    crate::mux_writer::recycle_encode_buf(buf);
+    let Some((opcode, first)) = first_res? else {
+        bail!("missing transport handshake")
+    };
+    if opcode != 2 {
+        crate::mux_writer::recycle_encode_buf(first);
+        bail!("invalid transport handshake opcode")
+    }
+    if first == b"UDP\n" {
+        crate::mux_writer::recycle_encode_buf(first);
+        return handle_server_udp_parts(rd, wr, cfg, cipher).await;
+    }
+    if first == b"MUX\n" {
+        crate::mux_writer::recycle_encode_buf(first);
+        return handle_mux_parts(rd, wr, cfg, cipher).await;
+    }
+    // Anything else is a plain non-MUX target ("host:port\n"),
+    // exactly like goway.go handleServer's fallthrough branch.
+    handle_server_tcp_parts(rd, wr, cfg, cipher, first).await
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
@@ -1531,42 +1527,9 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
-                    let result = async {
-                        let (mut rd, mut wr) = tokio::io::split(stream);
-                        let request = read_http_headers(&mut rd).await?;
-                        let key = validate_server_handshake(&request)?;
-                        wr.write_all(&build_server_handshake_response(&key)).await?;
-                        wr.flush().await?;
-                        let mut buf = Vec::with_capacity(64 * 1024);
-                        let Some((opcode, first)) =
-                            read_frame(&mut rd, Option::<&mut WriteHalf<TcpStream>>::None, &mut buf)
-                                .await?
-                        else {
-                            bail!("missing transport handshake")
-                        };
-                        if opcode != 2 {
-                            bail!("invalid transport handshake opcode")
-                        };
-                        let mut plain = first.clone();
-                        // Built exactly once per connection here and handed to
-                        // whichever transport handler runs below; it used to be
-                        // rebuilt inside each handler, costing a second
-                        // SHA-256 + 256 KiB keystream expansion per connection.
-                        let cipher = configured_cipher(&cfg2.key);
-                        transform_payload(&cipher, &mut plain);
-                        if plain == b"UDP\n" {
-                            return handle_server_udp_parts(rd, wr, cfg2, cipher, first).await;
-                        }
-                        if plain == b"MUX\n" {
-                            return handle_mux_parts(rd, wr, cfg2, cipher, first).await;
-                        }
-                        // Anything else is a plain non-MUX target ("host:port\n"),
-                        // exactly like goway.go handleServer's fallthrough branch.
-                        handle_server_tcp_parts(rd, wr, cfg2, cipher, first).await
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        tracing::debug!(%peer,error=%e,"transport connection closed")
+                    let (rd, wr) = tokio::io::split(stream);
+                    if let Err(e) = dispatch_server_ws_parts(rd, wr, cfg2).await {
+                        tracing::debug!(%peer, error=%e, "transport connection closed")
                     }
                 });
             }

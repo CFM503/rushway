@@ -1,12 +1,14 @@
 target/
 *.pdb
+*.log
 # Release binaries are published via CI/GitHub Releases, never committed.
 dist/
 *.exe
 *.tar.gz
 *.zip
-# Local competitor installs (sing-box/xray) for Phase 4 benchmarks.
+# Local competitor installs and benchmark dumps.
 tools/
+bench/
 # Scratch space for baseline exports / A-B staging.
 tmp/
 # ZCode workspace metadata (workflow drafts/runs).

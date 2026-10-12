@@ -23,8 +23,7 @@ use clap::Parser;
 use runtime::RuntimeConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration};
 use tracing_subscriber::layer::SubscriberExt;
@@ -373,18 +372,6 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
     let public_bind = format!("{}:{}", cfg.proxy_host, cfg.proxy_port);
     let listener = TcpListener::bind(&public_bind).await?;
     runtime::apply_listener_options(&listener);
-    let internal_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let internal_port = internal_listener.local_addr()?.port();
-    drop(internal_listener);
-
-    let mut internal_cfg = cfg.clone();
-    internal_cfg.proxy_host = "127.0.0.1".into();
-    internal_cfg.proxy_port = internal_port;
-    tokio::spawn(async move {
-        if let Err(error) = runtime::run_server(internal_cfg).await {
-            tracing::error!(%error, "private WS runtime stopped");
-        }
-    });
 
     let acceptor = tls::standalone_server_acceptor()?;
     tracing::info!("RushWay WSS server listening on {public_bind}");
@@ -429,42 +416,14 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                         // Bound the TLS handshake: a peer that connects and
                         // then stalls mid-handshake otherwise holds its
                         // semaphore permit and its task indefinitely.
-                        let mut tls_stream = timeout(
+                        let tls_stream = timeout(
                             Duration::from_secs(cfg2.connection_timeout.max(1)),
                             acceptor.accept(stream),
                         )
                         .await
                         .context("TLS handshake timeout")??;
-                        let request = ws::read_http_headers(&mut tls_stream).await?;
-                        let key = ws::validate_server_handshake(&request)?;
-                        tls_stream
-                            .write_all(&ws::build_server_handshake_response(&key))
-                            .await?;
-
-                        let mut internal = None;
-                        for _ in 0..100 {
-                            match TcpStream::connect(("127.0.0.1", internal_port)).await {
-                                Ok(stream) => {
-                                    internal = Some(stream);
-                                    break;
-                                }
-                                Err(_) => sleep(Duration::from_millis(20)).await,
-                            }
-                        }
-                        let mut internal = internal
-                            .ok_or_else(|| anyhow!("private WS runtime did not start"))?;
-                        runtime::apply_socket_options(&internal, &cfg2);
-                        let (request, key) = ws::build_client_handshake_request(
-                            &format!("127.0.0.1:{internal_port}"),
-                            "/",
-                            None,
-                            Some("same-origin"),
-                        );
-                        internal.write_all(&request).await?;
-                        let response = ws::read_http_headers(&mut internal).await?;
-                        ws::validate_client_handshake_response(&response, &key)?;
-                        copy_bidirectional(&mut tls_stream, &mut internal).await?;
-                        Ok::<(), anyhow::Error>(())
+                        let (rd, wr) = tokio::io::split(tls_stream);
+                        runtime::dispatch_server_ws_parts(rd, wr, cfg2).await
                     }
                     .await;
                     if let Err(error) = result {

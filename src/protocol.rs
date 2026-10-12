@@ -300,7 +300,33 @@ impl SynPayload {
         Ok(out)
     }
 
-    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+    /// Encodes `host:port` + `initial_data` directly into a single `Vec<u8>`
+    /// without intermediate `format!` or struct allocations.
+    pub fn encode_parts(
+        host: &str,
+        port: u16,
+        initial_data: &[u8],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        use std::io::Write as _;
+        // Max port string is 5 digits + 1 colon = 6 bytes.
+        let est_target_len = host.len() + 6;
+        let mut out = Vec::with_capacity(2 + est_target_len + initial_data.len());
+        out.extend_from_slice(&[0, 0]);
+        let _ = write!(&mut out, "{host}:{port}");
+        let target_len = out.len() - 2;
+        if target_len > u16::MAX as usize {
+            return Err(ProtocolError::TargetTooLarge(target_len));
+        }
+        let len_bytes = (target_len as u16).to_be_bytes();
+        out[0] = len_bytes[0];
+        out[1] = len_bytes[1];
+        out.extend_from_slice(initial_data);
+        Ok(out)
+    }
+
+    /// Decodes a SYN payload into borrowed `(target, initial_data)` slices
+    /// without heap allocation.
+    pub fn decode_slices(payload: &[u8]) -> Result<(&[u8], &[u8]), ProtocolError> {
         if payload.len() < 2 {
             return Err(ProtocolError::TruncatedSyn);
         }
@@ -308,9 +334,14 @@ impl SynPayload {
         if payload.len() < 2 + target_len {
             return Err(ProtocolError::TruncatedSyn);
         }
+        Ok((&payload[2..2 + target_len], &payload[2 + target_len..]))
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        let (target, initial_data) = Self::decode_slices(payload)?;
         Ok(Self {
-            target: payload[2..2 + target_len].to_vec(),
-            initial_data: payload[2 + target_len..].to_vec(),
+            target: target.to_vec(),
+            initial_data: initial_data.to_vec(),
         })
     }
 }
