@@ -11,7 +11,38 @@
 //! (decode error -> whole frame skipped, one mux frame per WS frame), so
 //! old endpoints keep v1 behavior automatically.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Fast single-multiply Fibonacci hasher for internal `u32` MUX stream IDs.
+/// Eliminates SipHash-1-3 overhead on per-frame stream table lookups.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct U32Hasher(u64);
+
+impl Hasher for U32Hasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut x = self.0;
+        for &b in bytes {
+            x = (x ^ u64::from(b)).wrapping_mul(0x517cc1b727220a95);
+        }
+        self.0 = x;
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i).wrapping_mul(0x517cc1b727220a95);
+    }
+}
+
+pub(crate) type U32BuildHasher = BuildHasherDefault<U32Hasher>;
+pub(crate) type U32HashMap<V> = HashMap<u32, V, U32BuildHasher>;
 
 pub const MUX_HEADER_LEN: usize = 7;
 pub const MUX_SYN: u8 = 0x01;

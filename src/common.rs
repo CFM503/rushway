@@ -346,7 +346,7 @@ where
     } else if is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?
     };
-    let (mut local_rd, mut local_wr) = tokio::io::split(local);
+    let (mut local_rd, mut local_wr) = local.into_split();
     // GoWay v1.8.5 non-MUX TCP: only the target handshake ("host:port\n")
     // and "OK\n" are XOR-encrypted. All subsequent data frames are plaintext.
     if let Some(initial) = initial_payload {

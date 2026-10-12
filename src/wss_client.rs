@@ -8,18 +8,21 @@ use crate::common::{
 use crate::crypto::XorCipher;
 use crate::dns;
 use crate::flow::CreditGate;
-use crate::mux_writer::MuxFrameWriter;
+use crate::mux_writer::{
+    recycle_encode_buf, recycle_encode_bufs, write_owned_frames_vectored, MuxFrameWriter,
+};
 use crate::protocol::{
     decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, MUX_INITIAL_WINDOW_KIB,
+    MUX_WINDOW_REFRESH,
 };
 use crate::proxy::{
     parse_authority_with_default, parse_socks5_udp_datagram, read_client_proxy_request,
     socks5_success_response, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
-    apply_listener_options, apply_socket_options, apply_socket_options_raw, check_target_policy,
-    drain_join_set, recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options_raw, check_target_policy, drain_join_set,
+    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
 };
 use crate::tls;
 use crate::udp_batch::UdpBatchReader;
@@ -29,7 +32,6 @@ use crate::ws::{
     write_frame,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -37,16 +39,13 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 
-pub(crate) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
-pub(crate) type BoxTransport = Box<dyn Transport>;
-pub(crate) type BoxReader = tokio::io::ReadHalf<BoxTransport>;
-pub(crate) type BoxWriter = tokio::io::WriteHalf<BoxTransport>;
+pub(crate) type TlsReader = ReadHalf<tls::RushTlsStream>;
+pub(crate) type TlsWriter = WriteHalf<tls::RushTlsStream>;
 
 const MAX_SESSION_COUNT: usize = 64;
 const MAX_STREAMS_PER_SESSION: usize = 2048;
@@ -139,24 +138,7 @@ async fn connect_tls(
 
     tracing::info!("[WSS] TCP connected");
 
-    let policy = RuntimeConfig {
-        proxy_host: "127.0.0.1".into(),
-        proxy_port: 0,
-        upstream: None,
-        key: None,
-        fakehost: None,
-        mux: true,
-        buffer_size: cfg.buffer_size,
-        connection_timeout: cfg.connection_timeout,
-        allow_open: false,
-        max_connections: 1,
-        block_local: false,
-        tcp_nodelay: cfg.tcp_nodelay,
-        tcp_keepalive: cfg.tcp_keepalive,
-        socket_buffer: cfg.socket_buffer,
-        obfs: false,
-    };
-    apply_socket_options(&tcp, &policy);
+    apply_socket_options_raw(&tcp, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
     let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl)
         .await
         .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
@@ -223,9 +205,7 @@ async fn dial_cloudflare_fallback(
     bail!("all Cloudflare fallback edges failed for fakehost: {tls_name}")
 }
 
-pub(crate) async fn connect_wss_upstream(
-    cfg: &WssConfig,
-) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, TlsWriter)> {
     let (addr, host, path) = parse_wss_url(&cfg.upstream)?;
     let (dns_host, dns_port) = split_authority(&addr)?;
     let resolved = dns::resolve_socket(&dns_host, dns_port).await?;
@@ -257,8 +237,7 @@ pub(crate) async fn connect_wss_upstream(
         }
     };
 
-    let boxed: BoxTransport = Box::new(tls_stream);
-    let (mut rd, mut wr) = tokio::io::split(boxed);
+    let (mut rd, mut wr) = tokio::io::split(tls_stream);
     let origin = format!("https://{}", tls_name);
     let header_host_name = header_host.split(':').next().unwrap_or(header_host);
     let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host_name) {
@@ -286,10 +265,10 @@ pub(crate) async fn connect_wss_upstream(
     validate_client_handshake_response(&response, &key)?;
     tracing::info!("[WSS] WebSocket handshake completed");
 
-    Ok((rd, Arc::new(Mutex::new(wr))))
+    Ok((rd, wr))
 }
 
-pub(crate) async fn open_upstream(cfg: &WssConfig) -> Result<(BoxReader, Arc<Mutex<BoxWriter>>)> {
+pub(crate) async fn open_upstream(cfg: &WssConfig) -> Result<(TlsReader, TlsWriter)> {
     connect_wss_upstream(cfg).await
 }
 
@@ -316,28 +295,26 @@ async fn handle_udp_proxy(
     let bound = udp.local_addr()?;
     let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
-    let (mut rd, writer) = open_upstream(&cfg).await?;
+    let (mut rd, mut wr) = open_upstream(&cfg).await?;
     let c = configured_cipher(&cfg.key);
     let mut hello = b"UDP\n".to_vec();
     c.apply(&mut hello);
-    {
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &hello, 2, true).await?
-    };
+    write_frame(&mut wr, &hello, 2, true).await?;
+    let writer = Arc::new(Mutex::new(wr));
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let Some((opcode, mut ok)) =
-        read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf).await?
+        read_frame(&mut rd, Option::<&mut TlsWriter>::None, &mut frame_buf).await?
     else {
-        crate::mux_writer::recycle_encode_buf(frame_buf);
+        recycle_encode_buf(frame_buf);
         bail!("WSS upstream closed during UDP handshake")
     };
     if opcode != 2 {
-        crate::mux_writer::recycle_encode_buf(frame_buf);
+        recycle_encode_buf(frame_buf);
         bail!("invalid WSS UDP handshake response opcode")
     };
     c.apply(&mut ok);
     if ok != b"OK\n" {
-        crate::mux_writer::recycle_encode_buf(frame_buf);
+        recycle_encode_buf(frame_buf);
         bail!("WSS upstream rejected UDP handshake")
     };
     let latest_client = Arc::new(StdMutex::new(None::<SocketAddr>));
@@ -372,7 +349,7 @@ async fn handle_udp_proxy(
                 crate::stats::add_bytes(packet.len() as i64, 0);
                 let mut w = writer_send.lock().await;
                 let res = write_frame(&mut *w, &packet, 2, true).await;
-                crate::mux_writer::recycle_encode_buf(packet);
+                recycle_encode_buf(packet);
                 if res.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
@@ -387,7 +364,7 @@ async fn handle_udp_proxy(
             loop {
                 let Some((opcode, packet)) = read_frame_with_cipher(
                     &mut rd,
-                    Option::<&mut BoxWriter>::None,
+                    Option::<&mut TlsWriter>::None,
                     &mut frame_buf,
                     Some(&c),
                 )
@@ -396,7 +373,7 @@ async fn handle_udp_proxy(
                     break;
                 };
                 if opcode != 2 {
-                    crate::mux_writer::recycle_encode_buf(packet);
+                    recycle_encode_buf(packet);
                     continue;
                 }
                 // Copy the peer out first: a std Mutex guard must never be
@@ -406,32 +383,24 @@ async fn handle_udp_proxy(
                     let _ = udp.send_to(&packet, peer).await;
                     crate::stats::add_bytes(0, packet.len() as i64);
                 }
-                crate::mux_writer::recycle_encode_buf(packet);
+                recycle_encode_buf(packet);
             }
             Ok::<(), anyhow::Error>(())
         } => {}
     }
-    crate::mux_writer::recycle_encode_buf(frame_buf);
+    recycle_encode_buf(frame_buf);
     upload.abort();
     let _ = control.shutdown().await;
     Ok(())
 }
 
-type NonMuxWssPool = NonMuxPool<WssConfig, BoxReader, BoxWriter>;
+type NonMuxWssPool = NonMuxPool<WssConfig, TlsReader, TlsWriter>;
 
-/// Boxed adapter so the shared [`NonMuxPool`] can dial the WSS opener. The
-/// pooled transport is single-use: its writer leaves the shared wrapper
-/// here, so the relay below needs no per-frame locking.
+/// Boxed adapter so the shared [`NonMuxPool`] can dial the WSS opener.
 fn dial_pooled_wss(
     cfg: &WssConfig,
-) -> Pin<Box<dyn Future<Output = Result<(BoxReader, BoxWriter)>> + Send + '_>> {
-    Box::pin(async move {
-        let (rd, wr) = open_upstream(cfg).await?;
-        let wr = Arc::try_unwrap(wr)
-            .map_err(|_| anyhow!("upstream writer unexpectedly shared"))?
-            .into_inner();
-        Ok((rd, wr))
-    })
+) -> Pin<Box<dyn Future<Output = Result<(TlsReader, TlsWriter)>> + Send + '_>> {
+    Box::pin(open_upstream(cfg))
 }
 
 const WSS_NON_MUX_RELAY: NonMuxRelaySpec = NonMuxRelaySpec {
@@ -536,18 +505,21 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
     Ok(())
 }
 
+struct ClientStreamEntry {
+    tx: mpsc::Sender<OwnedMuxFrame>,
+    gate: Arc<CreditGate>,
+}
+
 struct WssSessionState {
     writer: Arc<MuxFrameWriter>,
     cipher: XorCipher,
     obfs: bool,
-    // Read-mostly under concurrency (one lookup per DATA frame), so a
-    // RwLock: concurrent lookups, exclusive insert/remove.
-    streams: Arc<std::sync::RwLock<HashMap<u32, mpsc::Sender<OwnedMuxFrame>>>>,
+    // Read-mostly under concurrency (one shared lookup per DATA or WINDOW frame),
+    // so a single RwLock<U32HashMap> holds both the downstream channel and upload gate.
+    streams: Arc<std::sync::RwLock<U32HashMap<ClientStreamEntry>>>,
     /// Peer-advertised receive window in KiB once its VERSION arrived
     /// (0 => un-negotiated: v1 unbounded sends, no WINDOW refunds).
     peer_window_kib: AtomicU32,
-    /// Per-stream upload credit gates (populated in open_stream).
-    gates: StdMutex<HashMap<u32, Arc<CreditGate>>>,
     next_id: AtomicU32,
     active: AtomicUsize,
     closed: AtomicBool,
@@ -555,23 +527,20 @@ struct WssSessionState {
 }
 impl WssSessionState {
     async fn connect(cfg: &WssConfig, capacity_notify: Arc<Notify>) -> Result<Arc<Self>> {
-        let (mut rd, writer) = open_upstream(cfg).await?;
+        let (mut rd, mut wr) = open_upstream(cfg).await?;
         let c = configured_cipher(&cfg.key);
         let mut hello = b"MUX\n".to_vec();
         c.apply(&mut hello);
 
         tracing::info!("[WSS] Sending MUX handshake");
-        {
-            let mut w = writer.lock().await;
-            write_frame(&mut *w, &hello, 2, true)
-                .await
-                .context("MUX handshake request write failed")?;
-        };
+        write_frame(&mut wr, &hello, 2, true)
+            .await
+            .context("MUX handshake request write failed")?;
         let mut frame_buf = Vec::with_capacity(64 * 1024);
         let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
         let read_result = timeout(
             mux_timeout,
-            read_frame(&mut rd, Option::<&mut BoxWriter>::None, &mut frame_buf),
+            read_frame(&mut rd, Option::<&mut TlsWriter>::None, &mut frame_buf),
         )
         .await
         .context("MUX OK timeout")??;
@@ -589,19 +558,15 @@ impl WssSessionState {
         tracing::info!("[WSS] MUX handshake completed");
         // Hand the write half to the dedicated writer task; from here on
         // all MUX frames go through the serialized, coalescing queue.
-        let writer = Arc::try_unwrap(writer)
-            .map_err(|_| anyhow!("upstream writer unexpectedly shared"))?
-            .into_inner();
-        let (writer, _writer_task) = MuxFrameWriter::spawn(writer);
+        let (writer, _writer_task) = MuxFrameWriter::spawn(wr);
         let cipher_for_version = c.clone();
         let obfs_for_version = cfg.obfs;
         let session = Arc::new(Self {
             writer: writer.clone(),
             cipher: c.clone(),
             obfs: cfg.obfs,
-            streams: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            streams: Arc::new(std::sync::RwLock::new(U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
-            gates: StdMutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -625,14 +590,16 @@ impl WssSessionState {
                 tracing::debug!(%error,"WSS physical session reader stopped")
             };
             reader_session.closed.store(true, Ordering::Release);
-            let mut streams = reader_session.streams.write().unwrap_or_else(|e| e.into_inner());
-            streams.clear();
             // Unblock upload tasks parked on credit: no WINDOW will arrive.
-            let mut gates = reader_session.gates.lock().unwrap_or_else(|e| e.into_inner());
-            for gate in gates.values() {
-                gate.close();
+            let mut streams = reader_session
+                .streams
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for entry in streams.values() {
+                entry.gate.close();
             }
-            gates.clear();
+            streams.clear();
+            drop(streams);
             reader_session.active.store(0, Ordering::Release);
             reader_session.capacity_notify.notify_waiters();
         });
@@ -687,7 +654,11 @@ impl WssSessionState {
         if !self.try_reserve() {
             bail!("WSS physical session is full or closed")
         };
-        let (id, rx, gate) = {
+        // Pre-allocate channel and credit gate outside the RwLock write guard.
+        let (tx, rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
+        let gate = CreditGate::new();
+
+        let id = {
             let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
@@ -703,20 +674,18 @@ impl WssSessionState {
                     break;
                 }
             }
-            let (tx, rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
-            // Scoped gate registration: gates guard dies before the send awaits.
-            let gate = {
-                let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
-                let gate = CreditGate::new();
-                let kib = self.peer_window_kib.load(Ordering::Acquire);
-                if kib > 0 {
-                    gate.enable(i64::from(kib) * 1024);
-                }
-                gates.insert(stream_id, gate.clone());
-                gate
-            };
-            streams.insert(stream_id, tx);
-            (stream_id, rx, gate)
+            let kib = self.peer_window_kib.load(Ordering::Acquire);
+            if kib > 0 {
+                gate.enable(i64::from(kib) * 1024);
+            }
+            streams.insert(
+                stream_id,
+                ClientStreamEntry {
+                    tx,
+                    gate: gate.clone(),
+                },
+            );
+            stream_id
         };
         let port_digits = if target.port >= 10000 {
             5
@@ -772,22 +741,25 @@ impl WssSessionState {
         Ok((id, rx, gate))
     }
     async fn close_stream(&self, id: u32) {
-        if self.streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
+        if let Some(entry) = self
+            .streams
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            entry.gate.close();
             self.active.fetch_sub(1, Ordering::AcqRel);
             self.capacity_notify.notify_waiters();
         }
-        if let Some(gate) = self.gates.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-            gate.close();
-        }
     }
 }
-async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> Result<()> {
+async fn wss_reader_loop(rd: &mut TlsReader, session: Arc<WssSessionState>) -> Result<()> {
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let res = async {
         loop {
             let Some((opcode, payload)) = read_frame_with_cipher(
                 rd,
-                Option::<&mut BoxWriter>::None,
+                Option::<&mut TlsWriter>::None,
                 &mut frame_buf,
                 Some(&session.cipher),
             )
@@ -796,7 +768,7 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
                 return Ok(());
             };
             if opcode != 2 {
-                crate::mux_writer::recycle_encode_buf(payload);
+                recycle_encode_buf(payload);
                 continue;
             }
             let frame = match MuxFrame::decode_owned(payload) {
@@ -809,15 +781,18 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
             match frame.command {
                 MuxCommand::Version => {
                     let decoded = decode_version_payload(frame.payload());
-                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    recycle_encode_buf(frame.into_storage());
                     if let Some((version, kib)) = decoded {
                         if version >= 1 {
                             let prev = session.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
                             if prev == 0 {
-                                let gates = session.gates.lock().unwrap_or_else(|e| e.into_inner());
+                                let streams = session
+                                    .streams
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner());
                                 let window = i64::from(kib) * 1024;
-                                for gate in gates.values() {
-                                    gate.enable(window);
+                                for entry in streams.values() {
+                                    entry.gate.enable(window);
                                 }
                             }
                         }
@@ -827,15 +802,15 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
                 MuxCommand::Window => {
                     let stream_id = frame.stream_id;
                     let decoded = decode_window_payload(frame.payload());
-                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    recycle_encode_buf(frame.into_storage());
                     if let Some(credit) = decoded {
-                        if let Some(gate) = session
-                            .gates
-                            .lock()
+                        if let Some(entry) = session
+                            .streams
+                            .read()
                             .unwrap_or_else(|e| e.into_inner())
                             .get(&stream_id)
                         {
-                            gate.release(i64::from(credit));
+                            entry.gate.release(i64::from(credit));
                         }
                     }
                     continue;
@@ -843,51 +818,39 @@ async fn wss_reader_loop(rd: &mut BoxReader, session: Arc<WssSessionState>) -> R
                 _ => {}
             }
             let id = frame.stream_id;
-            let sender = session
-                .streams
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&id)
-                .cloned();
-            if let Some(tx) = sender {
-                // Terminal FIN/RST is forwarded; accounting is done once by the
-                // stream owner (see handle_connection cleanup below), mirroring
-                // mux_pool::client_reader_loop.
-                //
-                // Non-blocking, like the other two read loops: one local client
-                // that stops reading must not stall downloads for every other
-                // stream multiplexed on this session.
-                match tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(f)) => {
-                        crate::mux_writer::recycle_encode_buf(f.into_storage());
-                        tracing::warn!(
-                            stream_id = id,
-                            "mux RST: stream queue full; resetting stalled stream"
-                        );
-                        let _ = send_mux_parts(
-                            &session.writer,
-                            &session.cipher,
-                            id,
-                            MuxCommand::Rst,
-                            &[],
-                            session.obfs,
-                        )
-                        .await;
-                        session.close_stream(id).await;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(f)) => {
-                        crate::mux_writer::recycle_encode_buf(f.into_storage());
-                        session.close_stream(id).await;
-                    }
+            let send_res = {
+                let streams = session.streams.read().unwrap_or_else(|e| e.into_inner());
+                streams.get(&id).map(|entry| entry.tx.try_send(frame))
+            };
+            match send_res {
+                Some(Ok(())) => {}
+                Some(Err(mpsc::error::TrySendError::Full(f))) => {
+                    recycle_encode_buf(f.into_storage());
+                    tracing::warn!(
+                        stream_id = id,
+                        "mux RST: stream queue full; resetting stalled stream"
+                    );
+                    let _ = send_mux_parts(
+                        &session.writer,
+                        &session.cipher,
+                        id,
+                        MuxCommand::Rst,
+                        &[],
+                        session.obfs,
+                    )
+                    .await;
+                    session.close_stream(id).await;
                 }
-            } else {
-                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                Some(Err(mpsc::error::TrySendError::Closed(f))) => {
+                    recycle_encode_buf(f.into_storage());
+                    session.close_stream(id).await;
+                }
+                None => {}
             }
         }
     }
     .await;
-    crate::mux_writer::recycle_encode_buf(frame_buf);
+    recycle_encode_buf(frame_buf);
     res
 }
 
@@ -983,19 +946,21 @@ impl WssSessionPool {
     )> {
         let n = self.session_count;
         loop {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            let snapshot = sessions
-                .iter()
-                .filter(|s| s.available())
-                .map(|s| (s.active.load(Ordering::Acquire), s.clone()))
-                .collect::<Vec<_>>();
-            if let Some((_active, session)) = snapshot.into_iter().min_by_key(|(active, _)| *active) {
-                drop(sessions);
+            let (chosen, need_new) = {
+                let mut sessions = self.sessions.lock().await;
+                sessions.retain(|s| !s.closed.load(Ordering::Acquire));
+                let chosen = sessions
+                    .iter()
+                    .filter(|s| s.available())
+                    .min_by_key(|s| s.active.load(Ordering::Acquire))
+                    .cloned();
+                let need_new = sessions.len() < n;
+                (chosen, need_new)
+            };
+            if let Some(session) = chosen {
                 match session.open_stream(target, &initial_data).await {
                     Ok(opened) => {
-                        let current_len = self.sessions.lock().await.len();
-                        if current_len < n {
+                        if need_new {
                             let pool = self.clone();
                             tokio::spawn(async move {
                                 pool.replenish().await;
@@ -1006,8 +971,6 @@ impl WssSessionPool {
                     Err(_) => continue,
                 }
             }
-            let need_new = sessions.len() < n;
-            drop(sessions);
             if !need_new {
                 // Every session is at capacity: park until a stream release,
                 // a session close, or a replenished session signals spare
@@ -1073,7 +1036,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     } else if req.is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     };
-    let (mut local_rd, mut local_wr) = tokio::io::split(local);
+    let (mut local_rd, mut local_wr) = local.into_split();
     let buffer_size = pool.cfg.buffer_size;
     let upload = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
@@ -1116,7 +1079,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             Result::<()>::Ok(())
         }
         .await;
-        crate::mux_writer::recycle_encode_buf(frame_scratch);
+        recycle_encode_buf(frame_scratch);
         recycle_buf(buf).await;
         res
     });
@@ -1124,26 +1087,47 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     let mut refund_pending: u32 = 0;
     let mut result = Result::<()>::Ok(());
     let mut remote_fin = false;
-    while let Some(frame) = rx.recv().await {
+    let mut data_batch: Vec<OwnedMuxFrame> = Vec::with_capacity(16);
+    let mut deferred_ctrl: Option<OwnedMuxFrame> = None;
+    loop {
+        let frame = if let Some(ctrl) = deferred_ctrl.take() {
+            ctrl
+        } else {
+            match rx.recv().await {
+                Some(f) => f,
+                None => break,
+            }
+        };
         match frame.command {
             MuxCommand::Data => {
-                let payload_empty = frame.payload().is_empty();
-                let len = frame.payload().len();
-                let write_res = if !payload_empty {
-                    local_wr.write_all(frame.payload()).await
-                } else {
-                    Ok(())
-                };
-                crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                if let Err(e) = write_res {
-                    result = Err(e.into());
-                    break;
+                data_batch.push(frame);
+                while data_batch.len() < 16 {
+                    match rx.try_recv() {
+                        Ok(next) if next.command == MuxCommand::Data => data_batch.push(next),
+                        Ok(other) => {
+                            deferred_ctrl = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
-                if !payload_empty {
-                    crate::stats::add_bytes(0, len as i64);
+                let write_res = write_owned_frames_vectored(&mut local_wr, &data_batch).await;
+                recycle_encode_bufs(data_batch.drain(..).map(OwnedMuxFrame::into_storage));
+                let written = match write_res {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if let Some(ctrl) = deferred_ctrl.take() {
+                            recycle_encode_buf(ctrl.into_storage());
+                        }
+                        result = Err(e.into());
+                        break;
+                    }
+                };
+                if written > 0 {
+                    crate::stats::add_bytes(0, written as i64);
                     let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
                     if negotiated {
-                        refund_pending = refund_pending.saturating_add(len as u32);
+                        refund_pending = refund_pending.saturating_add(written as u32);
                         if refund_pending as usize >= MUX_WINDOW_REFRESH {
                             let credit = std::mem::take(&mut refund_pending);
                             if let Err(e) = send_mux_parts(
@@ -1156,6 +1140,9 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                             )
                             .await
                             {
+                                if let Some(ctrl) = deferred_ctrl.take() {
+                                    recycle_encode_buf(ctrl.into_storage());
+                                }
                                 result = Err(e);
                                 break;
                             }
@@ -1166,18 +1153,18 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 }
             }
             MuxCommand::Fin => {
-                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                recycle_encode_buf(frame.into_storage());
                 let _ = local_wr.shutdown().await;
                 remote_fin = true;
                 break;
             }
             MuxCommand::Rst => {
-                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                recycle_encode_buf(frame.into_storage());
                 result = Err(anyhow!("upstream reset after CONNECT established"));
                 break;
             }
             MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
-                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                recycle_encode_buf(frame.into_storage());
             }
         }
     }

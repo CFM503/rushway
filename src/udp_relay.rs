@@ -14,8 +14,8 @@ use crate::ws::{
 use anyhow::{anyhow, bail, Result};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{tcp::OwnedWriteHalf, TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 
 pub async fn handle_local_udp_proxy(
@@ -68,7 +68,7 @@ pub async fn handle_local_udp_proxy(
         }
     };
     apply_socket_options(&socket, &cfg);
-    let (mut rd, mut wr) = tokio::io::split(socket);
+    let (mut rd, mut wr) = socket.into_split();
     let sni_base = cfg
         .fakehost
         .as_deref()
@@ -98,7 +98,7 @@ pub async fn handle_local_udp_proxy(
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let Some((opcode, mut ok)) = read_frame(
         &mut rd,
-        Option::<&mut WriteHalf<TcpStream>>::None,
+        Option::<&mut OwnedWriteHalf>::None,
         &mut frame_buf,
     )
     .await?
@@ -160,7 +160,7 @@ pub async fn handle_local_udp_proxy(
             loop {
                 let Some((opcode, packet)) = read_frame_with_cipher(
                     &mut rd,
-                    Option::<&mut WriteHalf<TcpStream>>::None,
+                    Option::<&mut OwnedWriteHalf>::None,
                     &mut frame_buf,
                     Some(&c),
                 )

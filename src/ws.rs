@@ -182,11 +182,56 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
     let mut b = [0u8; 1];
-    let deadline = tokio::time::Instant::now() + timeout_duration;
 
-    loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
+    let read_loop = async {
+        loop {
+            match r.read_exact(&mut b).await {
+                Ok(_) => {
+                    out.push(b[0]);
+                    let len = out.len();
+                    if (len >= 4 && out[len - 4..] == *b"\r\n\r\n")
+                        || (len >= 2 && out[len - 2..] == *b"\n\n")
+                    {
+                        return Ok(());
+                    }
+                    if len >= MAX_HTTP_HEADER_SIZE {
+                        bail!("header too large");
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e));
+                }
+            }
+        }
+    };
+
+    match tokio::time::timeout(timeout_duration, read_loop).await {
+        Ok(Ok(())) => Ok(out),
+        Ok(Err(e)) => {
+            if out.is_empty() {
+                tracing::warn!(
+                    "[WSS] HTTP handshake connection closed by peer; received 0 response bytes ({})",
+                    e
+                );
+                bail!(
+                    "WSS HTTP handshake connection closed by peer; received 0 response bytes ({})",
+                    e
+                );
+            } else if e.to_string() == "header too large" {
+                Err(e)
+            } else {
+                let partial = String::from_utf8_lossy(&out);
+                tracing::warn!(
+                    "[WSS] HTTP handshake connection closed by peer; partial response:\n{}",
+                    partial
+                );
+                bail!(
+                    "WSS HTTP handshake connection closed by peer; partial response:\n{}",
+                    partial
+                );
+            }
+        }
+        Err(_elapsed) => {
             if out.is_empty() {
                 tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
                 bail!("WSS HTTP handshake response timeout; received 0 response bytes");
@@ -197,56 +242,6 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
                     "WSS HTTP handshake response timeout; partial response:\n{}",
                     partial
                 );
-            }
-        }
-        let remaining = deadline - now;
-        match tokio::time::timeout(remaining, r.read_exact(&mut b)).await {
-            Ok(Ok(_)) => {
-                out.push(b[0]);
-                if out.len() >= 4 && out[out.len() - 4..] == *b"\r\n\r\n" {
-                    return Ok(out);
-                }
-                if out.len() >= 2 && out[out.len() - 2..] == *b"\n\n" {
-                    return Ok(out);
-                }
-                if out.len() >= MAX_HTTP_HEADER_SIZE {
-                    bail!("header too large");
-                }
-            }
-            Ok(Err(e)) => {
-                if out.is_empty() {
-                    tracing::warn!(
-                        "[WSS] HTTP handshake connection closed by peer; received 0 response bytes ({})",
-                        e
-                    );
-                    bail!(
-                        "WSS HTTP handshake connection closed by peer; received 0 response bytes ({})",
-                        e
-                    );
-                } else {
-                    let partial = String::from_utf8_lossy(&out);
-                    tracing::warn!(
-                        "[WSS] HTTP handshake connection closed by peer; partial response:\n{}",
-                        partial
-                    );
-                    bail!(
-                        "WSS HTTP handshake connection closed by peer; partial response:\n{}",
-                        partial
-                    );
-                }
-            }
-            Err(_elapsed) => {
-                if out.is_empty() {
-                    tracing::warn!("[WSS] HTTP handshake timeout; received 0 response bytes");
-                    bail!("WSS HTTP handshake response timeout; received 0 response bytes");
-                } else {
-                    let partial = String::from_utf8_lossy(&out);
-                    tracing::warn!("[WSS] HTTP handshake timeout; partial response:\n{}", partial);
-                    bail!(
-                        "WSS HTTP handshake response timeout; partial response:\n{}",
-                        partial
-                    );
-                }
             }
         }
     }
@@ -841,61 +836,76 @@ where
             127 => 8,
             _ => 0,
         };
-        let mut rest = [0u8; 12];
-        let rest_len = ext_len + if masked { 4 } else { 0 };
-        if rest_len > 0 {
-            r.read_exact(&mut rest[..rest_len]).await?;
-        }
-        let mut len = len_marker as u64;
-        if ext_len == 2 {
-            len = u16::from_be_bytes(rest[..2].try_into().unwrap()) as u64;
-        } else if ext_len == 8 {
-            len = u64::from_be_bytes(rest[..8].try_into().unwrap());
-        }
-        if len > MAX_WS_FRAME_SIZE as u64 {
-            return Err(anyhow!("frame too large"));
-        }
         if opcode >= 0x8 {
-            if !fin || len > 125 {
+            if !fin || len_marker > 125 {
                 return Err(anyhow!("invalid websocket control frame"));
             }
         } else if opcode == 0 || !fin || (opcode != 1 && opcode != 2) {
             return Err(anyhow!("unsupported or fragmented websocket frame"));
         }
-        let mut key = [0u8; 4];
-        if masked {
-            key.copy_from_slice(&rest[ext_len..ext_len + 4]);
-        }
+
         // Match ENCODE_POOL_MAX_CAP (80 KiB) so a full 64 KiB MUX frame
         // (65535 + 7 = 65542 bytes, or up to 66942 bytes with obfs) is read
         // in a single `read_exact` call and never triggers `grow_amortized`
         // to 128 KiB (which would exceed the pool cap and force reallocs).
         const READ_SEGMENT: usize = 80 * 1024;
         buf.clear();
-        let total = len as usize;
-        if total > buf.capacity() {
-            if total > 4096 && total <= READ_SEGMENT {
-                buf.reserve_exact(READ_SEGMENT);
-            } else {
-                buf.reserve(total.min(READ_SEGMENT));
-            }
-        }
-        let mut read: usize = 0;
-        while read < total {
-            let chunk = (total - read).min(READ_SEGMENT);
-            let start = buf.len();
-            if buf.capacity() - start < chunk {
-                buf.reserve(chunk);
-            }
-            // SAFETY: `set_len` exposes `[start, start+chunk)`, which the
-            // `read_exact` below fully initializes before any of it is
-            // observed; on error we `truncate` back to `start` first.
-            unsafe { buf.set_len(start + chunk) };
-            if r.read_exact(&mut buf[start..start + chunk]).await.is_err() {
-                buf.truncate(start);
+
+        let mut key = [0u8; 4];
+        if ext_len == 0 && masked {
+            // Fast path for short masked frames (<= 125 bytes: SYN, WINDOW,
+            // FIN, RST, VERSION, Ping/Pong, and small DATA): read the 4-byte
+            // mask key and payload together in a single read_exact syscall.
+            let total = len_marker as usize;
+            let mut small = [0u8; 4 + 125];
+            if r.read_exact(&mut small[..4 + total]).await.is_err() {
                 return Err(anyhow!("websocket payload truncated"));
             }
-            read += chunk;
+            key.copy_from_slice(&small[..4]);
+            buf.extend_from_slice(&small[4..4 + total]);
+        } else {
+            let mut rest = [0u8; 12];
+            let rest_len = ext_len + if masked { 4 } else { 0 };
+            if rest_len > 0 {
+                r.read_exact(&mut rest[..rest_len]).await?;
+            }
+            let mut len = len_marker as u64;
+            if ext_len == 2 {
+                len = u16::from_be_bytes(rest[..2].try_into().unwrap()) as u64;
+            } else if ext_len == 8 {
+                len = u64::from_be_bytes(rest[..8].try_into().unwrap());
+            }
+            if len > MAX_WS_FRAME_SIZE as u64 {
+                return Err(anyhow!("frame too large"));
+            }
+            if masked {
+                key.copy_from_slice(&rest[ext_len..ext_len + 4]);
+            }
+            let total = len as usize;
+            if total > buf.capacity() {
+                if total > 4096 && total <= READ_SEGMENT {
+                    buf.reserve_exact(READ_SEGMENT);
+                } else {
+                    buf.reserve(total.min(READ_SEGMENT));
+                }
+            }
+            let mut read: usize = 0;
+            while read < total {
+                let chunk = (total - read).min(READ_SEGMENT);
+                let start = buf.len();
+                if buf.capacity() - start < chunk {
+                    buf.reserve(chunk);
+                }
+                // SAFETY: `set_len` exposes `[start, start+chunk)`, which the
+                // `read_exact` below fully initializes before any of it is
+                // observed; on error we `truncate` back to `start` first.
+                unsafe { buf.set_len(start + chunk) };
+                if r.read_exact(&mut buf[start..start + chunk]).await.is_err() {
+                    buf.truncate(start);
+                    return Err(anyhow!("websocket payload truncated"));
+                }
+                read += chunk;
+            }
         }
         match opcode {
             1 | 2 => {

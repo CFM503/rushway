@@ -66,16 +66,22 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     if let Ok(ip) = clean.parse::<IpAddr>() {
         return Ok(ip);
     }
-    let key = clean.trim_end_matches('.').to_ascii_lowercase();
-    // Fast path: synchronous read lock, zero tokio yield, nanosecond cache hit
+    let trimmed = clean.trim_end_matches('.');
+    let key: std::borrow::Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    // Fast path: synchronous read lock, zero tokio yield, zero heap allocation on lowercase cache hit
     if let Ok(guard) = cache().read() {
-        if let Some(&(ip, expires)) = guard.get(&key) {
+        if let Some(&(ip, expires)) = guard.get(key.as_ref()) {
             if expires > Instant::now() {
                 return Ok(ip);
             }
         }
     }
 
+    let key = key.into_owned();
     // SingleFlight coordination: deduplicate concurrent in-flight DNS lookups for the same host.
     let mut waiter = None;
     let mut tx = None;
@@ -177,15 +183,21 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
     if clean.parse::<Ipv6Addr>().is_ok() {
         return Ok(Vec::new());
     }
-    let key = clean.trim_end_matches('.').to_ascii_lowercase();
-    // Fast path: synchronous read lock, zero tokio yield
+    let trimmed = clean.trim_end_matches('.');
+    let key: std::borrow::Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    // Fast path: synchronous read lock, zero tokio yield, zero key allocation on lowercase cache hit
     if let Ok(guard) = all_v4_cache().read() {
-        if let Some((ips, expires)) = guard.get(&key) {
+        if let Some((ips, expires)) = guard.get(key.as_ref()) {
             if *expires > Instant::now() && !ips.is_empty() {
                 return Ok(ips.clone());
             }
         }
     }
+    let key = key.into_owned();
     let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
     let remote_result = match server {
         Some(server_ip) => query_remote_all_ipv4(&key, server_ip).await,

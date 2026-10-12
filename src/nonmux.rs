@@ -24,7 +24,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
+};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 
@@ -69,12 +72,7 @@ async fn connect_ws_with_fallback(
     Err(failed)
 }
 
-async fn open_upstream(
-    cfg: &RuntimeConfig,
-) -> Result<(
-    tokio::io::ReadHalf<TcpStream>,
-    tokio::io::WriteHalf<TcpStream>,
-)> {
+async fn open_upstream(cfg: &RuntimeConfig) -> Result<(OwnedReadHalf, OwnedWriteHalf)> {
     let upstream = cfg
         .upstream
         .as_deref()
@@ -89,7 +87,7 @@ async fn open_upstream(
         .unwrap_or(&target.host);
     let tcp = connect_ws_with_fallback(cfg, &target.host, target.port).await?;
     apply_socket_options(&tcp, cfg);
-    let (mut rd, mut wr) = tokio::io::split(tcp);
+    let (mut rd, mut wr) = tcp.into_split();
     let header_base = header_host.split(':').next().unwrap_or(&header_host);
     let origin = format!("http://{}", sni_base);
     let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
@@ -106,26 +104,12 @@ async fn open_upstream(
     Ok((rd, wr))
 }
 
-type PlainNonMuxPool = NonMuxPool<
-    RuntimeConfig,
-    tokio::io::ReadHalf<TcpStream>,
-    tokio::io::WriteHalf<TcpStream>,
->;
+type PlainNonMuxPool = NonMuxPool<RuntimeConfig, OwnedReadHalf, OwnedWriteHalf>;
 
 /// Boxed adapter so the shared [`NonMuxPool`] can dial the plain-WS opener.
 fn dial_pooled_plain(
     cfg: &RuntimeConfig,
-) -> Pin<
-    Box<
-        dyn Future<
-                Output = Result<(
-                    tokio::io::ReadHalf<TcpStream>,
-                    tokio::io::WriteHalf<TcpStream>,
-                )>,
-            > + Send
-            + '_,
-    >,
-> {
+) -> Pin<Box<dyn Future<Output = Result<(OwnedReadHalf, OwnedWriteHalf)>> + Send + '_>> {
     Box::pin(open_upstream(cfg))
 }
 
@@ -277,7 +261,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     Ok(())
 }
 async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (mut rd, mut wr) = stream.into_split();
     let request = read_http_headers(&mut rd).await?;
     let key = validate_server_handshake(&request)?;
     wr.write_all(&build_server_handshake_response(&key)).await?;
@@ -286,7 +270,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let Some((opcode, target_frame)) = read_frame_with_cipher(
         &mut rd,
-        Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
+        Option::<&mut OwnedWriteHalf>::None,
         &mut frame_buf,
         Some(&c),
     )
@@ -354,7 +338,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         crate::mux_writer::recycle_encode_buf(frame_buf);
         return Err(e.into());
     }
-    let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
+    let (mut target_rd, mut target_wr) = target_stream.into_split();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
@@ -378,7 +362,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
                 }
                 res = read_frame(
                     &mut rd,
-                    Option::<&mut tokio::io::WriteHalf<TcpStream>>::None,
+                    Option::<&mut OwnedWriteHalf>::None,
                     &mut frame_buf,
                 ) => {
                     let Some((opcode, payload)) = res? else {

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.42] - 2026-10-12
+
+### Performance & Forwarding Optimizations
+
+- **Lock-free `into_split()` across all TCP relay paths** (`runtime.rs`, `mux_pool.rs`, `wss_client.rs`, `common.rs`, `nonmux.rs`, `udp_relay.rs`, `quic.rs`) — replaced `tokio::io::split` (which wraps `TcpStream` in a shared `Arc<Mutex<TcpStream>>` locked on every read and write poll) with `TcpStream::into_split()` (`OwnedReadHalf` / `OwnedWriteHalf`) across server MUX targets, client MUX local sockets, non-MUX relays, UDP relays, and QUIC TCP streams.
+- **Vectored I/O (`writev` / `WSASend`) batching for MUX outbound-to-socket writes** (`mux_writer.rs`, `runtime.rs`, `mux_pool.rs`, `wss_client.rs`) — added `write_owned_frames_vectored` and coalesced up to 16 burst `MuxCommand::Data` frames (plus server pre-dial `pending` queues) via `rx.try_recv()` into a single vectored socket write and a single batched `recycle_encode_bufs` return.
+- **Single-multiply `U32Hasher` for `u32` MUX stream tables and unified client stream/gate map** (`protocol.rs`, `mux_writer.rs`, `runtime.rs`, `mux_pool.rs`, `wss_client.rs`) — replaced SipHash-1-3 on internal `u32` stream ID maps with `U32HashMap`, eliminated duplicate `HashMap` lookups in `Scheduler::next()`, merged `streams` and `gates` in `SessionState` / `WssSessionState` into a single `RwLock<U32HashMap<ClientStreamEntry>>`, pre-allocated `mpsc::channel` and `CreditGate` outside the write lock, and removed per-acquire `Vec` snapshot allocations in `MuxSessionPool::acquire` and `WssSessionPool::acquire`.
+- **Direct concrete TLS stream halves in WSS client** (`wss_client.rs`) — removed `Box<dyn Transport>` heap boxing, dynamic vtable dispatch (`BoxReader` / `BoxWriter`), and redundant `Arc<Mutex<...>>` wrapping on WSS upstream handshakes in favor of concrete `ReadHalf<tls::RushTlsStream>` and `WriteHalf<tls::RushTlsStream>`.
+- **Single-syscall short masked WebSocket frame read and single outer handshake timeout** (`ws.rs`) — combined the 4-byte mask key and payload read into a single `read_exact` call for masked frames `<= 125` bytes (`SYN`, `WINDOW`, `FIN`, `RST`, `VERSION`, `Ping`/`Pong`, `"MUX\n"`, and small `Data`), and replaced the per-byte `tokio::time::timeout` registration in `read_http_headers_timeout` with a single outer timeout.
+- **QUIC UDP single-write buffer reuse, zero-alloc lowercase DNS cache lookup, and stack-buffered SOCKS5 parsing** (`quic.rs`, `dns.rs`, `proxy.rs`) — coalesced the 2-byte length prefix and UDP payload into a reusable buffer in `relay_quic_udp` and `handle_server_udp_stream`, replaced `tokio::sync::Mutex` on the QUIC UDP peer slot with `std::sync::Mutex`, avoided `String` allocations on lowercase ASCII DNS cache hits via `Cow::Borrowed`, and replaced heap `Vec` allocations in `read_client_proxy_request` SOCKS5 parsing with fixed stack buffers.
+
+### Fixed
+
+- **Closed lost-wakeup race in `CreditGate::acquire` slow path** (`flow.rs`) — kept the fast path free of `Notified` construction while pinning and calling `notified.as_mut().enable()` before re-checking `self.state` on the slow path, preventing missed wakeups when `close()` or `enable()` calls `notify_waiters()` concurrently.
+
 ## [v0.0.41] - 2026-10-12
 
 ### Performance & Forwarding Speed Breakthroughs

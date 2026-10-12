@@ -7,7 +7,8 @@ use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
 use crate::protocol::{
     decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, MUX_INITIAL_WINDOW_KIB, MUX_WINDOW_REFRESH,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, MUX_INITIAL_WINDOW_KIB,
+    MUX_WINDOW_REFRESH,
 };
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
@@ -17,11 +18,12 @@ use crate::ws::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::{timeout, Duration};
@@ -523,7 +525,7 @@ async fn send_reset_encrypted(
 }
 async fn target_to_mux(
     id: u32,
-    mut target: ReadHalf<TcpStream>,
+    mut target: OwnedReadHalf,
     writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
     cipher: XorCipher,
@@ -713,8 +715,8 @@ where
 
     // Read-mostly under concurrency (one lookup per DATA frame), so a
     // RwLock: concurrent lookups, exclusive insert/remove.
-    let streams: Arc<std::sync::RwLock<HashMap<u32, StreamEntry>>> =
-        Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let streams: Arc<std::sync::RwLock<U32HashMap<StreamEntry>>> =
+        Arc::new(std::sync::RwLock::new(U32HashMap::default()));
     // Session-wide ceiling on bytes parked in pre-dial `pending` queues
     // across every stream multiplexed here (see `PendingBytes`).
     const MAX_SESSION_PENDING_BYTES: usize = 512 * 1024 * 1024;
@@ -861,7 +863,7 @@ where
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
-                    streams: &Arc<std::sync::RwLock<HashMap<u32, StreamEntry>>>,
+                    streams: &Arc<std::sync::RwLock<U32HashMap<StreamEntry>>>,
                     stream_id: u32,
                     obfs: bool,
                 ) {
@@ -985,7 +987,7 @@ where
                             }
                         }
                     }
-                    let (rd_target, mut wr_target) = tokio::io::split(target_stream);
+                    let (rd_target, mut wr_target) = target_stream.into_split();
 
                     let mut reader = tokio::spawn(target_to_mux(
                         stream_id,
@@ -1002,45 +1004,19 @@ where
                     // target. Only accumulated once the client negotiated.
                     let mut refund_pending: u32 = 0;
 
-                    for frame in pending {
-                        let len = frame.payload().len();
-                        let write_res = wr_target.write_all(frame.payload()).await;
-                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                        // The frame has left `pending` whether or not the
-                        // write succeeded, so return the budget either way.
-                        pending_budget.release(len);
-                        if write_res.is_err() {
-                            reader.abort();
-                            streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
-                            return;
-                        }
-                        crate::stats::add_bytes(len as i64, 0);
-                        maybe_send_window(
-                            &writer_task,
-                            &cipher_task,
-                            stream_id,
-                            cfg_task.obfs,
-                            &peer_window_task,
-                            &mut refund_pending,
-                            len,
-                        )
-                        .await;
-                    }
-
-                    if client_fin {
-                        let _ = wr_target.shutdown().await;
-                    } else {
-                        while let Some(command) = rx.recv().await {
-                            match command {
-                                StreamCommand::Data(frame) => {
-                                    let len = frame.payload().len();
-                                    let write_res = wr_target.write_all(frame.payload()).await;
-                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                                    pending_budget.release(len);
-                                    if write_res.is_err() {
-                                        break;
-                                    }
-                                    crate::stats::add_bytes(len as i64, 0);
+                    if !pending.is_empty() {
+                        let write_res =
+                            crate::mux_writer::write_owned_frames_vectored(&mut wr_target, &pending)
+                                .await;
+                        let held = pending_budget.held_bytes();
+                        crate::mux_writer::recycle_encode_bufs(
+                            pending.into_iter().map(OwnedMuxFrame::into_storage),
+                        );
+                        pending_budget.release(held);
+                        match write_res {
+                            Ok(written) => {
+                                if written > 0 {
+                                    crate::stats::add_bytes(written as i64, 0);
                                     maybe_send_window(
                                         &writer_task,
                                         &cipher_task,
@@ -1048,9 +1024,132 @@ where
                                         cfg_task.obfs,
                                         &peer_window_task,
                                         &mut refund_pending,
-                                        len,
+                                        written,
                                     )
                                     .await;
+                                }
+                            }
+                            Err(_) => {
+                                reader.abort();
+                                streams_task
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&stream_id);
+                                return;
+                            }
+                        }
+                    }
+
+                    if client_fin {
+                        let _ = wr_target.shutdown().await;
+                    } else {
+                        let mut data_batch: Vec<OwnedMuxFrame> = Vec::new();
+                        let mut deferred: Option<StreamCommand> = None;
+                        loop {
+                            let command = match deferred.take() {
+                                Some(c) => c,
+                                None => match rx.recv().await {
+                                    Some(c) => c,
+                                    None => break,
+                                },
+                            };
+                            match command {
+                                StreamCommand::Data(frame) => {
+                                    match rx.try_recv() {
+                                        Ok(StreamCommand::Data(second)) => {
+                                            if data_batch.capacity() == 0 {
+                                                data_batch.reserve(16);
+                                            }
+                                            data_batch.push(frame);
+                                            data_batch.push(second);
+                                            while data_batch.len() < 16 {
+                                                match rx.try_recv() {
+                                                    Ok(StreamCommand::Data(next)) => {
+                                                        data_batch.push(next);
+                                                    }
+                                                    Ok(other) => {
+                                                        deferred = Some(other);
+                                                        break;
+                                                    }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                            let write_res =
+                                                crate::mux_writer::write_owned_frames_vectored(
+                                                    &mut wr_target,
+                                                    &data_batch,
+                                                )
+                                                .await;
+                                            crate::mux_writer::recycle_encode_bufs(
+                                                data_batch
+                                                    .drain(..)
+                                                    .map(OwnedMuxFrame::into_storage),
+                                            );
+                                            match write_res {
+                                                Ok(written) => {
+                                                    if written > 0 {
+                                                        crate::stats::add_bytes(written as i64, 0);
+                                                        maybe_send_window(
+                                                            &writer_task,
+                                                            &cipher_task,
+                                                            stream_id,
+                                                            cfg_task.obfs,
+                                                            &peer_window_task,
+                                                            &mut refund_pending,
+                                                            written,
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        Ok(other) => {
+                                            deferred = Some(other);
+                                            let len = frame.payload().len();
+                                            let write_res =
+                                                wr_target.write_all(frame.payload()).await;
+                                            crate::mux_writer::recycle_encode_buf(
+                                                frame.into_storage(),
+                                            );
+                                            if write_res.is_err() {
+                                                break;
+                                            }
+                                            crate::stats::add_bytes(len as i64, 0);
+                                            maybe_send_window(
+                                                &writer_task,
+                                                &cipher_task,
+                                                stream_id,
+                                                cfg_task.obfs,
+                                                &peer_window_task,
+                                                &mut refund_pending,
+                                                len,
+                                            )
+                                            .await;
+                                        }
+                                        Err(_) => {
+                                            let len = frame.payload().len();
+                                            let write_res =
+                                                wr_target.write_all(frame.payload()).await;
+                                            crate::mux_writer::recycle_encode_buf(
+                                                frame.into_storage(),
+                                            );
+                                            if write_res.is_err() {
+                                                break;
+                                            }
+                                            crate::stats::add_bytes(len as i64, 0);
+                                            maybe_send_window(
+                                                &writer_task,
+                                                &cipher_task,
+                                                stream_id,
+                                                cfg_task.obfs,
+                                                &peer_window_task,
+                                                &mut refund_pending,
+                                                len,
+                                            )
+                                            .await;
+                                        }
+                                    }
                                 }
                                 StreamCommand::Fin => {
                                     let _ = wr_target.shutdown().await;
@@ -1240,7 +1339,7 @@ where
     let mut ok = b"OK\n".to_vec();
     cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
-    let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
+    let (mut target_rd, mut target_wr) = target_stream.into_split();
     let buffer_size = cfg.buffer_size;
     let mut download = tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
@@ -1527,7 +1626,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
-                    let (rd, wr) = tokio::io::split(stream);
+                    let (rd, wr) = stream.into_split();
                     if let Err(e) = dispatch_server_ws_parts(rd, wr, cfg2).await {
                         tracing::debug!(%peer, error=%e, "transport connection closed")
                     }

@@ -9,10 +9,10 @@
 //! vectored writes.
 
 use crate::crypto::XorCipher;
-use crate::protocol::{write_frame_parts, MuxCommand};
+use crate::protocol::{write_frame_parts, MuxCommand, OwnedMuxFrame, U32HashMap};
 use crate::ws::{next_mask, ws_header_into};
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io::IoSlice;
 use std::pin::Pin;
@@ -304,7 +304,7 @@ struct StreamQueue {
 /// streams), preserving the old backpressure contract.
 struct Scheduler {
     priority: VecDeque<(Option<u32>, bool, Vec<u8>)>,
-    streams: HashMap<u32, StreamQueue>,
+    streams: U32HashMap<StreamQueue>,
     rotation: Vec<u32>,
     pos: usize,
     total: usize,
@@ -314,7 +314,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             priority: VecDeque::new(),
-            streams: HashMap::new(),
+            streams: U32HashMap::default(),
             rotation: Vec::new(),
             pos: 0,
             total: 0,
@@ -411,35 +411,29 @@ impl Scheduler {
             let sid = self.rotation[self.pos];
             self.pos += 1;
             checked += 1;
-            let drained = match self.streams.get(&sid) {
-                Some(q) => q.frames.is_empty(),
-                // Defensive: rotation and map disagree; heal it below.
-                None => true,
-            };
-            if drained {
-                // Drop streams whose queue drained eagerly. Streams closed
-                // without a closing control (RST / abort paths that only
-                // clear the connection table) would otherwise linger in
-                // `rotation` forever, forcing every `next()` to scan them.
-                // `remove_stream` repairs `pos`; the priority-lane yield
-                // check below treats a missing entry as unblocked, so a
-                // pending FIN/RST still fires after its DATA.
-                self.remove_stream(&sid);
-                continue;
-            }
-            let Some(q) = self.streams.get_mut(&sid) else {
-                continue;
-            };
-            q.deficit = (q.deficit + DRR_QUANTUM).min(DRR_MAX_DEFICIT);
-            let affordable = q.frames.front().map(|f| f.len()).unwrap_or(usize::MAX);
-            if affordable <= q.deficit {
-                q.deficit -= affordable;
-                let frame = q.frames.pop_front();
-                self.total -= 1;
-                if frame.is_some() {
-                    return frame;
+            if let Some(q) = self.streams.get_mut(&sid) {
+                if !q.frames.is_empty() {
+                    q.deficit = (q.deficit + DRR_QUANTUM).min(DRR_MAX_DEFICIT);
+                    let affordable = q.frames.front().map(|f| f.len()).unwrap_or(usize::MAX);
+                    if affordable <= q.deficit {
+                        q.deficit -= affordable;
+                        let frame = q.frames.pop_front();
+                        self.total -= 1;
+                        if frame.is_some() {
+                            return frame;
+                        }
+                    }
+                    continue;
                 }
             }
+            // Drop streams whose queue drained eagerly. Streams closed
+            // without a closing control (RST / abort paths that only
+            // clear the connection table) would otherwise linger in
+            // `rotation` forever, forcing every `next()` to scan them.
+            // `remove_stream` repairs `pos`; the priority-lane yield
+            // check above treats a missing entry as unblocked, so a
+            // pending FIN/RST still fires after its DATA.
+            self.remove_stream(&sid);
         }
         None
     }
@@ -707,6 +701,72 @@ where
         }
     }
     Ok(())
+}
+
+/// Writes a slice of [`OwnedMuxFrame`] payloads to `w` using vectored I/O
+/// (`writev` / `WSASend`), returning the total payload bytes written.
+pub(crate) async fn write_owned_frames_vectored<W>(
+    w: &mut W,
+    batch: &[OwnedMuxFrame],
+) -> std::io::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut total_len = 0usize;
+    for f in batch {
+        total_len += f.payload().len();
+    }
+    if total_len == 0 {
+        return Ok(0);
+    }
+    if batch.len() == 1 {
+        w.write_all(batch[0].payload()).await?;
+        return Ok(total_len);
+    }
+    let mut idx = 0usize;
+    let mut off = 0usize;
+    while idx < batch.len() {
+        if batch[idx].payload().len() == off {
+            idx += 1;
+            off = 0;
+            continue;
+        }
+        let n = poll_fn(|cx| {
+            let count = (batch.len() - idx).min(BATCH_MAX_FRAMES);
+            let mut slices: [IoSlice<'_>; BATCH_MAX_FRAMES] =
+                [IoSlice::new(&[]); BATCH_MAX_FRAMES];
+            slices[0] = IoSlice::new(&batch[idx].payload()[off..]);
+            let mut slice_count = 1;
+            for f in &batch[idx + 1..idx + count] {
+                let p = f.payload();
+                if !p.is_empty() {
+                    slices[slice_count] = IoSlice::new(p);
+                    slice_count += 1;
+                }
+            }
+            Pin::new(&mut *w).poll_write_vectored(cx, &slices[..slice_count])
+        })
+        .await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "vectored write returned zero",
+            ));
+        }
+        let mut remaining = n;
+        while remaining > 0 {
+            let available = batch[idx].payload().len() - off;
+            if remaining < available {
+                off += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                idx += 1;
+                off = 0;
+            }
+        }
+    }
+    Ok(total_len)
 }
 
 #[cfg(test)]

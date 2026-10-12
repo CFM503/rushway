@@ -446,45 +446,43 @@ where
     let first = stream.read_u8().await?;
     if first == SOCKS5_VERSION {
         let n = stream.read_u8().await? as usize;
-        let mut methods = vec![0u8; n];
-        stream.read_exact(&mut methods).await?;
-        if !methods.contains(&0) {
+        let mut methods = [0u8; 255];
+        stream.read_exact(&mut methods[..n]).await?;
+        if !methods[..n].contains(&0) {
             stream.write_all(&[5, 0xff]).await?;
             anyhow::bail!("SOCKS5 no-auth unavailable")
         }
         stream.write_all(&[5, 0]).await?;
-        let mut head = [0u8; 4];
-        stream.read_exact(&mut head).await?;
-        if head[1] != SOCKS5_CONNECT && head[1] != SOCKS5_UDP_ASSOCIATE {
+        // Max SOCKS5 request is 4 (head) + 1 (domain len) + 255 (domain) + 2 (port) = 262 bytes.
+        let mut req = [0u8; 262];
+        stream.read_exact(&mut req[..4]).await?;
+        if req[1] != SOCKS5_CONNECT && req[1] != SOCKS5_UDP_ASSOCIATE {
             stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
             anyhow::bail!("unsupported SOCKS5 command")
         }
-        let mut req = head.to_vec();
-        match head[3] {
+        let req_len = match req[3] {
             1 => {
-                let mut b = [0u8; 6];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b);
+                stream.read_exact(&mut req[4..10]).await?;
+                10
             }
             3 => {
-                let mut n = [0u8; 1];
-                stream.read_exact(&mut n).await?;
-                req.extend_from_slice(&n);
-                let mut b = vec![0u8; n[0] as usize + 2];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b);
+                let dlen = stream.read_u8().await? as usize;
+                req[4] = dlen as u8;
+                let end = 5 + dlen + 2;
+                stream.read_exact(&mut req[5..end]).await?;
+                end
             }
             4 => {
-                let mut b = [0u8; 18];
-                stream.read_exact(&mut b).await?;
-                req.extend_from_slice(&b);
+                stream.read_exact(&mut req[4..22]).await?;
+                22
             }
             _ => {
                 stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
                 anyhow::bail!("unsupported SOCKS5 address type")
             }
-        }
-        let parsed = parse_socks5_request(&req).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        };
+        let parsed =
+            parse_socks5_request(&req[..req_len]).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         return Ok(ClientProxyRequest {
             command: parsed.command,
             target: parsed.target,
@@ -494,18 +492,22 @@ where
         });
     }
 
-    let mut buf = vec![first];
+    let mut buf = Vec::with_capacity(512);
+    buf.push(first);
     let mut temp = [0u8; 1024];
     while buf.len() < 8192 {
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n") {
-            break;
-        }
-        let max_to_read = (8192 - buf.len()).min(temp.len());
+        let prev_len = buf.len();
+        let max_to_read = (8192 - prev_len).min(temp.len());
         let n = stream.read(&mut temp[..max_to_read]).await?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&temp[..n]);
+        let scan_start = prev_len.saturating_sub(3);
+        let tail = &buf[scan_start..];
+        if tail.windows(4).any(|w| w == b"\r\n\r\n") || tail.windows(2).any(|w| w == b"\n\n") {
+            break;
+        }
     }
     let req = parse_http_proxy_request(&buf).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(ClientProxyRequest {

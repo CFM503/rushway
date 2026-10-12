@@ -324,6 +324,21 @@ async fn write_len_prefixed_udp(send: &mut SendStream, payload: &[u8]) -> Result
     send.write_all(payload).await?;
     Ok(())
 }
+async fn write_len_prefixed_udp_reuse(
+    send: &mut SendStream,
+    payload: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    if payload.len() > MAX_QUIC_UDP_PACKET {
+        bail!("QUIC UDP payload too large")
+    }
+    scratch.clear();
+    scratch.reserve(2 + payload.len());
+    scratch.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    scratch.extend_from_slice(payload);
+    send.write_all(scratch).await?;
+    Ok(())
+}
 #[derive(Clone)]
 struct QuicClientPool {
     endpoint: Endpoint,
@@ -469,7 +484,7 @@ async fn relay_quic(
     if let Some(initial) = req.initial_payload {
         send.write_all(&initial).await?;
     }
-    let (lr, lw) = tokio::io::split(local);
+    let (lr, lw) = local.into_split();
     let buffer_size = cfg.buffer_size;
     let upload = tokio::spawn(async move {
         let mut r = lr;
@@ -555,12 +570,13 @@ async fn relay_quic_udp(
     if ok != "OK" {
         bail!("QUIC UDP upstream rejected: {}", ok)
     }
-    let latest = Arc::new(tokio::sync::Mutex::new(None::<std::net::SocketAddr>));
+    let latest = Arc::new(StdMutex::new(None::<std::net::SocketAddr>));
     let udp_send = udp.clone();
     let latest_send = latest.clone();
     let mut send_task = send;
     let upload = tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
+        let mut scratch = Vec::with_capacity(2048);
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
@@ -568,9 +584,12 @@ async fn relay_quic_udp(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                *latest_send.lock().await = Some(peer);
+                *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 crate::stats::add_bytes(pkt.len() as i64, 0);
-                if write_len_prefixed_udp(&mut send_task, pkt).await.is_err() {
+                if write_len_prefixed_udp_reuse(&mut send_task, pkt, &mut scratch)
+                    .await
+                    .is_err()
+                {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -595,7 +614,8 @@ async fn relay_quic_udp(
                 if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
-                if let Some(peer) = *latest.lock().await {
+                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(peer) = peer_opt {
                     let _ = batch_writer.send(packet, peer).await;
                     crate::stats::add_bytes(0, packet_len as i64);
                 }
@@ -818,7 +838,7 @@ async fn handle_server_stream(
         }
     };
     apply_socket_options(&target_stream, &cfg);
-    let (mut target_rd, mut target_wr) = tokio::io::split(target_stream);
+    let (mut target_rd, mut target_wr) = target_stream.into_split();
     send.write_all(b"OK\n").await?;
     let buffer_size = cfg.buffer_size;
     let mut send_task = tokio::spawn(async move {
@@ -877,6 +897,7 @@ async fn handle_server_udp_stream(
     let known_send = known_targets.clone();
     let mut sender = tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
+        let mut packet = Vec::with_capacity(2048);
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
@@ -892,8 +913,17 @@ async fn handle_server_udp_stream(
                     tracing::debug!(%src, "QUIC UDP relay dropped a datagram from an undialed source");
                     continue;
                 }
+                let body_len = match src.ip() {
+                    std::net::IpAddr::V4(_) => 10 + pkt.len(),
+                    std::net::IpAddr::V6(_) => 22 + pkt.len(),
+                };
+                if body_len > MAX_QUIC_UDP_PACKET {
+                    continue;
+                }
                 crate::stats::add_bytes(0, pkt.len() as i64);
-                let mut packet = Vec::with_capacity(22 + pkt.len());
+                packet.clear();
+                packet.reserve(2 + body_len);
+                packet.extend_from_slice(&(body_len as u16).to_be_bytes());
                 packet.extend_from_slice(&[0, 0, 0]);
                 match src.ip() {
                     std::net::IpAddr::V4(ip) => {
@@ -907,7 +937,7 @@ async fn handle_server_udp_stream(
                 }
                 packet.extend_from_slice(&src.port().to_be_bytes());
                 packet.extend_from_slice(pkt);
-                if write_len_prefixed_udp(&mut send, &packet).await.is_err() {
+                if send.write_all(&packet).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }

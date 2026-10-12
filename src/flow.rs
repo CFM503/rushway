@@ -109,7 +109,36 @@ impl CreditGate {
     /// oversized frame can never wait for credit that can never arrive.
     #[inline]
     pub(crate) async fn acquire(&self, n: usize) {
+        // Fast path: try to acquire without constructing or registering a Notified waiter.
+        let mut cur = self.state.load(Ordering::Acquire);
         loop {
+            let (win, avail) = unpack_state(cur);
+            if win == UNBOUNDED_TAG || win == CLOSED_TAG {
+                return;
+            }
+            let need = n.min(win as usize) as u32;
+            if avail < need {
+                break;
+            }
+            match self.state.compare_exchange_weak(
+                cur,
+                pack_state(win, avail - need),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+
+        // Slow path: register waiter BEFORE re-checking state so neither
+        // `release()` (`notify_one`) nor `close()`/`enable()` (`notify_waiters`)
+        // can fire in the gap between the state check and `.await`.
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let mut cur = self.state.load(Ordering::Acquire);
             loop {
                 let (win, avail) = unpack_state(cur);
@@ -130,9 +159,8 @@ impl CreditGate {
                     Err(actual) => cur = actual,
                 }
             }
-            // Re-check after registering: release() between the check and
-            // the await stores one permit (notify_one), so no wakeup is lost.
-            self.notify.notified().await;
+
+            notified.await;
         }
     }
 }

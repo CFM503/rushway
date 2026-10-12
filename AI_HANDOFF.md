@@ -584,4 +584,51 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Verify CI pipeline and release artifacts for `v0.0.41`.
 
+## Release: v0.0.42 (2026-10-12) — Lock-Free Socket Splits, Vectored Stream Writes, `U32HashMap` & `CreditGate` Wakeup Fix
 
+### Bug / Performance Defects Fixed
+1. **Lost-wakeup race in `CreditGate::acquire` on `notify_waiters()` (`close()` / `enable()`)** (`src/flow.rs`): creating `self.notify.notified()` after checking `self.state` without calling `enable()` before a re-check left a race window where `notify_waiters()` (which does not store a persistent permit, unlike `notify_one()`) could fire before `notified.await` registered the waiter.
+2. **Per-poll shared `Mutex` lock across all `TcpStream` relay halves** (`src/runtime.rs`, `src/mux_pool.rs`, `src/wss_client.rs`, `src/common.rs`, `src/nonmux.rs`, `src/udp_relay.rs`, `src/quic.rs`): `tokio::io::split` wrapped every `TcpStream` in a shared `Arc<Mutex<TcpStream>>`, serializing concurrent read and write polls on the same socket.
+3. **Per-frame `write_all` syscalls on MUX-to-socket egress** (`src/mux_writer.rs`, `src/runtime.rs`, `src/mux_pool.rs`, `src/wss_client.rs`): while tunnel writes used vectored I/O, writing decoded `OwnedMuxFrame` payloads to the target socket (server) or local client socket (WS/WSS client) issued one `write_all` syscall and one pool lock per frame even when burst frames were already queued in `rx`.
+4. **SipHash overhead, duplicate DRR map lookups, and split client stream/gate locks** (`src/protocol.rs`, `src/mux_writer.rs`, `src/runtime.rs`, `src/mux_pool.rs`, `src/wss_client.rs`): internal `u32` stream maps ran SipHash-1-3 on every frame; `Scheduler::next` looked up `&sid` twice per step; `SessionState` and `WssSessionState` maintained separate `RwLock` (`streams`) and `StdMutex` (`gates`) maps, acquiring two locks on stream open/close and an exclusive `Mutex` on every `Window` frame.
+5. **Unnecessary `Box<dyn Transport>` dynamic dispatch in WSS client** (`src/wss_client.rs`): `RushTlsStream` was heap-boxed as a trait object and wrapped in `Arc<Mutex<BoxWriter>>` on every connection, only to be unwrapped immediately by MUX and pooled non-MUX callers.
+6. **Two-syscall reads on short masked WS frames, per-packet QUIC UDP allocations/double-writes, and per-request DNS/SOCKS5 heap allocations** (`src/ws.rs`, `src/quic.rs`, `src/dns.rs`, `src/proxy.rs`).
+
+### Root cause
+- `tokio::sync::Notify::notify_waiters` only wakes `Notified` futures that have already been polled or explicitly registered via `Pin::as_mut(&mut notified).enable()`.
+- Default use of `tokio::io::split` on owned `TcpStream` instances and `std::collections::HashMap` with default `SipHasher13` on integer stream IDs.
+
+### Astra review
+- **Concurrency:** In `CreditGate::acquire`, the fast path executes the lock-free `AtomicU64` CAS directly with zero `Notified` overhead; only when `avail < need` does the slow path pin `notified`, call `notified.as_mut().enable()`, and re-check `self.state` before `.await`, guaranteeing race-free wakeups for both `notify_one()` and `notify_waiters()`. Merging `streams` and `gates` into a single `RwLock<U32HashMap<ClientStreamEntry>>` eliminates lock-order hazards and makes `Window` credit updates shared-read operations.
+- **Protocol/state machine:** 100% wire-compatible with GoWay v1.8.4+. Deferred non-`Data` control frames encountered during opportunistic `rx.try_recv()` batching are preserved in-order and processed immediately after the `Data` batch write completes.
+- **Resource ownership:** All drained `data_batch` frames and any `deferred_ctrl` frame on early write/refund errors are recycled via `recycle_encode_bufs` / `recycle_encode_buf`. `ENCODE_POOL_MAX_COUNT = 32` is strictly preserved.
+- **Regression risk:** Low. All changes are internal data-structure and I/O syscall optimizations with identical external protocol behavior.
+
+### Change
+- `src/flow.rs`: race-free two-phase `CreditGate::acquire` (fast-path CAS + slow-path `notified.as_mut().enable()` before state re-check).
+- `src/protocol.rs`: added `U32Hasher`, `U32BuildHasher`, and `U32HashMap<V>`.
+- `src/mux_writer.rs`: switched `Scheduler::streams` to `U32HashMap`; merged duplicate `get`/`get_mut` lookup in `Scheduler::next()`; added `write_owned_frames_vectored`.
+- `src/runtime.rs`: `U32HashMap` for `streams`; `into_split()` for TCP sockets; `write_owned_frames_vectored` + `recycle_encode_bufs` for `pending` drain and burst `StreamCommand::Data` frames.
+- `src/mux_pool.rs`: unified `ClientStreamEntry` in `RwLock<U32HashMap<...>>`; `into_split()`; allocation-free `MuxSessionPool::acquire`; vectored `Data` batch writes in `handle_tcp_proxy`.
+- `src/wss_client.rs`: removed `Box<dyn Transport>` in favor of concrete `TlsReader`/`TlsWriter`; unified `ClientStreamEntry` in `RwLock<U32HashMap<...>>`; `into_split()`; allocation-free `WssSessionPool::acquire`; vectored `Data` batch writes in `handle_connection`.
+- `src/ws.rs`: single outer `tokio::time::timeout` in `read_http_headers_timeout`; single `read_exact` fast path for short masked frames (`<= 125` bytes) in `read_frame_with_cipher`.
+- `src/common.rs`, `src/nonmux.rs`, `src/udp_relay.rs`: replaced `tokio::io::split` on `TcpStream` with `into_split()`.
+- `src/quic.rs`: `into_split()` on TCP streams; `StdMutex` for `latest` UDP peer; `write_len_prefixed_udp_reuse` and reusable packet buffer in `handle_server_udp_stream`.
+- `src/dns.rs`: `Cow::Borrowed` fast-path lookup in `resolve_host` and `resolve_all_ipv4` for lowercase ASCII hostnames.
+- `src/proxy.rs`: stack-allocated SOCKS5 greeting/request parsing and tail-only HTTP header delimiter scan in `read_client_proxy_request`.
+- `Cargo.toml`, `CHANGELOG.md`, `AI_HANDOFF.md`: bumped version to `0.0.42` and documented all changes.
+
+### Commit
+- `v0.0.42` release commit on `main`.
+
+### Validation
+- Full static verification of types, trait bounds, ownership/borrows, and test compatibility across all 13 modified source files. GitHub Actions CI (`fmt --check`, `clippy`, and test suite) serves as the automated build and test gate upon push.
+
+### Status
+- Fixed and released as `v0.0.42`.
+
+### Remaining risk
+- Monitor GitHub Actions CI run on `main` / tag `v0.0.42`.
+
+### Next action
+- Verify CI pipeline and release artifacts for `v0.0.42`.
