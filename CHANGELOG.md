@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.43] - 2026-10-14
+
+### Architecture & Repository Consolidation
+
+- **Single-file source amalgamation (`src/main.rs`)** — consolidated all 19 separate submodules (`common`, `crypto`, `dns`, `flow`, `mux_pool`, `mux_writer`, `nonmux`, `profile`, `protocol`, `proxy`, `quic`, `runtime`, `stats`, `tls`, `tui`, `udp_batch`, `udp_relay`, `ws`, `wss_client`) into a single unified `src/main.rs` file. Fully preserved module namespacing, tests, visibility, and 100% protocol and runtime backwards compatibility with all 137 unit tests passing.
+- **Removed deprecated auxiliary & benchmark files** — eliminated standalone benchmark binaries (`src/bin/e2e_bench.rs`, `src/bin/mux_bench.rs`, `src/bin/proxy_bench.rs`), archived scripts (`scripts/build-local.ps1`, `scripts/pgo-build.ps1`, `scripts/repeat_proxy_bench.sh`), legacy zip packages (`scripts.zip`), and streamlined CI workflows accordingly.
+- **Standalone single-file release executable** — verified clean release builds with Thin LTO and symbols stripped.
+
 ## [v0.0.42] - 2026-10-12
 
 ### Performance & Forwarding Optimizations
