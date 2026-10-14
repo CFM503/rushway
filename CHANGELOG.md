@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.44] - 2026-10-14
+
+### Performance & Latency Optimizations
+
+- **Parallel MUX session replenishment (`src/main.rs:MuxSessionPool`)** — replaced serial, one-by-one physical session creation with concurrent dialing via `tokio::spawn` for all missing sessions up to target capacity, eliminating pool under-allocation stalls during burst handshakes.
+- **Concurrent dual-stack remote DNS queries (`src/main.rs:resolve_remote`)** — replaced sequential IPv4 (A) followed by IPv6 (AAAA) lookups with `tokio::join!`, halving remote DNS query latency and returning immediately upon the first successful record.
+- **Opportunistic 0-RTT/TFO application payload pre-fetch (`src/main.rs:handle_tcp_proxy`)** — added a non-blocking 3ms socket pre-read (up to 16 KiB) on newly accepted proxy connections to bundle the client's initial application request (e.g. HTTP GET / TLS ClientHello) directly into the MUX `SYN` frame, saving a round-trip on stream establishment.
+- **Enforced target policy before local handshake response (`src/main.rs:handle_tcp_proxy`)** — moved `enforce_target_policy` before emitting the SOCKS5 greeting/HTTP 200 response to reject forbidden destinations eagerly.
+- **Expanded non-MUX connection pool and accelerated maintenance (`src/main.rs`)** — raised `NON_MUX_POOL_SIZE` from 4 to 32 and lowered `NON_MUX_MAINTAIN_INTERVAL` from 5s to 500ms to sustain higher non-multiplexed connection throughput.
+- **Tightened default timeouts and instant local accept wakeup (`src/main.rs`)** — shortened default `RESOLVE_TIMEOUT` from 5s to 1.5s, default `connection_timeout` from 60s to 10s, and removed `TCP_DEFER_ACCEPT` on Linux listeners for instantaneous local socket accept notification.
+
 ## [v0.0.43] - 2026-10-14
 
 ### Architecture & Repository Consolidation

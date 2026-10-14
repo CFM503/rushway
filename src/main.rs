@@ -167,10 +167,10 @@ pub(crate) struct PooledUpstream<R, W> {
     last_used: Instant,
 }
 
-pub(crate) const NON_MUX_POOL_SIZE: usize = 4;
+pub(crate) const NON_MUX_POOL_SIZE: usize = 32;
 pub(crate) const NON_MUX_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 pub(crate) const NON_MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const NON_MUX_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const NON_MUX_MAINTAIN_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) fn pooled_usable(created: Instant, last_used: Instant, now: Instant) -> bool {
     now.duration_since(created) <= NON_MUX_MAX_AGE
@@ -1160,7 +1160,7 @@ use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+const RESOLVE_TIMEOUT: Duration = Duration::from_millis(1500);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
@@ -1395,15 +1395,20 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
 }
 
 async fn resolve_remote(host: &str, server: IpAddr) -> Result<IpAddr> {
-    let mut last_error = None;
-    for qtype in [1u16, 28u16] {
-        match query_remote(host, server, qtype).await {
-            Ok(Some(ip)) => return Ok(ip),
-            Ok(None) => {}
-            Err(err) => last_error = Some(err),
-        }
+    let (v4_res, v6_res) = tokio::join!(
+        query_remote(host, server, 1u16),
+        query_remote(host, server, 28u16)
+    );
+    if let Ok(Some(ip)) = v4_res {
+        return Ok(ip);
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("remote DNS returned no A/AAAA answer for {host}")))
+    if let Ok(Some(ip)) = v6_res {
+        return Ok(ip);
+    }
+    match (v4_res, v6_res) {
+        (Err(e), _) | (_, Err(e)) => Err(e),
+        _ => Err(anyhow!("remote DNS returned no A/AAAA answer for {host}")),
+    }
 }
 
 async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<IpAddr>> {
@@ -2633,28 +2638,38 @@ impl MuxSessionPool {
     async fn replenish(self: &Arc<Self>) -> bool {
         let target = self.session_count;
         let _guard = self.session_creation.lock().await;
-        let need_new = {
+        let missing = {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            sessions.len() < target
+            target.saturating_sub(sessions.len())
         };
-        if !need_new {
+        if missing == 0 {
             self.consecutive_failures.store(0, Ordering::Release);
             return false;
         }
-        match SessionState::connect(&self.cfg, self.capacity_notify.clone()).await {
-            Ok(s) => {
-                let mut sessions = self.sessions.lock().await;
-                sessions.push(s);
-                self.consecutive_failures.store(0, Ordering::Release);
-                self.capacity_notify.notify_waiters();
-                sessions.len() < target
+        let mut futs = Vec::with_capacity(missing);
+        for _ in 0..missing {
+            let cfg = self.cfg.clone();
+            let notify = self.capacity_notify.clone();
+            futs.push(tokio::spawn(async move {
+                SessionState::connect(&cfg, notify).await
+            }));
+        }
+        let mut added = 0usize;
+        for f in futs {
+            if let Ok(Ok(s)) = f.await {
+                self.sessions.lock().await.push(s);
+                added += 1;
             }
-            Err(error) => {
-                let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-                tracing::warn!(error=%error, failures, "MUX physical session creation failed; will retry with backoff");
-                false
-            }
+        }
+        if added > 0 {
+            self.consecutive_failures.store(0, Ordering::Release);
+            self.capacity_notify.notify_waiters();
+            false
+        } else {
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+            tracing::warn!(failures, "MUX physical session creation failed; will retry with backoff");
+            false
         }
     }
     async fn maintain(self: &Arc<Self>) {
@@ -2744,13 +2759,24 @@ async fn handle_tcp_proxy(
     if req.command != SocksCommand::Connect {
         bail!("MUX client supports CONNECT or UDP ASSOCIATE only")
     }
-    let initial_data = req.initial_payload.unwrap_or_default();
-    let (session, id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
+    enforce_target_policy(&cfg, &req.target)?;
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else if req.is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     }
+    let mut initial_data = req.initial_payload.unwrap_or_default();
+    if initial_data.is_empty() {
+        let mut first_pkt = vec![0u8; 16384];
+        if let Ok(Ok(n)) = timeout(Duration::from_millis(3), local.read(&mut first_pkt)).await {
+            if n > 0 {
+                crate::stats::add_bytes(n as i64, 0);
+                first_pkt.truncate(n);
+                initial_data = first_pkt;
+            }
+        }
+    }
+    let (session, id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
     let (mut local_rd, mut local_wr) = local.into_split();
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
@@ -7364,7 +7390,7 @@ impl Default for RuntimeConfig {
             fakehost: None,
             mux: true,
             buffer_size: 128 * 1024,
-            connection_timeout: 60,
+            connection_timeout: 10,
             allow_open: false,
             max_connections: 1500,
             block_local: true,
@@ -7755,16 +7781,7 @@ pub(crate) fn apply_listener_options(listener: &TcpListener) {
             );
         }
 
-        let defer_secs: libc::c_int = 3;
-        unsafe {
-            let _ = libc::setsockopt(
-                listener.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_DEFER_ACCEPT,
-                &defer_secs as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&defer_secs) as libc::socklen_t,
-            );
-        }
+        // Removed TCP_DEFER_ACCEPT for instant local proxy accept wakeup
     }
     let _ = listener;
 }
