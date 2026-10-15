@@ -195,7 +195,12 @@ pub(crate) struct NonMuxPool<C, R, W> {
     creation: Mutex<()>,
 }
 
-impl<C, R, W> NonMuxPool<C, R, W> {
+impl<C, R, W> NonMuxPool<C, R, W>
+where
+    C: Clone + Send + Sync + 'static,
+    R: Send + 'static,
+    W: Send + 'static,
+{
     pub(crate) fn new(cfg: C, dial: NonMuxDial<C, R, W>, log_tag: &'static str) -> Arc<Self> {
         Arc::new(Self {
             cfg,
@@ -220,12 +225,20 @@ impl<C, R, W> NonMuxPool<C, R, W> {
     /// Pops the freshest usable pre-warmed transport, or dials a fresh one
     /// when the pool is empty (all failures propagate to the caller).
     pub(crate) async fn get_or_dial(self: &Arc<Self>) -> Result<(R, W)> {
-        let pooled = {
+        let (pooled, need_refill) = {
             let mut conns = self.conns.lock().await;
             let now = Instant::now();
             conns.retain(|c| pooled_usable(c.created, c.last_used, now));
-            conns.pop()
+            let p = conns.pop();
+            let low = conns.len() < NON_MUX_POOL_SIZE / 2;
+            (p, low)
         };
+        if need_refill {
+            let pool = self.clone();
+            tokio::spawn(async move {
+                pool.replenish().await;
+            });
+        }
         if let Some(mut c) = pooled {
             c.last_used = Instant::now();
             tracing::debug!("{} using pre-warmed upstream connection", self.log_tag);
@@ -236,7 +249,9 @@ impl<C, R, W> NonMuxPool<C, R, W> {
     }
 
     async fn replenish(self: &Arc<Self>) {
-        let _guard = self.creation.lock().await;
+        let Ok(_guard) = self.creation.try_lock() else {
+            return;
+        };
         loop {
             let need = {
                 let mut conns = self.conns.lock().await;
@@ -246,18 +261,33 @@ impl<C, R, W> NonMuxPool<C, R, W> {
             if need == 0 {
                 return;
             }
-            match self.dial_pooled().await {
-                Ok(c) => self.conns.lock().await.push(c),
-                // GoWay parity: stop refilling for this tick on first
-                // failure instead of hammering a downed upstream.
-                Err(error) => {
+            let batch = need.min(8);
+            let mut set = tokio::task::JoinSet::new();
+            for _ in 0..batch {
+                let pool = self.clone();
+                set.spawn(async move { pool.dial_pooled().await });
+            }
+            let mut added = 0usize;
+            let mut first_err = None;
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(Ok(c)) => {
+                        self.conns.lock().await.push(c);
+                        added += 1;
+                    }
+                    Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                    _ => {}
+                }
+            }
+            if added == 0 {
+                if let Some(error) = first_err {
                     tracing::debug!(
                         error=%error,
                         "{} pre-warm dial failed; will retry next tick",
                         self.log_tag
                     );
-                    return;
                 }
+                return;
             }
         }
     }
@@ -1233,9 +1263,16 @@ pub(crate) fn invalidate_host(host: &str) {
     if clean.parse::<IpAddr>().is_ok() {
         return;
     }
-    let key = clean.to_ascii_lowercase();
+    let key: std::borrow::Cow<'_, str> = if clean.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(clean.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(clean)
+    };
     if let Ok(mut guard) = cache().write() {
-        guard.remove(&key);
+        guard.remove(key.as_ref());
+    }
+    if let Ok(mut guard) = all_v4_cache().write() {
+        guard.remove(key.as_ref());
     }
 }
 
@@ -1497,7 +1534,7 @@ async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<I
     .await?;
     socket.send_to(&request, server_addr).await?;
     let mut buf = [0u8; MAX_PACKET];
-    let size = recv_from_expected(&socket, &mut buf, server_addr).await?;
+    let size = recv_from_expected(&socket, &request, &mut buf, server_addr).await?;
     let pkt = &buf[..size];
     validate_transaction_id(pkt, expected_id)?;
     let (ip, truncated) = parse_response(pkt, qtype, host)?;
@@ -1521,7 +1558,7 @@ async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Add
     .await?;
     socket.send_to(&request, server_addr).await?;
     let mut buf = [0u8; MAX_PACKET];
-    let size = recv_from_expected(&socket, &mut buf, server_addr).await?;
+    let size = recv_from_expected(&socket, &request, &mut buf, server_addr).await?;
     let pkt = &buf[..size];
     validate_transaction_id(pkt, expected_id)?;
     let (ips, truncated) = parse_all_ipv4_from_response(pkt, host)?;
@@ -1533,31 +1570,46 @@ async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Add
     Ok(parse_all_ipv4_from_response(&response, host)?.0)
 }
 
-/// Receive one datagram, discarding (with a DEBUG log) any datagram whose
-/// source does not exactly match the resolver address the query was sent to,
-/// until the resolver timeout expires. Basic anti-spoofing: never accept a
-/// DNS reply that did not come from the queried server.
+/// Receive one datagram from `server_addr`, retransmitting `request` once at
+/// 250ms if the initial UDP packet was lost in transit.
 async fn recv_from_expected(
     socket: &UdpSocket,
+    request: &[u8],
     buf: &mut [u8],
     server_addr: SocketAddr,
 ) -> Result<usize> {
-    let (size, _) = timeout(
-        RESOLVE_TIMEOUT,
-        async {
-            loop {
+    let recv_loop = async {
+        let mut retried = false;
+        loop {
+            if !retried {
+                match timeout(Duration::from_millis(250), socket.recv_from(buf)).await {
+                    Ok(Ok((size, peer))) => {
+                        if peer != server_addr {
+                            tracing::debug!(peer=%peer, expected=%server_addr, "discarded DNS reply from unexpected source");
+                            continue;
+                        }
+                        return Ok::<usize, std::io::Error>(size);
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        retried = true;
+                        let _ = socket.send_to(request, server_addr).await;
+                    }
+                }
+            } else {
                 let (size, peer) = socket.recv_from(buf).await?;
                 if peer != server_addr {
                     tracing::debug!(peer=%peer, expected=%server_addr, "discarded DNS reply from unexpected source");
                     continue;
                 }
-                return Ok::<(usize, SocketAddr), std::io::Error>((size, peer));
+                return Ok(size);
             }
-        },
-    )
-    .await
-    .map_err(|_| anyhow!("remote DNS UDP timeout"))??;
-    Ok(size)
+        }
+    };
+    timeout(RESOLVE_TIMEOUT, recv_loop)
+        .await
+        .map_err(|_| anyhow!("remote DNS UDP timeout"))?
+        .map_err(Into::into)
 }
 
 async fn dns_tcp_query(server: SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
@@ -2861,30 +2913,41 @@ async fn handle_tcp_proxy(
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     }
     let mut initial_data = req.initial_payload.unwrap_or_default();
-    if initial_data.is_empty()
-        && timeout(Duration::from_millis(1), local.readable())
-            .await
-            .is_ok_and(|r| r.is_ok())
-    {
-        let mut first_pkt = crate::mux_writer::acquire_encode_buf();
-        if first_pkt.capacity() < 16384 {
-            first_pkt.reserve(16384 - first_pkt.len());
-        }
-        let cap = first_pkt.capacity().min(u16::MAX as usize);
-        // SAFETY: `try_read` writes into `[..cap]` and returns initialized count `n`;
-        // we immediately `truncate(n)` or `clear()` before reading any byte.
-        unsafe { first_pkt.set_len(cap) };
-        match local.try_read(&mut first_pkt) {
-            Ok(n) if n > 0 => {
-                first_pkt.truncate(n);
-                crate::stats::add_bytes(n as i64, 0);
-                initial_data = first_pkt;
+    if initial_data.is_empty() {
+        let _ = timeout(Duration::from_millis(2), async {
+            loop {
+                if local.readable().await.is_err() {
+                    break;
+                }
+                let mut first_pkt = crate::mux_writer::acquire_encode_buf();
+                if first_pkt.capacity() < 16384 {
+                    first_pkt.reserve(16384 - first_pkt.len());
+                }
+                let cap = first_pkt.capacity().min(u16::MAX as usize);
+                // SAFETY: `try_read` writes into `[..cap]` and returns initialized count `n`;
+                // we immediately `truncate(n)` or `clear()` before reading any byte.
+                unsafe { first_pkt.set_len(cap) };
+                match local.try_read(&mut first_pkt) {
+                    Ok(n) if n > 0 => {
+                        first_pkt.truncate(n);
+                        crate::stats::add_bytes(n as i64, 0);
+                        initial_data = first_pkt;
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        first_pkt.clear();
+                        recycle_encode_buf(first_pkt);
+                        continue;
+                    }
+                    _ => {
+                        first_pkt.clear();
+                        recycle_encode_buf(first_pkt);
+                        break;
+                    }
+                }
             }
-            _ => {
-                first_pkt.clear();
-                recycle_encode_buf(first_pkt);
-            }
-        }
+        })
+        .await;
     }
     let (session, id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
     let (mut local_rd, mut local_wr) = local.into_split();
@@ -3085,8 +3148,6 @@ pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> 
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -3095,8 +3156,6 @@ pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> 
                         continue;
                     }
                 };
-                // Fail fast at capacity so shutdown is never stuck behind
-                // a permit wait.
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
                     Err(_) => {
@@ -3107,6 +3166,7 @@ pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> 
                 let cfg2 = cfg.clone();
                 apply_socket_options(&stream, &cfg2);
                 let pool2 = pool.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
@@ -4602,8 +4662,6 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -4622,6 +4680,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 let cfg2 = cfg.clone();
                 apply_socket_options(&stream, &cfg2);
                 let pool2 = pool.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
@@ -4652,8 +4711,6 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -4671,6 +4728,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 };
                 let cfg2 = cfg.clone();
                 apply_socket_options(&stream, &cfg2);
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
@@ -6371,6 +6429,7 @@ fn transport_config() -> Arc<TransportConfig> {
     cfg.datagram_receive_buffer_size(None);
     cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("8MiB fits QUIC VarInt"));
     cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("16MiB fits QUIC VarInt"));
+    cfg.send_window(16 * 1024 * 1024);
     cfg.max_concurrent_uni_streams(0u32.into());
     // Without path MTU discovery every datagram stays near 1200 bytes;
     // discovering larger MTUs cuts per-packet crypto/scheduling overhead.
@@ -6951,6 +7010,25 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         "QUIC client UDP socket buffers requested"
     );
     let pool = QuicClientPool::new(endpoint, server_addr, server_name, cfg.connection_timeout);
+    let warm_pool = pool.clone();
+    tokio::spawn(async move {
+        let mut guard = warm_pool.connection.lock().await;
+        if guard.as_ref().is_none_or(|c| c.close_reason().is_some()) {
+            if let Ok(connecting) = warm_pool
+                .endpoint
+                .connect(warm_pool.server_addr, &warm_pool.server_name)
+            {
+                if let Ok(Ok(conn)) = timeout(
+                    Duration::from_secs(warm_pool.timeout_secs.max(1)),
+                    connecting,
+                )
+                .await
+                {
+                    *guard = Some(conn);
+                }
+            }
+        }
+    });
     let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
@@ -6967,8 +7045,6 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (mut stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -6987,14 +7063,10 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 };
                 let cfg2 = cfg.clone();
                 let pool2 = pool.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
-                    // The SOCKS/HTTP request must be read inside the spawned
-                    // task. Doing it on the accept loop meant a client that
-                    // connected and then sent nothing stalled `listener.accept()`
-                    // forever, freezing every other QUIC connection while it
-                    // held a semaphore permit.
                     let req = match timeout(
                         Duration::from_secs(cfg2.connection_timeout.max(1)),
                         read_client_proxy_request(&mut stream),
@@ -7060,6 +7132,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 };
                 let cfg2 = cfg.clone();
                 let sem = semaphore.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let permit = match sem.clone().try_acquire_owned() {
                         Ok(v) => v,
@@ -7987,6 +8060,28 @@ pub(crate) fn apply_listener_options(listener: &TcpListener) {
 pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
     apply_socket_options_raw(stream, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
 }
+async fn connect_hedged(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    let mut primary = Box::pin(TcpStream::connect(addr));
+    match timeout(Duration::from_millis(200), &mut primary).await {
+        Ok(res) => res,
+        Err(_) => {
+            // Hedged SYN: if the initial SYN was dropped on the WAN, fire a parallel
+            // connection at 200ms instead of waiting for the 1000ms OS SYN retransmit timer.
+            let mut secondary = Box::pin(TcpStream::connect(addr));
+            tokio::select! {
+                res1 = &mut primary => match res1 {
+                    Ok(s) => Ok(s),
+                    Err(_) => secondary.await,
+                },
+                res2 = &mut secondary => match res2 {
+                    Ok(s) => Ok(s),
+                    Err(_) => primary.await,
+                },
+            }
+        }
+    }
+}
+
 pub(crate) async fn dial_target(
     target: &TargetAddr,
     timeout_secs: u64,
@@ -7996,23 +8091,22 @@ pub(crate) async fn dial_target(
         let addr = resolve_target(cfg.block_local, &target.host, target.port)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let mut primary = Box::pin(TcpStream::connect(addr));
-        match timeout(Duration::from_millis(300), &mut primary).await {
-            Ok(res) => res,
-            Err(_) => {
-                // Hedged SYN: if the initial SYN was dropped on the WAN, fire a parallel
-                // connection at 300ms instead of waiting for the 1000ms OS SYN retransmit timer.
-                let mut secondary = Box::pin(TcpStream::connect(addr));
-                tokio::select! {
-                    res1 = &mut primary => match res1 {
-                        Ok(s) => Ok(s),
-                        Err(_) => secondary.await,
-                    },
-                    res2 = &mut secondary => match res2 {
-                        Ok(s) => Ok(s),
-                        Err(_) => primary.await,
-                    },
+        match connect_hedged(addr).await {
+            Ok(s) => Ok(s),
+            Err(first_err) => {
+                crate::dns::invalidate_host(&target.host);
+                if target.host.parse::<IpAddr>().is_err() {
+                    if let Ok(fresh_addr) =
+                        resolve_target(cfg.block_local, &target.host, target.port).await
+                    {
+                        if fresh_addr != addr {
+                            if let Ok(s) = connect_hedged(fresh_addr).await {
+                                return Ok(s);
+                            }
+                        }
+                    }
                 }
+                Err(first_err)
             }
         }
     })
@@ -8243,27 +8337,24 @@ where
     let (writer, _writer_task) = MuxFrameWriter::spawn(wr);
     let mut ok = b"OK\n".to_vec();
     cipher.apply(&mut ok);
-    writer
-        .send(encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?)
-        .await?;
-
-    // W3 version negotiation: advertise our protocol version + initial
-    // receive window right after the session handshake. Old clients skip
-    // the unknown command; new clients answer with their own VERSION.
+    let mut flight = encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?;
     let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
-    send_mux_parts_encrypted(
-        &writer,
-        &cipher,
+    let mut ver_buf = crate::mux_writer::acquire_encode_buf();
+    crate::mux_writer::encode_mux_ws_frame(
+        &mut ver_buf,
         0,
         MuxCommand::Version,
         &version_payload,
+        &cipher,
+        false,
         cfg.obfs,
     )
-    .await?;
+    .map_err(|e| anyhow!(e.to_string()))?;
+    flight.extend_from_slice(&ver_buf);
+    crate::mux_writer::recycle_encode_buf(ver_buf);
+    writer.send(flight).await?;
 
-    // Read-mostly under concurrency (one lookup per DATA frame), so a
-    // RwLock: concurrent lookups, exclusive insert/remove.
     let streams: Arc<std::sync::RwLock<U32HashMap<StreamEntry>>> =
         Arc::new(std::sync::RwLock::new(U32HashMap::default()));
     // Session-wide ceiling on bytes parked in pre-dial `pending` queues
@@ -8777,56 +8868,46 @@ where
 
             MuxCommand::Data => {
                 let id = frame.stream_id;
-                let tx = streams
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&id)
-                    .map(|s| s.tx.clone());
-                if let Some(tx) = tx {
-                    // Never park the session read loop on one stream's
-                    // backpressure. `send().await` here meant a single target
-                    // that stopped reading (with 64 frames already queued)
-                    // froze uploads for *every* stream multiplexed on this
-                    // session — no error, no timeout, no recovery until that
-                    // target drained. A full queue means this frame cannot be
-                    // delivered, so reset that stream and keep the session
-                    // moving; the blast radius stays on the one stalled flow.
-                    match tx.try_send(StreamCommand::Data(frame)) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(StreamCommand::Data(f))) => {
-                            crate::mux_writer::recycle_encode_buf(f.into_storage());
-                            tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
-                            let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
-                            streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                let send_res = {
+                    let guard = streams.read().unwrap_or_else(|e| e.into_inner());
+                    match guard.get(&id) {
+                        Some(s) => Some(s.tx.try_send(StreamCommand::Data(frame))),
+                        None => {
+                            crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                            None
                         }
-                        Err(mpsc::error::TrySendError::Closed(StreamCommand::Data(f))) => {
-                            crate::mux_writer::recycle_encode_buf(f.into_storage());
-                            streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                        }
-                        Err(_) => {}
                     }
-                } else {
-                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                };
+                match send_res {
+                    Some(Ok(())) | None => {}
+                    Some(Err(mpsc::error::TrySendError::Full(StreamCommand::Data(f)))) => {
+                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
+                        let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
+                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    }
+                    Some(Err(mpsc::error::TrySendError::Closed(StreamCommand::Data(f)))) => {
+                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    }
+                    Some(Err(_)) => {}
                 }
             }
 
             MuxCommand::Fin => {
                 let id = frame.stream_id;
                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                let tx = streams
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&id)
-                    .map(|s| s.tx.clone());
-                if let Some(tx) = tx {
-                    // Same non-blocking rule as DATA: a FIN addressed to an
-                    // already-backed-up stream must not stall the read loop.
-                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(StreamCommand::Fin)
-                    {
-                        tracing::warn!(stream_id = id, "mux RST: queue full at FIN; resetting stalled stream");
-                        let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
-                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                    }
+                let full = {
+                    let guard = streams.read().unwrap_or_else(|e| e.into_inner());
+                    matches!(
+                        guard.get(&id).map(|s| s.tx.try_send(StreamCommand::Fin)),
+                        Some(Err(mpsc::error::TrySendError::Full(_)))
+                    )
+                };
+                if full {
+                    tracing::warn!(stream_id = id, "mux RST: queue full at FIN; resetting stalled stream");
+                    let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
+                    streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 }
             }
 
@@ -9164,8 +9245,6 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -9174,8 +9253,6 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                         continue;
                     }
                 };
-                // Fail fast at capacity instead of stalling the accept loop and
-                // letting the TCP backlog fill up.
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
                     Err(_) => {
@@ -9185,6 +9262,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 };
                 let cfg2 = cfg.clone();
                 apply_socket_options(&stream, &cfg2);
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
@@ -11866,40 +11944,74 @@ pub fn build_client_handshake_request_with_profile(
     sec_fetch_site: Option<&str>,
     profile: &BrowserProfile,
 ) -> (Vec<u8>, String) {
+    use std::io::Write as _;
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
     let key = STANDARD.encode(key_bytes);
     let path = if path.is_empty() { "/" } else { path };
     let site = sec_fetch_site.unwrap_or("cross-site");
-    // Fixed top, mirroring GoWay: Host / Connection / Upgrade stay first.
-    let mut req = format!(
+    let mut req = Vec::with_capacity(640);
+    let _ = write!(
+        &mut req,
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
     );
-    // Shufflable middle section (GoWay Fisher-Yates shuffles these).
-    let mut middle: Vec<String> = Vec::with_capacity(9);
-    middle.push("Pragma: no-cache".to_string());
-    middle.push("Cache-Control: no-cache".to_string());
-    middle.push(format!("User-Agent: {}", profile.ua));
-    middle.push(format!("Accept-Language: {}", profile.accept_lang));
-    middle.push(format!("Accept-Encoding: {BROWSER_ACCEPT_ENCODING}"));
-    if let Some(origin) = origin {
-        middle.push(format!("Origin: {origin}"));
+    let mut indices = [0u8; 9];
+    let mut count = 5usize;
+    for (i, slot) in indices[..5].iter_mut().enumerate() {
+        *slot = i as u8;
     }
-    if profile.is_chromium {
-        if let Some(sec_ch_ua) = profile.sec_ch_ua {
-            middle.push(format!("sec-ch-ua: {sec_ch_ua}"));
-            middle.push(format!("sec-ch-ua-mobile: {}", profile.sec_ch_ua_mob));
-            middle.push(format!("sec-ch-ua-platform: {}", profile.sec_ch_ua_plat));
+    if origin.is_some() {
+        indices[count] = 5;
+        count += 1;
+    }
+    if profile.is_chromium && profile.sec_ch_ua.is_some() {
+        indices[count] = 6;
+        indices[count + 1] = 7;
+        indices[count + 2] = 8;
+        count += 3;
+    }
+    indices[..count].shuffle(&mut rand::thread_rng());
+    for &idx in &indices[..count] {
+        match idx {
+            0 => req.extend_from_slice(b"Pragma: no-cache\r\n"),
+            1 => req.extend_from_slice(b"Cache-Control: no-cache\r\n"),
+            2 => {
+                let _ = write!(&mut req, "User-Agent: {}\r\n", profile.ua);
+            }
+            3 => {
+                let _ = write!(&mut req, "Accept-Language: {}\r\n", profile.accept_lang);
+            }
+            4 => {
+                let _ = write!(&mut req, "Accept-Encoding: {BROWSER_ACCEPT_ENCODING}\r\n");
+            }
+            5 => {
+                if let Some(orig) = origin {
+                    let _ = write!(&mut req, "Origin: {orig}\r\n");
+                }
+            }
+            6 => {
+                if let Some(ch) = profile.sec_ch_ua {
+                    let _ = write!(&mut req, "sec-ch-ua: {ch}\r\n");
+                }
+            }
+            7 => {
+                let _ = write!(&mut req, "sec-ch-ua-mobile: {}\r\n", profile.sec_ch_ua_mob);
+            }
+            8 => {
+                let _ = write!(
+                    &mut req,
+                    "sec-ch-ua-platform: {}\r\n",
+                    profile.sec_ch_ua_plat
+                );
+            }
+            _ => unreachable!(),
         }
     }
-    middle.shuffle(&mut rand::thread_rng());
-    for line in &middle {
-        req.push_str(line);
-        req.push_str("\r\n");
-    }
-    // Fixed bottom, mirroring GoWay.
-    req.push_str(&format!("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: {site}\r\n\r\n"));
-    (req.into_bytes(), key)
+    let _ = write!(
+        &mut req,
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: {site}\r\n\r\n"
+    );
+    (req, key)
 }
 
 pub fn redact_handshake_request(req: &[u8]) -> String {
@@ -12453,6 +12565,18 @@ where
                 *buf = crate::mux_writer::acquire_encode_buf();
             }
             buf.extend_from_slice(&small[4..4 + total]);
+        } else if ext_len == 0 && !masked {
+            let total = len_marker as usize;
+            if total > 0 {
+                let mut small = [0u8; 125];
+                if r.read_exact(&mut small[..total]).await.is_err() {
+                    return Err(anyhow!("websocket payload truncated"));
+                }
+                if buf.capacity() == 0 {
+                    *buf = crate::mux_writer::acquire_encode_buf();
+                }
+                buf.extend_from_slice(&small[..total]);
+            }
         } else {
             let mut rest = [0u8; 12];
             let rest_len = ext_len + if masked { 4 } else { 0 };
@@ -13356,8 +13480,6 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -13381,6 +13503,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
                     cfg2.tcp_keepalive,
                 );
                 let pool2 = pool.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
@@ -13975,30 +14098,41 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     };
     let mut initial_data = req.initial_payload.unwrap_or_default();
-    if initial_data.is_empty()
-        && timeout(Duration::from_millis(1), local.readable())
-            .await
-            .is_ok_and(|r| r.is_ok())
-    {
-        let mut first_pkt = crate::mux_writer::acquire_encode_buf();
-        if first_pkt.capacity() < 16384 {
-            first_pkt.reserve(16384 - first_pkt.len());
-        }
-        let cap = first_pkt.capacity().min(u16::MAX as usize);
-        // SAFETY: `try_read` writes into `[..cap]` and returns initialized count `n`;
-        // we immediately `truncate(n)` or `clear()` before reading any byte.
-        unsafe { first_pkt.set_len(cap) };
-        match local.try_read(&mut first_pkt) {
-            Ok(n) if n > 0 => {
-                first_pkt.truncate(n);
-                crate::stats::add_bytes(n as i64, 0);
-                initial_data = first_pkt;
+    if initial_data.is_empty() {
+        let _ = timeout(Duration::from_millis(2), async {
+            loop {
+                if local.readable().await.is_err() {
+                    break;
+                }
+                let mut first_pkt = crate::mux_writer::acquire_encode_buf();
+                if first_pkt.capacity() < 16384 {
+                    first_pkt.reserve(16384 - first_pkt.len());
+                }
+                let cap = first_pkt.capacity().min(u16::MAX as usize);
+                // SAFETY: `try_read` writes into `[..cap]` and returns initialized count `n`;
+                // we immediately `truncate(n)` or `clear()` before reading any byte.
+                unsafe { first_pkt.set_len(cap) };
+                match local.try_read(&mut first_pkt) {
+                    Ok(n) if n > 0 => {
+                        first_pkt.truncate(n);
+                        crate::stats::add_bytes(n as i64, 0);
+                        initial_data = first_pkt;
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        first_pkt.clear();
+                        recycle_encode_buf(first_pkt);
+                        continue;
+                    }
+                    _ => {
+                        first_pkt.clear();
+                        recycle_encode_buf(first_pkt);
+                        break;
+                    }
+                }
             }
-            _ => {
-                first_pkt.clear();
-                recycle_encode_buf(first_pkt);
-            }
-        }
+        })
+        .await;
     }
     let (session, stream_id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
     let writer = session.writer.clone();
@@ -14209,8 +14343,6 @@ pub async fn run_client_from_config(
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -14233,6 +14365,7 @@ pub async fn run_client_from_config(
                     pool.cfg.tcp_keepalive,
                 );
                 let pool2 = pool.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
@@ -14836,9 +14969,6 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
 
     let acceptor = tls::standalone_server_acceptor()?;
     tracing::info!("RushWay WSS server listening on {public_bind}");
-    // This listener used to be the only one without a connection ceiling, so
-    // `-max-connections` never applied to WSS and peers that completed TCP
-    // but never spoke TLS parked a task forever.
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     let mut set = tokio::task::JoinSet::new();
     loop {
@@ -14848,8 +14978,6 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                 break;
             }
             res = listener.accept() => {
-                // A transient accept error (EMFILE, ENFILE, ENOBUFS) must not
-                // kill the whole proxy: log, back off briefly, and retry.
                 let (stream, peer) = match res {
                     Ok(v) => v,
                     Err(e) => {
@@ -14858,8 +14986,6 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                         continue;
                     }
                 };
-                // Fail fast at capacity instead of stalling the accept loop
-                // and letting the TCP backlog fill up.
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(v) => v,
                     Err(_) => {
@@ -14870,13 +14996,11 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                 runtime::apply_socket_options(&stream, &cfg);
                 let acceptor = acceptor.clone();
                 let cfg2 = cfg.clone();
+                while set.try_join_next().is_some() {}
                 set.spawn(async move {
                     let _permit = permit;
                     let _conn = stats::ConnGuard::new();
                     let result = async {
-                        // Bound the TLS handshake: a peer that connects and
-                        // then stalls mid-handshake otherwise holds its
-                        // semaphore permit and its task indefinitely.
                         let tls_stream = timeout(
                             Duration::from_secs(cfg2.connection_timeout.max(1)),
                             acceptor.accept(stream),

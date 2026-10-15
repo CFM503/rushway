@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.50] - 2026-10-15
+
+### Resilience, Failover Routing & Leak Prevention
+
+- **250ms UDP DNS Loss Retransmission (`src/main.rs:recv_from_expected`)** — added a 250ms fast-retransmit timeout to remote DNS UDP lookups, seamlessly recovering from intermediate packet drops without stalling until the 1500ms global deadline.
+- **Multi-Homed DNS Dial Failover & 200ms Hedging (`src/main.rs:dial_target`, `connect_hedged`)** — tightened hedged parallel SYN timeout to 200ms, and implemented automated DNS cache eviction and instant fallback to secondary resolved IPs if the primary endpoint rejects or drops connections.
+- **Global `JoinSet` Task Drain on Accept Loops (`src/main.rs`)** — introduced non-blocking `try_join_next()` draining across all TCP/WSS client and server connection listeners, preventing completed connection tasks from lingering in memory over extended runtimes.
+- **Non-MUX Pool Low-Watermark Replenishment (`src/main.rs:NonMuxPool`)** — added background batch pre-warming via `JoinSet` triggered immediately when pooled connections fall below 50% capacity, eliminating pool-exhaustion stall spikes.
+- **Adaptive 0-RTT Stream Prefetch with `WouldBlock` Backoff (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — refined prefetch loops to gracefully tolerate socket pseudo-readiness, polling up to 2ms to maximize 0-RTT frame capture rates.
+- **Fused Handshake Framing & Lock-Free Data Dispatch (`src/main.rs:runtime`)** — coalesced server `OK` and initial `VERSION` frames into a single outbound packet, and avoided `mpsc::Sender` cloning under read-lock during MUX data forwarding.
+- **Zero-Allocation HTTP Client Handshake Generation (`src/main.rs:build_client_handshake_request_with_profile`)** — eliminated per-connection intermediate `String` allocations by utilizing in-place stack array index shuffling.
+- **QUIC Send Window Expansion & Connection Pre-Warming (`src/main.rs:quic`)** — aligned transport send window to 16 MiB and pre-warmed initial client transport connections asynchronously upon startup.
+
 ## [v0.0.49] - 2026-10-15
 
 ### High-Concurrency Throughput, JIT Buffer Allocation & Fair Scheduling

@@ -964,6 +964,54 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.49`.
 
+## Release: v0.0.50 (2026-10-15) — Resilient UDP DNS Retransmit, Multi-Homed Dial Failover & Global JoinSet Pruning
+
+### Context & User Directives
+- **Directives:** "我手动修改了一下代码，检查一下修改前和修改后都改变了什么，是不是正向优化" followed by "更新版本号,更新tag ,更新日志，更新AI交接接力日志，推送仓库".
+- **Astra Engineering Review:**
+  - **Concurrency & Correctness:**
+    - `recv_from_expected` incorporates a 250ms retransmission check: if an upstream UDP DNS packet is dropped in transit, a duplicate query is emitted at 250ms rather than blocking until the full 1500ms timeout expires.
+    - `dial_target` introduces multi-homed failover: if primary endpoint connection fails or times out after 200ms hedged race, stale DNS mappings are purged immediately via `invalidate_host` and alternative resolved IPs are dialed automatically, providing zero-downtime recovery during backend node rotation.
+    - `NonMuxPool` low-watermark replenishment: background `JoinSet` batch connection creation is spawned as soon as pool reserves dip below 50%, preventing pool exhaustion under burst traffic.
+    - `handle_tcp_proxy` and `handle_connection` 0-RTT prefetch loop tolerates transient `WouldBlock` conditions within a 2ms window, preventing spurious readable wakeups from prematurely abandoning prefetch.
+  - **Memory & Resource Safety:**
+    - Global `JoinSet` pruning: `while set.try_join_next().is_some() {}` executed upon each incoming client/server connection accept, reclaiming completed task handles and preventing task leak accumulation over long uptimes.
+    - Handshake frame fusion: coalesced server `OK` and `VERSION` WebSocket frames into a single outbound buffer.
+    - Lock-free MUX frame dispatch: removed `mpsc::Sender::clone()` calls within the reader loop.
+    - HTTP handshake generator uses in-place stack array index shuffling, eliminating intermediate `String` allocations.
+  - **Regression Risk:** Zero. Retains strict protocol compliance and backwards compatibility.
+
+### Changes Implemented
+1. **250ms UDP DNS Retransmission (`src/main.rs:dns`)**:
+   - Fast retransmit at 250ms for lossy remote DNS lookups.
+2. **Multi-Homed Failover & 200ms Hedging (`src/main.rs:runtime`)**:
+   - Secondary parallel SYN at 200ms with automatic DNS cache eviction and secondary IP retry.
+3. **Global Listener JoinSet Pruning (`src/main.rs:main`)**:
+   - Added `try_join_next()` draining to all accept loops to eliminate task handle memory retention.
+4. **NonMuxPool Low-Watermark Pre-Warming (`src/main.rs:common`)**:
+   - Concurrent batch replenishment triggered when pool falls below half capacity.
+5. **Zero-Allocation HTTP Handshake Formatting (`src/main.rs:ws`)**:
+   - Stack-based header index shuffling with direct byte stream output.
+6. **QUIC Send Window Expansion (`src/main.rs:quic`)**:
+   - Aligned transport send window to 16 MiB with asynchronous initial connection pre-warming.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.50` in `Cargo.toml` and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.50 - resilient UDP DNS retransmit, multi-homed dial failover, and global JoinSet pruning`
+- Tag: `v0.0.50`
+
+### Status
+- Completed and released as `v0.0.50`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.50`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.50`.
+
+
 
 
 
