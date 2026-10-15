@@ -5909,10 +5909,15 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let target = parse_http_connect(buf)?;
+        let initial_payload = if buf.len() > end {
+            Some(buf[end..].to_vec())
+        } else {
+            None
+        };
         return Ok(HttpProxyRequest {
             target,
             is_connect: true,
-            initial_payload: None,
+            initial_payload,
         });
     }
 
@@ -6112,6 +6117,13 @@ mod tests {
         assert_eq!(parse_http_connect(req).unwrap().port, 443);
         let req6 = b"CONNECT [::1]:8443 HTTP/1.1\r\n\r\n";
         assert_eq!(parse_http_connect(req6).unwrap().host, "::1");
+
+        let pipelined = b"CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n\x16\x03\x01\x00\x10test";
+        let parsed_pipe = parse_http_proxy_request(pipelined).unwrap();
+        assert!(parsed_pipe.is_connect);
+        assert_eq!(parsed_pipe.target.host, "1.1.1.1");
+        assert_eq!(parsed_pipe.target.port, 443);
+        assert_eq!(parsed_pipe.initial_payload.as_deref(), Some(&b"\x16\x03\x01\x00\x10test"[..]));
     }
 
     #[test]
@@ -8486,6 +8498,9 @@ where
                     };
 
                     if *cancelled.borrow() {
+                        crate::mux_writer::recycle_encode_bufs(
+                            pending.drain(..).map(OwnedMuxFrame::into_storage),
+                        );
                         streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                         return;
                     }
@@ -8500,6 +8515,10 @@ where
                                     || !pending_budget
                                         .try_reserve(len, MAX_SESSION_PENDING_BYTES)
                                 {
+                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                    crate::mux_writer::recycle_encode_bufs(
+                                        pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                    );
                                     reject_pending_overflow(
                                         &writer_task,
                                         &cipher_task,
@@ -8514,6 +8533,9 @@ where
                             }
                             StreamCommand::Fin => client_fin = true,
                             StreamCommand::Reset => {
+                                crate::mux_writer::recycle_encode_bufs(
+                                    pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                );
                                 streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                 return;
                             }

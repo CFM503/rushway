@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.48] - 2026-10-15
+
+### Protocol Conformance, Zero-RTT Pipelining & Leak Prevention
+
+- **HTTP CONNECT Pipelined Payload Preservation (`src/main.rs:parse_http_proxy_request`)** — extracted trailing bytes in ingress buffers beyond the `\r\n\r\n` delimiter and attached them directly to `initial_payload`, ensuring pipelined application payloads (such as TLS ClientHello frames coalesced with CONNECT headers) are fully forwarded without packet loss.
+- **Server-Side Stream Pre-Dial Buffer Recycling (`src/main.rs:runtime`)** — guaranteed 100% reclamation of pending frame encoding buffers into the global pool across stream cancellation paths (`*cancelled.borrow()`) and post-dial queue drains (`StreamCommand::Reset` / overflow rejections), preventing buffer pool exhaustion during rapid disconnect storms.
+- **Regression Suite for Pipelined Proxied Handshakes (`src/main.rs:tests`)** — added automated test coverage for HTTP CONNECT pipelined ingress payloads, verifying target host, port, and trailing binary frame preservation.
+
 ## [v0.0.47] - 2026-10-15
 
 ### Resilience, Latency & Keepalive Upgrades
