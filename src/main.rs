@@ -1162,6 +1162,7 @@ use tokio::time::timeout;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_millis(1500);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const STALE_TTL: Duration = Duration::from_secs(30 * 60);
 const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
 const CACHE_MAX_ENTRIES: usize = 4096;
@@ -1216,6 +1217,20 @@ pub(crate) async fn configure(server: Option<String>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn invalidate_host(host: &str) {
+    let clean = host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.');
+    if clean.parse::<IpAddr>().is_ok() {
+        return;
+    }
+    let key = clean.to_ascii_lowercase();
+    if let Ok(mut guard) = cache().write() {
+        guard.remove(&key);
+    }
+}
+
 pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     let clean = host.trim().trim_matches(|c| c == '[' || c == ']');
     if let Ok(ip) = clean.parse::<IpAddr>() {
@@ -1227,16 +1242,35 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     } else {
         std::borrow::Cow::Borrowed(trimmed)
     };
-    // Fast path: synchronous read lock, zero tokio yield, zero heap allocation on lowercase cache hit
+    // Fast path: synchronous read lock, zero tokio yield, zero heap allocation on lowercase cache hit.
+    // Stale-While-Revalidate: if expired within STALE_TTL, return the cached IP in 0ms and refresh in background.
     if let Ok(guard) = cache().read() {
         if let Some(&(ip, expires)) = guard.get(key.as_ref()) {
-            if expires > Instant::now() {
+            let now = Instant::now();
+            if expires > now {
+                return Ok(ip);
+            }
+            if now.duration_since(expires) < STALE_TTL {
+                let already_inflight = in_flight()
+                    .lock()
+                    .map(|m| m.contains_key(key.as_ref()))
+                    .unwrap_or(true);
+                if !already_inflight {
+                    let bg_key = key.into_owned();
+                    tokio::spawn(async move {
+                        let _ = resolve_host_fresh(&bg_key, &bg_key, bg_key.clone()).await;
+                    });
+                }
                 return Ok(ip);
             }
         }
     }
 
     let key = key.into_owned();
+    resolve_host_fresh(clean, host, key).await
+}
+
+async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAddr> {
     // SingleFlight coordination: deduplicate concurrent in-flight DNS lookups for the same host.
     let mut waiter = None;
     let mut tx = None;
@@ -1454,11 +1488,11 @@ async fn query_remote(host: &str, server: IpAddr, qtype: u16) -> Result<Option<I
     })
     .await?;
     socket.send_to(&request, server_addr).await?;
-    let mut buf = vec![0u8; MAX_PACKET];
+    let mut buf = [0u8; MAX_PACKET];
     let size = recv_from_expected(&socket, &mut buf, server_addr).await?;
-    buf.truncate(size);
-    validate_transaction_id(&buf, expected_id)?;
-    let (ip, truncated) = parse_response(&buf, qtype, host)?;
+    let pkt = &buf[..size];
+    validate_transaction_id(pkt, expected_id)?;
+    let (ip, truncated) = parse_response(pkt, qtype, host)?;
     if !truncated {
         return Ok(ip);
     }
@@ -1478,11 +1512,11 @@ async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Add
     })
     .await?;
     socket.send_to(&request, server_addr).await?;
-    let mut buf = vec![0u8; MAX_PACKET];
+    let mut buf = [0u8; MAX_PACKET];
     let size = recv_from_expected(&socket, &mut buf, server_addr).await?;
-    buf.truncate(size);
-    validate_transaction_id(&buf, expected_id)?;
-    let (ips, truncated) = parse_all_ipv4_from_response(&buf, host)?;
+    let pkt = &buf[..size];
+    validate_transaction_id(pkt, expected_id)?;
+    let (ips, truncated) = parse_all_ipv4_from_response(pkt, host)?;
     if !truncated && !ips.is_empty() {
         return Ok(ips);
     }
@@ -2167,7 +2201,7 @@ use crate::runtime::{
 };
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
-    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_with_cipher,
+    build_client_handshake_request, encode_ws_frame, read_frame,
     validate_client_handshake_response,
 };
 use anyhow::{anyhow, bail, Result};
@@ -2484,7 +2518,7 @@ impl SessionState {
             id
         };
 
-        if let Err(e) = send_mux_parts(
+        let send_syn_res = send_mux_parts(
             &self.writer,
             &self.cipher,
             id,
@@ -2492,8 +2526,9 @@ impl SessionState {
             &syn_payload,
             self.obfs,
         )
-        .await
-        {
+        .await;
+        recycle_encode_buf(syn_payload);
+        if let Err(e) = send_syn_res {
             if let Some(entry) = self
                 .streams
                 .write()
@@ -2553,9 +2588,10 @@ async fn client_reader_loop(mut rd: OwnedReadHalf, state: Arc<SessionState>) -> 
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let res = async {
         loop {
-            let Some((opcode, payload)) = read_frame_with_cipher(
+            let Some((opcode, payload)) = crate::ws::read_frame_mux(
                 &mut rd,
-                Option::<&mut OwnedWriteHalf>::None,
+                &state.writer,
+                true,
                 &mut frame_buf,
                 Some(&state.cipher),
             )
@@ -2680,7 +2716,9 @@ impl MuxSessionPool {
     }
     async fn replenish(self: &Arc<Self>) -> bool {
         let target = self.session_count;
-        let _guard = self.session_creation.lock().await;
+        let Ok(_guard) = self.session_creation.try_lock() else {
+            return false;
+        };
         let missing = {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
@@ -5223,7 +5261,8 @@ impl SynPayload {
         use std::io::Write as _;
         // Max port string is 5 digits + 1 colon = 6 bytes.
         let est_target_len = host.len() + 6;
-        let mut out = Vec::with_capacity(2 + est_target_len + initial_data.len());
+        let mut out = crate::mux_writer::acquire_encode_buf();
+        out.reserve(2 + est_target_len + initial_data.len());
         out.extend_from_slice(&[0, 0]);
         let _ = write!(&mut out, "{host}:{port}");
         let target_len = out.len() - 2;
@@ -7782,7 +7821,9 @@ pub(crate) fn apply_socket_options_raw(
         let _ = sock.set_recv_buffer_size(bytes);
     }
     if keepalive {
-        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
         let _ = sock.set_tcp_keepalive(&ka);
     }
     #[cfg(target_os = "linux")]
@@ -7899,14 +7940,42 @@ async fn dial_target(
     timeout_secs: u64,
     cfg: &RuntimeConfig,
 ) -> Result<TcpStream> {
-    let stream = timeout(Duration::from_secs(timeout_secs.max(1)), async {
+    let connect_res = timeout(Duration::from_secs(timeout_secs.max(1)), async {
         let addr = resolve_target(cfg.block_local, &target.host, target.port)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        TcpStream::connect(addr).await
+        let mut primary = Box::pin(TcpStream::connect(addr));
+        match timeout(Duration::from_millis(300), &mut primary).await {
+            Ok(res) => res,
+            Err(_) => {
+                // Hedged SYN: if the initial SYN was dropped on the WAN, fire a parallel
+                // connection at 300ms instead of waiting for the 1000ms OS SYN retransmit timer.
+                let mut secondary = Box::pin(TcpStream::connect(addr));
+                tokio::select! {
+                    res1 = &mut primary => match res1 {
+                        Ok(s) => Ok(s),
+                        Err(_) => secondary.await,
+                    },
+                    res2 = &mut secondary => match res2 {
+                        Ok(s) => Ok(s),
+                        Err(_) => primary.await,
+                    },
+                }
+            }
+        }
     })
-    .await
-    .context("target connection timeout")??;
+    .await;
+    let stream = match connect_res {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            crate::dns::invalidate_host(&target.host);
+            return Err(e.into());
+        }
+        Err(_) => {
+            crate::dns::invalidate_host(&target.host);
+            bail!("target connection timeout")
+        }
+    };
     apply_socket_options(&stream, cfg);
     Ok(stream)
 }
@@ -8157,9 +8226,10 @@ where
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
 
     loop {
-        let Some((opcode, payload)) = read_frame_with_cipher(
+        let Some((opcode, payload)) = crate::ws::read_frame_mux(
             &mut rd,
-            Option::<&mut W>::None,
+            &writer,
+            false,
             &mut frame_buf,
             Some(&cipher),
         )
@@ -12250,10 +12320,44 @@ where
 // any of it is observed, and the buffer is truncated back on error (see the
 // SAFETY comment at the `set_len` site). `resize(.., 0)` was measured ~7% CPU
 // in pprof 2026-09-23, so the zero-fill is deliberately skipped.
-#[allow(clippy::uninit_vec)]
 pub async fn read_frame_with_cipher<R, W>(
     r: &mut R,
+    reply: Option<&mut W>,
+    buf: &mut Vec<u8>,
+    cipher: Option<&crate::crypto::XorCipher>,
+) -> Result<Option<(u8, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    read_frame_inner(r, reply, None, buf, cipher).await
+}
+
+pub(crate) async fn read_frame_mux<R>(
+    r: &mut R,
+    writer: &crate::mux_writer::MuxFrameWriter,
+    masked_pong: bool,
+    buf: &mut Vec<u8>,
+    cipher: Option<&crate::crypto::XorCipher>,
+) -> Result<Option<(u8, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+{
+    read_frame_inner(
+        r,
+        Option::<&mut tokio::io::Sink>::None,
+        Some((writer, masked_pong)),
+        buf,
+        cipher,
+    )
+    .await
+}
+
+#[allow(clippy::uninit_vec)]
+async fn read_frame_inner<R, W>(
+    r: &mut R,
     mut reply: Option<&mut W>,
+    pong_writer: Option<(&crate::mux_writer::MuxFrameWriter, bool)>,
     buf: &mut Vec<u8>,
     cipher: Option<&crate::crypto::XorCipher>,
 ) -> Result<Option<(u8, Vec<u8>)>>
@@ -12380,6 +12484,10 @@ where
                 }
                 if let Some(w) = reply.as_deref_mut() {
                     write_frame(w, buf, 0xA, !masked).await?;
+                } else if let Some((writer, masked_pong)) = pong_writer {
+                    if let Ok(pong) = encode_ws_frame(buf, 0xA, masked_pong) {
+                        let _ = writer.send(pong).await;
+                    }
                 }
             }
             10 => {}
@@ -13456,7 +13564,7 @@ impl WssSessionState {
                 return Err(anyhow!(e.to_string()));
             }
         };
-        if let Err(error) = send_mux_parts(
+        let send_syn_res = send_mux_parts(
             &self.writer,
             &self.cipher,
             id,
@@ -13464,8 +13572,9 @@ impl WssSessionState {
             &syn_payload,
             self.obfs,
         )
-        .await
-        {
+        .await;
+        recycle_encode_buf(syn_payload);
+        if let Err(error) = send_syn_res {
             self.closed.store(true, Ordering::Release);
             self.close_stream(id).await;
             return Err(error);
@@ -13505,9 +13614,10 @@ async fn wss_reader_loop(rd: &mut TlsReader, session: Arc<WssSessionState>) -> R
     let mut frame_buf = crate::mux_writer::acquire_encode_buf();
     let res = async {
         loop {
-            let Some((opcode, payload)) = read_frame_with_cipher(
+            let Some((opcode, payload)) = crate::ws::read_frame_mux(
                 rd,
-                Option::<&mut TlsWriter>::None,
+                &session.writer,
+                true,
                 &mut frame_buf,
                 Some(&session.cipher),
             )
@@ -13630,7 +13740,9 @@ impl WssSessionPool {
     }
     async fn replenish(self: &Arc<Self>) -> bool {
         let target = self.session_count;
-        let _guard = self.session_creation.lock().await;
+        let Ok(_guard) = self.session_creation.try_lock() else {
+            return false;
+        };
         let missing = {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));

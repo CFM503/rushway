@@ -832,6 +832,57 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.46`.
 
+## Release: v0.0.47 (2026-10-15) — Stale-While-Revalidate DNS, Hedged SYN WAN Dialing, Full-Duplex Ping/Pong & Keepalive Tuning
+
+### Context & User Directives
+- **Directives:** "手动改了代码，对比一下修改前修改后" followed by "更新版本号，更新tag,更新日志，更新AI交接接力日志，推送仓库".
+- **Astra Engineering Review:**
+  - **Concurrency & Correctness:**
+    - Stale-While-Revalidate (SWR) logic checks `in_flight()` under lock before spawning background refresh, preventing duplicate background queries. Returns valid cached IP in 0ms on expired entries `<= STALE_TTL` (30 min).
+    - `invalidate_host` purges entries safely using write guard without locking contention.
+    - `dial_target` hedged dialing pins primary `TcpStream::connect` and spawns a secondary connection at 300ms, racing via `tokio::select!`. Both paths clean up properly without socket leakage.
+    - `read_frame_mux` handles WebSocket Ping (0x9) frames inline by dispatching Pong frames directly to `MuxFrameWriter` (masked for client, unmasked for server), guaranteeing heartbeat responses without blocking reader loops.
+    - `MuxSessionPool::replenish` and `WssSessionPool::replenish` use `session_creation.try_lock()` to avoid thundering-herd queueing.
+  - **Memory & Resource Safety:**
+    - DNS UDP reception buffers in `query_remote` and `query_remote_all_ipv4` converted to fixed stack arrays (`[0u8; MAX_PACKET]`), avoiding 4 KiB heap allocation per query.
+    - SYN encoding buffers pooled with `acquire_encode_buf` and returned via `recycle_encode_buf`.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **Stale-While-Revalidate 0ms DNS Resolution (`src/main.rs:resolve_host`)**:
+   - Immediate 0ms cache return with asynchronous background lookup within `STALE_TTL` (30 mins).
+2. **Dynamic DNS Invalidation on Failure (`src/main.rs:invalidate_host`, `dial_target`)**:
+   - Automatic cache eviction on target dial failure or timeout.
+3. **Hedged SYN WAN Dialing (`src/main.rs:dial_target`)**:
+   - Parallel secondary connect after 300ms timeout to bypass 1000ms OS SYN retransmit penalty.
+4. **Automatic WebSocket Ping/Pong Loop (`src/main.rs:read_frame_mux`, `read_frame_inner`)**:
+   - Automated Pong response emission to keep connections alive through CDNs and reverse proxies.
+5. **Fine-Grained 10-Second TCP Keepalive (`src/main.rs:apply_socket_options_raw`)**:
+   - Added `with_interval(10s)` alongside `with_time(30s)` for rapid dead-socket detection.
+6. **Zero-Alloc Stack Buffering & SYN Recycling (`src/main.rs`)**:
+   - Stack allocation for DNS query packets and pooled SYN buffer lifetime recycling.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.47` in `Cargo.toml` & `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Validation
+- `cargo check`: Passed with 0 errors.
+- `cargo test`: 137 passed; 0 failed; 0 ignored; finished in 0.38s.
+
+### Commit & Tag
+- Commit: `release: v0.0.47 - SWR 0ms DNS, hedged SYN dialing, WebSocket ping/pong loop, and keepalive tuning`
+- Tag: `v0.0.47`
+
+### Status
+- Completed and released as `v0.0.47`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.47`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.47`.
+
+
 
 
 

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.47] - 2026-10-15
+
+### Resilience, Latency & Keepalive Upgrades
+
+- **Stale-While-Revalidate (SWR) 0ms DNS Resolution (`src/main.rs:resolve_host`)** — added a 30-minute stale cache tolerance window (`STALE_TTL`) that serves cached IPs in 0ms on expiry while asynchronously triggering a non-blocking background re-resolution, eliminating DNS lookup latency spikes under load.
+- **Dynamic DNS Invalidation on Dial Failure (`src/main.rs:invalidate_host`)** — exposed `invalidate_host` and automatically purged stale or drifted DNS mappings upon TCP connection timeouts or handshake rejections in `dial_target`.
+- **Hedged SYN Dialing for WAN Latency Resilience (`src/main.rs:dial_target`)** — added a 300ms hedged connection race that spawns a secondary parallel dial if the initial SYN packet is dropped on lossy WAN routes, cutting retransmission delay from the 1000ms kernel timer to 300ms.
+- **Automatic WebSocket Ping/Pong Heartbeat Loop (`src/main.rs:read_frame_mux`)** — wired `MuxFrameWriter` into the frame reader to immediately answer incoming WebSocket Ping frames with appropriate Pong replies (masked for clients, unmasked for servers), preventing CDN and gateway idle disconnects.
+- **Granular 10-Second TCP Keepalive Interval (`src/main.rs:apply_socket_options_raw`)** — configured explicit 10-second retransmission intervals (`with_interval`) alongside the 30-second idle timer, speeding dead-socket detection.
+- **Zero-Allocation SYN Framing & Pool Replenish Try-Lock (`src/main.rs`)** — pooled SYN frame encoding buffers via `acquire_encode_buf` / `recycle_encode_buf`, and converted session pool replenishment locks to non-blocking `try_lock()` to avoid redundant creation worker queues.
+
 ## [v0.0.46] - 2026-10-15
 
 ### Bug Fixes, Concurrency & High-Throughput Optimizations
