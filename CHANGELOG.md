@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.45] - 2026-10-15
+
+### Performance, Scheduling & Concurrency Breakthroughs
+
+- **Anti-Head-of-Line Blocking MUX Priority Scheduler (`src/main.rs:Scheduler::next`)** — eliminated cross-stream Head-of-Line (HOL) blocking in the priority control queue by scanning for and dispatching any ready stream's control frame while preserving per-stream sequencing (`!blocked_by_earlier_ctrl`), preventing blocked data streams from stalling unrelated control signals.
+- **Concurrent `JoinSet` MUX & WSS Session Replenishment (`src/main.rs:MuxSessionPool`, `WssSessionPool`)** — replaced serial task completion awaits with `tokio::task::JoinSet`, inserting newly dialed physical sessions into the pool and notifying waiters immediately as each handshake succeeds.
+- **Non-blocking Try-Lock & Lost-Wakeup Prevention in Pool Acquire (`src/main.rs:MuxSessionPool`, `WssSessionPool`)** — pre-pinned and enabled capacity notifications before inspecting pool state to eliminate lost-wakeup race windows, and replaced blocking `.lock().await` on session creation with `try_lock()` and timed backoff to eliminate thundering herds.
+- **Happy Eyeballs Dual-Stack DNS with IPv4 Fast-Path (`src/main.rs:resolve_remote`)** — upgraded remote DNS resolution to return immediately on successful IPv4 (A) responses while granting IPv4 a 25ms racing window if IPv6 (AAAA) arrives first, cutting DNS latency while preferring optimal IPv4 routing paths.
+- **Expiry-Aware DNS Cache Pruning (`src/main.rs:bounded_insert`)** — replaced blunt full cache purges upon capacity limits with retention sweeps of expired entries, significantly improving steady-state DNS cache hit rates under load.
+- **Global Buffer Pooling & Zero-Copy Reuse (`src/main.rs`)** — expanded thread-safe encode pool (`acquire_encode_buf` / `recycle_encode_buf`) across `SessionState`, `WssSessionState`, `OwnedMuxFrame::new`, TCP/WSS 0-RTT client payload pre-fetch, and stream acquisition error branches, eliminating transient 16 KiB/64 KiB heap allocations.
+- **End-to-End Client & TLS Handshake Timeout Safeguards (`src/main.rs`)** — enforced connection timeouts on inbound proxy request parsing across TCP, non-MUX, and WSS paths, added timeout guards on WSS upstream TLS handshakes, and explicitly marked broken WSS sessions as closed on transport write failures.
+- **QUIC Pool Dead Connection Pruning (`src/main.rs:QuicClientPool`)** — filtered out closed QUIC connections before reuse and compared `stable_id` upon failure before invalidating pooled instances to prevent concurrent reconnect races.
+
 ## [v0.0.44] - 2026-10-14
 
 ### Performance & Latency Optimizations

@@ -1188,9 +1188,17 @@ fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<IpAdd
 /// table is cleared before inserting. Clearing everything instead of evicting
 /// per-entry trades cache hit-rate for simplicity and a hard bound on memory
 /// growth.
-fn bounded_insert<K: Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: V) {
+fn bounded_insert<K: Hash + Eq, T>(
+    map: &mut HashMap<K, (T, Instant)>,
+    key: K,
+    value: (T, Instant),
+) {
     if map.len() >= CACHE_MAX_ENTRIES {
-        map.clear();
+        let now = Instant::now();
+        map.retain(|_, (_, expires)| *expires > now);
+        if map.len() >= CACHE_MAX_ENTRIES {
+            map.clear();
+        }
     }
     map.insert(key, value);
 }
@@ -1281,23 +1289,15 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     let _guard = InFlightGuard(&key);
 
     let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
-    let remote_result = match server {
-        Some(server_ip) => resolve_remote(&key, server_ip).await,
-        None => Err(anyhow!("remote DNS not configured")),
-    };
-    let query_result = match remote_result {
-        Ok(ip) => Ok(ip),
-        Err(remote_error) => {
-            tracing::warn!(host=%host, error=%remote_error, "remote DNS failed; falling back to system DNS");
-            match timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
-                Ok(Ok(mut addresses)) => addresses
-                    .next()
-                    .map(|addr| addr.ip())
-                    .ok_or_else(|| anyhow!("system DNS returned no addresses for {host}")),
-                Ok(Err(e)) => Err(e.into()),
-                Err(_) => Err(anyhow!("system DNS timeout for {host}")),
+    let query_result = match server {
+        Some(server_ip) => match resolve_remote(&key, server_ip).await {
+            Ok(ip) => Ok(ip),
+            Err(remote_error) => {
+                tracing::warn!(host=%host, error=%remote_error, "remote DNS failed; falling back to system DNS");
+                resolve_system_dns(clean, host).await
             }
-        }
+        },
+        None => resolve_system_dns(clean, host).await,
     };
 
     match query_result {
@@ -1346,39 +1346,16 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
     }
     let key = key.into_owned();
     let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
-    let remote_result = match server {
-        Some(server_ip) => query_remote_all_ipv4(&key, server_ip).await,
-        None => Err(anyhow!("remote DNS not configured")),
-    };
-    let ips = match remote_result {
-        Ok(list) if !list.is_empty() => list,
-        Err(err) => {
-            tracing::warn!(host=%host, error=%err, "remote DNS failed for fakehost; falling back to system DNS");
-            let mut result = Vec::new();
-            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
-                for addr in iter {
-                    if let IpAddr::V4(v4) = addr.ip() {
-                        if !result.contains(&v4) {
-                            result.push(v4);
-                        }
-                    }
-                }
+    let ips = match server {
+        Some(server_ip) => match query_remote_all_ipv4(&key, server_ip).await {
+            Ok(list) if !list.is_empty() => list,
+            Ok(_) => resolve_system_all_ipv4(clean).await,
+            Err(err) => {
+                tracing::warn!(host=%host, error=%err, "remote DNS failed for fakehost; falling back to system DNS");
+                resolve_system_all_ipv4(clean).await
             }
-            result
-        }
-        _ => {
-            let mut result = Vec::new();
-            if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
-                for addr in iter {
-                    if let IpAddr::V4(v4) = addr.ip() {
-                        if !result.contains(&v4) {
-                            result.push(v4);
-                        }
-                    }
-                }
-            }
-            result
-        }
+        },
+        None => resolve_system_all_ipv4(clean).await,
     };
     let mut unique = Vec::new();
     for ip in ips {
@@ -1394,20 +1371,75 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
     Ok(unique)
 }
 
+async fn resolve_system_dns(clean: &str, host: &str) -> Result<IpAddr> {
+    match timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
+        Ok(Ok(addresses)) => {
+            let mut first_v6 = None;
+            for addr in addresses {
+                let ip = addr.ip();
+                if ip.is_ipv4() {
+                    return Ok(ip);
+                } else if first_v6.is_none() {
+                    first_v6 = Some(ip);
+                }
+            }
+            first_v6.ok_or_else(|| anyhow!("system DNS returned no addresses for {host}"))
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(anyhow!("system DNS timeout for {host}")),
+    }
+}
+
+async fn resolve_system_all_ipv4(clean: &str) -> Vec<Ipv4Addr> {
+    let mut result = Vec::new();
+    if let Ok(Ok(iter)) = timeout(RESOLVE_TIMEOUT, lookup_host((clean, 0))).await {
+        for addr in iter {
+            if let IpAddr::V4(v4) = addr.ip() {
+                if !result.contains(&v4) {
+                    result.push(v4);
+                }
+            }
+        }
+    }
+    result
+}
+
 async fn resolve_remote(host: &str, server: IpAddr) -> Result<IpAddr> {
-    let (v4_res, v6_res) = tokio::join!(
-        query_remote(host, server, 1u16),
-        query_remote(host, server, 28u16)
-    );
-    if let Ok(Some(ip)) = v4_res {
-        return Ok(ip);
-    }
-    if let Ok(Some(ip)) = v6_res {
-        return Ok(ip);
-    }
-    match (v4_res, v6_res) {
-        (Err(e), _) | (_, Err(e)) => Err(e),
-        _ => Err(anyhow!("remote DNS returned no A/AAAA answer for {host}")),
+    let v4_fut = query_remote(host, server, 1u16);
+    let v6_fut = query_remote(host, server, 28u16);
+    tokio::pin!(v4_fut);
+    tokio::pin!(v6_fut);
+
+    tokio::select! {
+        v4_res = &mut v4_fut => {
+            if let Ok(Some(ip)) = v4_res {
+                return Ok(ip);
+            }
+            let v6_res = v6_fut.await;
+            if let Ok(Some(ip)) = v6_res {
+                return Ok(ip);
+            }
+            match (v4_res, v6_res) {
+                (Err(e), _) | (_, Err(e)) => Err(e),
+                _ => Err(anyhow!("remote DNS returned no A/AAAA answer for {host}")),
+            }
+        }
+        v6_res = &mut v6_fut => {
+            if let Ok(Some(ip6)) = v6_res {
+                if let Ok(Ok(Some(ip4))) = timeout(Duration::from_millis(25), v4_fut).await {
+                    return Ok(ip4);
+                }
+                return Ok(ip6);
+            }
+            let v4_res = v4_fut.await;
+            if let Ok(Some(ip4)) = v4_res {
+                return Ok(ip4);
+            }
+            match (v4_res, v6_res) {
+                (Err(e), _) | (_, Err(e)) => Err(e),
+                _ => Err(anyhow!("remote DNS returned no A/AAAA answer for {host}")),
+            }
+        }
     }
 }
 
@@ -2136,7 +2168,7 @@ use crate::runtime::{
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
     build_client_handshake_request, encode_ws_frame, read_frame, read_frame_with_cipher,
-    read_http_headers, validate_client_handshake_response,
+    validate_client_handshake_response,
 };
 use anyhow::{anyhow, bail, Result};
 use std::sync::{
@@ -2270,7 +2302,8 @@ impl SessionState {
         );
         wr.write_all(&request).await?;
         wr.flush().await?;
-        let response = read_http_headers(&mut rd).await?;
+        let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+        let response = crate::ws::read_http_headers_timeout(&mut rd, hs_timeout).await?;
         validate_client_handshake_response(&response, &key)?;
         let (writer, _writer_task) = MuxFrameWriter::spawn(wr);
         let cipher = configured_cipher(&cfg.key);
@@ -2279,21 +2312,29 @@ impl SessionState {
         writer
             .send(encode_ws_frame(&hello, 2, true).map_err(|e| anyhow!(e.to_string()))?)
             .await?;
-        let mut frame_buf = Vec::with_capacity(64 * 1024);
-        let Some((opcode, mut ok)) = read_frame(
-            &mut rd,
-            Option::<&mut OwnedWriteHalf>::None,
-            &mut frame_buf,
+        let mut frame_buf = crate::mux_writer::acquire_encode_buf();
+        let read_res = timeout(
+            hs_timeout,
+            read_frame(
+                &mut rd,
+                Option::<&mut OwnedWriteHalf>::None,
+                &mut frame_buf,
+            ),
         )
-        .await?
-        else {
+        .await
+        .map_err(|_| anyhow!("upstream MUX handshake OK timed out"))?;
+        recycle_encode_buf(frame_buf);
+        let Some((opcode, mut ok)) = read_res? else {
             bail!("upstream closed during MUX handshake")
         };
         if opcode != 2 {
+            recycle_encode_buf(ok);
             bail!("invalid MUX handshake response opcode")
         };
         cipher.apply(&mut ok);
-        if ok != b"OK\n" {
+        let is_ok = ok == b"OK\n";
+        recycle_encode_buf(ok);
+        if !is_ok {
             bail!("upstream rejected MUX handshake")
         };
         // W3 version negotiation: advertise our version + initial receive
@@ -2647,24 +2688,24 @@ impl MuxSessionPool {
             self.consecutive_failures.store(0, Ordering::Release);
             return false;
         }
-        let mut futs = Vec::with_capacity(missing);
+        let mut set = tokio::task::JoinSet::new();
         for _ in 0..missing {
             let cfg = self.cfg.clone();
             let notify = self.capacity_notify.clone();
-            futs.push(tokio::spawn(async move {
+            set.spawn(async move {
                 SessionState::connect(&cfg, notify).await
-            }));
+            });
         }
         let mut added = 0usize;
-        for f in futs {
-            if let Ok(Ok(s)) = f.await {
+        while let Some(res) = set.join_next().await {
+            if let Ok(Ok(s)) = res {
                 self.sessions.lock().await.push(s);
                 added += 1;
+                self.capacity_notify.notify_waiters();
             }
         }
         if added > 0 {
             self.consecutive_failures.store(0, Ordering::Release);
-            self.capacity_notify.notify_waiters();
             false
         } else {
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
@@ -2694,6 +2735,10 @@ impl MuxSessionPool {
         enforce_target_policy(&self.cfg, target)?;
         let n = self.session_count;
         loop {
+            let notified = self.capacity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let (chosen, need_new) = {
                 let mut sessions = self.sessions.lock().await;
                 sessions.retain(|s| !s.closed.load(Ordering::Acquire));
@@ -2708,6 +2753,7 @@ impl MuxSessionPool {
             if let Some(s) = chosen {
                 match s.open_stream(target, &initial_data).await {
                     Ok(r) => {
+                        recycle_encode_buf(initial_data);
                         if need_new {
                             let pool = self.clone();
                             tokio::spawn(async move {
@@ -2716,30 +2762,32 @@ impl MuxSessionPool {
                         }
                         return Ok((s, r.0, r.1, r.2));
                     }
-                    Err(_) => continue,
+                    Err(_) if s.closed.load(Ordering::Acquire) || !s.available() => continue,
+                    Err(e) => {
+                        recycle_encode_buf(initial_data);
+                        return Err(e);
+                    }
                 }
             }
             if !need_new {
-                // Every session is at capacity: park until a stream release,
-                // a session close, or a replenished session signals spare
-                // capacity. The bounded wait is also the lost-wakeup backstop
-                // for `notify_waiters` races (a waiter registers on first
-                // poll, so a signal between the scan and the poll is lost).
-                let notified = self.capacity_notify.notified();
-                let _ = timeout(Duration::from_millis(500), notified).await;
+                let _ = timeout(Duration::from_millis(500), &mut notified).await;
                 continue;
             }
 
-            let _creation_guard = self.session_creation.lock().await;
+            let Ok(_creation_guard) = self.session_creation.try_lock() else {
+                let _ = timeout(Duration::from_millis(200), &mut notified).await;
+                continue;
+            };
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            if sessions.len() >= n {
+            if sessions.iter().any(|s| s.available()) || sessions.len() >= n {
                 continue;
             }
             drop(sessions);
 
             let s = SessionState::connect(&self.cfg, self.capacity_notify.clone()).await?;
             let r = s.open_stream(target, &initial_data).await?;
+            recycle_encode_buf(initial_data);
             self.sessions.lock().await.push(s.clone());
             self.capacity_notify.notify_waiters();
             return Ok((s, r.0, r.1, r.2));
@@ -2752,7 +2800,12 @@ async fn handle_tcp_proxy(
     cfg: RuntimeConfig,
     pool: Arc<MuxSessionPool>,
 ) -> Result<()> {
-    let req = read_client_proxy_request(&mut local).await?;
+    let req = timeout(
+        Duration::from_secs(cfg.connection_timeout.max(1)),
+        read_client_proxy_request(&mut local),
+    )
+    .await
+    .map_err(|_| anyhow!("client proxy request timed out"))??;
     if req.command == SocksCommand::UdpAssociate {
         return handle_local_udp_proxy(local, cfg, req.target).await;
     }
@@ -2767,12 +2820,16 @@ async fn handle_tcp_proxy(
     }
     let mut initial_data = req.initial_payload.unwrap_or_default();
     if initial_data.is_empty() {
-        let mut first_pkt = vec![0u8; 16384];
-        if let Ok(Ok(n)) = timeout(Duration::from_millis(3), local.read(&mut first_pkt)).await {
-            if n > 0 {
+        let mut first_pkt = crate::mux_writer::acquire_encode_buf();
+        first_pkt.resize(16384, 0);
+        match timeout(Duration::from_millis(2), local.read(&mut first_pkt)).await {
+            Ok(Ok(n)) if n > 0 => {
                 crate::stats::add_bytes(n as i64, 0);
                 first_pkt.truncate(n);
                 initial_data = first_pkt;
+            }
+            _ => {
+                recycle_encode_buf(first_pkt);
             }
         }
     }
@@ -3392,12 +3449,33 @@ impl Scheduler {
     /// DATA as unknown-stream. System frames (`None`) and controls for
     /// streams with empty queues jump immediately.
     fn next(&mut self) -> Option<Vec<u8>> {
-        if let Some(&(sid, yield_to_data, _)) = self.priority.front() {
-            let blocked = yield_to_data
-                && sid
-                    .is_some_and(|id| self.streams.get(&id).is_some_and(|q| !q.frames.is_empty()));
-            if !blocked {
-                let (sid_opt, yield_flag, frame) = self.priority.pop_front().unwrap();
+        if !self.priority.is_empty() {
+            let ready_idx =
+                self.priority
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, &(sid, yield_to_data, _))| {
+                        let blocked_by_data = yield_to_data
+                            && sid.is_some_and(|id| {
+                                self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
+                            });
+                        if blocked_by_data {
+                            return None;
+                        }
+                        if let Some(id) = sid {
+                            let blocked_by_earlier_ctrl = self
+                                .priority
+                                .iter()
+                                .take(idx)
+                                .any(|&(earlier_sid, _, _)| earlier_sid == Some(id));
+                            if blocked_by_earlier_ctrl {
+                                return None;
+                            }
+                        }
+                        Some(idx)
+                    });
+            if let Some(idx) = ready_idx {
+                let (sid_opt, yield_flag, frame) = self.priority.remove(idx).unwrap();
                 self.total -= 1;
                 if yield_flag {
                     if let Some(id) = sid_opt {
@@ -4424,7 +4502,12 @@ async fn handle_client_connection(
     cfg: RuntimeConfig,
     pool: Arc<PlainNonMuxPool>,
 ) -> Result<()> {
-    let req = read_client_proxy_request(&mut local).await?;
+    let req = timeout(
+        Duration::from_secs(cfg.connection_timeout.max(1)),
+        read_client_proxy_request(&mut local),
+    )
+    .await
+    .map_err(|_| anyhow!("non-MUX client proxy request timed out"))??;
     if req.command == SocksCommand::UdpAssociate {
         return handle_local_udp_proxy(local, cfg, req.target).await;
     }
@@ -5033,7 +5116,8 @@ impl OwnedMuxFrame {
         if payload_len > MAX_MUX_PAYLOAD {
             return Err(ProtocolError::PayloadTooLarge(payload_len));
         }
-        let mut storage = Vec::with_capacity(MUX_HEADER_LEN + payload_len);
+        let mut storage = crate::mux_writer::acquire_encode_buf();
+        storage.reserve(MUX_HEADER_LEN + payload_len);
         write_frame_parts(&mut storage, stream_id, command, payload)?;
         Ok(Self {
             stream_id,
@@ -6473,7 +6557,11 @@ impl QuicClientPool {
         for _ in 0..2 {
             let connection = {
                 let mut guard = self.connection.lock().await;
-                if let Some(existing) = guard.clone() {
+                if let Some(existing) = guard
+                    .as_ref()
+                    .filter(|c| c.close_reason().is_none())
+                    .cloned()
+                {
                     existing
                 } else {
                     let connecting = self.endpoint.connect(self.server_addr, &self.server_name)?;
@@ -6486,7 +6574,13 @@ impl QuicClientPool {
             match connection.open_bi().await {
                 Ok(pair) => return Ok(pair),
                 Err(_) => {
-                    self.connection.lock().await.take();
+                    let mut guard = self.connection.lock().await;
+                    if guard
+                        .as_ref()
+                        .is_some_and(|c| c.stable_id() == connection.stable_id())
+                    {
+                        guard.take();
+                    }
                 }
             }
         }
@@ -8313,16 +8407,6 @@ where
                     }
                     let (rd_target, mut wr_target) = target_stream.into_split();
 
-                    let mut reader = tokio::spawn(target_to_mux(
-                        stream_id,
-                        rd_target,
-                        writer_task.clone(),
-                        cfg_task.buffer_size,
-                        cipher_task.clone(),
-                        cfg_task.obfs,
-                        gate_task.clone(),
-                    ));
-
                     // W3 receive-side refunds: credit the client's upload
                     // window once we have consumed >= 64 KiB toward the
                     // target. Only accumulated once the client negotiated.
@@ -8354,7 +8438,6 @@ where
                                 }
                             }
                             Err(_) => {
-                                reader.abort();
                                 streams_task
                                     .write()
                                     .unwrap_or_else(|e| e.into_inner())
@@ -8363,6 +8446,16 @@ where
                             }
                         }
                     }
+
+                    let mut reader = tokio::spawn(target_to_mux(
+                        stream_id,
+                        rd_target,
+                        writer_task.clone(),
+                        cfg_task.buffer_size,
+                        cipher_task.clone(),
+                        cfg_task.obfs,
+                        gate_task.clone(),
+                    ));
 
                     if client_fin {
                         let _ = wr_target.shutdown().await;
@@ -12702,9 +12795,13 @@ async fn connect_tls(
     tracing::info!("[WSS] TCP connected");
 
     apply_socket_options_raw(&tcp, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
-    let tls_stream = tls::connect(tcp, tls_name, cfg.verify_ssl)
-        .await
-        .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
+    let tls_stream = timeout(
+        Duration::from_secs(cfg.connection_timeout.max(1)),
+        tls::connect(tcp, tls_name, cfg.verify_ssl),
+    )
+    .await
+    .context("WSS upstream TLS handshake timeout")?
+    .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
 
     let (_, conn) = tls_stream.get_ref();
     let alpn = conn
@@ -12872,11 +12969,14 @@ async fn handle_udp_proxy(
         bail!("WSS upstream closed during UDP handshake")
     };
     if opcode != 2 {
+        recycle_encode_buf(ok);
         recycle_encode_buf(frame_buf);
         bail!("invalid WSS UDP handshake response opcode")
     };
     c.apply(&mut ok);
-    if ok != b"OK\n" {
+    let is_ok = ok == b"OK\n";
+    recycle_encode_buf(ok);
+    if !is_ok {
         recycle_encode_buf(frame_buf);
         bail!("WSS upstream rejected UDP handshake")
     };
@@ -12979,7 +13079,12 @@ async fn handle_non_mux_connection(
     cfg: WssConfig,
     pool: Arc<NonMuxWssPool>,
 ) -> Result<()> {
-    let req = read_client_proxy_request(&mut local).await?;
+    let req = timeout(
+        Duration::from_secs(cfg.connection_timeout.max(1)),
+        read_client_proxy_request(&mut local),
+    )
+    .await
+    .map_err(|_| anyhow!("WSS non-MUX client proxy request timed out"))??;
     if req.command == SocksCommand::UdpAssociate {
         return handle_udp_proxy(local, cfg, req.target).await;
     }
@@ -13099,25 +13204,31 @@ impl WssSessionState {
         write_frame(&mut wr, &hello, 2, true)
             .await
             .context("MUX handshake request write failed")?;
-        let mut frame_buf = Vec::with_capacity(64 * 1024);
+        let mut frame_buf = crate::mux_writer::acquire_encode_buf();
         let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
         let read_result = timeout(
             mux_timeout,
             read_frame(&mut rd, Option::<&mut TlsWriter>::None, &mut frame_buf),
         )
         .await
-        .context("MUX OK timeout")??;
+        .context("MUX OK timeout");
+        recycle_encode_buf(frame_buf);
+        let read_result = read_result??;
 
         let Some((opcode, mut ok)) = read_result else {
             bail!("WSS upstream closed during MUX handshake")
         };
         if opcode != 2 {
+            recycle_encode_buf(ok);
             bail!("invalid WSS MUX response opcode: {opcode}")
         };
         c.apply(&mut ok);
         if ok != b"OK\n" {
-            bail!("MUX rejected: {:?}", String::from_utf8_lossy(&ok).trim())
+            let msg = String::from_utf8_lossy(&ok).trim().to_string();
+            recycle_encode_buf(ok);
+            bail!("MUX rejected: {msg:?}")
         };
+        recycle_encode_buf(ok);
         tracing::info!("[WSS] MUX handshake completed");
         // Hand the write half to the dedicated writer task; from here on
         // all MUX frames go through the serialized, coalescing queue.
@@ -13283,6 +13394,7 @@ impl WssSessionState {
         )
         .await
         {
+            self.closed.store(true, Ordering::Release);
             self.close_stream(id).await;
             return Err(error);
         }
@@ -13297,6 +13409,7 @@ impl WssSessionState {
             )
             .await
             {
+                self.closed.store(true, Ordering::Release);
                 self.close_stream(id).await;
                 return Err(error);
             }
@@ -13444,25 +13557,42 @@ impl WssSessionPool {
     async fn replenish(self: &Arc<Self>) -> bool {
         let target = self.session_count;
         let _guard = self.session_creation.lock().await;
-        let need_new = {
+        let missing = {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            sessions.len() < target
+            target.saturating_sub(sessions.len())
         };
-        if !need_new {
+        if missing == 0 {
             self.consecutive_failures.store(0, Ordering::Release);
             return false;
         }
-        match WssSessionState::connect(&self.cfg, self.capacity_notify.clone()).await {
-            Ok(s) => {
-                let mut sessions = self.sessions.lock().await;
-                sessions.push(s);
-                self.consecutive_failures.store(0, Ordering::Release);
-                self.capacity_notify.notify_waiters();
-                sessions.len() < target
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..missing {
+            let cfg = self.cfg.clone();
+            let notify = self.capacity_notify.clone();
+            set.spawn(async move {
+                WssSessionState::connect(&cfg, notify).await
+            });
+        }
+        let mut added = 0usize;
+        let mut last_err = None;
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(s)) => {
+                    self.sessions.lock().await.push(s);
+                    added += 1;
+                    self.capacity_notify.notify_waiters();
+                }
+                Ok(Err(e)) => last_err = Some(e),
+                Err(e) => last_err = Some(e.into()),
             }
-            Err(error) => {
-                let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        }
+        if added > 0 {
+            self.consecutive_failures.store(0, Ordering::Release);
+            false
+        } else {
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+            if let Some(error) = last_err {
                 let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
                 let sni = self
                     .cfg
@@ -13481,8 +13611,8 @@ impl WssSessionPool {
                     failures,
                     "WSS physical session creation failed; will retry with backoff"
                 );
-                false
             }
+            false
         }
     }
     async fn maintain(self: &Arc<Self>) {
@@ -13494,7 +13624,7 @@ impl WssSessionPool {
             }
             let failures = self.consecutive_failures.load(Ordering::Acquire);
             let backoff = (failures.saturating_mul(500)).min(5000);
-            tokio::time::sleep(Duration::from_millis(500 + backoff as u64)).await;
+            tokio::time::sleep(Duration::from_millis(250 + backoff as u64)).await;
         }
     }
     async fn acquire(
@@ -13509,6 +13639,10 @@ impl WssSessionPool {
     )> {
         let n = self.session_count;
         loop {
+            let notified = self.capacity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let (chosen, need_new) = {
                 let mut sessions = self.sessions.lock().await;
                 sessions.retain(|s| !s.closed.load(Ordering::Acquire));
@@ -13523,6 +13657,7 @@ impl WssSessionPool {
             if let Some(session) = chosen {
                 match session.open_stream(target, &initial_data).await {
                     Ok(opened) => {
+                        recycle_encode_buf(initial_data);
                         if need_new {
                             let pool = self.clone();
                             tokio::spawn(async move {
@@ -13531,23 +13666,27 @@ impl WssSessionPool {
                         }
                         return Ok((session, opened.0, opened.1, opened.2));
                     }
-                    Err(_) => continue,
+                    Err(_) if session.closed.load(Ordering::Acquire) || !session.available() => {
+                        continue;
+                    }
+                    Err(e) => {
+                        recycle_encode_buf(initial_data);
+                        return Err(e);
+                    }
                 }
             }
             if !need_new {
-                // Every session is at capacity: park until a stream release,
-                // a session close, or a replenished session signals spare
-                // capacity. The bounded wait is also the lost-wakeup backstop
-                // for `notify_waiters` races.
-                let notified = self.capacity_notify.notified();
-                let _ = timeout(Duration::from_millis(500), notified).await;
+                let _ = timeout(Duration::from_millis(500), &mut notified).await;
                 continue;
             }
 
-            let _creation_guard = self.session_creation.lock().await;
+            let Ok(_creation_guard) = self.session_creation.try_lock() else {
+                let _ = timeout(Duration::from_millis(200), &mut notified).await;
+                continue;
+            };
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-            if sessions.len() >= n {
+            if sessions.iter().any(|s| s.available()) || sessions.len() >= n {
                 continue;
             }
             drop(sessions);
@@ -13573,6 +13712,7 @@ impl WssSessionPool {
                 e
             })?;
             let opened = session.open_stream(target, &initial_data).await?;
+            recycle_encode_buf(initial_data);
             self.sessions.lock().await.push(session.clone());
             self.capacity_notify.notify_waiters();
             return Ok((session, opened.0, opened.1, opened.2));
@@ -13581,7 +13721,12 @@ impl WssSessionPool {
 }
 
 async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> Result<()> {
-    let req = read_client_proxy_request(&mut local).await?;
+    let req = timeout(
+        Duration::from_secs(pool.cfg.connection_timeout.max(1)),
+        read_client_proxy_request(&mut local),
+    )
+    .await
+    .map_err(|_| anyhow!("WSS client proxy request timed out"))??;
     if req.command == SocksCommand::UdpAssociate {
         return handle_udp_proxy(local, pool.cfg.clone(), req.target).await;
     }
@@ -13589,16 +13734,30 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         bail!("WSS path only supports CONNECT or UDP ASSOCIATE")
     };
     check_target_policy(pool.cfg.block_local, &req.target)?;
-    let initial_data = req.initial_payload.unwrap_or_default();
-    let (session, stream_id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
-    let writer = session.writer.clone();
-    let cipher = session.cipher.clone();
-    let obfs = session.obfs;
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else if req.is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     };
+    let mut initial_data = req.initial_payload.unwrap_or_default();
+    if initial_data.is_empty() {
+        let mut first_pkt = crate::mux_writer::acquire_encode_buf();
+        first_pkt.resize(16384, 0);
+        match timeout(Duration::from_millis(2), local.read(&mut first_pkt)).await {
+            Ok(Ok(n)) if n > 0 => {
+                crate::stats::add_bytes(n as i64, 0);
+                first_pkt.truncate(n);
+                initial_data = first_pkt;
+            }
+            _ => {
+                recycle_encode_buf(first_pkt);
+            }
+        }
+    }
+    let (session, stream_id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
+    let writer = session.writer.clone();
+    let cipher = session.cipher.clone();
+    let obfs = session.obfs;
     let (mut local_rd, mut local_wr) = local.into_split();
     let buffer_size = pool.cfg.buffer_size;
     let upload = tokio::spawn(async move {
