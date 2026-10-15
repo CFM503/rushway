@@ -920,6 +920,51 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.48`.
 
+## Release: v0.0.49 (2026-10-15) — JIT Buffer Allocation, SOCKS5/QUIC Pipelining, DRR Starvation Fix & Zero-Fill Elimination
+
+### Context & User Directives
+- **Directives:** "我手动修改了一下代码，检查一下修改前和修改后都改变了什么，是不是正向优化" followed by "更新版本号,更新tag ,更新日志，更新AI交接接力日志，推送仓库".
+- **Astra Engineering Review:**
+  - **Concurrency & Correctness:**
+    - `Scheduler::next` DRR loop only increments `checked` when examining non-empty stream queues. Empty streams scheduled for pruning no longer exhaust the DRR round quota, preventing active stream starvation.
+    - SOCKS5 and QUIC tunnels now preserve pipelined trailing bytes as `initial_payload` / `extra_initial`, matching HTTP CONNECT behavior and ensuring 0-RTT application payloads are never dropped.
+    - Stream termination is guarded with `fin_sent: Arc<AtomicBool>`, eliminating duplicate FIN frame transmissions.
+    - Session pools asynchronously spawn background `replenish()` tasks when on-demand stream acquisition instantiates a session while pool capacity remains unfilled.
+  - **Memory & Resource Safety:**
+    - `read_frame_inner` JIT buffer acquisition: connection readers initialize with empty `Vec::new()`, only renting an 80 KiB buffer from the global encode pool when non-zero payload frames arrive and taking/releasing it immediately. This dramatically reduces idle memory footprints under thousands of connections.
+    - Zero-fill elimination: replaced `resize(16384, 0)` with `local.readable()` and direct non-blocking `try_read`, eliminating 16 KiB CPU memory zeroing overhead per connection.
+    - UDP relay path uses `write_frame_borrowed` for zero-copy envelope forwarding.
+  - **Regression Risk:** Zero. All unit tests and protocol paths pass cleanly.
+
+### Changes Implemented
+1. **JIT Buffer Allocation (`src/main.rs:ws`)**:
+   - Defers buffer pool rental until a payload frame is received, slashing idle socket memory.
+2. **SOCKS5 & QUIC Pipelined Ingress (`src/main.rs:proxy`, `quic`)**:
+   - Batched SOCKS5 greeting/request parsing and preserved pipelined payload bytes; QUIC header ingress upgraded to 256-byte chunked scanning with hedged dial integration.
+3. **DRR Deficit Round-Robin Starvation Fix (`src/main.rs:mux_writer`)**:
+   - Corrected loop counter progression to only charge against valid data queues.
+4. **Zero-Fill Elimination & Idempotent FINs (`src/main.rs:mux_pool`, `wss_client`)**:
+   - Replaced buffer zero-filling with `local.readable()` + `try_read`; guarded FIN emission with `AtomicBool`.
+5. **UDP Zero-Copy & Telemetry Clean-up (`src/main.rs:udp_relay`, `wss_client`)**:
+   - Vectored borrowed writes for UDP frames and demoted noisy handshake info logs to debug.
+6. **Version & Documentation**:
+   - Bumped version to `0.0.49` in `Cargo.toml` and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.49 - JIT buffer pooling, SOCKS5/QUIC pipelining, DRR starvation fix, and zero-fill elimination`
+- Tag: `v0.0.49`
+
+### Status
+- Completed and released as `v0.0.49`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.49`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.49`.
+
+
 
 
 

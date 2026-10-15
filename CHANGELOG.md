@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.49] - 2026-10-15
+
+### High-Concurrency Throughput, JIT Buffer Allocation & Fair Scheduling
+
+- **Just-In-Time (JIT) Buffer Allocation for Idle Sockets (`src/main.rs:read_frame_inner`)** — deferred frame buffer acquisition from the global pool until a valid WebSocket frame header with a non-zero payload is received, eliminating persistent 80 KiB idle memory allocations across thousands of idle connections.
+- **Batched SOCKS5 Ingress & Pipelined Payload Forwarding (`src/main.rs:read_client_proxy_request`)** — coalesced multi-step greeting and request reads into a 512-byte buffered pass to halve syscall overhead, and extracted trailing pipelined application bytes following SOCKS5 request headers into `initial_payload`.
+- **DRR Priority Scheduler Starvation Bug Fix (`src/main.rs:Scheduler::next`)** — fixed Deficit Round-Robin loop accounting to only increment the `checked` counter when examining non-empty streams, preventing empty stream pruning passes from burning quota and starving active streams.
+- **High-Performance QUIC Header Ingress & Pipelining (`src/main.rs:read_quic_line_with_extra`)** — replaced 1-byte incremental stream reads with 256-byte chunked scanning to eliminate 99% of QUIC header read syscalls, extracted post-delimiter bytes, and unified target connection through hedged `dial_target`.
+- **Zero-Fill Elimination in 0-RTT Stream Prefetch (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — replaced 16 KiB `.resize(..., 0)` zero-fill passes with `local.readable()` and direct `try_read`, eliminating CPU cache pollution during pre-fetch.
+- **Idempotent Atomic FIN Dispatch (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — guarded outbound stream closures with `fin_sent: Arc<AtomicBool>` to guarantee exactly-once FIN emission and prevent duplicate stream termination frames.
+- **Opportunistic Session Pool Warmup (`src/main.rs:MuxSessionPool`, `WssSessionPool`)** — triggered non-blocking background replenishment whenever on-demand stream acquisition instantiates a session below pool capacity, eliminating cold-start latency.
+- **Zero-Copy UDP Relay Framing & Telemetry Streamlining (`src/main.rs:udp_relay`, `wss_client`)** — switched UDP websocket envelope serialization to `write_frame_borrowed` to avoid per-datagram heap allocations, and demoted high-frequency connection lifecycle messages from `INFO` to `DEBUG`.
+
 ## [v0.0.48] - 2026-10-15
 
 ### Protocol Conformance, Zero-RTT Pipelining & Leak Prevention
