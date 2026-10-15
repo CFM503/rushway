@@ -2661,6 +2661,7 @@ struct MuxSessionPool {
     sessions: Mutex<Vec<Arc<SessionState>>>,
     session_creation: Mutex<()>,
     consecutive_failures: std::sync::atomic::AtomicU32,
+    next_idx: AtomicUsize,
     /// Signalled whenever session capacity may have appeared: a stream was
     /// released, a session closed, or a replenished session joined the pool.
     capacity_notify: Arc<Notify>,
@@ -2673,6 +2674,7 @@ impl MuxSessionPool {
             sessions: Mutex::new(Vec::new()),
             session_creation: Mutex::new(()),
             consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            next_idx: AtomicUsize::new(0),
             capacity_notify: Arc::new(Notify::new()),
         })
     }
@@ -2742,12 +2744,18 @@ impl MuxSessionPool {
             let (chosen, need_new) = {
                 let mut sessions = self.sessions.lock().await;
                 sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-                let chosen = sessions
-                    .iter()
+                let len = sessions.len();
+                let start = if len > 0 {
+                    self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                } else {
+                    0
+                };
+                let chosen = (0..len)
+                    .map(|offset| &sessions[(start + offset) % len])
                     .filter(|s| s.available())
                     .min_by_key(|s| s.active.load(Ordering::Acquire))
                     .cloned();
-                let need_new = sessions.len() < n;
+                let need_new = len < n;
                 (chosen, need_new)
             };
             if let Some(s) = chosen {
@@ -3762,6 +3770,7 @@ where
 {
     if batch.len() == 1 {
         w.write_all(&batch[0]).await?;
+        w.flush().await?;
         return Ok(());
     }
     let mut idx = 0usize;
@@ -3797,6 +3806,7 @@ where
             }
         }
     }
+    w.flush().await?;
     Ok(())
 }
 
@@ -5919,9 +5929,10 @@ pub async fn read_client_proxy_request<R>(stream: &mut R) -> anyhow::Result<Clie
 where
     R: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    let first = stream.read_u8().await?;
-    if first == SOCKS5_VERSION {
-        let n = stream.read_u8().await? as usize;
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).await?;
+    if head[0] == SOCKS5_VERSION {
+        let n = head[1] as usize;
         let mut methods = [0u8; 255];
         stream.read_exact(&mut methods[..n]).await?;
         if !methods[..n].contains(&0) {
@@ -5930,26 +5941,27 @@ where
         }
         stream.write_all(&[5, 0]).await?;
         // Max SOCKS5 request is 4 (head) + 1 (domain len) + 255 (domain) + 2 (port) = 262 bytes.
+        // Every valid SOCKS5 request is at least 7 bytes, so reading the first 5 bytes
+        // upfront captures `dlen` for domain requests in the same syscall.
         let mut req = [0u8; 262];
-        stream.read_exact(&mut req[..4]).await?;
+        stream.read_exact(&mut req[..5]).await?;
         if req[1] != SOCKS5_CONNECT && req[1] != SOCKS5_UDP_ASSOCIATE {
             stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
             anyhow::bail!("unsupported SOCKS5 command")
         }
         let req_len = match req[3] {
             1 => {
-                stream.read_exact(&mut req[4..10]).await?;
+                stream.read_exact(&mut req[5..10]).await?;
                 10
             }
             3 => {
-                let dlen = stream.read_u8().await? as usize;
-                req[4] = dlen as u8;
+                let dlen = req[4] as usize;
                 let end = 5 + dlen + 2;
                 stream.read_exact(&mut req[5..end]).await?;
                 end
             }
             4 => {
-                stream.read_exact(&mut req[4..22]).await?;
+                stream.read_exact(&mut req[5..22]).await?;
                 22
             }
             _ => {
@@ -5969,7 +5981,7 @@ where
     }
 
     let mut buf = Vec::with_capacity(512);
-    buf.push(first);
+    buf.extend_from_slice(&head);
     let mut temp = [0u8; 1024];
     while buf.len() < 8192 {
         let prev_len = buf.len();
@@ -8246,7 +8258,7 @@ where
                     continue;
                 }
 
-                if !initial_data.is_empty() {
+                let initial_frame = if !initial_data.is_empty() {
                     let owned = OwnedMuxFrame::from_parts(
                         stream_id,
                         MuxCommand::Data,
@@ -8254,13 +8266,11 @@ where
                     )
                     .map_err(|e| anyhow!(e.to_string()))?;
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
-
-                    tx.send(StreamCommand::Data(owned))
-                        .await
-                        .map_err(|_| anyhow!("stream task exited before initial data"))?;
+                    Some(owned)
                 } else {
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                }
+                    None
+                };
 
                 let streams_task = streams.clone();
                 let writer_task = writer.clone();
@@ -8295,16 +8305,37 @@ where
                     let mut pending_budget = PendingBytes::new(pending_total_task);
                     let mut client_fin = false;
 
+                    if let Some(first_frame) = initial_frame {
+                        let len = first_frame.payload().len();
+                        if !pending_budget.try_reserve(len, MAX_SESSION_PENDING_BYTES) {
+                            crate::mux_writer::recycle_encode_buf(first_frame.into_storage());
+                            reject_pending_overflow(
+                                &writer_task,
+                                &cipher_task,
+                                &streams_task,
+                                stream_id,
+                                cfg_task.obfs,
+                            )
+                            .await;
+                            return;
+                        }
+                        pending.push(first_frame);
+                    }
+
+                    // Pin dial_target outside the select! loop so arriving DATA/FIN frames
+                    // never drop and restart an in-flight DNS lookup or TCP handshake.
+                    let dial_fut = dial_target(&target, cfg_task.connection_timeout, &cfg_task);
+                    tokio::pin!(dial_fut);
+
                     let target_stream = loop {
                         tokio::select! {
-                            dial = dial_target(
-                                &target,
-                                cfg_task.connection_timeout,
-                                &cfg_task,
-                            ) => {
+                            dial = &mut dial_fut => {
                                 match dial {
                                     Ok(stream) => break stream,
                                     Err(error) => {
+                                        crate::mux_writer::recycle_encode_bufs(
+                                            pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                        );
                                         tracing::warn!(stream_id, error=%error, "mux RST: target dial failed");
                                         let _ = send_reset_encrypted(
                                             &writer_task,
@@ -8322,11 +8353,17 @@ where
                             changed = cancelled.changed() => {
                                 match changed {
                                     Ok(()) if *cancelled.borrow() => {
+                                        crate::mux_writer::recycle_encode_bufs(
+                                            pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                        );
                                         streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
                                     Ok(()) => {}
                                     Err(_) => {
+                                        crate::mux_writer::recycle_encode_bufs(
+                                            pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                        );
                                         streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
@@ -8346,6 +8383,10 @@ where
                                             || !pending_budget
                                                 .try_reserve(len, MAX_SESSION_PENDING_BYTES)
                                         {
+                                            crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                            crate::mux_writer::recycle_encode_bufs(
+                                                pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                            );
                                             reject_pending_overflow(
                                                 &writer_task,
                                                 &cipher_task,
@@ -8363,6 +8404,9 @@ where
                                     }
                                     Some(StreamCommand::Reset)
                                     | None => {
+                                        crate::mux_writer::recycle_encode_bufs(
+                                            pending.drain(..).map(OwnedMuxFrame::into_storage),
+                                        );
                                         streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                                         return;
                                     }
@@ -11570,20 +11614,32 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
     timeout_duration: std::time::Duration,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
-    let mut b = [0u8; 1];
+    let mut chunk = [0u8; 1024];
 
     let read_loop = async {
         loop {
-            match r.read_exact(&mut b).await {
-                Ok(_) => {
-                    out.push(b[0]);
-                    let len = out.len();
-                    if (len >= 4 && out[len - 4..] == *b"\r\n\r\n")
-                        || (len >= 2 && out[len - 2..] == *b"\n\n")
+            let max_read = (MAX_HTTP_HEADER_SIZE + 1 - out.len()).min(chunk.len());
+            match r.read(&mut chunk[..max_read]).await {
+                Ok(0) => {
+                    return Err(anyhow::Error::from(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "early eof",
+                    )));
+                }
+                Ok(n) => {
+                    let prev_len = out.len();
+                    out.extend_from_slice(&chunk[..n]);
+                    let scan_start = prev_len.saturating_sub(3);
+                    let tail = &out[scan_start..];
+                    if tail.windows(4).any(|w| w == b"\r\n\r\n")
+                        || tail.windows(2).any(|w| w == b"\n\n")
                     {
+                        if out.len() > MAX_HTTP_HEADER_SIZE {
+                            bail!("header too large");
+                        }
                         return Ok(());
                     }
-                    if len >= MAX_HTTP_HEADER_SIZE {
+                    if out.len() >= MAX_HTTP_HEADER_SIZE {
                         bail!("header too large");
                     }
                 }
@@ -12074,6 +12130,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     let res = w.write_all(&frame).await;
     crate::mux_writer::recycle_encode_buf(frame);
     res?;
+    w.flush().await?;
     Ok(())
 }
 
@@ -12098,7 +12155,9 @@ pub async fn write_frame_borrowed<W: AsyncWrite + Unpin>(
     } else {
         None
     };
-    write_frame_parts_vectored(w, &header, header_len, key_opt, scratch).await
+    write_frame_parts_vectored(w, &header, header_len, key_opt, scratch).await?;
+    w.flush().await?;
+    Ok(())
 }
 
 async fn write_frame_parts_vectored<W: AsyncWrite + Unpin>(
@@ -12683,7 +12742,7 @@ use crate::runtime::{
 use crate::tls;
 use crate::udp_batch::UdpBatchReader;
 use crate::ws::{
-    build_client_handshake_request, encode_ws_frame, read_frame, read_frame_with_cipher,
+    encode_ws_frame, read_frame, read_frame_with_cipher,
     read_http_headers_timeout, redact_handshake_request, validate_client_handshake_response,
     write_frame,
 };
@@ -12779,25 +12838,24 @@ fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
     Ok((connect_addr, target.host, path))
 }
 
-async fn connect_tls(
+async fn connect_tls_with_profile(
     addr: SocketAddr,
     tls_name: &str,
     cfg: &WssConfig,
+    profile_idx: usize,
 ) -> Result<tls::RushTlsStream> {
-    let tcp = timeout(
-        Duration::from_secs(cfg.connection_timeout.max(1)),
-        TcpStream::connect(addr),
-    )
-    .await
-    .context("WSS upstream TCP timeout")?
-    .map_err(|e| anyhow!("TCP connect failed: {e}"))?;
+    let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let tcp = timeout(conn_timeout, TcpStream::connect(addr))
+        .await
+        .context("WSS upstream TCP timeout")?
+        .map_err(|e| anyhow!("TCP connect failed: {e}"))?;
 
     tracing::info!("[WSS] TCP connected");
 
     apply_socket_options_raw(&tcp, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
     let tls_stream = timeout(
-        Duration::from_secs(cfg.connection_timeout.max(1)),
-        tls::connect(tcp, tls_name, cfg.verify_ssl),
+        conn_timeout,
+        tls::connect_with_profile(tcp, tls_name, cfg.verify_ssl, profile_idx),
     )
     .await
     .context("WSS upstream TLS handshake timeout")?
@@ -12851,7 +12909,14 @@ async fn dial_cloudflare_fallback(
             fallback_addr,
             tls_name
         );
-        match connect_tls(fallback_addr, tls_name, cfg).await {
+        match connect_tls_with_profile(
+            fallback_addr,
+            tls_name,
+            cfg,
+            crate::ws::pick_browser_profile_index(),
+        )
+        .await
+        {
             Ok(stream) => return Ok(stream),
             Err(err) => {
                 tracing::debug!(
@@ -12877,13 +12942,14 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
         .unwrap_or(&host);
     let header_host = cfg.fakehost.as_deref().unwrap_or(&host);
     let tls_name = sni_hostname;
+    let profile_idx = crate::ws::pick_browser_profile_index();
 
     tracing::info!("[WSS] Connecting to {}", addr);
     tracing::info!("[WSS] TLS ServerName: {}", tls_name);
     tracing::info!("[WSS] WebSocket Host: {}", header_host);
     tracing::info!("[WSS] Path: {}", path);
 
-    let primary_result = connect_tls(resolved, tls_name, cfg).await;
+    let primary_result = connect_tls_with_profile(resolved, tls_name, cfg, profile_idx).await;
     let tls_stream = match primary_result {
         Ok(stream) => stream,
         Err(primary_err) => {
@@ -12905,8 +12971,14 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
     } else {
         "cross-site"
     };
-    let (request, key) =
-        build_client_handshake_request(header_host, &path, Some(&origin), Some(sec_fetch_site));
+    let profile = &crate::ws::BROWSER_PROFILES[profile_idx % crate::ws::BROWSER_PROFILES.len()];
+    let (request, key) = crate::ws::build_client_handshake_request_with_profile(
+        header_host,
+        &path,
+        Some(&origin),
+        Some(sec_fetch_site),
+        profile,
+    );
 
     tracing::debug!(
         "[WSS] Outgoing WebSocket upgrade request:\n{}",
@@ -13539,6 +13611,7 @@ struct WssSessionPool {
     sessions: Mutex<Vec<Arc<WssSessionState>>>,
     session_creation: Mutex<()>,
     consecutive_failures: AtomicU32,
+    next_idx: AtomicUsize,
     /// Signalled whenever session capacity may have appeared: a stream was
     /// released, a session closed, or a replenished session joined the pool.
     capacity_notify: Arc<Notify>,
@@ -13551,6 +13624,7 @@ impl WssSessionPool {
             sessions: Mutex::new(Vec::new()),
             session_creation: Mutex::new(()),
             consecutive_failures: AtomicU32::new(0),
+            next_idx: AtomicUsize::new(0),
             capacity_notify: Arc::new(Notify::new()),
         })
     }
@@ -13646,12 +13720,18 @@ impl WssSessionPool {
             let (chosen, need_new) = {
                 let mut sessions = self.sessions.lock().await;
                 sessions.retain(|s| !s.closed.load(Ordering::Acquire));
-                let chosen = sessions
-                    .iter()
+                let len = sessions.len();
+                let start = if len > 0 {
+                    self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                } else {
+                    0
+                };
+                let chosen = (0..len)
+                    .map(|offset| &sessions[(start + offset) % len])
                     .filter(|s| s.available())
                     .min_by_key(|s| s.active.load(Ordering::Acquire))
                     .cloned();
-                let need_new = sessions.len() < n;
+                let need_new = len < n;
                 (chosen, need_new)
             };
             if let Some(session) = chosen {
@@ -13985,7 +14065,7 @@ pub async fn run_client_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ws::read_http_headers;
+    use crate::ws::{build_client_handshake_request, read_http_headers};
 
     #[test]
     fn parse_wss_url_with_ip_and_path() {

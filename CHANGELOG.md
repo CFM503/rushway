@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.46] - 2026-10-15
+
+### Bug Fixes, Concurrency & High-Throughput Optimizations
+
+- **Pinned Target Dialing Future in Server Stream Task (`src/main.rs`)** — pinned `dial_target` outside the inner event `tokio::select!` loop so arriving client data frames, window updates, and cancellation events never drop and re-instantiate in-flight DNS lookups and TCP handshakes, fixing stalled and broken stream establishments under continuous ingress traffic.
+- **LC-RR Session Pool Load-Balancing (`src/main.rs:MuxSessionPool`, `WssSessionPool`)** — added atomic round-robin cursor `next_idx` in session acquisition to distribute new streams across multiple equally loaded or idle physical sessions, eliminating traffic concentration on the 0-th session and maximizing multi-session aggregate bandwidth.
+- **Batched 1024-Byte HTTP Handshake Header Read (`src/main.rs:read_http_headers_timeout`)** — replaced 1-byte incremental `read_exact` with a 1024-byte stack chunk buffer and rolling window slice scanning for `\r\n\r\n` / `\n\n`, slashing kernel read system calls and context switches by over 99% during WebSocket and HTTP CONNECT handshakes.
+- **Fast 2-Byte & 5-Byte SOCKS5 Ingress Parsing (`src/main.rs:read_client_proxy_request`)** — coalesced greeting reads into a single 2-byte read and request parsing into an initial 5-byte read, reducing SOCKS5 handshake syscall count by half while preserving full backwards-compatible HTTP fallback detection.
+- **Harmonized TLS & HTTP Browser Profile Fingerprints (`src/main.rs:connect_wss_upstream`)** — unified browser profile index selection across TLS ClientHello negotiation (`connect_tls_with_profile`) and HTTP WebSocket upgrade header generation (`build_client_handshake_request_with_profile`), preventing cross-layer fingerprint inconsistencies.
+- **Flushed MUX Outbound Frames & Comprehensive Pending Buffer Recycling (`src/main.rs`)** — added `w.flush().await` across frame writer and borrowed write paths to eliminate buffered frame dispatch latency, and guaranteed 100% recycling of pre-dial pending frame storage back into the encode buffer pool across all error, cancellation, and rejection branches.
+
 ## [v0.0.45] - 2026-10-15
 
 ### Performance, Scheduling & Concurrency Breakthroughs
