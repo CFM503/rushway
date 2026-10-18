@@ -1,5 +1,13 @@
 // RushWay - Single-file amalgamation
 
+// ============================================================================
+// 程序版本配置 (Version Configuration)
+// ============================================================================
+/// 当前程序发布版本号。
+/// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
+pub const APP_VERSION: &str = "0.0.53";
+pub const VERSION: &str = APP_VERSION;
+
 pub mod common {
 //! Helpers shared verbatim by the transport paths (WS/WSS/MUX/UDP relay).
 //!
@@ -342,7 +350,11 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let c = configured_cipher(key);
-    let mut hello = format!("{}:{}\n", target.host, target.port).into_bytes();
+    let mut hello = if target.host.contains(':') && !target.host.starts_with('[') {
+        format!("[{}]:{}\n", target.host, target.port).into_bytes()
+    } else {
+        format!("{}:{}\n", target.host, target.port).into_bytes()
+    };
     c.apply(&mut hello);
     write_frame(&mut wr, &hello, 2, true).await?;
     let mut frame_buf = Vec::new();
@@ -2529,7 +2541,8 @@ impl SessionState {
         } else {
             1
         };
-        let target_len = target.host.len() + 1 + port_digits;
+        let ipv6_brackets = if target.host.contains(':') && !target.host.starts_with('[') { 2 } else { 0 };
+        let target_len = target.host.len() + ipv6_brackets + 1 + port_digits;
         let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
         let (syn_initial, remaining_initial) =
             initial_data.split_at(initial_data.len().min(max_syn_initial));
@@ -3809,14 +3822,22 @@ where
         // return to the encode pool instead of being freed.
         debug_assert!(batch.is_empty());
         let mut bytes = 0usize;
+        let mut empty_rounds = 0usize;
         while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES {
             match sched.next() {
                 Some(frame) => {
+                    empty_rounds = 0;
                     bytes += frame.len();
                     batch.push(frame);
                 }
                 None if sched.is_empty() => break,
-                None => continue,
+                None => {
+                    empty_rounds += 1;
+                    if empty_rounds > 8 {
+                        break;
+                    }
+                    continue;
+                }
             }
         }
         if batch.is_empty() {
@@ -5330,9 +5351,13 @@ impl SynPayload {
         // Max port string is 5 digits + 1 colon = 6 bytes.
         let est_target_len = host.len() + 6;
         let mut out = crate::mux_writer::acquire_encode_buf();
-        out.reserve(2 + est_target_len + initial_data.len());
+        out.reserve(2 + est_target_len + 2 + initial_data.len());
         out.extend_from_slice(&[0, 0]);
-        let _ = write!(&mut out, "{host}:{port}");
+        if host.contains(':') && !host.starts_with('[') {
+            let _ = write!(&mut out, "[{host}]:{port}");
+        } else {
+            let _ = write!(&mut out, "{host}:{port}");
+        }
         let target_len = out.len() - 2;
         if target_len > u16::MAX as usize {
             return Err(ProtocolError::TargetTooLarge(target_len));
@@ -6776,7 +6801,11 @@ impl QuicClientPool {
     }
 }
 fn format_target(target: &TargetAddr) -> String {
-    format!("{}:{}", target.host, target.port)
+    if target.host.contains(':') && !target.host.starts_with('[') {
+        format!("[{}]:{}", target.host, target.port)
+    } else {
+        format!("{}:{}", target.host, target.port)
+    }
 }
 async fn relay_quic(
     mut local: TcpStream,
@@ -6891,7 +6920,11 @@ async fn relay_quic_udp(
     cfg: RuntimeConfig,
     pool: Arc<QuicClientPool>,
 ) -> Result<()> {
-    let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let local_ip = match control.local_addr() {
+        Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
+        _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    };
+    let udp = Arc::new(UdpSocket::bind(std::net::SocketAddr::new(local_ip, 0)).await?);
     let bound = udp.local_addr()?;
     let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
@@ -6978,8 +7011,9 @@ async fn relay_quic_udp(
                     break;
                 };
                 let packet = &frame_buf[..packet_len];
-                let (target, _payload) =
-                    parse_socks5_udp_datagram(packet).map_err(|e| anyhow!(e.to_string()))?;
+                let Ok((target, _payload)) = parse_socks5_udp_datagram(packet) else {
+                    continue;
+                };
                 if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
@@ -10513,7 +10547,7 @@ impl TuiConfig {
             "Disabled".to_string()
         };
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: APP_VERSION.to_string(),
             mode,
             listen: format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
             upstream: cfg.upstream.clone().unwrap_or_else(|| "N/A".to_string()),
@@ -11419,13 +11453,11 @@ pub async fn handle_local_udp_proxy(
     cfg: RuntimeConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
-    let _ = enforce_target_policy(&cfg, &bind_hint);
-    let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host.is_empty() {
-        "0.0.0.0"
-    } else {
-        bind_hint.host.as_str()
+    let local_ip = match control.local_addr() {
+        Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
+        _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
-    let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
+    let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     let bound = udp.local_addr()?;
     let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
@@ -11575,12 +11607,9 @@ pub async fn handle_local_udp_proxy(
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                let (target, _payload) = match parse_socks5_udp_datagram(&packet) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        crate::mux_writer::recycle_encode_buf(packet);
-                        return Err(anyhow!(e.to_string()));
-                    }
+                let Ok((target, _payload)) = parse_socks5_udp_datagram(&packet) else {
+                    crate::mux_writer::recycle_encode_buf(packet);
+                    continue;
                 };
                 if enforce_target_policy(&cfg, &target).is_err() {
                     crate::mux_writer::recycle_encode_buf(packet);
@@ -13280,12 +13309,12 @@ async fn handle_udp_proxy(
     cfg: WssConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
-    let bind_ip = if bind_hint.host == "0.0.0.0" || bind_hint.host.is_empty() {
-        "0.0.0.0"
-    } else {
-        bind_hint.host.as_str()
+    let _ = &bind_hint;
+    let local_ip = match control.local_addr() {
+        Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
+        _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
-    let udp = Arc::new(UdpSocket::bind(format!("{}:0", bind_ip)).await?);
+    let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     let bound = udp.local_addr()?;
     let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
@@ -13696,7 +13725,8 @@ impl WssSessionState {
         } else {
             1
         };
-        let target_len = target.host.len() + 1 + port_digits;
+        let ipv6_brackets = if target.host.contains(':') && !target.host.starts_with('[') { 2 } else { 0 };
+        let target_len = target.host.len() + ipv6_brackets + 1 + port_digits;
         let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
         let (syn_initial, remaining_initial) =
             initial_data.split_at(initial_data.len().min(max_syn_initial));
@@ -14619,7 +14649,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Debug, Parser)]
 #[command(
     name = "rushway",
-    version,
+    version = APP_VERSION,
     about = "Rust forwarding service compatible with GoWay"
 )]
 struct Args {
@@ -15034,7 +15064,7 @@ fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str, ver
     } else {
         "Disabled (Open)"
     };
-    println!("{CYAN}RushWay v{}{RESET}", env!("CARGO_PKG_VERSION"));
+    println!("{CYAN}RushWay v{}{RESET}", APP_VERSION);
     println!("{CYAN}------------------------------------------------------------{RESET}");
     println!(" [+] Mode:        {mode}");
     println!(" [+] Listen:      {}:{}", cfg.proxy_host, cfg.proxy_port);

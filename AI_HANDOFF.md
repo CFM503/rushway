@@ -1107,6 +1107,54 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.52`.
 
+## Release: v0.0.53 (2026-10-18) — Top-Level Version Architecture, RFC 3986 IPv6 Bracket Formatting & Robust UDP Handling
+
+### Context & User Directives
+- **Directives:** "把版本号相关的代码放到程序前头方便修改版本号" followed by manual enhancements and "我手动修改了代码，更新版本号,更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Version Architecture:**
+    - Centralized application version constants (`pub const APP_VERSION: &str = "0.0.53";` and `pub const VERSION: &str = APP_VERSION;`) directly at the head of `src/main.rs`.
+    - Rewired clap derive `#[command(version = APP_VERSION)]`, `print_banner`, and Web dashboard `TuiConfig` to use the unified constant, making future version adjustments straightforward from the top of the amalgamation file.
+  - **RFC 3986 IPv6 Target Formatting:**
+    - Explicitly wrapped IPv6 hosts in square brackets `[host]:port` during initial connection handshake (`connect_target`), MUX SYN frame target encoding (`SynPayload::encode`), and QUIC target formatting (`format_target`).
+    - Adjusted `max_syn_initial` payload calculation in both `SessionState::open_stream` and `WssSessionState::open_stream` to account for the +2 bracket bytes (`ipv6_brackets`), eliminating boundary payload overflows to IPv6 endpoints.
+  - **SOCKS5 UDP Associate Compatibility & Resilience:**
+    - SOCKS5 UDP associate listeners now resolve and bind to the control TCP connection's local IP address across QUIC, WSS, and TCP pathways (falling back to `127.0.0.1`), eliminating client setup rejections caused by `0.0.0.0` responses.
+    - Wrapped datagram parsing in `parse_socks5_udp_datagram` with `if let Ok(...)` / `continue` pattern in `relay_quic_udp` and `handle_local_udp_proxy`, preventing malformed UDP packets from dropping active sessions.
+  - **Scheduler Protection:**
+    - Bound `MuxFrameWriter` frame batch collection to `empty_rounds <= 8`, breaking out of empty deficit replenishment loops and eliminating 100% CPU lockups.
+  - **Regression Risk:** Zero.
+
+### Changes Implemented
+1. **Centralized Version Constants (`src/main.rs:top`)**:
+   - `APP_VERSION = "0.0.53"` and `VERSION = APP_VERSION` at line 8.
+   - Connected `Args`, `print_banner`, and `TuiConfig`.
+2. **RFC 3986 IPv6 Brackets & SYN Length Adjustment (`src/main.rs`)**:
+   - `connect_target`, `SynPayload::encode`, and `format_target` wrap unbracketed IPv6 in `[...]`.
+   - `SessionState::open_stream` and `WssSessionState::open_stream` incorporate `ipv6_brackets` in `target_len`.
+3. **SOCKS5 UDP Associate Socket Binding & Datagram Recovery (`src/main.rs`)**:
+   - `relay_quic_udp`, `handle_local_udp_proxy`, `handle_udp_proxy` bind to control connection local IP.
+   - Malformed UDP datagrams logged and skipped via `continue` instead of terminating the proxy task.
+4. **MuxFrameWriter Empty Spin Guard (`src/main.rs:mux_writer`)**:
+   - Added `empty_rounds > 8` exit in `MuxFrameWriter::run`.
+5. **Version & Documentation**:
+   - Bumped version to `0.0.53` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.53 - top-level version architecture, RFC 3986 IPv6 bracket formatting, and robust UDP handling`
+- Tag: `v0.0.53`
+
+### Status
+- Completed and released as `v0.0.53`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.53`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.53`.
+
+
 
 
 

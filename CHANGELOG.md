@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.53] - 2026-10-18
+
+### Top-Level Version Architecture, RFC 3986 IPv6 Bracket Formatting & Robust UDP Handling
+
+- **Centralized Top-of-File Version Constants (`src/main.rs:APP_VERSION`, `VERSION`)** — unified application version declaration into top-level constants at the head of `src/main.rs`, propagating seamlessly to CLI `--version`, console startup banner, and Web dashboard status.
+- **Strict RFC 3986 IPv6 Target Bracket Formatting (`src/main.rs:connect_target`, `SynPayload::encode`, `format_target`)** — wrapped raw IPv6 host targets in brackets (`[host]:port`) across WebSocket, QUIC, and MUX SYN frame encodings, preventing IPv6 colon parsing ambiguities from rejecting valid connections.
+- **Accurate IPv6 SYN Initial Length Accounting (`src/main.rs:SessionState::open_stream`, `WssSessionState::open_stream`)** — factored IPv6 bracket expansion (+2 bytes) into `max_syn_initial` payload length calculations, preventing frame size overruns on first-packet transfers to IPv6 targets.
+- **SOCKS5 UDP Associate Socket Binding Parity (`src/main.rs:relay_quic_udp`, `handle_local_udp_proxy`, `handle_udp_proxy`)** — bound SOCKS5 UDP associate relay sockets to the control connection's actual interface IP (with localhost fallback) across QUIC, WSS, and TCP listeners, resolving client connection rejections caused by `0.0.0.0` BND.ADDR returns.
+- **Resilient UDP Malformed Datagram Recovery (`src/main.rs:relay_quic_udp`, `handle_local_udp_proxy`)** — graceful recovery for malformed UDP packets via `continue` and buffer recycling instead of aborting the session task, isolating malformed datagrams from tearing down healthy client associations.
+- **Scheduler Busy-Loop Mitigation (`src/main.rs:MuxFrameWriter::run`)** — added an 8-round empty spin break limit (`empty_rounds > 8`) to the DRR frame collection loop, preventing 100% CPU lockups during dry deficit replenishment cycles.
+
 ## [v0.0.52] - 2026-10-18
 
 ### Scheduler Deadlock Fix, Safe Buffer Ingress & Robust DNS Eviction
