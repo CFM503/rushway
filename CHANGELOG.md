@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.52] - 2026-10-18
+
+### Scheduler Deadlock Fix, Safe Buffer Ingress & Robust DNS Eviction
+
+- **Scheduler Stream Removal Counter Leak & Deadlock Fix (`src/main.rs:Scheduler::remove_stream`)** — decremented `self.total` by remaining queued frames when removing terminated streams, eliminating frame counter drift that previously caused scheduler false-saturation and MUX session deadlocks over long uptimes.
+- **Ordered FIN/RST Stream Cleanup Guard (`src/main.rs:Scheduler::next`)** — deferred stream entry deregistration until its associated application frame queue is completely drained (`is_none_or(|q| q.frames.is_empty())`), preventing inflight data frames from being truncated upon connection closure.
+- **QUIC Server Target Authority Prefix Bug Fix (`src/main.rs:handle_server_stream`)** — replaced loose `.starts_with("UDP")` matching with strict `eq_ignore_ascii_case("UDP")`, resolving connection failures for regular domain targets prefixed with "udp" (e.g., `udpxy.*`, `udp-tracker.*`).
+- **Safe 0-RTT Buffer Ingress via `try_read_buf` (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — replaced `unsafe set_len` uninitialized buffer slicing with Tokio's idiomatic `try_read_buf`, completely removing memory safety undefined behavior risks on 0-RTT prefetch loops.
+- **Anti-Stampede Proportional DNS Cache Eviction (`src/main.rs:bounded_insert`)** — replaced full table clearance on cache saturation with 25% proportional eviction (`take(CACHE_MAX_ENTRIES / 4)`), eliminating cache avalanches and remote DNS re-resolution latency spikes.
+- **Optimal TCP Low-Watermark & Dead Code Elimination (`src/main.rs:apply_socket_options_raw`)** — recalibrated `TCP_NOTSENT_LOWAT` from 256 KiB to 64 KiB to balance high-throughput MUX batching with sub-millisecond interactive queueing latency, and removed ineffective one-shot `TCP_QUICKACK` socket option calls.
+
 ## [v0.0.51] - 2026-10-18
 
 ### High-BDP Throughput Optimization, 16MB MUX Window Expansion & Balanced Queue Sizing

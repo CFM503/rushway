@@ -1227,7 +1227,7 @@ fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<IpAdd
 /// table is cleared before inserting. Clearing everything instead of evicting
 /// per-entry trades cache hit-rate for simplicity and a hard bound on memory
 /// growth.
-fn bounded_insert<K: Hash + Eq, T>(
+fn bounded_insert<K: Hash + Eq + Clone, T>(
     map: &mut HashMap<K, (T, Instant)>,
     key: K,
     value: (T, Instant),
@@ -1236,7 +1236,14 @@ fn bounded_insert<K: Hash + Eq, T>(
         let now = Instant::now();
         map.retain(|_, (_, expires)| *expires > now);
         if map.len() >= CACHE_MAX_ENTRIES {
-            map.clear();
+            let victims: Vec<K> = map
+                .keys()
+                .take(CACHE_MAX_ENTRIES / 4)
+                .cloned()
+                .collect();
+            for k in victims {
+                map.remove(&k);
+            }
         }
     }
     map.insert(key, value);
@@ -2923,24 +2930,20 @@ async fn handle_tcp_proxy(
                 if first_pkt.capacity() < 16384 {
                     first_pkt.reserve(16384 - first_pkt.len());
                 }
-                let cap = first_pkt.capacity().min(u16::MAX as usize);
-                // SAFETY: `try_read` writes into `[..cap]` and returns initialized count `n`;
-                // we immediately `truncate(n)` or `clear()` before reading any byte.
-                unsafe { first_pkt.set_len(cap) };
-                match local.try_read(&mut first_pkt) {
+                match local.try_read_buf(&mut first_pkt) {
                     Ok(n) if n > 0 => {
-                        first_pkt.truncate(n);
-                        crate::stats::add_bytes(n as i64, 0);
+                        if first_pkt.len() > u16::MAX as usize {
+                            first_pkt.truncate(u16::MAX as usize);
+                        }
+                        crate::stats::add_bytes(first_pkt.len() as i64, 0);
                         initial_data = first_pkt;
                         break;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        first_pkt.clear();
                         recycle_encode_buf(first_pkt);
                         continue;
                     }
                     _ => {
-                        first_pkt.clear();
                         recycle_encode_buf(first_pkt);
                         break;
                     }
@@ -3606,7 +3609,10 @@ impl Scheduler {
                 self.total -= 1;
                 if yield_flag {
                     if let Some(id) = sid_opt {
-                        self.remove_stream(&id);
+                        let empty = self.streams.get(&id).is_none_or(|q| q.frames.is_empty());
+                        if empty {
+                            self.remove_stream(&id);
+                        }
                     }
                 }
                 return Some(frame);
@@ -3656,7 +3662,9 @@ impl Scheduler {
     }
 
     fn remove_stream(&mut self, sid: &u32) {
-        self.streams.remove(sid);
+        if let Some(q) = self.streams.remove(sid) {
+            self.total = self.total.saturating_sub(q.frames.len());
+        }
         if let Some(idx) = self.rotation.iter().position(|s| s == sid) {
             self.rotation.remove(idx);
             if self.pos > idx {
@@ -7181,8 +7189,7 @@ async fn handle_server_stream(
     } else {
         line.as_str()
     };
-    if target_str.eq_ignore_ascii_case("UDP") || target_str.to_ascii_uppercase().starts_with("UDP")
-    {
+    if target_str.eq_ignore_ascii_case("UDP") {
         return handle_server_udp_stream(send, recv, cfg).await;
     }
     let target_addr = match parse_target_authority(target_str) {
@@ -7957,9 +7964,8 @@ pub(crate) fn apply_socket_options_raw(
         let fd = stream.as_raw_fd();
 
         // 1. TCP_NOTSENT_LOWAT bounds unsent bytes buffered in the kernel send
-        // queue before poll/epoll reports writable. This prevents bufferbloat
-        // on high-BDP cross-border links (Cloudflare/HTTP2 standard practice: 16 KiB).
-        let lowat: libc::c_uint = 262144;
+        // queue before poll/epoll reports writable (64 KiB balances MUX batching & low latency).
+        let lowat: libc::c_uint = 65536;
         unsafe {
             let _ = libc::setsockopt(
                 fd,
@@ -7971,9 +7977,6 @@ pub(crate) fn apply_socket_options_raw(
         }
 
         // 2. TCP_CONGESTION: Set BBR congestion control algorithm.
-        // On cross-border/WAN links with random packet loss (1%~3%), loss-based algorithms
-        // like Cubic collapse throughput by repeatedly halving the congestion window,
-        // whereas BBR builds a model of the network to sustain maximum throughput.
         // Best-effort: if BBR is unavailable in the kernel, setsockopt fails gracefully.
         let bbr = b"bbr\0";
         unsafe {
@@ -7983,20 +7986,6 @@ pub(crate) fn apply_socket_options_raw(
                 libc::TCP_CONGESTION,
                 bbr.as_ptr() as *const libc::c_void,
                 bbr.len() as libc::socklen_t,
-            );
-        }
-
-        // 3. TCP_QUICKACK: Suppress delayed ACK timer during stream setup.
-        // Prevents TCP receiver from delaying ACKs up to 40ms during handshake
-        // and initial protocol frame exchange.
-        let quickack: libc::c_int = 1;
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_QUICKACK,
-                &quickack as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&quickack) as libc::socklen_t,
             );
         }
 
@@ -14108,24 +14097,20 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 if first_pkt.capacity() < 16384 {
                     first_pkt.reserve(16384 - first_pkt.len());
                 }
-                let cap = first_pkt.capacity().min(u16::MAX as usize);
-                // SAFETY: `try_read` writes into `[..cap]` and returns initialized count `n`;
-                // we immediately `truncate(n)` or `clear()` before reading any byte.
-                unsafe { first_pkt.set_len(cap) };
-                match local.try_read(&mut first_pkt) {
+                match local.try_read_buf(&mut first_pkt) {
                     Ok(n) if n > 0 => {
-                        first_pkt.truncate(n);
-                        crate::stats::add_bytes(n as i64, 0);
+                        if first_pkt.len() > u16::MAX as usize {
+                            first_pkt.truncate(u16::MAX as usize);
+                        }
+                        crate::stats::add_bytes(first_pkt.len() as i64, 0);
                         initial_data = first_pkt;
                         break;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        first_pkt.clear();
                         recycle_encode_buf(first_pkt);
                         continue;
                     }
                     _ => {
-                        first_pkt.clear();
                         recycle_encode_buf(first_pkt);
                         break;
                     }

@@ -13,3 +13,5 @@ bench/
 tmp/
 # ZCode workspace metadata (workflow drafts/runs).
 .zcode/
+*.py
+*.bak
