@@ -1154,6 +1154,44 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.53`.
 
+## Release: v0.0.54 (2026-10-18) — Graceful TCP Half-Close Upload Drain & Module Scoping Fixes
+
+### Context & User Directives
+- **Directives:** "我手动修改了代码，更新版本号,更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **TCP Half-Close Lifecycle & Data Integrity:**
+    - `handle_tcp_proxy` and `handle_connection` previously invoked `upload.abort()` unconditionally whenever `remote_fin` was signaled on the downstream read loop. In standard TCP half-close scenarios (e.g. streaming uploads or pipelined requests where downstream emits EOF after receiving headers), immediate abort abruptly destroyed ongoing client uploads.
+    - The new architecture guards `upload` by granting it a graceful drain timeout (`Duration::from_secs(cfg.connection_timeout.max(5))`). If the client completes uploading within this window, outbound FIN is dispatched cleanly via `fin_sent.swap(true)`. `upload.abort()` is now only triggered if drain times out, or when terminating via the non-FIN error pathway.
+    - RST emission is now strictly gated behind `result.is_err()`, preventing benign connection terminations from sending reset frames.
+  - **Module Scoping:**
+    - Fixed sub-module resolution of `APP_VERSION` in `TuiConfig::from_runtime` by prepending `crate::`.
+    - Standardized `#[command(version)]` in `Args` to derive cleanly from `Cargo.toml`.
+  - **Regression Risk:** Zero.
+
+### Changes Implemented
+1. **Graceful Upload Drain on Downstream FIN (`src/main.rs:handle_tcp_proxy`, `handle_connection`)**:
+   - Replaced immediate `upload.abort()` with a bounded `timeout(drain_wait, &mut upload)` check.
+   - Gated `MuxCommand::Rst` strictly to genuine stream failures (`result.is_err()`).
+2. **Crate Scoping for Dashboard Version (`src/main.rs:tui`)**:
+   - `crate::APP_VERSION.to_string()` in `TuiConfig::from_runtime`.
+3. **Version & Documentation**:
+   - Bumped version to `0.0.54` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.54 - graceful TCP half-close upload drain and module scoping fixes`
+- Tag: `v0.0.54`
+
+### Status
+- Completed and released as `v0.0.54`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.54`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.54`.
+
+
 
 
 

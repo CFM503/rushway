@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.53";
+pub const APP_VERSION: &str = "0.0.54";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod common {
@@ -3117,8 +3117,12 @@ async fn handle_tcp_proxy(
             }
         }
     }
-    upload.abort();
     if remote_fin {
+        let mut upload = upload;
+        let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
+        if timeout(drain_wait, &mut upload).await.is_err() {
+            upload.abort();
+        }
         if !fin_sent.swap(true, Ordering::AcqRel) {
             let _ = send_mux_parts(
                 &session.writer,
@@ -3130,16 +3134,19 @@ async fn handle_tcp_proxy(
             )
             .await;
         }
-    } else if result.is_err() {
-        let _ = send_mux_parts(
-            &session.writer,
-            &session.cipher,
-            id,
-            MuxCommand::Rst,
-            &[],
-            session.obfs,
-        )
-        .await;
+    } else {
+        upload.abort();
+        if result.is_err() {
+            let _ = send_mux_parts(
+                &session.writer,
+                &session.cipher,
+                id,
+                MuxCommand::Rst,
+                &[],
+                session.obfs,
+            )
+            .await;
+        }
     }
 
     session.close_stream(id).await;
@@ -14303,8 +14310,12 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             }
         }
     }
-    upload.abort();
     if remote_fin {
+        let mut upload = upload;
+        let drain_wait = Duration::from_secs(pool.cfg.connection_timeout.max(5));
+        if timeout(drain_wait, &mut upload).await.is_err() {
+            upload.abort();
+        }
         if !fin_sent.swap(true, Ordering::AcqRel) {
             let _ = send_mux_parts(
                 &session.writer,
@@ -14316,16 +14327,19 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             )
             .await;
         }
-    } else if result.is_err() {
-        let _ = send_mux_parts(
-            &session.writer,
-            &session.cipher,
-            stream_id,
-            MuxCommand::Rst,
-            &[],
-            session.obfs,
-        )
-        .await;
+    } else {
+        upload.abort();
+        if result.is_err() {
+            let _ = send_mux_parts(
+                &session.writer,
+                &session.cipher,
+                stream_id,
+                MuxCommand::Rst,
+                &[],
+                session.obfs,
+            )
+            .await;
+        }
     }
 
     session.close_stream(stream_id).await;

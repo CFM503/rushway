@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.54] - 2026-10-18
+
+### Graceful TCP Half-Close Upload Drain & Module Scoping Fixes
+
+- **Graceful TCP Half-Close (FIN) Upload Drain Guard (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — eliminated immediate `upload.abort()` truncation upon receiving downstream `remote_fin`; the upload worker is now granted a `connection_timeout` (minimum 5s) graceful drain window to deliver lingering inflight client bytes before emitting outbound FIN.
+- **Error-Only RST Emission Guarantee (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — restructured termination logic to ensure MUX stream `Rst` commands are emitted strictly on genuine operational failures (`result.is_err()`), preventing benign half-closed streams from being reset prematurely.
+- **TUI Dashboard Crate-Scoped Version Reference (`src/main.rs:TuiConfig::from_runtime`)** — addressed sub-module visibility isolation by prefixing `crate::APP_VERSION`, guaranteeing error-free compilation across all workspace build targets.
+
 ## [v0.0.53] - 2026-10-18
 
 ### Top-Level Version Architecture, RFC 3986 IPv6 Bracket Formatting & Robust UDP Handling
