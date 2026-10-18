@@ -1191,6 +1191,46 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.54`.
 
+## Release: v0.0.55 (2026-10-18) — Non-Blocking MUX Control Frames, Deadlock Prevention & Adaptive DRR Batching
+
+### Context & User Directives
+- **Directives:** "我手动修改了程序代码，对比一下修改前和修改后" followed by technical review and "更新版本号,更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Deadlock Elimination in Reader Loops:**
+    - `client_reader_loop`, `wss_reader_loop`, and `send_reset_encrypted` were vulnerable to reciprocal backpressure deadlocks when dispatching RST frames during outbound channel (`writer.tx`) saturation. Because the read loop awaited channel availability while writer was backpressured by socket flow control, both loops locked up.
+    - Added `MuxFrameWriter::try_send_mux` and `try_send_mux_parts`: tries non-blocking enqueue first, and automatically spawns a detached asynchronous task (`tokio::spawn`) if the writer channel is full, completely decoupling reader responsiveness from writer backpressure.
+  - **Dynamic DRR Batching for Large Frames:**
+    - Modified empty-round threshold in `MuxFrameWriter::run`: dynamically shifts from 8 to 64 rounds when the outgoing batch is empty (`batch.is_empty()`). This allows large (64 KiB) frames to accumulate enough deficit rounds without prematurely stalling and yielding control to `rx.recv()`.
+  - **Downstream UDP Validation & SSRF Prevention:**
+    - `handle_udp_proxy` now validates incoming UDP packets with `parse_socks5_udp_datagram` and strictly enforces `check_target_policy(cfg.block_local, &target)`, eliminating malformed datagram relay and blocking local reflection attacks.
+  - **Regression Risk:** Zero.
+
+### Changes Implemented
+1. **Non-Blocking Control Frame Architecture (`src/main.rs:mux_writer`, `common`)**:
+   - Implemented `MuxFrameWriter::try_send_mux` with background fallback.
+   - Wired `try_send_mux_parts` across reader loops and `send_reset_encrypted`.
+2. **Adaptive DRR Batch Spinning (`src/main.rs:mux_writer`)**:
+   - `limit = if batch.is_empty() { 64 } else { 8 }`.
+3. **UDP Egress Policy Enforcement (`src/main.rs:wss_client`)**:
+   - Added `check_target_policy` check in `handle_udp_proxy`.
+4. **Version & Documentation**:
+   - Bumped version to `0.0.55` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.55 - non-blocking MUX control frames, deadlock prevention, and adaptive DRR batching`
+- Tag: `v0.0.55`
+
+### Status
+- Completed and released as `v0.0.55`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.55`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.55`.
+
+
 
 
 

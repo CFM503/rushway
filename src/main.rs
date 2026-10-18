@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.54";
+pub const APP_VERSION: &str = "0.0.55";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod common {
@@ -159,6 +159,27 @@ pub(crate) async fn send_mux_parts(
         writer, cipher, stream_id, command, payload, &mut bytes, obfs,
     )
     .await
+}
+
+/// Non-blocking MUX control frame sender for read loops.
+pub(crate) fn try_send_mux_parts(
+    writer: &Arc<MuxFrameWriter>,
+    cipher: &XorCipher,
+    stream_id: u32,
+    command: MuxCommand,
+    payload: &[u8],
+    obfs: bool,
+) {
+    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    if crate::mux_writer::encode_mux_ws_frame(
+        &mut bytes, stream_id, command, payload, cipher, true, obfs,
+    )
+    .is_ok()
+    {
+        writer.try_send_mux(stream_id, command, bytes);
+    } else {
+        crate::mux_writer::recycle_encode_buf(bytes);
+    }
 }
 
 /// Pre-warmed non-MUX upstream pool, mirroring GoWay `ConnPool`.
@@ -2718,15 +2739,14 @@ async fn client_reader_loop(mut rd: OwnedReadHalf, state: Arc<SessionState>) -> 
                         stream_id = id,
                         "mux RST: stream queue full; resetting stalled stream"
                     );
-                    let _ = send_mux_parts(
+                    crate::common::try_send_mux_parts(
                         &state.writer,
                         &state.cipher,
                         id,
                         MuxCommand::Rst,
                         &[],
                         state.obfs,
-                    )
-                    .await;
+                    );
                     state.close_stream(id).await;
                 }
                 Some(Err(mpsc::error::TrySendError::Closed(f))) => {
@@ -3501,6 +3521,40 @@ impl MuxFrameWriter {
         .await
     }
 
+    /// Non-blocking enqueue for control frames emitted from the session read loop
+    /// (prevents read/write deadlock when the outbound channel is saturated).
+    pub fn try_send_mux(
+        self: &Arc<Self>,
+        stream_id: u32,
+        command: MuxCommand,
+        frame: Vec<u8>,
+    ) {
+        if self.closed.load(Ordering::Acquire) {
+            recycle_encode_buf(frame);
+            return;
+        }
+        let yield_to_data = command == MuxCommand::Fin || command == MuxCommand::Rst;
+        let out = OutboundFrame {
+            stream_id: Some(stream_id),
+            priority: command != MuxCommand::Data,
+            yield_to_data,
+            bytes: frame,
+        };
+        match self.tx.try_send(out) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(out)) => {
+                let writer = self.clone();
+                tokio::spawn(async move {
+                    let _ = writer.send_frame(out).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(out)) => {
+                self.closed.store(true, Ordering::Release);
+                recycle_encode_buf(out.bytes);
+            }
+        }
+    }
+
     async fn send_frame(&self, frame: OutboundFrame) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(anyhow!("mux writer closed"));
@@ -3840,7 +3894,11 @@ where
                 None if sched.is_empty() => break,
                 None => {
                     empty_rounds += 1;
-                    if empty_rounds > 8 {
+                    // Only break early if we already have at least one frame to flush;
+                    // if batch is empty, keep spinning (up to 64 rounds) so large frames
+                    // can accumulate enough DRR quantum instead of parking on rx.recv().
+                    let limit = if batch.is_empty() { 64 } else { 8 };
+                    if empty_rounds > limit {
                         break;
                     }
                     continue;
@@ -8194,7 +8252,23 @@ async fn send_reset_encrypted(
     id: u32,
     obfs: bool,
 ) -> Result<()> {
-    send_mux_parts_encrypted(writer, cipher, id, MuxCommand::Rst, &[], obfs).await
+    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    if crate::mux_writer::encode_mux_ws_frame(
+        &mut bytes,
+        id,
+        MuxCommand::Rst,
+        &[],
+        cipher,
+        false,
+        obfs,
+    )
+    .is_ok()
+    {
+        writer.try_send_mux(id, MuxCommand::Rst, bytes);
+    } else {
+        crate::mux_writer::recycle_encode_buf(bytes);
+    }
+    Ok(())
 }
 async fn target_to_mux(
     id: u32,
@@ -13411,6 +13485,14 @@ async fn handle_udp_proxy(
                     recycle_encode_buf(packet);
                     continue;
                 }
+                let Ok((target, _payload)) = parse_socks5_udp_datagram(&packet) else {
+                    recycle_encode_buf(packet);
+                    continue;
+                };
+                if check_target_policy(cfg.block_local, &target).is_err() {
+                    recycle_encode_buf(packet);
+                    continue;
+                }
                 let peer_opt = *latest_client.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(peer) = peer_opt {
                     let n = packet.len();
@@ -13867,15 +13949,14 @@ async fn wss_reader_loop(rd: &mut TlsReader, session: Arc<WssSessionState>) -> R
                         stream_id = id,
                         "mux RST: stream queue full; resetting stalled stream"
                     );
-                    let _ = send_mux_parts(
+                    crate::common::try_send_mux_parts(
                         &session.writer,
                         &session.cipher,
                         id,
                         MuxCommand::Rst,
                         &[],
                         session.obfs,
-                    )
-                    .await;
+                    );
                     session.close_stream(id).await;
                 }
                 Some(Err(mpsc::error::TrySendError::Closed(f))) => {

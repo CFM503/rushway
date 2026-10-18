@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.55] - 2026-10-18
+
+### Non-Blocking MUX Control Frames, Deadlock Prevention & Adaptive DRR Batching
+
+- **Non-Blocking Control Frame Dispatch via `try_send_mux` (`src/main.rs:MuxFrameWriter::try_send_mux`, `try_send_mux_parts`)** — introduced dedicated non-blocking enqueuing for MUX control/RST frames emitted from reader loops (`client_reader_loop`, `wss_reader_loop`, and `send_reset_encrypted`); falls back to background `tokio::spawn` during writer channel saturation, eliminating reader/writer reciprocal backpressure deadlocks.
+- **Adaptive DRR Batch Spinning with Large Frame Accumulation (`src/main.rs:MuxFrameWriter::run`)** — adjusted the empty-round threshold dynamically: kept at 8 rounds once batch has pending frames to flush immediately, but expanded to 64 rounds on an empty batch to allow large (64 KiB) frames sufficient deficit accumulation without premature sleep stalls.
+- **WSS UDP Ingress Datagram Validation & Egress Target Policy Enforcement (`src/main.rs:handle_udp_proxy`)** — added `parse_socks5_udp_datagram` verification and `check_target_policy` validation to WSS client UDP downstream packet handling, preventing malformed datagram processing and blocking local network reflection (SSRF) exploits.
+
 ## [v0.0.54] - 2026-10-18
 
 ### Graceful TCP Half-Close Upload Drain & Module Scoping Fixes
