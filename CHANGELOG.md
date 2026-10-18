@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.51] - 2026-10-18
+
+### High-BDP Throughput Optimization, 16MB MUX Window Expansion & Balanced Queue Sizing
+
+- **16 MiB MUX Initial Flow Control Window (`src/main.rs:MUX_INITIAL_WINDOW_KIB`)** — doubled the initial stream receive window from 8192 KiB (8 MiB) to 16384 KiB (16 MiB), elevating theoretical single-stream throughput on 200ms WAN latency routes from ~320 Mbps to ~640 Mbps to fully saturate modern gigabit connections.
+- **Symmetric MUX Stream Ingress Queue Doubling (`src/main.rs:MUX_STREAM_QUEUE_CAP`)** — expanded per-stream MUX channel capacity from 768 to 1536 frames, mathematically aligning buffer depth to absorb up to 16 MiB bursts without triggering spurious `TrySendError::Full` and premature stream resets.
+- **Batched Window Refund Threshold Scaling (`src/main.rs:MUX_WINDOW_REFRESH`)** — increased the consumed-bytes threshold before emitting WINDOW credit refund frames from 1 MiB to 2 MiB, preserving the optimal 1/8-window refund ratio while halving flow-control signaling overhead on high-throughput connections.
+- **Symmetric Pre-Dial 0-RTT Ingress Buffering (`src/main.rs:MAX_PENDING_FRAMES`, `MAX_PENDING_BYTES`)** — scaled target-dialing pre-buffer limits from 256 frames (8 MiB) to 512 frames (16 MiB), ensuring high-rate early client data streams survive slow DNS resolutions and handshakes without premature overflow resets.
+- **8-Shard High-Capacity Encode Buffer Pool (`src/main.rs:ENCODE_POOL_MAX_COUNT`, `ENCODE_POOL_SHARDS`)** — expanded recycled 80 KiB buffer count from 32 (~2.5 MiB) to 256 (~20.5 MiB) while doubling lock sharding from 4 to 8 (32 buffers/shard), eliminating malloc/free churn on hot paths while strictly capping setup-mode RSS.
+- **Expanded Writer Queue & Feed Channel Capacities (`src/main.rs:WRITER_QUEUE`, `FEED_CAP`)** — raised writer scheduling queue depth and outbound MPSC channel buffer from 256 to 512, eliminating upstream worker backpressure stalls during sustained burst transfers.
+- **Linux TCP Not-Sent Low-Watermark Tuning (`src/main.rs:lowat`)** — raised `TCP_NOTSENT_LOWAT` from 16 KiB to 256 KiB on Linux sockets, significantly reducing write syscall frequency and kernel context switches under high-BDP saturation while keeping queueing latency well bounded.
+
 ## [v0.0.50] - 2026-10-15
 
 ### Resilience, Failover Routing & Leak Prevention

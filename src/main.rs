@@ -3229,8 +3229,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-const WRITER_QUEUE: usize = 256;
-const FEED_CAP: usize = 256;
+const WRITER_QUEUE: usize = 512;
+const FEED_CAP: usize = 512;
 const BATCH_MAX_FRAMES: usize = 32;
 const BATCH_MAX_BYTES: usize = 1024 * 1024;
 /// Wall-clock bound for one batch write. A peer that silently stops reading
@@ -3247,7 +3247,7 @@ const WRITE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Kept deliberately small: one batch is at most [`BATCH_MAX_FRAMES`], and
 /// a larger pool showed up as a clear setup-mode RSS regression (8:0) in
 /// the first A/B — 32 × ~80 KiB ≈ 2.5 MiB retained ceiling.
-const ENCODE_POOL_MAX_COUNT: usize = 32;
+const ENCODE_POOL_MAX_COUNT: usize = 256;
 /// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
 /// ~80 KiB so a rare huge frame cannot pin memory.
 const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
@@ -3260,7 +3260,7 @@ const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
 /// [`ENCODE_POOL_MAX_COUNT`] buffers: the per-shard cap is `MAX / SHARDS`,
 /// because the first A/B measured a larger pool as a setup-mode RSS
 /// regression and sharding deliberately must not grow it.
-const ENCODE_POOL_SHARDS: usize = 4;
+const ENCODE_POOL_SHARDS: usize = 8;
 const ENCODE_POOL_SHARD_MAX_COUNT: usize = ENCODE_POOL_MAX_COUNT / ENCODE_POOL_SHARDS;
 /// Per-stream byte credit added each deficit round (GoWay parity).
 /// Set to 128KB so that even maximum-size MUX frames (~67KB) can be
@@ -5037,10 +5037,10 @@ pub const MAX_MUX_PAYLOAD: usize = u16::MAX as usize;
 pub const MUX_PROTO_VERSION: u8 = 1;
 /// Initial per-stream receive window advertised in VERSION (KiB).
 #[allow(dead_code)]
-pub const MUX_INITIAL_WINDOW_KIB: u16 = 8192;
+pub const MUX_INITIAL_WINDOW_KIB: u16 = 16384;
 /// Send a WINDOW refund once this many consumed bytes have accumulated.
 #[allow(dead_code)]
-pub const MUX_WINDOW_REFRESH: usize = 1024 * 1024;
+pub const MUX_WINDOW_REFRESH: usize = 2 * 1024 * 1024;
 /// Floor applied to a peer-advertised window so a broken/zero VERSION
 /// can never starve the sender (frames are at most 64 KiB).
 #[allow(dead_code)]
@@ -5050,7 +5050,7 @@ pub const MUX_WINDOW_MIN_KIB: u16 = 64;
 /// (up to ~512-768 frames of 10-16 KiB each) can be absorbed in-flight
 /// without hitting `TrySendError::Full` and triggering premature stream resets.
 #[allow(dead_code)]
-pub const MUX_STREAM_QUEUE_CAP: usize = 768;
+pub const MUX_STREAM_QUEUE_CAP: usize = 1536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxCommand {
@@ -7959,7 +7959,7 @@ pub(crate) fn apply_socket_options_raw(
         // 1. TCP_NOTSENT_LOWAT bounds unsent bytes buffered in the kernel send
         // queue before poll/epoll reports writable. This prevents bufferbloat
         // on high-BDP cross-border links (Cloudflare/HTTP2 standard practice: 16 KiB).
-        let lowat: libc::c_uint = 16384;
+        let lowat: libc::c_uint = 262144;
         unsafe {
             let _ = libc::setsockopt(
                 fd,
@@ -8497,8 +8497,8 @@ where
                 // muxServerStreamBufferLimit (8 MiB): a single eager flow
                 // (e.g. 4 MiB written right after CONNECT) must survive a
                 // slow target dial instead of being reset.
-                const MAX_PENDING_FRAMES: usize = 256;
-                const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+                const MAX_PENDING_FRAMES: usize = 512;
+                const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
