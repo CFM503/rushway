@@ -10547,7 +10547,7 @@ impl TuiConfig {
             "Disabled".to_string()
         };
         Self {
-            version: APP_VERSION.to_string(),
+            version: crate::APP_VERSION.to_string(),
             mode,
             listen: format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
             upstream: cfg.upstream.clone().unwrap_or_else(|| "N/A".to_string()),
@@ -11453,6 +11453,7 @@ pub async fn handle_local_udp_proxy(
     cfg: RuntimeConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
+    let _ = &bind_hint;
     let local_ip = match control.local_addr() {
         Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
         _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -14649,7 +14650,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Debug, Parser)]
 #[command(
     name = "rushway",
-    version = APP_VERSION,
+    version,
     about = "Rust forwarding service compatible with GoWay"
 )]
 struct Args {
