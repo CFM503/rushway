@@ -1230,15 +1230,49 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.55`.
 
+## Release: v0.0.56 (2026-10-19) — Non-MUX Graceful Response Drain, MUX Writer Liveness & Leak Mitigation
 
+### Context & User Directives
+- **Directives:** "我手动修改了代码，对比一下修改前和修改后" followed by "修复编译错误，更新版本号0.0.56，更新修改日志，更新AI接力交接日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Non-MUX Graceful Response Drain & Borrow Checker Safety:**
+    - In `handle_client_stream`, manual edits added a 15-second graceful drain window for `download` upon upload clean completion (`matches!(res, Ok(Ok(())))`), followed by `local_wr.shutdown()`.
+    - However, `tokio::pin!(download)` caused `download` to borrow `frame_buf` until the enclosing function exited, inducing compile error `E0505: cannot move out of frame_buf because it is borrowed` when invoking `recycle_encode_buf(frame_buf)`.
+    - Resolved by enclosing the `download` coroutine, its pinning, and the `tokio::select!` construct within an isolated block scope `{ ... }`. This ensures deterministic destructor execution on the coroutine and its pin before buffer recycling.
+  - **Transport Writer Liveness in Stream Reservation:**
+    - Both `SessionState::try_reserve` and `WssSessionState::try_reserve` now check `|| self.writer.is_closed()`. This fast-fails stream reservations when writer channel has broken before `self.closed` has propagated.
+  - **WSS Stream Allocation Closed-Session Waiter Notification:**
+    - Added `self.capacity_notify.notify_waiters()` in `WssSessionState::open_stream` when session closure is encountered after incrementing active counter, ensuring pending callers awaiting capacity do not hang.
+  - **Scheduler Empty-Stream Immediate Deregistration:**
+    - Added `if q.frames.is_empty() { self.remove_stream(&sid); }` in `Scheduler::pop`, pruning emptied streams immediately rather than retaining dormant entries in scheduler tables.
+  - **Server UDP Target Cache Bounded Retention:**
+    - Guarded `known_targets` in `handle_server_udp_stream` with a 4096-entry ceiling, executing clear-and-insert to prevent memory growth under unbounded destination churn.
+  - **Regression Risk:** Zero. All 137 unit tests pass without errors.
 
+### Changes Implemented
+1. **Non-MUX Client Stream Drain & Scope Isolation (`src/main.rs:handle_client_stream`)**:
+   - Implemented 15s post-upload drain and scoped coroutine execution to safely drop `frame_buf` borrow prior to pool recycling.
+2. **Writer Channel Liveness Check (`src/main.rs:SessionState::try_reserve`, `WssSessionState::try_reserve`)**:
+   - Added `|| self.writer.is_closed()` to capacity reservation.
+3. **WSS Capacity Waiter Notification (`src/main.rs:WssSessionState::open_stream`)**:
+   - Called `self.capacity_notify.notify_waiters()` upon closed session detection.
+4. **Immediate Scheduler Stream Cleanup (`src/main.rs:Scheduler::pop`)**:
+   - Immediate stream removal upon draining frame queue.
+5. **UDP Server Known Targets Bounding (`src/main.rs:handle_server_udp_stream`)**:
+   - Capped `known_targets` size to 4096.
+6. **Version & Documentation**:
+   - Bumped version to `0.0.56` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
 
+### Commit & Tag
+- Commit: `release: v0.0.56 - non-MUX graceful response drain, MUX writer liveness, and leak mitigation`
+- Tag: `v0.0.56`
 
+### Status
+- Completed and released as `v0.0.56`.
 
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.56`.
 
-
-
-
-
-
-
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.56`.

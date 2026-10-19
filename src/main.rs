@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.55";
+pub const APP_VERSION: &str = "0.0.56";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod common {
@@ -439,9 +439,8 @@ where
         recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
-    tokio::select! {
-        _ = &mut upload => {}
-        _ = async {
+    {
+        let download = async {
             loop {
                 let Some((opcode, payload)) =
                     read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf).await?
@@ -468,8 +467,19 @@ where
                     }
                 }
             }
+            let _ = local_wr.shutdown().await;
             Result::<()>::Ok(())
-        } => {}
+        };
+        tokio::pin!(download);
+        tokio::select! {
+            res = &mut upload => {
+                // If upload finished cleanly (local EOF), allow download to finish draining response.
+                if matches!(res, Ok(Ok(()))) {
+                    let _ = timeout(Duration::from_secs(15), &mut download).await;
+                }
+            }
+            _ = &mut download => {}
+        }
     }
     crate::mux_writer::recycle_encode_buf(frame_buf);
     upload.abort();
@@ -2533,7 +2543,7 @@ impl SessionState {
             && self.active.load(Ordering::Acquire) < MAX_STREAMS_PER_SESSION
     }
     fn try_reserve(&self) -> bool {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.writer.is_closed() {
             return false;
         }
         self.active
@@ -3723,6 +3733,9 @@ impl Scheduler {
                         q.deficit -= affordable;
                         let frame = q.frames.pop_front();
                         self.total -= 1;
+                        if q.frames.is_empty() {
+                            self.remove_stream(&sid);
+                        }
                         if frame.is_some() {
                             return frame;
                         }
@@ -7439,10 +7452,13 @@ async fn handle_server_udp_stream(
                 let addr = resolve_target(cfg.block_local, &target.host, target.port).await?;
                 // Recorded before the first payload leaves, so a reply can
                 // never arrive ahead of its target joining the known set.
-                known_targets
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(addr);
+                {
+                    let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() >= 4096 {
+                        guard.clear();
+                    }
+                    guard.insert(addr);
+                }
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
             }
@@ -13755,7 +13771,7 @@ impl WssSessionState {
             && self.active.load(Ordering::Acquire) < MAX_STREAMS_PER_SESSION
     }
     fn try_reserve(&self) -> bool {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.writer.is_closed() {
             return false;
         }
         self.active
@@ -13779,6 +13795,7 @@ impl WssSessionState {
             let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
             if self.closed.load(Ordering::Acquire) {
                 self.active.fetch_sub(1, Ordering::AcqRel);
+                self.capacity_notify.notify_waiters();
                 bail!("WSS physical session closed")
             }
             let mut stream_id;

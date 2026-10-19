@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.56] - 2026-10-19
+
+### Non-MUX Graceful Response Drain, MUX Writer Liveness & Leak Mitigation
+
+- **Non-MUX Client Stream Graceful Response Drain (`src/main.rs:handle_client_stream`)** — pinned the downstream reader loop and introduced a 15-second graceful drain window upon clean upload completion (EOF), accompanied by explicit `shutdown()` on the local writer to ensure server response bytes are fully flushed.
+- **Scope-Isolated Coroutine Lifetime for Safe Buffer Recycling (`src/main.rs:handle_client_stream`)** — wrapped pinned coroutines in an isolated block scope to deterministically drop borrows on `frame_buf` before passing ownership to `recycle_encode_buf`.
+- **Eager MUX Writer Liveness Verification (`src/main.rs:SessionState::try_reserve`, `WssSessionState::try_reserve`)** — guarded session capacity reservations with `|| self.writer.is_closed()`, rejecting new stream allocations immediately if the underlying transport writer channel has terminated.
+- **WSS Stream Allocation Closed-Session Waiter Notification (`src/main.rs:WssSessionState::open_stream`)** — triggered `self.capacity_notify.notify_waiters()` upon detecting session closure during stream creation, preventing awaiting tasks from hanging indefinitely.
+- **Eager Scheduler Stream Deregistration (`src/main.rs:Scheduler::pop`)** — immediately pruned emptied stream queues from scheduler tracking via `self.remove_stream(&sid)`, eliminating idle stream table retention and scheduler iteration overhead.
+- **Server UDP Target Cache Bounded Retention (`src/main.rs:handle_server_udp_stream`)** — enforced a 4096-entry limit on `known_targets` with proactive clearance, preventing memory leakage under unbounded external UDP peer churn.
+
 ## [v0.0.55] - 2026-10-18
 
 ### Non-Blocking MUX Control Frames, Deadlock Prevention & Adaptive DRR Batching
