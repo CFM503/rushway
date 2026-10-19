@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.58";
+pub const APP_VERSION: &str = "0.0.59";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -15165,7 +15165,7 @@ struct Args {
     no_tcp_keepalive: bool,
     #[arg(long = "dns")]
     dns: Option<String>,
-    #[arg(long = "block-local", default_value_t = false)]
+    #[arg(long = "block-local", default_value_t = true)]
     block_local: bool,
     #[arg(long = "no-block-local", default_value_t = false)]
     no_block_local: bool,
@@ -15542,6 +15542,14 @@ fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str, ver
     );
     println!(" [+] Buffer:      {} KB", cfg.buffer_size / 1024);
     println!(" [+] Max Conns:   {}", cfg.max_connections);
+    println!(
+        " [+] Block Local: {}",
+        if cfg.block_local {
+            "Enabled (Client & Server)"
+        } else {
+            "Disabled"
+        }
+    );
     if cfg.upstream.is_some() && !verify_ssl {
         println!(
             "{RED} [!] TLS certificate verification is DISABLED (--no-verify-ssl).{RESET}"
@@ -15652,7 +15660,7 @@ async fn main() -> Result<()> {
     }
     if args.no_block_local {
         cfg.block_local = false;
-    } else if args.block_local {
+    } else if raw_args.iter().any(|a| a == "--block-local") {
         cfg.block_local = true;
     }
     if let Some(v) = args.connection_timeout {

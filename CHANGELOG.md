@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.59] - 2026-10-19
+
+### Secure-by-Default Block Local Policy, Console Banner Visibility & CLI Precedence Alignment
+
+- **Secure-by-Default Block Local Policy (`src/main.rs:Args::block_local`)** — Changed CLI default for `--block-local` from `false` to `true`, providing out-of-the-box defense-in-depth against Server-Side Request Forgery (SSRF) and intranet reflection exploits by automatically dropping target connection attempts to loopback (127.0.0.1, localhost) and private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+- **Non-Destructive CLI Argument Precedence (`src/main.rs:main`)** — Replaced `else if args.block_local` with `raw_args.iter().any(|a| a == "--block-local")` to inspect explicit command-line tokens, ensuring default CLI flag states never overwrite `"block_local": false` settings defined in JSON configuration files.
+- **Console Startup Banner Security Visibility (`src/main.rs:print_banner`)** — Added `Block Local: Enabled / Disabled` inspection output to the startup console banner, explicitly communicating active local IP filtering policy at boot.
+- **Vectorized Fused XOR Crypto Test Optimization (`src/main.rs:crypto::tests::test_fused_xor_matches_reference`)** — Isolated scalar test reference calculation via `std::hint::black_box`, preventing compiler autovectorizer optimization anomalies from distorting test assertions across SIMD parity runs.
+
 ## [v0.0.58] - 2026-10-19
 
 ### Adaptive System Memory Profiling, Robust IPv6 / DNS Handling & CLI Configuration Precedence (Major Adaptive Architecture Release)
