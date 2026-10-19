@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.56";
+pub const APP_VERSION: &str = "0.0.57";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod common {
@@ -3509,6 +3509,33 @@ impl MuxFrameWriter {
         .await
     }
 
+    /// Non-blocking enqueue for system control frames (e.g. Pong replies from the read loop).
+    pub fn try_send_system(self: &Arc<Self>, frame: Vec<u8>) {
+        if self.closed.load(Ordering::Acquire) {
+            recycle_encode_buf(frame);
+            return;
+        }
+        let out = OutboundFrame {
+            stream_id: None,
+            priority: true,
+            yield_to_data: false,
+            bytes: frame,
+        };
+        match self.tx.try_send(out) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(out)) => {
+                let writer = self.clone();
+                tokio::spawn(async move {
+                    let _ = writer.send_frame(out).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(out)) => {
+                self.closed.store(true, Ordering::Release);
+                recycle_encode_buf(out.bytes);
+            }
+        }
+    }
+
     /// Queues one pre-encoded MUX frame. Non-DATA commands take the priority
     /// lane; DATA frames are DRR-scheduled per stream. Same failure and
     /// backpressure contract as [`MuxFrameWriter::send`].
@@ -4942,10 +4969,14 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
                     &mut frame_buf,
                 ) => {
                     let Some((opcode, payload)) = res? else {
+                        let _ = target_wr.shutdown().await;
+                        let _ = timeout(Duration::from_secs(cfg.connection_timeout.max(5)), &mut download).await;
                         break;
                     };
                     if opcode == 8 {
                         crate::mux_writer::recycle_encode_buf(payload);
+                        let _ = target_wr.shutdown().await;
+                        let _ = timeout(Duration::from_secs(cfg.connection_timeout.max(5)), &mut download).await;
                         break;
                     }
                     if opcode != 2 {
@@ -7350,6 +7381,7 @@ async fn handle_server_stream(
         Result::<()>::Ok(())
     });
     let mut buf = relay_buf(buffer_size).await;
+    let mut recv_eof = false;
     loop {
         tokio::select! {
             _ = &mut send_task => {
@@ -7357,9 +7389,14 @@ async fn handle_server_stream(
             }
             res = recv.read(&mut buf) => {
                 match res? {
-                    Some(0) | None => break,
+                    Some(0) | None => {
+                        recv_eof = true;
+                        break;
+                    }
                     Some(n) => {
-                        target_wr.write_all(&buf[..n]).await?;
+                        if target_wr.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
                         crate::stats::add_bytes(n as i64, 0);
                     }
                 }
@@ -7367,8 +7404,15 @@ async fn handle_server_stream(
         }
     }
     let _ = target_wr.shutdown().await;
-    send_task.abort();
     recycle_buf(buf).await;
+    if recv_eof {
+        let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
+        if timeout(drain_wait, &mut send_task).await.is_err() {
+            send_task.abort();
+        }
+    } else {
+        send_task.abort();
+    }
     Ok(())
 }
 
@@ -8368,15 +8412,22 @@ async fn maybe_send_window(
         return;
     }
     let credit = std::mem::take(refund_pending);
-    let _ = send_mux_parts_encrypted(
-        writer,
-        cipher,
+    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    if crate::mux_writer::encode_mux_ws_frame(
+        &mut bytes,
         stream_id,
         MuxCommand::Window,
         &encode_window_payload(credit),
+        cipher,
+        false,
         obfs,
     )
-    .await;
+    .is_ok()
+    {
+        writer.try_send_mux(stream_id, MuxCommand::Window, bytes);
+    } else {
+        crate::mux_writer::recycle_encode_buf(bytes);
+    }
 }
 
 /// Session-wide accounting for bytes parked in pre-dial `pending` queues.
@@ -12601,7 +12652,7 @@ where
 
 pub(crate) async fn read_frame_mux<R>(
     r: &mut R,
-    writer: &crate::mux_writer::MuxFrameWriter,
+    writer: &std::sync::Arc<crate::mux_writer::MuxFrameWriter>,
     masked_pong: bool,
     buf: &mut Vec<u8>,
     cipher: Option<&crate::crypto::XorCipher>,
@@ -12623,7 +12674,7 @@ where
 async fn read_frame_inner<R, W>(
     r: &mut R,
     mut reply: Option<&mut W>,
-    pong_writer: Option<(&crate::mux_writer::MuxFrameWriter, bool)>,
+    pong_writer: Option<(&std::sync::Arc<crate::mux_writer::MuxFrameWriter>, bool)>,
     buf: &mut Vec<u8>,
     cipher: Option<&crate::crypto::XorCipher>,
 ) -> Result<Option<(u8, Vec<u8>)>>
@@ -12766,7 +12817,7 @@ where
                     write_frame(w, buf, 0xA, !masked).await?;
                 } else if let Some((writer, masked_pong)) = pong_writer {
                     if let Ok(pong) = encode_ws_frame(buf, 0xA, masked_pong) {
-                        let _ = writer.send(pong).await;
+                        writer.try_send_system(pong);
                     }
                 }
             }

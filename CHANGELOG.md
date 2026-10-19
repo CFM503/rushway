@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.57] - 2026-10-19
+
+### Non-Blocking System Control Frames, Window Credit Refund Decoupling & Server Stream Graceful Drain
+
+- **Non-Blocking System Control Frame Dispatch via `try_send_system` (`src/main.rs:MuxFrameWriter::try_send_system`, `read_frame_inner`, `read_frame_mux`)** — implemented non-blocking enqueue for system control frames (e.g. WebSocket Pong replies from reader loops); prioritizes non-blocking channel send with automatic detached background task fallback upon channel saturation, fully decoupling reader loop responsiveness from writer backpressure and eliminating reciprocal deadlocks.
+- **Asynchronous MUX Window Credit Refund Decoupling (`src/main.rs:maybe_send_window`)** — migrated stream flow-control credit refunds from blocking `send_mux_parts_encrypted(...).await` to non-blocking `writer.try_send_mux(stream_id, MuxCommand::Window, bytes)`, eliminating reader thread stalls during window replenishment.
+- **WebSocket/TCP Server Stream Graceful Response Drain (`src/main.rs:handle_server`)** — on receiving downstream EOF or Close frame (opcode 8), explicitly issued `target_wr.shutdown()` followed by a bounded drain timeout (`connection_timeout.max(5)`) on the download task, allowing pending server response bytes to reach the client before termination.
+- **QUIC Server Single-Stream Downstream Half-Close & Drain (`src/main.rs:handle_server_stream`)** — introduced clean EOF detection on QUIC ingress reads, issuing downstream TCP shutdown and granting `send_task` a graceful drain timeout before aborting, preventing premature response truncation.
+
 ## [v0.0.56] - 2026-10-19
 
 ### Non-MUX Graceful Response Drain, MUX Writer Liveness & Leak Mitigation

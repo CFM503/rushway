@@ -1276,3 +1276,46 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.56`.
+
+## Release: v0.0.57 (2026-10-19) — Non-Blocking System Control Frames, Window Credit Refund Decoupling & Server Stream Graceful Drain
+
+### Context & User Directives
+- **Directives:** "我手动修改了代码，对比一下修改前和修改后" followed by "检查编译有没有错误，更新版本号0.0.57，更新修改日志，更新AI接力交接日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **System Frame Non-Blocking Dispatch & Deadlock Prevention:**
+    - Reader loops previously executed `writer.send(pong).await` upon encountering WebSocket Ping control frames. When the writer channel (`writer.tx`) was full due to outbound socket backpressure, the reader loop suspended, halting inbound socket consumption and precipitating reciprocal deadlocks.
+    - Implemented `MuxFrameWriter::try_send_system`: executes non-blocking `tx.try_send` first and falls back to a detached background `tokio::spawn` worker on channel saturation (`TrySendError::Full`). Propagated `&Arc<MuxFrameWriter>` through `read_frame_mux` and `read_frame_inner`.
+  - **Asynchronous MUX Window Credit Refund Decoupling:**
+    - `maybe_send_window` previously blocked callers on `send_mux_parts_encrypted(...).await`.
+    - Refactored to encode directly using `encode_mux_ws_frame` and dispatch via non-blocking `writer.try_send_mux(stream_id, MuxCommand::Window, bytes)`.
+  - **Server Stream Downstream Graceful Drain (TCP/WS & QUIC):**
+    - Both `handle_server` (WebSocket/TCP) and `handle_server_stream` (QUIC) previously dropped or immediately aborted download/send tasks upon encountering client-side EOF or Close frames (opcode 8).
+    - Introduced explicit downstream `target_wr.shutdown().await` to propagate TCP half-close to the destination, followed by a bounded graceful drain timeout (`connection_timeout.max(5)`) to ensure pending response data completes transmission before socket teardown.
+  - **Regression Risk:** Zero. All 137 unit tests pass without errors.
+
+### Changes Implemented
+1. **Non-Blocking System Control Frame Dispatch (`src/main.rs:MuxFrameWriter::try_send_system`, `read_frame_mux`, `read_frame_inner`)**:
+   - Implemented non-blocking system control frame queueing with detached async spawn fallback for Pong frames.
+2. **Non-Blocking Flow Control Window Dispatch (`src/main.rs:maybe_send_window`)**:
+   - Replaced blocking channel send with `try_send_mux` for WINDOW credit frames.
+3. **TCP/WebSocket Server Stream Drain (`src/main.rs:handle_server`)**:
+   - Added `shutdown()` and bounded drain wait on EOF and Close frames.
+4. **QUIC Server Single-Stream Drain (`src/main.rs:handle_server_stream`)**:
+   - Added clean EOF detection, downstream shutdown, and drain timeout for `send_task`.
+5. **Version & Documentation**:
+   - Bumped version to `0.0.57` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.57 - non-blocking system frames, window refund decoupling, and graceful server response drain`
+- Tag: `v0.0.57`
+
+### Status
+- Completed and released as `v0.0.57`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.57`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.57`.
+
