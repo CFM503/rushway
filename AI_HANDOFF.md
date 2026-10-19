@@ -1419,4 +1419,56 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.59`.
 
+## Release: v0.0.60 (2026-10-19) — Concurrent Stream Table ABA Protection, Immediate RST Pruning & Dual-Stack QUIC Binding
+
+### Context & User Directives
+- **Directives:** "更新版本号0.0.60,更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Stream Table Concurrency & ABA Mitigation:**
+    - High-frequency connection churn under latency or load can produce overlapping lifecycle events where a slow teardown coroutine executes `.remove(&stream_id)` after a new SYN has already re-registered that ID.
+    - Implemented `remove_if_same_stream`: guards removal by verifying pointer identity on `StreamEntry.gate` (`Arc::ptr_eq`), preventing stale coroutines from destroying newly registered active streams.
+  - **RST Priority Dispatch & Eager Resource Eviction:**
+    - Inverted `yield_to_data` for `Rst` commands so reset signals immediately bypass backlogged DATA frames.
+    - Added eager stream eviction to `Scheduler::push`: on receiving an `is_rst` outbound frame, all backlogged DATA frames for that stream are immediately purged from the scheduler, returned to the encode buffer pool, and the stream entry is promptly unmapped.
+  - **QUIC Upstream Wildcard Binding Dual-Stack Parity:**
+    - Binding unconditionally to `[::]:0` fails on IPv4-only hosts or containers where IPv6 sockets are disabled by the OS.
+    - Implemented dynamic upstream socket address family selection (`0.0.0.0:0` for IPv4 upstreams, `[::]:0` otherwise) with automatic fallback to IPv4 wildcard socket binding.
+  - **0-RTT Prefetch Memory Footprint Decoupling:**
+    - 0-RTT prefetch loops previously checked out 80 KiB pooled buffers, causing high lock contention and cache thrashing when no data was pending (`WouldBlock`).
+    - Decoupled prefetch using direct 16 KiB heap vectors (`Vec::with_capacity(16384)`).
+  - **Fine-Grained WebSocket Control Frame Ingress Allocation:**
+    - Replaced 80 KiB pooled buffer borrowing for small unextended WebSocket frames with exact allocations (`buf.reserve_exact(total)`).
+  - **Unconditional Non-Truncated Remote DNS Direct Return:**
+    - Avoided spurious fallback TCP DNS queries when UDP lookups return non-truncated empty responses (`!truncated`).
+  - **Regression Risk:** Zero. All 137 unit tests pass without errors.
+
+### Changes Implemented
+1. **ABA-Safe Stream Map Removal (`src/main.rs:remove_if_same_stream`)**:
+   - Added pointer equality gate verification before deleting stream entries.
+2. **Scheduler Immediate RST Purging (`src/main.rs:MuxFrameWriter`, `Scheduler::push`)**:
+   - Added `is_rst` flag, removed DATA yield on RST, and purged backlogged stream frames immediately in scheduler push.
+3. **Dual-Stack QUIC Upstream Socket Binding (`src/main.rs:quic::run_client`)**:
+   - Dynamic address family selection with IPv4 fallback.
+4. **Scoped 0-RTT Buffer Allocation (`src/main.rs:handle_tcp_proxy`, `handle_connection`)**:
+   - Replaced pooled buffer usage with exact 16 KiB vector allocation.
+5. **Exact Frame Decoders & Direct DNS Return (`src/main.rs:read_frame_inner`, `query_remote_all_ipv4`)**:
+   - Removed 80 KiB allocation on small WS frames and direct return on non-truncated DNS responses.
+6. **Version & Documentation**:
+   - Bumped version to `0.0.60` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.60 - concurrent stream table ABA protection, immediate RST pruning, and dual-stack QUIC binding`
+- Tag: `v0.0.60`
+
+### Status
+- Completed and released as `v0.0.60`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.60`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.60`.
+
+
 

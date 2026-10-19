@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.60] - 2026-10-19
+
+### Concurrent Stream Table ABA Protection, Immediate RST Pruning & Dual-Stack QUIC Binding
+
+- **Atomic Stream Identity Validation on Teardown (`src/main.rs:remove_if_same_stream`)** — Guarded stream map removal across error and cleanup paths by verifying matching `CreditGate` pointers (`Arc::ptr_eq(&e.gate, gate)`), preventing stale coroutines from evicting newly established streams sharing the same `stream_id` (ABA race hazard mitigation).
+- **Immediate Scheduler RST Frame Dispatch & Backlogged Data Pruning (`src/main.rs:MuxFrameWriter::send_frame`, `Scheduler::push`)** — Eliminated `yield_to_data` priority inhibition for RST frames, allowing reset commands to bypass queued data frames immediately. When an RST frame enters `Scheduler::push`, all queued outbound DATA frames for that stream are immediately purged, recycled into the buffer pool, and the stream entry is promptly unmapped.
+- **Dual-Stack & IPv4-Only QUIC Upstream Socket Binding (`src/main.rs:quic::run_client`)** — Dynamically selected `0.0.0.0:0` vs `[::]:0` based on resolved upstream address family, with automatic fallback to IPv4 wildcard socket binding to prevent startup failures on IPv4-only hosts.
+- **Dedicated 0-RTT Stream Prefetch Buffering (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — Replaced pooled 80 KiB buffer borrowing with scoped 16 KiB allocations (`Vec::with_capacity(16384)`), eliminating lock contention and buffer turnover in the global encode pool during 0-RTT prefetch polling.
+- **Fine-Grained WebSocket Control Frame Ingress Allocation (`src/main.rs:read_frame_inner`)** — Shifted small, unextended WebSocket frame reads from the shared 80 KiB encode pool to exact allocations (`buf.reserve_exact(total)`), preventing pool memory pin and reducing baseline RSS footprint.
+- **Unconditional Non-Truncated Remote DNS Direct Return (`src/main.rs:query_remote_all_ipv4`)** — Preserved non-truncated empty DNS responses (`!truncated`) directly rather than redundantly triggering secondary TCP DNS queries on NXDOMAIN or NODATA lookups.
+
 ## [v0.0.59] - 2026-10-19
 
 ### Secure-by-Default Block Local Policy, Console Banner Visibility & CLI Precedence Alignment

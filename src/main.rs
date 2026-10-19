@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.59";
+pub const APP_VERSION: &str = "0.0.60";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -1792,7 +1792,7 @@ async fn query_remote_all_ipv4(host: &str, server: IpAddr) -> Result<Vec<Ipv4Add
     let pkt = &buf[..size];
     validate_transaction_id(pkt, expected_id)?;
     let (ips, truncated) = parse_all_ipv4_from_response(pkt, host)?;
-    if !truncated && !ips.is_empty() {
+    if !truncated {
         return Ok(ips);
     }
     let response = dns_tcp_query(server_addr, &request).await?;
@@ -3187,25 +3187,17 @@ async fn handle_tcp_proxy(
                 if local.readable().await.is_err() {
                     break;
                 }
-                let mut first_pkt = crate::mux_writer::acquire_encode_buf();
-                if first_pkt.capacity() < 16384 {
-                    first_pkt.reserve(16384 - first_pkt.len());
-                }
+                let mut first_pkt = Vec::with_capacity(16384);
                 match local.try_read_buf(&mut first_pkt) {
                     Ok(n) if n > 0 => {
-                        if first_pkt.len() > u16::MAX as usize {
-                            first_pkt.truncate(u16::MAX as usize);
-                        }
                         crate::stats::add_bytes(first_pkt.len() as i64, 0);
                         initial_data = first_pkt;
                         break;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        recycle_encode_buf(first_pkt);
                         continue;
                     }
                     _ => {
-                        recycle_encode_buf(first_pkt);
                         break;
                     }
                 }
@@ -3670,6 +3662,7 @@ pub(crate) struct OutboundFrame {
     stream_id: Option<u32>,
     priority: bool,
     yield_to_data: bool,
+    is_rst: bool,
     bytes: Vec<u8>,
 }
 
@@ -3711,6 +3704,7 @@ impl MuxFrameWriter {
             stream_id: None,
             priority: true,
             yield_to_data: false,
+            is_rst: false,
             bytes: frame,
         })
         .await
@@ -3726,6 +3720,7 @@ impl MuxFrameWriter {
             stream_id: None,
             priority: true,
             yield_to_data: false,
+            is_rst: false,
             bytes: frame,
         };
         match self.tx.try_send(out) {
@@ -3755,11 +3750,12 @@ impl MuxFrameWriter {
         // Only stream-CLOSING controls yield to their own queued DATA.
         // SYN must lead (it creates the peer-side stream); DATA never
         // takes the priority lane at all.
-        let yield_to_data = command == MuxCommand::Fin || command == MuxCommand::Rst;
+        let yield_to_data = command == MuxCommand::Fin;
         self.send_frame(OutboundFrame {
             stream_id: Some(stream_id),
             priority: command != MuxCommand::Data,
             yield_to_data,
+            is_rst: command == MuxCommand::Rst,
             bytes: frame,
         })
         .await
@@ -3777,11 +3773,12 @@ impl MuxFrameWriter {
             recycle_encode_buf(frame);
             return;
         }
-        let yield_to_data = command == MuxCommand::Fin || command == MuxCommand::Rst;
+        let yield_to_data = command == MuxCommand::Fin;
         let out = OutboundFrame {
             stream_id: Some(stream_id),
             priority: command != MuxCommand::Data,
             yield_to_data,
+            is_rst: command == MuxCommand::Rst,
             bytes: frame,
         };
         match self.tx.try_send(out) {
@@ -3864,6 +3861,15 @@ impl Scheduler {
         // stream. MUX frames top out near 67KB — far below the cap.
         debug_assert!(frame.bytes.len() <= DRR_MAX_DEFICIT);
         if frame.priority {
+            if frame.is_rst {
+                if let Some(sid) = frame.stream_id {
+                    if let Some(q) = self.streams.remove(&sid) {
+                        self.total = self.total.saturating_sub(q.frames.len());
+                        recycle_encode_bufs(q.frames);
+                    }
+                    self.remove_stream(&sid);
+                }
+            }
             self.priority
                 .push_back((frame.stream_id, frame.yield_to_data, frame.bytes));
             self.total += 1;
@@ -4557,6 +4563,7 @@ mod tests {
             stream_id: Some(stream_id),
             priority,
             yield_to_data,
+            is_rst: false,
             bytes,
         }
     }
@@ -4566,6 +4573,7 @@ mod tests {
             stream_id: None,
             priority: true,
             yield_to_data: false,
+            is_rst: false,
             bytes: vec![tag; len],
         }
     }
@@ -7372,7 +7380,13 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("QUIC client requires upstream"))?;
     let (server_addr, server_name) = resolve_upstream(&upstream).await?;
     let socket_buf = quic_socket_buffer_bytes(&cfg);
-    let std_socket = bound_udp_socket("[::]:0".parse().unwrap(), socket_buf)?;
+    let bind_addr: std::net::SocketAddr = if server_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let std_socket = bound_udp_socket(bind_addr, socket_buf)
+        .or_else(|_| bound_udp_socket("0.0.0.0:0".parse().unwrap(), socket_buf))?;
     let mut endpoint = Endpoint::new(
         Default::default(),
         None,
@@ -8905,16 +8919,27 @@ where
                 // slow target dial instead of being reset.
                 let max_pending_frames: usize = crate::adaptive::profile().max_stream_pending_frames;
                 let max_pending_bytes: usize = crate::adaptive::profile().max_stream_pending_bytes;
+                fn remove_if_same_stream(
+                    streams: &Arc<std::sync::RwLock<U32HashMap<StreamEntry>>>,
+                    stream_id: u32,
+                    gate: &Arc<CreditGate>,
+                ) {
+                    let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
+                    if guard.get(&stream_id).is_some_and(|e| Arc::ptr_eq(&e.gate, gate)) {
+                        guard.remove(&stream_id);
+                    }
+                }
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
                     streams: &Arc<std::sync::RwLock<U32HashMap<StreamEntry>>>,
                     stream_id: u32,
+                    gate: &Arc<CreditGate>,
                     obfs: bool,
                 ) {
                     tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
                     let _ = send_reset_encrypted(writer, cipher, stream_id, obfs).await;
-                    streams.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                    remove_if_same_stream(streams, stream_id, gate);
                 }
                 stream_tasks.spawn(async move {
                     let mut cancelled = cancelled;
@@ -8931,6 +8956,7 @@ where
                                 &cipher_task,
                                 &streams_task,
                                 stream_id,
+                                &gate_task,
                                 cfg_task.obfs,
                             )
                             .await;
@@ -8961,7 +8987,7 @@ where
                                             cfg_task.obfs,
                                         )
                                         .await;
-                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                                        remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                         return;
                                     }
                                 }
@@ -8973,7 +8999,7 @@ where
                                         crate::mux_writer::recycle_encode_bufs(
                                             pending.drain(..).map(OwnedMuxFrame::into_storage),
                                         );
-                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                                        remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                         return;
                                     }
                                     Ok(()) => {}
@@ -8981,7 +9007,7 @@ where
                                         crate::mux_writer::recycle_encode_bufs(
                                             pending.drain(..).map(OwnedMuxFrame::into_storage),
                                         );
-                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                                        remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                         return;
                                     }
                                 }
@@ -9009,6 +9035,7 @@ where
                                                 &cipher_task,
                                                 &streams_task,
                                                 stream_id,
+                                                &gate_task,
                                                 cfg_task.obfs,
                                             )
                                             .await;
@@ -9024,7 +9051,7 @@ where
                                         crate::mux_writer::recycle_encode_bufs(
                                             pending.drain(..).map(OwnedMuxFrame::into_storage),
                                         );
-                                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                                        remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                         return;
                                     }
                                 }
@@ -9036,7 +9063,7 @@ where
                         crate::mux_writer::recycle_encode_bufs(
                             pending.drain(..).map(OwnedMuxFrame::into_storage),
                         );
-                        streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                        remove_if_same_stream(&streams_task, stream_id, &gate_task);
                         return;
                     }
 
@@ -9059,6 +9086,7 @@ where
                                         &cipher_task,
                                         &streams_task,
                                         stream_id,
+                                        &gate_task,
                                         cfg_task.obfs,
                                     )
                                     .await;
@@ -9071,7 +9099,7 @@ where
                                 crate::mux_writer::recycle_encode_bufs(
                                     pending.drain(..).map(OwnedMuxFrame::into_storage),
                                 );
-                                streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                                remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                 return;
                             }
                         }
@@ -9109,10 +9137,7 @@ where
                                 }
                             }
                             Err(_) => {
-                                streams_task
-                                    .write()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .remove(&stream_id);
+                                remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                 return;
                             }
                         }
@@ -9293,7 +9318,7 @@ where
                             crate::mux_writer::recycle_encode_buf(f.into_storage());
                         }
                     }
-                    streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
+                    remove_if_same_stream(&streams_task, stream_id, &gate_task);
                 });
 
                 // Reclaim streams that already finished instead of holding
@@ -13014,8 +13039,8 @@ where
                 return Err(anyhow!("websocket payload truncated"));
             }
             key.copy_from_slice(&small[..4]);
-            if buf.capacity() == 0 && total > 0 {
-                *buf = crate::mux_writer::acquire_encode_buf();
+            if total > buf.capacity() {
+                buf.reserve_exact(total);
             }
             buf.extend_from_slice(&small[4..4 + total]);
         } else if ext_len == 0 && !masked {
@@ -13025,8 +13050,8 @@ where
                 if r.read_exact(&mut small[..total]).await.is_err() {
                     return Err(anyhow!("websocket payload truncated"));
                 }
-                if buf.capacity() == 0 {
-                    *buf = crate::mux_writer::acquire_encode_buf();
+                if total > buf.capacity() {
+                    buf.reserve_exact(total);
                 }
                 buf.extend_from_slice(&small[..total]);
             }
@@ -14573,25 +14598,17 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                 if local.readable().await.is_err() {
                     break;
                 }
-                let mut first_pkt = crate::mux_writer::acquire_encode_buf();
-                if first_pkt.capacity() < 16384 {
-                    first_pkt.reserve(16384 - first_pkt.len());
-                }
+                let mut first_pkt = Vec::with_capacity(16384);
                 match local.try_read_buf(&mut first_pkt) {
                     Ok(n) if n > 0 => {
-                        if first_pkt.len() > u16::MAX as usize {
-                            first_pkt.truncate(u16::MAX as usize);
-                        }
                         crate::stats::add_bytes(first_pkt.len() as i64, 0);
                         initial_data = first_pkt;
                         break;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        recycle_encode_buf(first_pkt);
                         continue;
                     }
                     _ => {
-                        recycle_encode_buf(first_pkt);
                         break;
                     }
                 }
