@@ -5,8 +5,168 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.57";
+pub const APP_VERSION: &str = "0.0.58";
 pub const VERSION: &str = APP_VERSION;
+
+pub mod adaptive {
+    //! Startup system memory detector (host + cgroup v1/v2) and adaptive resource profile.
+    use std::sync::OnceLock;
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct MemProfile {
+        pub detected_mib: usize,
+        pub tier_name: &'static str,
+        pub mux_initial_window_kib: u16,
+        pub mux_window_refresh: usize,
+        pub mux_stream_queue_cap: usize,
+        pub encode_pool_shard_cap: usize,
+        pub relay_pool_max_count: usize,
+        pub max_session_pending_bytes: usize,
+        pub max_stream_pending_bytes: usize,
+        pub max_stream_pending_frames: usize,
+        pub non_mux_pool_size: usize,
+    }
+
+    static PROFILE: OnceLock<MemProfile> = OnceLock::new();
+
+    #[inline(always)]
+    pub fn profile() -> &'static MemProfile {
+        PROFILE.get_or_init(|| {
+            let mib = detect_memory_mib();
+            if mib <= 640 {
+                MemProfile {
+                    detected_mib: mib,
+                    tier_name: "Low-RAM",
+                    mux_initial_window_kib: 4096,
+                    mux_window_refresh: 512 * 1024,
+                    mux_stream_queue_cap: 768,
+                    encode_pool_shard_cap: 8, // 8 * 8 = 64 bufs (~5 MiB)
+                    relay_pool_max_count: 32, // ~4 MiB
+                    max_session_pending_bytes: 32 * 1024 * 1024,
+                    max_stream_pending_bytes: 4 * 1024 * 1024,
+                    max_stream_pending_frames: 128,
+                    non_mux_pool_size: 8,
+                }
+            } else if mib <= 2048 {
+                MemProfile {
+                    detected_mib: mib,
+                    tier_name: "Balanced",
+                    mux_initial_window_kib: 8192,
+                    mux_window_refresh: 1024 * 1024,
+                    mux_stream_queue_cap: 1536,
+                    encode_pool_shard_cap: 16, // 8 * 16 = 128 bufs (~10 MiB)
+                    relay_pool_max_count: 64,  // ~8 MiB
+                    max_session_pending_bytes: 96 * 1024 * 1024,
+                    max_stream_pending_bytes: 8 * 1024 * 1024,
+                    max_stream_pending_frames: 256,
+                    non_mux_pool_size: 16,
+                }
+            } else {
+                MemProfile {
+                    detected_mib: mib,
+                    tier_name: "High-BDP",
+                    mux_initial_window_kib: 16384,
+                    mux_window_refresh: 2 * 1024 * 1024,
+                    mux_stream_queue_cap: 3072,
+                    encode_pool_shard_cap: 32, // 8 * 32 = 256 bufs (~20.5 MiB)
+                    relay_pool_max_count: 128, // ~16 MiB
+                    max_session_pending_bytes: 256 * 1024 * 1024,
+                    max_stream_pending_bytes: 16 * 1024 * 1024,
+                    max_stream_pending_frames: 512,
+                    non_mux_pool_size: 32,
+                }
+            }
+        })
+    }
+
+    fn detect_memory_mib() -> usize {
+        if let Ok(val) = std::env::var("RUSHWAY_MEM_MIB") {
+            if let Ok(parsed) = val.trim().parse::<usize>() {
+                if parsed > 0 {
+                    return parsed;
+                }
+            }
+        }
+        let host_bytes = detect_host_memory_bytes().unwrap_or(2 * 1024 * 1024 * 1024);
+        let cgroup_bytes = detect_cgroup_memory_bytes().unwrap_or(u64::MAX);
+        let effective = host_bytes.min(cgroup_bytes);
+        ((effective / (1024 * 1024)) as usize).max(64)
+    }
+
+    fn detect_cgroup_memory_bytes() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut limit = u64::MAX;
+            for path in [
+                "/sys/fs/cgroup/memory.max",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            ] {
+                if let Ok(raw) = std::fs::read_to_string(path) {
+                    if let Ok(v) = raw.trim().parse::<u64>() {
+                        if v > 0 && v < (1u64 << 50) {
+                            limit = limit.min(v);
+                        }
+                    }
+                }
+            }
+            if limit < u64::MAX {
+                return Some(limit);
+            }
+        }
+        None
+    }
+
+    fn detect_host_memory_bytes() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                for line in meminfo.lines() {
+                    if let Some(rest) = line.strip_prefix("MemTotal:") {
+                        let kib_str = rest.trim().split_whitespace().next()?;
+                        let kib = kib_str.parse::<u64>().ok()?;
+                        return Some(kib.saturating_mul(1024));
+                    }
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            unsafe {
+                let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+                let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+                if pages > 0 && page_size > 0 {
+                    return Some((pages as u64).saturating_mul(page_size as u64));
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            #[repr(C)]
+            struct MemoryStatusEx {
+                dw_length: u32,
+                dw_memory_load: u32,
+                ull_total_phys: u64,
+                ull_avail_phys: u64,
+                ull_total_page_file: u64,
+                ull_avail_page_file: u64,
+                ull_total_virtual: u64,
+                ull_avail_virtual: u64,
+                ull_avail_extended_virtual: u64,
+            }
+            extern "system" {
+                fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
+            }
+            unsafe {
+                let mut status: MemoryStatusEx = std::mem::zeroed();
+                status.dw_length = std::mem::size_of::<MemoryStatusEx>() as u32;
+                if GlobalMemoryStatusEx(&mut status) != 0 && status.ull_total_phys > 0 {
+                    return Some(status.ull_total_phys);
+                }
+            }
+        }
+        None
+    }
+}
 
 pub mod common {
 //! Helpers shared verbatim by the transport paths (WS/WSS/MUX/UDP relay).
@@ -48,17 +208,31 @@ pub(crate) const HTTP_502_BAD_GATEWAY: &[u8] =
 
 /// Builds the 10-byte SOCKS5 UDP ASSOCIATE reply advertising `bound`.
 /// A non-IPv4 bind address leaves BND.ADDR zeroed, as before.
-pub(crate) fn socks5_udp_associate_reply(bound: SocketAddr) -> [u8; 10] {
-    let mut resp = [0u8; 10];
-    resp[0] = 5;
-    resp[1] = 0;
-    resp[2] = 0;
-    resp[3] = 1;
-    if let IpAddr::V4(ip) = bound.ip() {
-        resp[4..8].copy_from_slice(&ip.octets())
+pub(crate) fn socks5_udp_associate_reply(bound: SocketAddr) -> Vec<u8> {
+    match bound.ip() {
+        IpAddr::V4(ip) => {
+            let mut resp = Vec::with_capacity(10);
+            resp.extend_from_slice(&[5, 0, 0, 1]);
+            resp.extend_from_slice(&ip.octets());
+            resp.extend_from_slice(&bound.port().to_be_bytes());
+            resp
+        }
+        IpAddr::V6(v6) => {
+            if let Some(ip4) = v6.to_ipv4_mapped() {
+                let mut resp = Vec::with_capacity(10);
+                resp.extend_from_slice(&[5, 0, 0, 1]);
+                resp.extend_from_slice(&ip4.octets());
+                resp.extend_from_slice(&bound.port().to_be_bytes());
+                resp
+            } else {
+                let mut resp = Vec::with_capacity(22);
+                resp.extend_from_slice(&[5, 0, 0, 4]);
+                resp.extend_from_slice(&v6.octets());
+                resp.extend_from_slice(&bound.port().to_be_bytes());
+                resp
+            }
+        }
     }
-    resp[8..10].copy_from_slice(&bound.port().to_be_bytes());
-    resp
 }
 
 /// Shared `ws://` upstream core: strips the scheme (failing with
@@ -196,7 +370,10 @@ pub(crate) struct PooledUpstream<R, W> {
     last_used: Instant,
 }
 
-pub(crate) const NON_MUX_POOL_SIZE: usize = 32;
+#[inline(always)]
+pub(crate) fn non_mux_pool_size() -> usize {
+    crate::adaptive::profile().non_mux_pool_size
+}
 pub(crate) const NON_MUX_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 pub(crate) const NON_MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const NON_MUX_MAINTAIN_INTERVAL: Duration = Duration::from_millis(500);
@@ -259,7 +436,7 @@ where
             let now = Instant::now();
             conns.retain(|c| pooled_usable(c.created, c.last_used, now));
             let p = conns.pop();
-            let low = conns.len() < NON_MUX_POOL_SIZE / 2;
+            let low = conns.len() < non_mux_pool_size() / 2;
             (p, low)
         };
         if need_refill {
@@ -285,7 +462,7 @@ where
             let need = {
                 let mut conns = self.conns.lock().await;
                 conns.retain(|c| pooled_usable(c.created, c.last_used, Instant::now()));
-                NON_MUX_POOL_SIZE.saturating_sub(conns.len())
+                non_mux_pool_size().saturating_sub(conns.len())
             };
             if need == 0 {
                 return;
@@ -431,6 +608,7 @@ where
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
+                let _ = write_frame(&mut wr, &[], 8, true).await;
                 break;
             }
             crate::stats::add_bytes(n as i64, 0);
@@ -1190,7 +1368,9 @@ mod tests {
             let orig: Vec<u8> = (0..len).map(|x| (x * 7 + 3) as u8).collect();
             let mut ref_buf = orig.clone();
             for (i, b) in ref_buf.iter_mut().enumerate() {
-                *b ^= key_data[i % key_data.len()] ^ ws_mask[i & 3];
+                let k = std::hint::black_box(key_data[i % key_data.len()]);
+                let m = std::hint::black_box(ws_mask[i & 3]);
+                *b ^= k ^ m;
             }
 
             let mut fused_buf = orig.clone();
@@ -1722,6 +1902,9 @@ fn parse_response(buf: &[u8], qtype: u16, host: &str) -> Result<(Option<IpAddr>,
         bail!("DNS response too short");
     }
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 {
+        bail!("DNS packet is not a response");
+    }
     let truncated = flags & 0x0200 != 0;
     let rcode = flags & 0x000f;
     if rcode != 0 {
@@ -1730,10 +1913,23 @@ fn parse_response(buf: &[u8], qtype: u16, host: &str) -> Result<(Option<IpAddr>,
     let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
     let mut offset = 12usize;
-    validate_question_section(buf, &mut offset, qd, host, qtype)?;
+    if let Err(e) = validate_question_section(buf, &mut offset, qd, host, qtype) {
+        if truncated {
+            return Ok((None, true));
+        }
+        return Err(e);
+    }
     for _ in 0..an {
-        skip_name(buf, &mut offset)?;
+        if let Err(e) = skip_name(buf, &mut offset) {
+            if truncated {
+                return Ok((None, true));
+            }
+            return Err(e);
+        }
         if offset + 10 > buf.len() {
+            if truncated {
+                return Ok((None, true));
+            }
             bail!("truncated DNS answer header");
         }
         let rr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
@@ -1741,6 +1937,9 @@ fn parse_response(buf: &[u8], qtype: u16, host: &str) -> Result<(Option<IpAddr>,
         let rd_len = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
         offset += 10;
         if offset + rd_len > buf.len() {
+            if truncated {
+                return Ok((None, true));
+            }
             bail!("truncated DNS answer data");
         }
         if class == 1 && rr_type == qtype {
@@ -1774,6 +1973,9 @@ fn parse_all_ipv4_from_response(buf: &[u8], host: &str) -> Result<(Vec<Ipv4Addr>
         bail!("DNS response too short");
     }
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 {
+        bail!("DNS packet is not a response");
+    }
     let truncated = flags & 0x0200 != 0;
     let rcode = flags & 0x000f;
     if rcode != 0 {
@@ -1782,11 +1984,24 @@ fn parse_all_ipv4_from_response(buf: &[u8], host: &str) -> Result<(Vec<Ipv4Addr>
     let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
     let mut offset = 12usize;
-    validate_question_section(buf, &mut offset, qd, host, 1)?;
+    if let Err(e) = validate_question_section(buf, &mut offset, qd, host, 1) {
+        if truncated {
+            return Ok((Vec::new(), true));
+        }
+        return Err(e);
+    }
     let mut ips = Vec::new();
     for _ in 0..an {
-        skip_name(buf, &mut offset)?;
+        if let Err(e) = skip_name(buf, &mut offset) {
+            if truncated {
+                return Ok((ips, true));
+            }
+            return Err(e);
+        }
         if offset + 10 > buf.len() {
+            if truncated {
+                return Ok((ips, true));
+            }
             bail!("truncated DNS answer header");
         }
         let rr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
@@ -1794,6 +2009,9 @@ fn parse_all_ipv4_from_response(buf: &[u8], host: &str) -> Result<(Vec<Ipv4Addr>
         let rd_len = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
         offset += 10;
         if offset + rd_len > buf.len() {
+            if truncated {
+                return Ok((ips, true));
+            }
             bail!("truncated DNS answer data");
         }
         if class == 1 && rr_type == 1 && rd_len == 4 {
@@ -2298,8 +2516,8 @@ use crate::mux_writer::{
 };
 use crate::protocol::{
     decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, MUX_INITIAL_WINDOW_KIB,
-    MUX_WINDOW_REFRESH,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
+    mux_window_refresh,
 };
 use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response, SocksCommand,
@@ -2481,7 +2699,7 @@ impl SessionState {
         if !is_ok {
             bail!("upstream rejected MUX handshake")
         };
-        let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
+        let version_payload = encode_version_payload(mux_initial_window_kib());
         send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload, cfg.obfs)
             .await?;
         let state = Arc::new(Self {
@@ -2587,7 +2805,7 @@ impl SessionState {
             }
         };
 
-        let (tx, rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
+        let (tx, rx) = mpsc::channel(crate::protocol::mux_stream_queue_cap());
         let gate = CreditGate::new();
 
         let id = {
@@ -3107,24 +3325,16 @@ async fn handle_tcp_proxy(
                     let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(written as u32);
-                        if refund_pending as usize >= MUX_WINDOW_REFRESH {
+                        if refund_pending as usize >= mux_window_refresh() {
                             let credit = std::mem::take(&mut refund_pending);
-                            if let Err(e) = send_mux_parts(
+                            crate::common::try_send_mux_parts(
                                 &session.writer,
                                 &session.cipher,
                                 id,
                                 MuxCommand::Window,
                                 &encode_window_payload(credit),
                                 session.obfs,
-                            )
-                            .await
-                            {
-                                if let Some(ctrl) = deferred_ctrl.take() {
-                                    recycle_encode_buf(ctrl.into_storage());
-                                }
-                                result = Err(e);
-                                break;
-                            }
+                            );
                         }
                     } else {
                         refund_pending = 0;
@@ -3185,7 +3395,7 @@ async fn handle_tcp_proxy(
 
 pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> {
     let pool = MuxSessionPool::new(cfg.clone(), session_count);
-    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     apply_listener_options(&listener);
     let pool_maintainer = pool.clone();
     tokio::spawn(async move {
@@ -3300,21 +3510,18 @@ const WRITE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Kept deliberately small: one batch is at most [`BATCH_MAX_FRAMES`], and
 /// a larger pool showed up as a clear setup-mode RSS regression (8:0) in
 /// the first A/B — 32 × ~80 KiB ≈ 2.5 MiB retained ceiling.
-const ENCODE_POOL_MAX_COUNT: usize = 256;
+/// Minimum capacity worth pooling in the 80 KiB encode pool; smaller frames
+/// allocate exact capacity so queued small frames never pin 80 KiB each on low-RAM VPS.
+const ENCODE_POOL_MIN_CAP: usize = 32 * 1024;
 /// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
 /// ~80 KiB so a rare huge frame cannot pin memory.
 const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
-/// Shards for the encode-buffer pool.
-///
-/// One global mutex made every relay's encode/recycle pair serialise against
-/// every other relay in the process, which caps packets-per-second scaling
-/// once frames get small. Sharding spreads that across [`ENCODE_POOL_SHARDS`]
-/// locks while keeping the *total* retained ceiling at
-/// [`ENCODE_POOL_MAX_COUNT`] buffers: the per-shard cap is `MAX / SHARDS`,
-/// because the first A/B measured a larger pool as a setup-mode RSS
-/// regression and sharding deliberately must not grow it.
 const ENCODE_POOL_SHARDS: usize = 8;
-const ENCODE_POOL_SHARD_MAX_COUNT: usize = ENCODE_POOL_MAX_COUNT / ENCODE_POOL_SHARDS;
+
+#[inline(always)]
+fn encode_pool_shard_max_count() -> usize {
+    crate::adaptive::profile().encode_pool_shard_cap
+}
 /// Per-stream byte credit added each deficit round (GoWay parity).
 /// Set to 128KB so that even maximum-size MUX frames (~67KB) can be
 /// dispatched in a single round without deficit underflow stall.
@@ -3352,7 +3559,7 @@ fn encode_pool() -> &'static [PoolShard; ENCODE_POOL_SHARDS] {
     ENCODE_POOL.get_or_init(|| {
         std::array::from_fn(|_| PoolShard {
             len: AtomicUsize::new(0),
-            bufs: StdMutex::new(Vec::with_capacity(ENCODE_POOL_SHARD_MAX_COUNT)),
+            bufs: StdMutex::new(Vec::with_capacity(encode_pool_shard_max_count())),
         })
     })
 }
@@ -3386,7 +3593,7 @@ pub(crate) fn acquire_encode_buf() -> Vec<u8> {
 /// Returns a post-write frame buffer to the pool (best-effort: zero-cap or
 /// oversized buffers are dropped, as are buffers when every shard is full).
 pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
-    if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
+    if buf.capacity() < ENCODE_POOL_MIN_CAP || buf.capacity() > ENCODE_POOL_MAX_CAP {
         return;
     }
     buf.clear();
@@ -3394,11 +3601,11 @@ pub(crate) fn recycle_encode_buf(mut buf: Vec<u8>) {
     let start = pool_shard();
     for offset in 0..ENCODE_POOL_SHARDS {
         let shard = &shards[(start + offset) % ENCODE_POOL_SHARDS];
-        if shard.len.load(Ordering::Relaxed) >= ENCODE_POOL_SHARD_MAX_COUNT {
+        if shard.len.load(Ordering::Relaxed) >= encode_pool_shard_max_count() {
             continue;
         }
         let mut pool = shard.bufs.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.len() < ENCODE_POOL_SHARD_MAX_COUNT {
+        if pool.len() < encode_pool_shard_max_count() {
             pool.push(buf);
             shard.len.store(pool.len(), Ordering::Relaxed);
             return;
@@ -3423,14 +3630,14 @@ where
             return;
         }
         let shard = &shards[(start + offset) % ENCODE_POOL_SHARDS];
-        if shard.len.load(Ordering::Relaxed) >= ENCODE_POOL_SHARD_MAX_COUNT {
+        if shard.len.load(Ordering::Relaxed) >= encode_pool_shard_max_count() {
             continue;
         }
         let mut pool = shard.bufs.lock().unwrap_or_else(|e| e.into_inner());
-        while pool.len() < ENCODE_POOL_SHARD_MAX_COUNT {
+        while pool.len() < encode_pool_shard_max_count() {
             match iter.next() {
                 Some(mut buf) => {
-                    if buf.capacity() == 0 || buf.capacity() > ENCODE_POOL_MAX_CAP {
+                    if buf.capacity() < ENCODE_POOL_MIN_CAP || buf.capacity() > ENCODE_POOL_MAX_CAP {
                         continue;
                     }
                     buf.clear();
@@ -4614,7 +4821,7 @@ pub mod nonmux {
 
 use crate::common::{
     configured_cipher, relay_non_mux_ws, split_ws_url, try_cloudflare_edges, NonMuxOkRejection,
-    NonMuxPool, NonMuxRelaySpec, NON_MUX_POOL_SIZE,
+    NonMuxPool, NonMuxRelaySpec, non_mux_pool_size,
 };
 use crate::dns::resolve_socket;
 use crate::proxy::{
@@ -4779,14 +4986,14 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     tokio::spawn(async move {
         maintainer.maintain().await;
     });
-    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     crate::runtime::apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
         "RushWay non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
         cfg.proxy_host,
         cfg.proxy_port,
-        NON_MUX_POOL_SIZE,
+        non_mux_pool_size(),
     );
     let mut set = tokio::task::JoinSet::new();
     loop {
@@ -4829,7 +5036,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     Ok(())
 }
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
-    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     crate::runtime::apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
@@ -5173,22 +5380,25 @@ pub const MAX_MUX_PAYLOAD: usize = u16::MAX as usize;
 /// Wire version advertised in the VERSION frame payload.
 #[allow(dead_code)]
 pub const MUX_PROTO_VERSION: u8 = 1;
-/// Initial per-stream receive window advertised in VERSION (KiB).
-#[allow(dead_code)]
-pub const MUX_INITIAL_WINDOW_KIB: u16 = 16384;
-/// Send a WINDOW refund once this many consumed bytes have accumulated.
-#[allow(dead_code)]
-pub const MUX_WINDOW_REFRESH: usize = 2 * 1024 * 1024;
+/// Initial per-stream receive window advertised in VERSION (KiB), adaptive to RAM.
+#[inline(always)]
+pub fn mux_initial_window_kib() -> u16 {
+    crate::adaptive::profile().mux_initial_window_kib
+}
+/// Send a WINDOW refund once this many consumed bytes have accumulated, adaptive to RAM.
+#[inline(always)]
+pub fn mux_window_refresh() -> usize {
+    crate::adaptive::profile().mux_window_refresh
+}
 /// Floor applied to a peer-advertised window so a broken/zero VERSION
 /// can never starve the sender (frames are at most 64 KiB).
 #[allow(dead_code)]
 pub const MUX_WINDOW_MIN_KIB: u16 = 64;
-/// Capacity for per-stream MUX data channel (GoWay parity).
-/// Sized to 768 frames so that an entire 8 MiB window burst
-/// (up to ~512-768 frames of 10-16 KiB each) can be absorbed in-flight
-/// without hitting `TrySendError::Full` and triggering premature stream resets.
-#[allow(dead_code)]
-pub const MUX_STREAM_QUEUE_CAP: usize = 1536;
+/// Capacity for per-stream MUX data channel, adaptive to RAM tier.
+#[inline(always)]
+pub fn mux_stream_queue_cap() -> usize {
+    crate::adaptive::profile().mux_stream_queue_cap
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxCommand {
@@ -7030,7 +7240,13 @@ async fn relay_quic_udp(
     pool: Arc<QuicClientPool>,
 ) -> Result<()> {
     let local_ip = match control.local_addr() {
-        Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
+        Ok(addr) if !addr.ip().is_unspecified() => match addr.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            ip => ip,
+        },
         _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
     let udp = Arc::new(UdpSocket::bind(std::net::SocketAddr::new(local_ip, 0)).await?);
@@ -7082,6 +7298,7 @@ async fn relay_quic_udp(
         bail!("QUIC UDP upstream rejected: {}", ok)
     }
     let latest = Arc::new(StdMutex::new(None::<std::net::SocketAddr>));
+    let block_local = cfg.block_local;
     let udp_send = udp.clone();
     let latest_send = latest.clone();
     let mut send_task = send;
@@ -7095,6 +7312,13 @@ async fn relay_quic_udp(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
+                let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
+                    continue;
+                };
+                if let Err(e) = crate::runtime::check_target_policy(block_local, &target) {
+                    tracing::debug!(error = %e, "QUIC UDP datagram dropped by target policy");
+                    continue;
+                }
                 *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 crate::stats::add_bytes(pkt.len() as i64, 0);
                 if write_len_prefixed_udp_reuse(&mut send_task, pkt, &mut scratch)
@@ -7180,7 +7404,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
             }
         }
     });
-    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
@@ -7255,7 +7479,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
-    let bind: std::net::SocketAddr = format!("{}:{}", cfg.proxy_host, cfg.proxy_port).parse()?;
+    let bind: std::net::SocketAddr = crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port).parse()?;
     let socket_buf = quic_socket_buffer_bytes(&cfg);
     let std_socket = bound_udp_socket(bind, socket_buf)?;
     let endpoint = Endpoint::new(
@@ -7488,8 +7712,9 @@ async fn handle_server_udp_stream(
                 read_len_prefixed_udp(&mut recv, &mut frame_buf).await?
             {
                 let packet = &frame_buf[..packet_len];
-                let (target, payload) =
-                    parse_socks5_udp_datagram(packet).map_err(|e| anyhow!(e.to_string()))?;
+                let Ok((target, payload)) = parse_socks5_udp_datagram(packet) else {
+                    continue;
+                };
                 if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
@@ -7776,14 +8001,14 @@ use crate::flow::CreditGate;
 use crate::mux_writer::MuxFrameWriter;
 use crate::protocol::{
     decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, MUX_INITIAL_WINDOW_KIB,
-    MUX_WINDOW_REFRESH,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
+    mux_window_refresh,
 };
 use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame, read_frame_with_cipher,
-    read_http_headers, validate_server_handshake, write_frame, write_frame_borrowed,
+    validate_server_handshake, write_frame, write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::SockRef;
@@ -7928,7 +8153,6 @@ pub(crate) const SHUTDOWN_DRAIN_SECS: u64 = 5;
 /// overwritten by `read` before the used prefix is consumed, so no
 /// zeroing is needed on either path.
 const POOLED_BUF_MAX_SIZE: usize = 1024 * 1024;
-const POOLED_BUF_MAX_COUNT: usize = 128;
 
 static RELAY_BUFS: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
 
@@ -7940,8 +8164,9 @@ fn recycle_buf_sync(buf: Vec<u8>) {
     if buf.len() > POOLED_BUF_MAX_SIZE {
         return;
     }
+    let max_count = crate::adaptive::profile().relay_pool_max_count;
     let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
-    if pool.len() < POOLED_BUF_MAX_COUNT {
+    if pool.len() < max_count {
         pool.push(buf);
     }
 }
@@ -8205,6 +8430,15 @@ pub(crate) fn apply_listener_options(listener: &TcpListener) {
     }
     let _ = listener;
 }
+pub(crate) fn format_listen_addr(host: &str, port: u16) -> String {
+    let clean = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if clean.contains(':') {
+        format!("[{clean}]:{port}")
+    } else {
+        format!("{clean}:{port}")
+    }
+}
+
 pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
     apply_socket_options_raw(stream, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
 }
@@ -8408,7 +8642,7 @@ async fn maybe_send_window(
         return;
     }
     *refund_pending = refund_pending.saturating_add(consumed as u32);
-    if (*refund_pending as usize) < MUX_WINDOW_REFRESH {
+    if (*refund_pending as usize) < mux_window_refresh() {
         return;
     }
     let credit = std::mem::take(refund_pending);
@@ -8510,7 +8744,7 @@ where
     cipher.apply(&mut ok);
     let mut flight = encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?;
     let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-    let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
+    let version_payload = encode_version_payload(mux_initial_window_kib());
     let mut ver_buf = crate::mux_writer::acquire_encode_buf();
     crate::mux_writer::encode_mux_ws_frame(
         &mut ver_buf,
@@ -8530,7 +8764,7 @@ where
         Arc::new(std::sync::RwLock::new(U32HashMap::default()));
     // Session-wide ceiling on bytes parked in pre-dial `pending` queues
     // across every stream multiplexed here (see `PendingBytes`).
-    const MAX_SESSION_PENDING_BYTES: usize = 512 * 1024 * 1024;
+    let max_session_pending_bytes: usize = crate::adaptive::profile().max_session_pending_bytes;
     let pending_bytes_total = Arc::new(AtomicUsize::new(0));
     // JoinSet, not Vec<JoinHandle>: a long-lived session used to push one
     // handle per stream it ever opened and only released them at session end.
@@ -8602,7 +8836,7 @@ where
                     continue;
                 }
 
-                let (tx, mut rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
+                let (tx, mut rx) = mpsc::channel(crate::protocol::mux_stream_queue_cap());
                 let (cancel, cancelled) = watch::channel(false);
                 let gate = CreditGate::new();
                 let kib = peer_window.load(Ordering::Acquire);
@@ -8612,26 +8846,27 @@ where
 
                 // Atomically admit and register the logical stream. This removes
                 // the check-then-insert race during large concurrent SYN bursts.
-                let (admitted, old_cancel) = {
+                let (admitted, old_entry) = {
                     let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                     if guard.len() >= 2048 {
                         (false, None)
                     } else if let Some(old) = guard.remove(&stream_id) {
-                        (false, Some(old.cancel))
+                        (false, Some(old))
                     } else {
                         guard.insert(
                             stream_id,
                             StreamEntry {
-                                tx: tx.clone(),
-                                cancel: cancel.clone(),
+                                tx,
+                                cancel,
                                 gate: gate.clone(),
                             },
                         );
                         (true, None)
                     }
                 };
-                if let Some(old_cancel) = old_cancel {
-                    let _ = old_cancel.send(true);
+                if let Some(old) = old_entry {
+                    old.gate.close();
+                    let _ = old.cancel.send(true);
                 }
                 if !admitted {
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
@@ -8668,8 +8903,8 @@ where
                 // muxServerStreamBufferLimit (8 MiB): a single eager flow
                 // (e.g. 4 MiB written right after CONNECT) must survive a
                 // slow target dial instead of being reset.
-                const MAX_PENDING_FRAMES: usize = 512;
-                const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+                let max_pending_frames: usize = crate::adaptive::profile().max_stream_pending_frames;
+                let max_pending_bytes: usize = crate::adaptive::profile().max_stream_pending_bytes;
                 async fn reject_pending_overflow(
                     writer: &Arc<MuxFrameWriter>,
                     cipher: &XorCipher,
@@ -8689,7 +8924,7 @@ where
 
                     if let Some(first_frame) = initial_frame {
                         let len = first_frame.payload().len();
-                        if !pending_budget.try_reserve(len, MAX_SESSION_PENDING_BYTES) {
+                        if !pending_budget.try_reserve(len, max_session_pending_bytes) {
                             crate::mux_writer::recycle_encode_buf(first_frame.into_storage());
                             reject_pending_overflow(
                                 &writer_task,
@@ -8759,11 +8994,11 @@ where
                                         // Per-stream ceiling first so no
                                         // reservation is made when it trips,
                                         // then the session-wide budget.
-                                        if pending.len() >= MAX_PENDING_FRAMES
+                                        if pending.len() >= max_pending_frames
                                             || pending_budget.held_bytes().saturating_add(len)
-                                                > MAX_PENDING_BYTES
+                                                > max_pending_bytes
                                             || !pending_budget
-                                                .try_reserve(len, MAX_SESSION_PENDING_BYTES)
+                                                .try_reserve(len, max_session_pending_bytes)
                                         {
                                             crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                             crate::mux_writer::recycle_encode_bufs(
@@ -8809,11 +9044,11 @@ where
                         match command {
                             StreamCommand::Data(frame) => {
                                 let len = frame.payload().len();
-                                if pending.len() >= MAX_PENDING_FRAMES
+                                if pending.len() >= max_pending_frames
                                     || pending_budget.held_bytes().saturating_add(len)
-                                        > MAX_PENDING_BYTES
+                                        > max_pending_bytes
                                     || !pending_budget
-                                        .try_reserve(len, MAX_SESSION_PENDING_BYTES)
+                                        .try_reserve(len, max_session_pending_bytes)
                                 {
                                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                     crate::mux_writer::recycle_encode_bufs(
@@ -8899,11 +9134,22 @@ where
                         let mut data_batch: Vec<OwnedMuxFrame> = Vec::new();
                         let mut deferred: Option<StreamCommand> = None;
                         loop {
+                            if *cancelled.borrow() {
+                                break;
+                            }
                             let command = match deferred.take() {
                                 Some(c) => c,
-                                None => match rx.recv().await {
-                                    Some(c) => c,
-                                    None => break,
+                                None => tokio::select! {
+                                    cmd = rx.recv() => match cmd {
+                                        Some(c) => c,
+                                        None => break,
+                                    },
+                                    changed = cancelled.changed() => {
+                                        if changed.is_err() || *cancelled.borrow() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                 },
                             };
                             match command {
@@ -9014,14 +9260,27 @@ where
                         }
                     }
 
-                    if client_fin {
-                        tokio::select! {
-                            _ = &mut reader => {}
-                            cmd = rx.recv() => {
-                                if let Some(StreamCommand::Reset) = cmd {
-                                    reader.abort();
-                                } else {
-                                    let _ = reader.await;
+                    if client_fin && !*cancelled.borrow() {
+                        loop {
+                            tokio::select! {
+                                _ = &mut reader => break,
+                                changed = cancelled.changed() => {
+                                    if changed.is_err() || *cancelled.borrow() {
+                                        reader.abort();
+                                        break;
+                                    }
+                                }
+                                cmd = rx.recv() => {
+                                    match cmd {
+                                        Some(StreamCommand::Reset) | None => {
+                                            reader.abort();
+                                            break;
+                                        }
+                                        Some(StreamCommand::Data(f)) => {
+                                            crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                        }
+                                        Some(StreamCommand::Fin) => {}
+                                    }
                                 }
                             }
                         }
@@ -9029,6 +9288,11 @@ where
                         reader.abort();
                     }
 
+                    while let Ok(cmd) = rx.try_recv() {
+                        if let StreamCommand::Data(f) = cmd {
+                            crate::mux_writer::recycle_encode_buf(f.into_storage());
+                        }
+                    }
                     streams_task.write().unwrap_or_else(|e| e.into_inner()).remove(&stream_id);
                 });
 
@@ -9055,11 +9319,17 @@ where
                         crate::mux_writer::recycle_encode_buf(f.into_storage());
                         tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
                         let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
-                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                        if let Some(old) = streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+                            old.gate.close();
+                            let _ = old.cancel.send(true);
+                        }
                     }
                     Some(Err(mpsc::error::TrySendError::Closed(StreamCommand::Data(f)))) => {
                         crate::mux_writer::recycle_encode_buf(f.into_storage());
-                        streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                        if let Some(old) = streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+                            old.gate.close();
+                            let _ = old.cancel.send(true);
+                        }
                     }
                     Some(Err(_)) => {}
                 }
@@ -9078,7 +9348,10 @@ where
                 if full {
                     tracing::warn!(stream_id = id, "mux RST: queue full at FIN; resetting stalled stream");
                     let _ = send_reset_encrypted(&writer, &cipher, id, cfg.obfs).await;
-                    streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    if let Some(old) = streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+                        old.gate.close();
+                        let _ = old.cancel.send(true);
+                    }
                 }
             }
 
@@ -9089,12 +9362,9 @@ where
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&stream_id)
-                    .map(|s| (s.tx.clone(), s.cancel.clone()));
-                if let Some((tx, cancel)) = target {
-                    // Best-effort: the data queue may already be full, and
-                    // `cancel` is an out-of-band watch channel, so the stream
-                    // task is signalled either way without blocking the read
-                    // loop on a stalled consumer.
+                    .map(|s| (s.tx.clone(), s.cancel.clone(), s.gate.clone()));
+                if let Some((tx, cancel, gate)) = target {
+                    gate.close();
                     let _ = tx.try_send(StreamCommand::Reset);
                     let _ = cancel.send(true);
                 }
@@ -9201,10 +9471,22 @@ where
                     &mut frame_buf,
                 ) => {
                     let Some((opcode, payload)) = res? else {
+                        let _ = target_wr.shutdown().await;
+                        let _ = timeout(
+                            Duration::from_secs(cfg.connection_timeout.max(5)),
+                            &mut download,
+                        )
+                        .await;
                         break;
                     };
                     if opcode == 8 {
                         crate::mux_writer::recycle_encode_buf(payload);
+                        let _ = target_wr.shutdown().await;
+                        let _ = timeout(
+                            Duration::from_secs(cfg.connection_timeout.max(5)),
+                            &mut download,
+                        )
+                        .await;
                         break;
                     }
                     if opcode != 2 {
@@ -9317,12 +9599,9 @@ where
                 crate::mux_writer::recycle_encode_buf(packet);
                 continue;
             }
-            let (target, payload) = match parse_socks5_udp_datagram(&packet) {
-                Ok(res) => res,
-                Err(e) => {
-                    crate::mux_writer::recycle_encode_buf(packet);
-                    return Err(anyhow!(e.to_string()));
-                }
+            let Ok((target, payload)) = parse_socks5_udp_datagram(&packet) else {
+                crate::mux_writer::recycle_encode_buf(packet);
+                continue;
             };
             if cfg.block_local && is_blocked_local_host(&target.host) {
                 crate::mux_writer::recycle_encode_buf(packet);
@@ -9400,7 +9679,7 @@ where
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
-    let listener = TcpListener::bind(format!("{}:{}", cfg.proxy_host, cfg.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!(
@@ -11603,7 +11882,13 @@ pub async fn handle_local_udp_proxy(
 ) -> Result<()> {
     let _ = &bind_hint;
     let local_ip = match control.local_addr() {
-        Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
+        Ok(addr) if !addr.ip().is_unspecified() => match addr.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            ip => ip,
+        },
         _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
     let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
@@ -11716,11 +12001,12 @@ pub async fn handle_local_udp_proxy(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                if let Ok((target, _)) = parse_socks5_udp_datagram(pkt) {
-                    if let Err(e) = check_target_policy(block_local, &target) {
-                        tracing::debug!(error = %e, "WS UDP datagram dropped by target policy");
-                        continue;
-                    }
+                let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
+                    continue;
+                };
+                if let Err(e) = check_target_policy(block_local, &target) {
+                    tracing::debug!(error = %e, "WS UDP datagram dropped by target policy");
+                    continue;
                 }
                 *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 let mut packet = crate::mux_writer::acquire_encode_buf();
@@ -12763,14 +13049,14 @@ where
                 key.copy_from_slice(&rest[ext_len..ext_len + 4]);
             }
             let total = len as usize;
-            if buf.capacity() == 0 && total > 0 {
+            if buf.capacity() == 0 && total >= 32 * 1024 {
                 *buf = crate::mux_writer::acquire_encode_buf();
             }
             if total > buf.capacity() {
-                if total > 4096 && total <= READ_SEGMENT {
+                if total >= 32 * 1024 && total <= READ_SEGMENT {
                     buf.reserve_exact(READ_SEGMENT);
                 } else {
-                    buf.reserve(total.min(READ_SEGMENT));
+                    buf.reserve_exact(total.min(READ_SEGMENT));
                 }
             }
             let mut read: usize = 0;
@@ -13156,7 +13442,7 @@ pub mod wss_client {
 
 use crate::common::{
     configured_cipher, relay_non_mux_ws, send_mux_parts, send_mux_parts_reuse,
-    socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED, NON_MUX_POOL_SIZE,
+    socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED, non_mux_pool_size,
     NonMuxOkRejection, NonMuxPool, NonMuxRelaySpec,
 };
 use crate::crypto::XorCipher;
@@ -13167,8 +13453,8 @@ use crate::mux_writer::{
 };
 use crate::protocol::{
     decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, MUX_INITIAL_WINDOW_KIB,
-    MUX_WINDOW_REFRESH,
+    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
+    mux_window_refresh,
 };
 use crate::proxy::{
     parse_authority_with_default, parse_socks5_udp_datagram, read_client_proxy_request,
@@ -13460,7 +13746,13 @@ async fn handle_udp_proxy(
 ) -> Result<()> {
     let _ = &bind_hint;
     let local_ip = match control.local_addr() {
-        Ok(addr) if !addr.ip().is_unspecified() => addr.ip(),
+        Ok(addr) if !addr.ip().is_unspecified() => match addr.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            ip => ip,
+        },
         _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
     let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
@@ -13512,11 +13804,12 @@ async fn handle_udp_proxy(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                if let Ok((target, _)) = parse_socks5_udp_datagram(pkt) {
-                    if let Err(e) = check_target_policy(block_local, &target) {
-                        tracing::debug!(error = %e, "WSS UDP datagram dropped by target policy");
-                        continue;
-                    }
+                let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
+                    continue;
+                };
+                if let Err(e) = check_target_policy(block_local, &target) {
+                    tracing::debug!(error = %e, "WSS UDP datagram dropped by target policy");
+                    continue;
                 }
                 *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 let mut packet = crate::mux_writer::acquire_encode_buf();
@@ -13638,14 +13931,14 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
     tokio::spawn(async move {
         maintainer.maintain().await;
     });
-    let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&wc.proxy_host, wc.proxy_port)).await?;
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     tracing::info!(
         "RushWay WSS non-MUX client proxy listening on {}:{} ({} pre-warmed upstream connections)",
         wc.proxy_host,
         wc.proxy_port,
-        NON_MUX_POOL_SIZE,
+        non_mux_pool_size(),
     );
     let mut set = tokio::task::JoinSet::new();
     loop {
@@ -13764,7 +14057,7 @@ impl WssSessionState {
             closed: AtomicBool::new(false),
             capacity_notify,
         });
-        let version_payload = encode_version_payload(MUX_INITIAL_WINDOW_KIB);
+        let version_payload = encode_version_payload(mux_initial_window_kib());
         send_mux_parts(
             &writer,
             &cipher_for_version,
@@ -13839,7 +14132,7 @@ impl WssSessionState {
         if !self.try_reserve() {
             bail!("WSS physical session is full or closed")
         };
-        let (tx, rx) = mpsc::channel(crate::protocol::MUX_STREAM_QUEUE_CAP);
+        let (tx, rx) = mpsc::channel(crate::protocol::mux_stream_queue_cap());
         let gate = CreditGate::new();
 
         let id = {
@@ -14419,24 +14712,16 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                     let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(written as u32);
-                        if refund_pending as usize >= MUX_WINDOW_REFRESH {
+                        if refund_pending as usize >= mux_window_refresh() {
                             let credit = std::mem::take(&mut refund_pending);
-                            if let Err(e) = send_mux_parts(
+                            crate::common::try_send_mux_parts(
                                 &session.writer,
                                 &session.cipher,
                                 stream_id,
                                 MuxCommand::Window,
                                 &encode_window_payload(credit),
                                 session.obfs,
-                            )
-                            .await
-                            {
-                                if let Some(ctrl) = deferred_ctrl.take() {
-                                    recycle_encode_buf(ctrl.into_storage());
-                                }
-                                result = Err(e);
-                                break;
-                            }
+                            );
                         }
                     } else {
                         refund_pending = 0;
@@ -14502,7 +14787,7 @@ pub async fn run_client_from_config(
 ) -> Result<()> {
     let wc = WssConfig::from_runtime_config(&cfg, verify_ssl)?;
     let pool = WssSessionPool::new(wc.clone(), session_count);
-    let listener = TcpListener::bind(format!("{}:{}", wc.proxy_host, wc.proxy_port)).await?;
+    let listener = TcpListener::bind(crate::runtime::format_listen_addr(&wc.proxy_host, wc.proxy_port)).await?;
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     let pool_maintainer = pool.clone();
@@ -14974,6 +15259,13 @@ where
                                     format!("--no-{name}")
                                 };
                             }
+                            "obfs" | "wss-server" => {
+                                return if value {
+                                    format!("--{name}")
+                                } else {
+                                    String::new()
+                                };
+                            }
                             "no-mux"
                             | "no-block-local"
                             | "no-tcp-nodelay"
@@ -15142,7 +15434,7 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
 }
 
 async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
-    let public_bind = format!("{}:{}", cfg.proxy_host, cfg.proxy_port);
+    let public_bind = runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port);
     let listener = TcpListener::bind(&public_bind).await?;
     runtime::apply_listener_options(&listener);
 
@@ -15240,6 +15532,14 @@ fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str, ver
     );
     println!(" [+] DNS:         {dns_display}");
     println!(" [+] Auth:        {auth}");
+    let mem_prof = adaptive::profile();
+    println!(
+        " [+] Memory:      {} MiB ({} profile, Window: {} MiB, Queue: {})",
+        mem_prof.detected_mib,
+        mem_prof.tier_name,
+        mem_prof.mux_initial_window_kib / 1024,
+        mem_prof.mux_stream_queue_cap
+    );
     println!(" [+] Buffer:      {} KB", cfg.buffer_size / 1024);
     println!(" [+] Max Conns:   {}", cfg.max_connections);
     if cfg.upstream.is_some() && !verify_ssl {
@@ -15330,11 +15630,15 @@ async fn main() -> Result<()> {
     if let Some(v) = args.socket_buffer_kib {
         cfg.socket_buffer = v;
     }
-    cfg.tcp_nodelay = !args.no_tcp_nodelay;
-    cfg.tcp_keepalive = !args.no_tcp_keepalive;
+    if args.no_tcp_nodelay {
+        cfg.tcp_nodelay = false;
+    }
+    if args.no_tcp_keepalive {
+        cfg.tcp_keepalive = false;
+    }
     if args.no_mux {
         cfg.mux = false;
-    } else if args.mux {
+    } else if raw_args.iter().any(|a| a == "--mux") {
         cfg.mux = true;
     }
     if args.allow_open {

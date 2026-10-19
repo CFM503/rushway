@@ -1319,3 +1319,60 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.57`.
 
+## Release: v0.0.58 (2026-10-19) — Adaptive Memory Profiling, Robust IPv6 / DNS Handling & CLI Configuration Precedence (Major Adaptive Architecture Release)
+
+### Context & User Directives
+- **Directives:** "检查编译有没有错误，更新修改日志，更新AI接力交接日志，推送仓库，推送tag，日志上要明确这次是一个自适应版本重要的升级、".
+- **Astra Engineering Review:**
+  - **Adaptive System Memory Profiling Architecture (Major Upgrade):**
+    - High-throughput defaults (16 MiB MUX window, 1536/3072-frame stream queues, 32 pre-warmed non-MUX connections, large encode/relay buffer pools) optimize for high-BDP servers but previously caused excessive memory pressure and potential OOM crashes on resource-constrained (512M / 1G RAM) VPS instances or containerized deployments.
+    - Implemented `crate::adaptive` module: performs early startup memory detection across Linux (`/proc/meminfo` + cgroup v1/v2), Unix (`libc::sysconf`), Windows (`GlobalMemoryStatusEx`), with optional `RUSHWAY_MEM_MIB` environment variable override.
+    - Maps effective host/cgroup memory into three distinct operational profiles:
+      - `Low-RAM` (<= 640 MiB): 4 MiB initial window, 512 KiB refresh, 768 stream queue cap, 8 pre-warmed connections, 5 MiB encode pool, 4 MiB relay pool, 32 MiB session pending cap.
+      - `Balanced` (641 - 2048 MiB): 8 MiB initial window, 1024 KiB refresh, 1536 stream queue cap, 16 pre-warmed connections, 10 MiB encode pool, 8 MiB relay pool, 96 MiB session pending cap.
+      - `High-BDP` (> 2048 MiB): 16 MiB initial window, 2048 KiB refresh, 3072 stream queue cap, 32 pre-warmed connections, 20.5 MiB encode pool, 16 MiB relay pool, 256 MiB session pending cap.
+  - **Exact Capacity Sizing & Pool Fragmentation Mitigation:**
+    - Small frames previously checked out 80 KiB pooled buffers, tying up significant memory for small payload transfers.
+    - Added `ENCODE_POOL_MIN_CAP = 32 KiB`: buffers smaller than 32 KiB bypass the pool and allocate exact lengths. Replaced `.reserve(...)` with `.reserve_exact(...)` in WebSocket frame decoders to eliminate allocator memory sprawl.
+  - **IPv6 RFC Compliance & Listener Formatting:**
+    - Standardized listener binding address construction via `format_listen_addr`, enclosing IPv6 hosts in brackets (`[host]:port`) to prevent parse errors.
+    - Refactored `socks5_udp_associate_reply` to dynamically return RFC 1928 compliant IPv6 (ATYP=4, 22-byte) or mapped IPv4 addresses instead of zeroed fields.
+  - **DNS Truncated (TC) Packet Resilience:**
+    - Validated DNS QR flag (`flags & 0x8000 != 0`) and added graceful handling for truncated (TC=1) packets, enabling seamless TCP fallback without abrupt bailing.
+  - **UDP Ingress Datagram Resilience:**
+    - Malformed SOCKS5 UDP packets previously aborted the entire UDP proxy task. Replaced error aborts with `continue` and buffer recycling, isolating corrupt or probing datagrams from tearing down healthy sessions.
+  - **CLI Flag Precedence Preservation:**
+    - Fixed `--mux`, `--no-tcp-nodelay`, and `--no-tcp-keepalive` override logic: explicitly inspects raw CLI tokens before applying defaults, strictly respecting JSON configuration files when flags are omitted on the command line.
+  - **Regression Risk:** Zero. All 137 unit tests pass without errors in debug and release profiles.
+
+### Changes Implemented
+1. **Adaptive Memory Profile Module (`src/main.rs:adaptive`)**:
+   - Implemented cross-platform physical and cgroup memory detection with 3-tier profiles (`Low-RAM`, `Balanced`, `High-BDP`).
+   - Dynamicized all static flow-control windows, queue capacities, buffer pools, and pre-warmed connection limits.
+2. **Buffer Pooling & Exact Allocation Optimization (`src/main.rs:recycle_encode_buf`, `read_frame_inner`, `read_frame_with_cipher`)**:
+   - Enforced 32 KiB pool lower bound and `reserve_exact` allocation.
+3. **IPv6 Listener Formatting & SOCKS5 UDP Associate Reply (`src/main.rs:format_listen_addr`, `socks5_udp_associate_reply`)**:
+   - Bracketed IPv6 address formatting and compliant ATYP=4 UDP associate replies.
+4. **DNS Truncation Fallback & QR Verification (`src/main.rs:parse_response`, `parse_all_ipv4_from_response`)**:
+   - Handled TC bit gracefully and verified response flags.
+5. **UDP Ingress Error Isolation (`src/main.rs:relay_quic_udp`, `handle_server_udp_stream`, `handle_udp_proxy`, `handle_local_udp_proxy`)**:
+   - Swapped error termination for datagram skip and pool recycling.
+6. **CLI Configuration Precedence Fix (`src/main.rs:main`)**:
+   - Raw CLI inspection preserving JSON configuration defaults.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.58` across `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.58 - major adaptive memory profiling, IPv6 listener formatting, DNS TC resilience, and CLI config precedence`
+- Tag: `v0.0.58`
+
+### Status
+- Completed and released as `v0.0.58`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.58`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.58`.
+

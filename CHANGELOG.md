@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.58] - 2026-10-19
+
+### Adaptive System Memory Profiling, Robust IPv6 / DNS Handling & CLI Configuration Precedence (Major Adaptive Architecture Release)
+
+- **Adaptive System Memory Profiling & Dynamic Sizing (`src/main.rs:adaptive`)** — Major architectural upgrade: introduced startup host and container memory detection (Linux `/proc/meminfo` + cgroup v1/v2, Unix `sysconf`, Windows `GlobalMemoryStatusEx`, and `RUSHWAY_MEM_MIB` override) with three operational profiles (`Low-RAM`, `Balanced`, `High-BDP`). Dynamically sizes MUX initial window (4/8/16 MiB), stream queue capacity (768/1536/3072 frames), buffer pools, and non-MUX pre-warmed connection count (8/16/32). Eliminates OOM and RSS bloat on low-memory (512M/1G) VPS while saturating gigabit bandwidth on high-BDP servers.
+- **Granular Buffer Allocation & Exact Capacity Sizing (`src/main.rs:recycle_encode_buf`, `read_frame_inner`, `read_frame_with_cipher`)** — introduced `ENCODE_POOL_MIN_CAP` (32 KiB) to restrict the ~80 KiB pooled buffer pool to large frames, allocating exact memory for small control/data frames. Replaced speculative `.reserve()` with `.reserve_exact()` in frame decoders to eliminate allocator memory fragmentation and idle RSS inflation.
+- **RFC 1928 / IPv6 SOCKS5 UDP Associate & Bracketed Listen Address Formatting (`src/main.rs:format_listen_addr`, `socks5_udp_associate_reply`)** — wrapped IPv6 listen hosts in brackets `[host]:port` across all TCP, WSS, and QUIC listeners, fixing binding failures on IPv6 addresses. Upgraded `socks5_udp_associate_reply` to dynamically return compliant SOCKS5 IPv6 (ATYP=4, 22-byte) or mapped IPv4 replies.
+- **Truncated DNS (TC Flag) Fallback & Response Flag Verification (`src/main.rs:parse_response`, `parse_all_ipv4_from_response`)** — added DNS QR response flag validation (`flags & 0x8000 != 0`) and graceful handling of truncated (TC=1) packets, preventing parser bailouts and enabling clean upstream TCP fallback on large DNS responses.
+- **Resilient UDP Proxy Ingress Datagram Recovery (`src/main.rs:relay_quic_udp`, `handle_server_udp_stream`, `handle_udp_proxy`, `handle_local_udp_proxy`)** — changed malformed SOCKS5 UDP datagram handling from error aborts to `continue` and buffer recycling, isolating corrupt or probing datagrams from terminating active UDP proxy sessions. Added local target policy enforcement to QUIC UDP forwarders.
+- **WebSocket Eager Close Frame Emission & Server Drain (`src/main.rs:handle_server`, `run_client`)** — emits RFC 6455 Close frame (opcode 8) on upstream local client EOF, and shuts down target TCP streams with bounded drain timeouts upon Close frame reception on server forwarders.
+- **Explicit CLI Flag Precedence Preservation (`src/main.rs:main`)** — refactored `--mux` override logic to inspect raw input arguments (`raw_args.iter().any(|a| a == "--mux")`), ensuring command-line defaults no longer overwrite user-defined options in JSON configuration files. Similarly protected `--no-tcp-nodelay` and `--no-tcp-keepalive`.
+- **Startup Console Banner Memory Visibility (`src/main.rs:print_banner`)** — added system memory profile inspection to console banner, displaying detected MiB, active tier, window size, and stream queue capacity on startup.
+
 ## [v0.0.57] - 2026-10-19
 
 ### Non-Blocking System Control Frames, Window Credit Refund Decoupling & Server Stream Graceful Drain
