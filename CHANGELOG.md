@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.67] - 2026-10-20
+
+### SOCKS5 UDP Anti-Hijacking Security, MUX Stream Teardown Race Safety & Full-Stack Relay De-duplication
+
+- **RFC 1928 SOCKS5 UDP Anti-Hijacking Security & Client Address Normalization (`src/main.rs:udp_client_allowed`, `normalize_ip`, `relay_udp_ws`, `relay_quic_udp`)** — Implemented RFC 1928 §7 compliance by validating client UDP source addresses against `bind_hint` (port and non-unspecified IP) and TCP control connection peer IP. Added IPv4-mapped IPv6 address normalization (`normalize_ip`) and locked in the client address on the first authorized datagram, preventing local unauthorized processes or LAN attackers from hijacking ephemeral UDP relay ports across WS, WSS, and QUIC tunnels.
+- **Shared WebSocket UDP Relay Consolidation (`src/main.rs:relay_udp_ws`, `udp_relay::handle_local_udp_proxy`, `wss_client::handle_udp_proxy`)** — Unified bidirectional SOCKS5 UDP relay routines between plain WebSocket (`ws://`) and secure WebSocket (`wss://`) into a generic `relay_udp_ws` abstraction, eliminating over 300 lines of duplicated handshake verification, batch reading/writing, and target policy enforcement.
+- **Shared Client MUX Stream Forwarding Loop (`src/main.rs:relay_client_mux_stream`, `mux_pool::handle_tcp_proxy`, `wss_client::handle_connection`)** — Consolidated identical client-side MUX stream data forwarding, half-close coordination, rate/window credit refunding (`mux_window_refresh`), and upload/download drain select loops between `mux_pool` and `wss_client` into `relay_client_mux_stream`, eliminating approximately 600 lines of redundant code.
+- **Atomic CreditGate-Matched MUX Stream Deregistration (`src/main.rs:close_stream_if_same`, `SessionState`, `WssSessionState`, `ActiveStreamGuard`)** — Replaced raw stream ID removal with pointer-identity verified cleanup (`Arc::ptr_eq(&entry.gate, gate)`), preventing ABA race conditions where an asynchronous cleanup task drops or decrements the active counter of a newly reassigned stream sharing the same stream ID.
+- **Non-MUX Server TCP Logic De-duplication & Buffer Leak Prevention (`src/main.rs:nonmux::handle_server`, `runtime::handle_server_tcp_parts`)** — Reused `runtime::handle_server_tcp_parts` in `nonmux::handle_server`, and ensured `target_frame` is unconditionally returned to the encode buffer pool via `recycle_encode_buf` even when UTF-8 decoding or authority parsing fails.
+- **UDP Batch Writer Immediate Async Send & Accurate Push Argument (`src/main.rs:UdpBatchWriter::send`)** — Fixed `UdpBatchWriter::send` to pass the original `addr` to `push` rather than `dest`, avoiding redundant target socket conversions. Handled `ErrorKind::WouldBlock` on an empty queue via direct `sock.send_to(payload, dest).await`, bypassing allocation and queue enqueue overhead.
+- **Encode Buffer Pool Acquisition Threshold Heuristic (`src/main.rs:ws::read_frame`)** — Lowered the WS frame encode buffer pool acquisition threshold from 32 KiB to 4 KiB (`total > 4096`), improving buffer pool reuse and avoiding dynamic heap allocations for typical medium-sized network frames.
+
 ## [v0.0.66] - 2026-10-20
 
 ### Architecture Consolidation, Lock-Free UDP Hot-Path, Buffer Leak Fix & Unified Stream Cleanup

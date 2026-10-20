@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.66";
+pub const APP_VERSION: &str = "0.0.67";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -459,6 +459,407 @@ pub(crate) fn local_udp_bind_ip(control: &TcpStream) -> IpAddr {
         },
         _ => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     }
+}
+
+/// Normalizes an `IpAddr` by unwrapping IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`).
+#[inline]
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
+/// Validates whether a local UDP datagram from `peer` is authorized for a SOCKS5
+/// `UDP ASSOCIATE` session controlled by `control_peer_ip` with client `bind_hint`
+/// (RFC 1928 §7). Once the first valid client `SocketAddr` is locked in (`established`),
+/// only datagrams from that exact `SocketAddr` are accepted, preventing other local
+/// processes or LAN hosts from hijacking the ephemeral UDP relay port.
+pub(crate) fn udp_client_allowed(
+    peer: SocketAddr,
+    control_peer_ip: Option<IpAddr>,
+    bind_hint: &TargetAddr,
+    established: Option<SocketAddr>,
+) -> bool {
+    let peer = crate::udp_batch::normalize_peer_addr(peer);
+    if let Some(est) = established {
+        return peer == est;
+    }
+    if bind_hint.port != 0 && peer.port() != bind_hint.port {
+        return false;
+    }
+    if let Ok(hint_ip) = bind_hint.host.parse::<IpAddr>() {
+        let hint_ip = normalize_ip(hint_ip);
+        if !hint_ip.is_unspecified() {
+            return peer.ip() == hint_ip;
+        }
+    }
+    if let Some(ctrl_ip) = control_peer_ip.map(normalize_ip) {
+        if !ctrl_ip.is_unspecified() {
+            return peer.ip() == ctrl_ip;
+        }
+    }
+    true
+}
+
+/// Shared WebSocket (`ws://` and `wss://`) client UDP relay loop: sends the
+/// XOR-encrypted `"UDP
+"` handshake, verifies `"OK
+"`, and relays SOCKS5 UDP
+/// datagrams bidirectionally while enforcing target policy and source address locking.
+pub(crate) async fn relay_udp_ws<R, W>(
+    mut control: TcpStream,
+    udp: Arc<tokio::net::UdpSocket>,
+    bind_hint: &TargetAddr,
+    mut rd: R,
+    mut wr: W,
+    key: &Option<String>,
+    conn_timeout: Duration,
+    block_local: bool,
+    err_prefix: &'static str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let control_peer_ip = control.peer_addr().ok().map(|a| a.ip());
+    let hint = bind_hint.clone();
+    let c = configured_cipher(key);
+    let mut hello = b"UDP
+".to_vec();
+    c.apply(&mut hello);
+    write_frame(&mut wr, &hello, 2, true).await?;
+    let mut frame_buf = Vec::new();
+    let ok_res = timeout(
+        conn_timeout,
+        read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf),
+    )
+    .await
+    .map_err(|_| anyhow!("{err_prefix} UDP handshake OK timed out"))?;
+    let Some((opcode, mut ok)) = ok_res.inspect_err(|_| {
+        crate::mux_writer::recycle_encode_buf(std::mem::take(&mut frame_buf));
+    })?
+    else {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
+        bail!("{err_prefix} closed during UDP handshake")
+    };
+    if opcode != 2 {
+        crate::mux_writer::recycle_encode_buf(ok);
+        crate::mux_writer::recycle_encode_buf(frame_buf);
+        bail!("invalid {err_prefix} UDP handshake response opcode")
+    }
+    c.apply(&mut ok);
+    let is_ok = ok == b"OK
+";
+    crate::mux_writer::recycle_encode_buf(ok);
+    if !is_ok {
+        crate::mux_writer::recycle_encode_buf(frame_buf);
+        bail!("{err_prefix} rejected UDP handshake")
+    }
+    let latest = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
+    let udp_send = udp.clone();
+    let c_send = c.clone();
+    let latest_send = latest.clone();
+    let mut upload = AbortOnDrop(tokio::spawn(async move {
+        let mut batch = crate::udp_batch::UdpBatchReader::new(udp_send);
+        let mut packet = Vec::with_capacity(2048);
+        loop {
+            let count = match batch.recv().await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            for i in 0..count {
+                let (pkt, peer) = batch.packet(i);
+                let established = *latest_send.lock().unwrap_or_else(|e| e.into_inner());
+                if !udp_client_allowed(peer, control_peer_ip, &hint, established) {
+                    tracing::debug!(%peer, "UDP associate dropped datagram from unauthorized local peer");
+                    continue;
+                }
+                let Ok((target, _)) = crate::proxy::parse_socks5_udp_datagram(pkt) else {
+                    continue;
+                };
+                if let Err(e) = crate::runtime::check_target_policy(block_local, &target) {
+                    tracing::debug!(error = %e, "UDP datagram dropped by target policy");
+                    continue;
+                }
+                if established.is_none() {
+                    *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
+                }
+                packet.clear();
+                packet.extend_from_slice(pkt);
+                c_send.apply(&mut packet);
+                crate::stats::add_bytes(packet.len() as i64, 0);
+                if write_frame_borrowed(&mut wr, &mut packet, 2, true)
+                    .await
+                    .is_err()
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }));
+    let mut dummy = [0u8; 1];
+    let mut batch_writer = crate::udp_batch::UdpBatchWriter::new(udp);
+    tokio::select! {
+        _ = control.read(&mut dummy) => {}
+        _ = &mut upload => {}
+        _ = async {
+            loop {
+                let Some((opcode, packet)) = crate::ws::read_frame_with_cipher(
+                    &mut rd,
+                    Option::<&mut W>::None,
+                    &mut frame_buf,
+                    Some(&c),
+                )
+                .await?
+                else {
+                    break;
+                };
+                if opcode != 2 {
+                    crate::mux_writer::recycle_encode_buf(packet);
+                    continue;
+                }
+                let Ok((target, _payload)) = crate::proxy::parse_socks5_udp_datagram(&packet) else {
+                    crate::mux_writer::recycle_encode_buf(packet);
+                    continue;
+                };
+                if crate::runtime::check_target_policy(block_local, &target).is_err() {
+                    crate::mux_writer::recycle_encode_buf(packet);
+                    continue;
+                }
+                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(peer) = peer_opt {
+                    let n = packet.len();
+                    let _ = batch_writer.send(&packet, peer).await;
+                    crate::stats::add_bytes(0, n as i64);
+                }
+                crate::mux_writer::recycle_encode_buf(packet);
+            }
+            let _ = batch_writer.flush().await;
+            Ok::<(), anyhow::Error>(())
+        } => {}
+    }
+    crate::mux_writer::recycle_encode_buf(frame_buf);
+    upload.abort();
+    let _ = control.shutdown().await;
+    Ok(())
+}
+
+/// Shared client-side MUX stream bidirectional relay loop used by both `mux_pool`
+/// (`ws://`) and `wss_client` (`wss://`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relay_client_mux_stream(
+    local: TcpStream,
+    id: u32,
+    mut rx: tokio::sync::mpsc::Receiver<crate::protocol::OwnedMuxFrame>,
+    gate: Arc<crate::flow::CreditGate>,
+    writer: Arc<MuxFrameWriter>,
+    cipher: XorCipher,
+    obfs: bool,
+    peer_window_kib: & std::sync::atomic::AtomicU32,
+    buffer_size: usize,
+    connection_timeout: u64,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut local_rd, mut local_wr) = local.into_split();
+    let writer_up = writer.clone();
+    let cipher_up = cipher.clone();
+    let fin_sent = Arc::new(AtomicBool::new(false));
+    let fin_sent_up = fin_sent.clone();
+    let mut upload = AbortOnDrop(tokio::spawn(async move {
+        let mut buf = relay_buf(buffer_size).await;
+        let mut frame_scratch = Vec::new();
+        let res = async {
+            loop {
+                let n = match local_rd.read(&mut buf).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = send_mux_parts_reuse(
+                            &writer_up,
+                            &cipher_up,
+                            id,
+                            MuxCommand::Rst,
+                            &[],
+                            &mut frame_scratch,
+                            obfs,
+                        )
+                        .await;
+                        return Err(e.into());
+                    }
+                };
+                if n == 0 {
+                    if !fin_sent_up.swap(true, Ordering::AcqRel) {
+                        let _ = send_mux_parts_reuse(
+                            &writer_up,
+                            &cipher_up,
+                            id,
+                            MuxCommand::Fin,
+                            &[],
+                            &mut frame_scratch,
+                            obfs,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+                crate::stats::add_bytes(n as i64, 0);
+                let mut off = 0;
+                while off < n {
+                    let end = (off + u16::MAX as usize).min(n);
+                    gate.acquire(end - off).await;
+                    send_mux_parts_reuse(
+                        &writer_up,
+                        &cipher_up,
+                        id,
+                        MuxCommand::Data,
+                        &buf[off..end],
+                        &mut frame_scratch,
+                        obfs,
+                    )
+                    .await?;
+                    off = end
+                }
+            }
+            Result::<()>::Ok(())
+        }
+        .await;
+        crate::mux_writer::recycle_encode_buf(frame_scratch);
+        recycle_buf(buf).await;
+        res
+    }));
+    let mut upload_done = false;
+    let mut result = Result::<()>::Ok(());
+    let mut remote_fin = false;
+    let mut remote_rst = false;
+    let mut refund_pending: u32 = 0;
+    let mut data_batch: Vec<crate::protocol::OwnedMuxFrame> = Vec::with_capacity(16);
+    let mut deferred_ctrl: Option<crate::protocol::OwnedMuxFrame> = None;
+    loop {
+        let frame = if let Some(ctrl) = deferred_ctrl.take() {
+            ctrl
+        } else if !upload_done {
+            tokio::select! {
+                maybe_frame = rx.recv() => match maybe_frame {
+                    Some(f) => f,
+                    None => break,
+                },
+                up_res = &mut upload => {
+                    upload_done = true;
+                    match up_res {
+                        Ok(Ok(())) => match rx.recv().await {
+                            Some(f) => f,
+                            None => break,
+                        },
+                        Ok(Err(e)) => {
+                            result = Err(e);
+                            break;
+                        }
+                        Err(e) => {
+                            result = Err(anyhow!("upload task panicked: {e}"));
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            match rx.recv().await {
+                Some(f) => f,
+                None => break,
+            }
+        };
+        match frame.command {
+            MuxCommand::Data => {
+                data_batch.push(frame);
+                while data_batch.len() < 16 {
+                    match rx.try_recv() {
+                        Ok(next) if next.command == MuxCommand::Data => data_batch.push(next),
+                        Ok(other) => {
+                            deferred_ctrl = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let write_res =
+                    crate::mux_writer::write_owned_frames_vectored(&mut local_wr, &data_batch)
+                        .await;
+                crate::mux_writer::recycle_encode_bufs(
+                    data_batch
+                        .drain(..)
+                        .map(crate::protocol::OwnedMuxFrame::into_storage),
+                );
+                let written = match write_res {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if let Some(ctrl) = deferred_ctrl.take() {
+                            crate::mux_writer::recycle_encode_buf(ctrl.into_storage());
+                        }
+                        result = Err(e.into());
+                        break;
+                    }
+                };
+                if written > 0 {
+                    crate::stats::add_bytes(0, written as i64);
+                    let negotiated = peer_window_kib.load(Ordering::Relaxed) > 0;
+                    if negotiated {
+                        refund_pending = refund_pending.saturating_add(written as u32);
+                        if refund_pending as usize >= crate::protocol::mux_window_refresh() {
+                            let credit = std::mem::take(&mut refund_pending);
+                            try_send_mux_parts(
+                                &writer,
+                                &cipher,
+                                id,
+                                MuxCommand::Window,
+                                &crate::protocol::encode_window_payload(credit),
+                                obfs,
+                            );
+                        }
+                    } else {
+                        refund_pending = 0;
+                    }
+                }
+            }
+            MuxCommand::Fin => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                let _ = local_wr.shutdown().await;
+                remote_fin = true;
+                break;
+            }
+            MuxCommand::Rst => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                remote_rst = true;
+                result = Err(anyhow!("upstream reset after CONNECT established"));
+                break;
+            }
+            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
+                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+            }
+        }
+    }
+    if remote_fin {
+        if !upload_done {
+            let drain_wait = Duration::from_secs(connection_timeout.max(5));
+            if timeout(drain_wait, &mut upload).await.is_err() {
+                upload.abort();
+            }
+        }
+        if !fin_sent.swap(true, Ordering::AcqRel) {
+            let _ = send_mux_parts(&writer, &cipher, id, MuxCommand::Fin, &[], obfs).await;
+        }
+    } else {
+        if !upload_done {
+            upload.abort();
+        }
+        if result.is_err() && !remote_rst {
+            try_send_mux_parts(&writer, &cipher, id, MuxCommand::Rst, &[], obfs);
+        }
+    }
+
+    while let Ok(f) = rx.try_recv() {
+        crate::mux_writer::recycle_encode_buf(f.into_storage());
+    }
+    result
 }
 
 /// Coalesces any pipelined initial payload or awaits up to 2ms for the client's
@@ -2762,26 +3163,23 @@ pub mod mux_pool {
 //! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
 
 use crate::common::{
-    configured_cipher, send_mux_parts, send_mux_parts_reuse, HTTP_200_CONNECTION_ESTABLISHED,
+    configured_cipher, send_mux_parts, HTTP_200_CONNECTION_ESTABLISHED,
 };
 #[cfg(test)]
 use crate::common::parse_ws_url_with_port;
 use crate::crypto::XorCipher;
 use crate::flow::CreditGate;
-use crate::mux_writer::{
-    recycle_encode_buf, recycle_encode_bufs, write_owned_frames_vectored, MuxFrameWriter,
-};
+use crate::mux_writer::{recycle_encode_buf, MuxFrameWriter};
 use crate::protocol::{
-    decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
+    decode_version_payload, decode_window_payload, encode_version_payload,
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
-    mux_window_refresh,
 };
 use crate::proxy::{
     read_client_proxy_request, socks5_success_response, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
     apply_listener_options, apply_socket_options, drain_join_set, enforce_target_policy,
-    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    wait_shutdown, RuntimeConfig,
 };
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{encode_ws_frame, read_frame};
@@ -2790,7 +3188,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpListener, TcpStream,
@@ -3037,6 +3435,7 @@ impl SessionState {
         struct OpenStreamGuard<'a> {
             session: &'a SessionState,
             id: u32,
+            gate: Arc<CreditGate>,
             syn_sent: bool,
             armed: bool,
         }
@@ -3053,13 +3452,14 @@ impl SessionState {
                             self.session.obfs,
                         );
                     }
-                    self.session.close_stream_sync(self.id);
+                    self.session.close_stream_if_same(self.id, &self.gate);
                 }
             }
         }
         let mut open_guard = OpenStreamGuard {
             session: self,
             id,
+            gate: gate.clone(),
             syn_sent: false,
             armed: true,
         };
@@ -3109,6 +3509,17 @@ impl SessionState {
             entry.gate.close();
             self.dec_active(1);
             self.capacity_notify.notify_waiters();
+        }
+    }
+    fn close_stream_if_same(&self, id: u32, gate: &Arc<CreditGate>) {
+        let mut guard = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        if guard.get(&id).is_some_and(|e| Arc::ptr_eq(&e.gate, gate)) {
+            if let Some(entry) = guard.remove(&id) {
+                entry.gate.close();
+                self.dec_active(1);
+                drop(guard);
+                self.capacity_notify.notify_waiters();
+            }
         }
     }
 }
@@ -3433,10 +3844,11 @@ async fn handle_tcp_proxy(
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     }
     let initial_data = crate::common::peek_initial_payload(&mut local, req.initial_payload).await;
-    let (session, id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
+    let (session, id, rx, gate) = pool.acquire(&req.target, initial_data).await?;
     struct ActiveStreamGuard {
         session: Arc<SessionState>,
         id: u32,
+        gate: Arc<CreditGate>,
         armed: bool,
     }
     impl Drop for ActiveStreamGuard {
@@ -3452,225 +3864,31 @@ async fn handle_tcp_proxy(
                         self.session.obfs,
                     );
                 }
-                self.session.close_stream_sync(self.id);
+                self.session.close_stream_if_same(self.id, &self.gate);
             }
         }
     }
     let mut stream_guard = ActiveStreamGuard {
         session: session.clone(),
         id,
+        gate: gate.clone(),
         armed: true,
     };
-    let (mut local_rd, mut local_wr) = local.into_split();
-    let writer = session.writer.clone();
-    let cipher = session.cipher.clone();
-    let obfs = session.obfs;
-    let fin_sent = Arc::new(AtomicBool::new(false));
-    let fin_sent_up = fin_sent.clone();
-    let upload = crate::common::AbortOnDrop(tokio::spawn(async move {
-        let mut buf = relay_buf(cfg.buffer_size).await;
-        let mut frame_scratch = Vec::new();
-        let res = async {
-            loop {
-                let n = match local_rd.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let _ = send_mux_parts_reuse(
-                            &writer,
-                            &cipher,
-                            id,
-                            MuxCommand::Rst,
-                            &[],
-                            &mut frame_scratch,
-                            obfs,
-                        )
-                        .await;
-                        return Err(e.into());
-                    }
-                };
-                if n == 0 {
-                    if !fin_sent_up.swap(true, Ordering::AcqRel) {
-                        let _ = send_mux_parts_reuse(
-                            &writer,
-                            &cipher,
-                            id,
-                            MuxCommand::Fin,
-                            &[],
-                            &mut frame_scratch,
-                            obfs,
-                        )
-                        .await;
-                    }
-                    break;
-                }
-                crate::stats::add_bytes(n as i64, 0);
-                let mut off = 0;
-                while off < n {
-                    let end = (off + u16::MAX as usize).min(n);
-                    gate.acquire(end - off).await;
-                    send_mux_parts_reuse(
-                        &writer,
-                        &cipher,
-                        id,
-                        MuxCommand::Data,
-                        &buf[off..end],
-                        &mut frame_scratch,
-                        obfs,
-                    )
-                    .await?;
-                    off = end
-                }
-            }
-            Result::<()>::Ok(())
-        }
-        .await;
-        recycle_encode_buf(frame_scratch);
-        recycle_buf(buf).await;
-        res
-    }));
-    let mut upload = upload;
-    let mut upload_done = false;
-    let mut result = Result::<()>::Ok(());
-    let mut remote_fin = false;
-    let mut remote_rst = false;
-    let mut refund_pending: u32 = 0;
-    let mut data_batch: Vec<OwnedMuxFrame> = Vec::with_capacity(16);
-    let mut deferred_ctrl: Option<OwnedMuxFrame> = None;
-    loop {
-        let frame = if let Some(ctrl) = deferred_ctrl.take() {
-            ctrl
-        } else if !upload_done {
-            tokio::select! {
-                maybe_frame = rx.recv() => match maybe_frame {
-                    Some(f) => f,
-                    None => break,
-                },
-                up_res = &mut upload => {
-                    upload_done = true;
-                    match up_res {
-                        Ok(Ok(())) => match rx.recv().await {
-                            Some(f) => f,
-                            None => break,
-                        },
-                        Ok(Err(e)) => {
-                            result = Err(e);
-                            break;
-                        }
-                        Err(e) => {
-                            result = Err(anyhow!("upload task panicked: {e}"));
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            match rx.recv().await {
-                Some(f) => f,
-                None => break,
-            }
-        };
-        match frame.command {
-            MuxCommand::Data => {
-                data_batch.push(frame);
-                while data_batch.len() < 16 {
-                    match rx.try_recv() {
-                        Ok(next) if next.command == MuxCommand::Data => data_batch.push(next),
-                        Ok(other) => {
-                            deferred_ctrl = Some(other);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let write_res = write_owned_frames_vectored(&mut local_wr, &data_batch).await;
-                recycle_encode_bufs(data_batch.drain(..).map(OwnedMuxFrame::into_storage));
-                let written = match write_res {
-                    Ok(n) => n,
-                    Err(e) => {
-                        if let Some(ctrl) = deferred_ctrl.take() {
-                            recycle_encode_buf(ctrl.into_storage());
-                        }
-                        result = Err(e.into());
-                        break;
-                    }
-                };
-                if written > 0 {
-                    crate::stats::add_bytes(0, written as i64);
-                    let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
-                    if negotiated {
-                        refund_pending = refund_pending.saturating_add(written as u32);
-                        if refund_pending as usize >= mux_window_refresh() {
-                            let credit = std::mem::take(&mut refund_pending);
-                            crate::common::try_send_mux_parts(
-                                &session.writer,
-                                &session.cipher,
-                                id,
-                                MuxCommand::Window,
-                                &encode_window_payload(credit),
-                                session.obfs,
-                            );
-                        }
-                    } else {
-                        refund_pending = 0;
-                    }
-                }
-            }
-            MuxCommand::Fin => {
-                recycle_encode_buf(frame.into_storage());
-                let _ = local_wr.shutdown().await;
-                remote_fin = true;
-                break;
-            }
-            MuxCommand::Rst => {
-                recycle_encode_buf(frame.into_storage());
-                remote_rst = true;
-                result = Err(anyhow!("upstream reset after CONNECT established"));
-                break;
-            }
-            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
-                recycle_encode_buf(frame.into_storage());
-            }
-        }
-    }
-    if remote_fin {
-        if !upload_done {
-            let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
-            if timeout(drain_wait, &mut upload).await.is_err() {
-                upload.abort();
-            }
-        }
-        if !fin_sent.swap(true, Ordering::AcqRel) {
-            let _ = send_mux_parts(
-                &session.writer,
-                &session.cipher,
-                id,
-                MuxCommand::Fin,
-                &[],
-                session.obfs,
-            )
-            .await;
-        }
-    } else {
-        if !upload_done {
-            upload.abort();
-        }
-        if result.is_err() && !remote_rst {
-            crate::common::try_send_mux_parts(
-                &session.writer,
-                &session.cipher,
-                id,
-                MuxCommand::Rst,
-                &[],
-                session.obfs,
-            );
-        }
-    }
-
-    while let Ok(f) = rx.try_recv() {
-        recycle_encode_buf(f.into_storage());
-    }
+    let result = crate::common::relay_client_mux_stream(
+        local,
+        id,
+        rx,
+        gate.clone(),
+        session.writer.clone(),
+        session.cipher.clone(),
+        session.obfs,
+        &session.peer_window_kib,
+        cfg.buffer_size,
+        cfg.connection_timeout,
+    )
+    .await;
     stream_guard.armed = false;
-    session.close_stream_sync(id);
+    session.close_stream_if_same(id, &gate);
     result
 }
 
@@ -5140,23 +5358,20 @@ use crate::common::{
     configured_cipher, relay_non_mux_ws, NonMuxOkRejection, NonMuxPool, NonMuxRelaySpec,
     non_mux_pool_size,
 };
-use crate::proxy::{
-    parse_target_authority, read_client_proxy_request, ClientProxyRequest, SocksCommand,
-};
+use crate::proxy::{read_client_proxy_request, ClientProxyRequest, SocksCommand};
 use crate::runtime::{
-    apply_socket_options, dial_target, drain_join_set, enforce_target_policy, recycle_buf,
-    relay_buf, wait_shutdown, RuntimeConfig,
+    apply_socket_options, drain_join_set, enforce_target_policy, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
-    build_server_handshake_response, read_frame, read_frame_with_cipher,
-    read_http_headers_timeout, validate_server_handshake, write_frame, write_frame_borrowed,
+    build_server_handshake_response, read_frame_with_cipher,
+    read_http_headers_timeout, validate_server_handshake,
 };
 use anyhow::{anyhow, bail, Result};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpListener, TcpStream,
@@ -5358,134 +5573,12 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("invalid non-MUX target opcode")
     };
+    crate::mux_writer::recycle_encode_buf(frame_buf);
     if target_frame == b"UDP\n" {
         crate::mux_writer::recycle_encode_buf(target_frame);
-        crate::mux_writer::recycle_encode_buf(frame_buf);
         return crate::runtime::handle_server_udp_parts(rd, wr, cfg, c).await;
     }
-    let target_addr = match std::str::from_utf8(&target_frame) {
-        Ok(text) => match parse_target_authority(text.trim()) {
-            Ok(addr) => addr,
-            Err(e) => {
-                crate::mux_writer::recycle_encode_buf(target_frame);
-                crate::mux_writer::recycle_encode_buf(frame_buf);
-                return Err(anyhow!(e.to_string()));
-            }
-        },
-        Err(_) => {
-            crate::mux_writer::recycle_encode_buf(target_frame);
-            crate::mux_writer::recycle_encode_buf(frame_buf);
-            bail!("invalid non-MUX target UTF-8")
-        }
-    };
-    crate::mux_writer::recycle_encode_buf(target_frame);
-    if let Err(e) = enforce_target_policy(&cfg, &target_addr) {
-        crate::mux_writer::recycle_encode_buf(frame_buf);
-        return Err(e);
-    }
-    let target_stream = match dial_target(&target_addr, cfg.connection_timeout, &cfg).await {
-        Ok(s) => s,
-        Err(e) => {
-            crate::mux_writer::recycle_encode_buf(frame_buf);
-            return Err(e);
-        }
-    };
-    let mut ok = b"OK\n".to_vec();
-    c.apply(&mut ok);
-    if let Err(e) = write_frame(&mut wr, &ok, 2, false).await {
-        crate::mux_writer::recycle_encode_buf(frame_buf);
-        return Err(e);
-    }
-    let (mut target_rd, mut target_wr) = target_stream.into_split();
-    let buffer_size = cfg.buffer_size;
-    let mut download = crate::common::AbortOnDrop(tokio::spawn(async move {
-        let mut buf = relay_buf(buffer_size).await;
-        loop {
-            let n = target_rd.read(&mut buf).await?;
-            if n == 0 {
-                let _ = write_frame(&mut wr, &[], 8, false).await;
-                break;
-            }
-            crate::stats::add_bytes(0, n as i64);
-            // Non-MUX data frames are plaintext per GoWay server.
-            write_frame_borrowed(&mut wr, &mut buf[..n], 2, false).await?
-        }
-        recycle_buf(buf).await;
-        Result::<()>::Ok(())
-    }));
-    let mut download_done = false;
-    let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
-    let result = async {
-        loop {
-            let res = if !download_done {
-                tokio::select! {
-                    dl_res = &mut download => {
-                        download_done = true;
-                        match dl_res {
-                            Ok(Ok(())) => continue,
-                            _ => break,
-                        }
-                    }
-                    r = read_frame(
-                        &mut rd,
-                        Option::<&mut OwnedWriteHalf>::None,
-                        &mut frame_buf,
-                    ) => r,
-                }
-            } else {
-                match timeout(
-                    drain_wait,
-                    read_frame(
-                        &mut rd,
-                        Option::<&mut OwnedWriteHalf>::None,
-                        &mut frame_buf,
-                    ),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => break,
-                }
-            };
-            let Some((opcode, payload)) = res? else {
-                let _ = target_wr.shutdown().await;
-                if !download_done {
-                    let _ = timeout(drain_wait, &mut download).await;
-                    download_done = true;
-                }
-                break;
-            };
-            if opcode == 8 {
-                crate::mux_writer::recycle_encode_buf(payload);
-                let _ = target_wr.shutdown().await;
-                if !download_done {
-                    let _ = timeout(drain_wait, &mut download).await;
-                    download_done = true;
-                }
-                break;
-            }
-            if opcode != 2 {
-                crate::mux_writer::recycle_encode_buf(payload);
-                continue;
-            }
-            // Non-MUX data frames are plaintext per GoWay server.
-            let len = payload.len();
-            let write_res = target_wr.write_all(&payload).await;
-            crate::mux_writer::recycle_encode_buf(payload);
-            if write_res.is_err() {
-                break;
-            }
-            crate::stats::add_bytes(len as i64, 0);
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    crate::mux_writer::recycle_encode_buf(frame_buf);
-    let _ = target_wr.shutdown().await;
-    if !download_done {
-        download.abort();
-    }
-    result
+    crate::runtime::handle_server_tcp_parts(rd, wr, cfg, c, target_frame).await
 }
 } // mod nonmux
 
@@ -7672,7 +7765,9 @@ async fn relay_quic_udp(
     mut control: TcpStream,
     cfg: RuntimeConfig,
     pool: Arc<QuicClientPool>,
+    bind_hint: TargetAddr,
 ) -> Result<()> {
+    let control_peer_ip = control.peer_addr().ok().map(|a| a.ip());
     let local_ip = crate::common::local_udp_bind_ip(&control);
     let udp = Arc::new(UdpSocket::bind(std::net::SocketAddr::new(local_ip, 0)).await?);
     let bound = udp.local_addr()?;
@@ -7743,6 +7838,11 @@ async fn relay_quic_udp(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
+                let established = *latest_send.lock().unwrap_or_else(|e| e.into_inner());
+                if !crate::common::udp_client_allowed(peer, control_peer_ip, &bind_hint, established) {
+                    tracing::debug!(%peer, "QUIC UDP associate dropped datagram from unauthorized local peer");
+                    continue;
+                }
                 let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
                     continue;
                 };
@@ -7750,7 +7850,9 @@ async fn relay_quic_udp(
                     tracing::debug!(error = %e, "QUIC UDP datagram dropped by target policy");
                     continue;
                 }
-                *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
+                if established.is_none() {
+                    *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
+                }
                 crate::stats::add_bytes(pkt.len() as i64, 0);
                 if write_len_prefixed_udp_reuse(&mut send_task, pkt, &mut scratch)
                     .await
@@ -7912,7 +8014,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                     };
                     match req.command {
                         SocksCommand::UdpAssociate => {
-                            if let Err(e) = relay_quic_udp(stream, cfg2, pool2).await {
+                            if let Err(e) = relay_quic_udp(stream, cfg2, pool2, req.target).await {
                                 tracing::debug!(%peer,error=%e,"QUIC UDP proxy closed")
                             }
                         }
@@ -9881,7 +9983,7 @@ where
 /// Plain non-MUX TCP relay, mirroring goway.go `handleServer`:
 /// only the target hello (`host:port\n`) and `OK\n` are XOR-encrypted,
 /// all subsequent data frames are plaintext.
-async fn handle_server_tcp_parts<R, W>(
+pub(crate) async fn handle_server_tcp_parts<R, W>(
     mut rd: R,
     mut wr: W,
     cfg: RuntimeConfig,
@@ -9892,10 +9994,12 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let target_text =
-        std::str::from_utf8(&target_frame).map_err(|_| anyhow!("invalid non-MUX target UTF-8"))?;
-    let target = parse_target_authority(target_text.trim()).map_err(|e| anyhow!(e.to_string()))?;
+    let target_res = match std::str::from_utf8(&target_frame) {
+        Ok(text) => parse_target_authority(text.trim()).map_err(|e| anyhow!(e.to_string())),
+        Err(_) => Err(anyhow!("invalid non-MUX target UTF-8")),
+    };
     crate::mux_writer::recycle_encode_buf(target_frame);
+    let target = target_res?;
     enforce_target_policy(&cfg, &target)?;
     let target_stream = dial_target(&target, cfg.connection_timeout, &cfg).await?;
     let mut ok = b"OK\n".to_vec();
@@ -12136,11 +12240,14 @@ impl UdpBatchWriter {
         if self.queue.is_empty() {
             match self.sock.try_send_to(payload, dest) {
                 Ok(_) => return Ok(()),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.sock.send_to(payload, dest).await?;
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
         }
-        self.push(payload, dest).await?;
+        self.push(payload, addr).await?;
         self.flush().await?;
         Ok(())
     }
@@ -12400,149 +12507,41 @@ mod tests {
 } // mod udp_batch
 
 pub mod udp_relay {
-use crate::common::{configured_cipher, socks5_udp_associate_reply};
-use crate::proxy::{parse_socks5_udp_datagram, TargetAddr};
-use crate::runtime::{check_target_policy, enforce_target_policy, RuntimeConfig};
-use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
-use crate::ws::{read_frame, read_frame_with_cipher, write_frame, write_frame_borrowed};
-use anyhow::{anyhow, bail, Result};
+use crate::common::socks5_udp_associate_reply;
+use crate::proxy::TargetAddr;
+use crate::runtime::RuntimeConfig;
+use anyhow::Result;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{tcp::OwnedWriteHalf, TcpStream, UdpSocket};
-use tokio::time::{timeout, Duration};
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::Duration;
 
 pub async fn handle_local_udp_proxy(
     mut control: TcpStream,
     cfg: RuntimeConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
-    let _ = &bind_hint;
     let local_ip = crate::common::local_udp_bind_ip(&control);
     let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     let bound = udp.local_addr()?;
     let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
     let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let (mut rd, mut wr) =
+    let (rd, wr) =
         crate::common::open_ws_upstream(&cfg, "UDP relay requires ws:// upstream").await?;
-    let c = configured_cipher(&cfg.key);
-    let mut hello = b"UDP\n".to_vec();
-    c.apply(&mut hello);
-    write_frame(&mut wr, &hello, 2, true).await?;
-    let mut frame_buf = Vec::new();
-    let ok_res = timeout(
+    crate::common::relay_udp_ws(
+        control,
+        udp,
+        &bind_hint,
+        rd,
+        wr,
+        &cfg.key,
         conn_timeout,
-        read_frame(
-            &mut rd,
-            Option::<&mut OwnedWriteHalf>::None,
-            &mut frame_buf,
-        ),
+        cfg.block_local,
+        "upstream",
     )
     .await
-    .map_err(|_| anyhow!("upstream UDP handshake OK timed out"))?;
-    let Some((opcode, mut ok)) = ok_res.inspect_err(|_| {
-        crate::mux_writer::recycle_encode_buf(std::mem::take(&mut frame_buf));
-    })?
-    else {
-        crate::mux_writer::recycle_encode_buf(frame_buf);
-        bail!("upstream closed during UDP handshake")
-    };
-    if opcode != 2 {
-        crate::mux_writer::recycle_encode_buf(ok);
-        crate::mux_writer::recycle_encode_buf(frame_buf);
-        bail!("invalid UDP handshake response opcode")
-    }
-    c.apply(&mut ok);
-    if ok != b"OK\n" {
-        crate::mux_writer::recycle_encode_buf(ok);
-        crate::mux_writer::recycle_encode_buf(frame_buf);
-        bail!("upstream rejected UDP handshake")
-    }
-    crate::mux_writer::recycle_encode_buf(ok);
-    let latest = Arc::new(StdMutex::new(None::<SocketAddr>));
-    let block_local = cfg.block_local;
-    let udp_send = udp.clone();
-    let c_send = c.clone();
-    let latest_send = latest.clone();
-    let upload = crate::common::AbortOnDrop(tokio::spawn(async move {
-        let mut batch = UdpBatchReader::new(udp_send);
-        let mut packet = Vec::with_capacity(2048);
-        loop {
-            let count = match batch.recv().await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            for i in 0..count {
-                let (pkt, peer) = batch.packet(i);
-                let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
-                    continue;
-                };
-                if let Err(e) = check_target_policy(block_local, &target) {
-                    tracing::debug!(error = %e, "WS UDP datagram dropped by target policy");
-                    continue;
-                }
-                *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
-                packet.clear();
-                packet.extend_from_slice(pkt);
-                c_send.apply(&mut packet);
-                crate::stats::add_bytes(packet.len() as i64, 0);
-                if write_frame_borrowed(&mut wr, &mut packet, 2, true)
-                    .await
-                    .is_err()
-                {
-                    return Ok::<(), anyhow::Error>(());
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    }));
-    let mut upload = upload;
-    let mut dummy = [0u8; 1];
-    let mut batch_writer = UdpBatchWriter::new(udp.clone());
-    tokio::select! {
-        _ = control.read(&mut dummy) => {}
-        _ = &mut upload => {}
-        _ = async {
-            loop {
-                let Some((opcode, packet)) = read_frame_with_cipher(
-                    &mut rd,
-                    Option::<&mut OwnedWriteHalf>::None,
-                    &mut frame_buf,
-                    Some(&c),
-                )
-                .await?
-                else {
-                    break;
-                };
-                if opcode != 2 {
-                    crate::mux_writer::recycle_encode_buf(packet);
-                    continue;
-                }
-                let Ok((target, _payload)) = parse_socks5_udp_datagram(&packet) else {
-                    crate::mux_writer::recycle_encode_buf(packet);
-                    continue;
-                };
-                if enforce_target_policy(&cfg, &target).is_err() {
-                    crate::mux_writer::recycle_encode_buf(packet);
-                    continue;
-                }
-                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(peer) = peer_opt {
-                    let n = packet.len();
-                    let _ = batch_writer.send(&packet, peer).await;
-                    crate::stats::add_bytes(0, n as i64);
-                }
-                crate::mux_writer::recycle_encode_buf(packet);
-            }
-            let _ = batch_writer.flush().await;
-            Ok::<(), anyhow::Error>(())
-        } => {}
-    }
-    crate::mux_writer::recycle_encode_buf(frame_buf);
-    upload.abort();
-    let _ = control.shutdown().await;
-    Ok(())
 }
 } // mod udp_relay
 
@@ -13517,11 +13516,11 @@ where
                 key.copy_from_slice(&rest[ext_len..ext_len + 4]);
             }
             let total = len as usize;
-            if buf.capacity() == 0 && total >= 32 * 1024 {
+            if buf.capacity() == 0 && total > 4096 {
                 *buf = crate::mux_writer::acquire_encode_buf();
             }
             if total > buf.capacity() {
-                if total >= 32 * 1024 && total <= READ_SEGMENT {
+                if total > 4096 && total <= READ_SEGMENT {
                     buf.reserve_exact(READ_SEGMENT);
                 } else {
                     buf.reserve_exact(total.min(READ_SEGMENT));
@@ -13909,35 +13908,30 @@ pub mod wss_client {
 //! WSS client paths for GoWay-compatible upstreams.
 
 use crate::common::{
-    configured_cipher, relay_non_mux_ws, send_mux_parts, send_mux_parts_reuse,
+    configured_cipher, relay_non_mux_ws, send_mux_parts,
     socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED, non_mux_pool_size,
     NonMuxOkRejection, NonMuxPool, NonMuxRelaySpec,
 };
 use crate::crypto::XorCipher;
 use crate::dns;
 use crate::flow::CreditGate;
-use crate::mux_writer::{
-    recycle_encode_buf, recycle_encode_bufs, write_owned_frames_vectored, MuxFrameWriter,
-};
+use crate::mux_writer::{recycle_encode_buf, MuxFrameWriter};
 use crate::protocol::{
-    decode_version_payload, decode_window_payload, encode_version_payload, encode_window_payload,
+    decode_version_payload, decode_window_payload, encode_version_payload,
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
-    mux_window_refresh,
 };
 use crate::proxy::{
-    parse_authority_with_default, parse_socks5_udp_datagram, read_client_proxy_request,
+    parse_authority_with_default, read_client_proxy_request,
     socks5_success_response, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
     apply_listener_options, apply_socket_options_raw, check_target_policy, drain_join_set,
-    recycle_buf, relay_buf, wait_shutdown, RuntimeConfig,
+    wait_shutdown, RuntimeConfig,
 };
 use crate::tls;
-use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
-    encode_ws_frame, read_frame, read_frame_with_cipher, read_http_headers_timeout,
+    encode_ws_frame, read_frame, read_http_headers_timeout,
     redact_handshake_request, validate_client_handshake_response, write_frame,
-    write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::future::Future;
@@ -13945,9 +13939,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-    Arc, Mutex as StdMutex,
+    Arc,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
@@ -14222,126 +14216,25 @@ async fn handle_udp_proxy(
     cfg: WssConfig,
     bind_hint: TargetAddr,
 ) -> Result<()> {
-    let _ = &bind_hint;
     let local_ip = crate::common::local_udp_bind_ip(&control);
     let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     let bound = udp.local_addr()?;
     let resp = socks5_udp_associate_reply(bound);
     control.write_all(&resp).await?;
-    let (mut rd, mut wr) = open_upstream(&cfg).await?;
-    let c = configured_cipher(&cfg.key);
-    let mut hello = b"UDP\n".to_vec();
-    c.apply(&mut hello);
-    write_frame(&mut wr, &hello, 2, true).await?;
-    let mut frame_buf = Vec::new();
-    let ok_res = timeout(
-        Duration::from_secs(cfg.connection_timeout.max(1)),
-        read_frame(&mut rd, Option::<&mut TlsWriter>::None, &mut frame_buf),
+    let (rd, wr) = open_upstream(&cfg).await?;
+    let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    crate::common::relay_udp_ws(
+        control,
+        udp,
+        &bind_hint,
+        rd,
+        wr,
+        &cfg.key,
+        conn_timeout,
+        cfg.block_local,
+        "WSS upstream",
     )
     .await
-    .context("WSS UDP handshake OK timeout")?;
-    let Some((opcode, mut ok)) = ok_res.inspect_err(|_| {
-        recycle_encode_buf(std::mem::take(&mut frame_buf));
-    })?
-    else {
-        recycle_encode_buf(frame_buf);
-        bail!("WSS upstream closed during UDP handshake")
-    };
-    if opcode != 2 {
-        recycle_encode_buf(ok);
-        recycle_encode_buf(frame_buf);
-        bail!("invalid WSS UDP handshake response opcode")
-    };
-    c.apply(&mut ok);
-    let is_ok = ok == b"OK\n";
-    recycle_encode_buf(ok);
-    if !is_ok {
-        recycle_encode_buf(frame_buf);
-        bail!("WSS upstream rejected UDP handshake")
-    };
-    let latest_client = Arc::new(StdMutex::new(None::<SocketAddr>));
-    let block_local = cfg.block_local;
-    let udp_send = udp.clone();
-    let cipher_send = c.clone();
-    let latest_send = latest_client.clone();
-    let upload = crate::common::AbortOnDrop(tokio::spawn(async move {
-        let mut batch = UdpBatchReader::new(udp_send);
-        let mut packet = Vec::with_capacity(2048);
-        loop {
-            let count = match batch.recv().await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            for i in 0..count {
-                let (pkt, peer) = batch.packet(i);
-                let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
-                    continue;
-                };
-                if let Err(e) = check_target_policy(block_local, &target) {
-                    tracing::debug!(error = %e, "WSS UDP datagram dropped by target policy");
-                    continue;
-                }
-                *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
-                packet.clear();
-                packet.extend_from_slice(pkt);
-                cipher_send.apply(&mut packet);
-                crate::stats::add_bytes(packet.len() as i64, 0);
-                if write_frame_borrowed(&mut wr, &mut packet, 2, true)
-                    .await
-                    .is_err()
-                {
-                    return Ok::<(), anyhow::Error>(());
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    }));
-    let mut upload = upload;
-    let mut dummy = [0u8; 1];
-    let mut batch_writer = UdpBatchWriter::new(udp.clone());
-    tokio::select! {
-        _ = control.read(&mut dummy) => {}
-        _ = &mut upload => {}
-        _ = async {
-            loop {
-                let Some((opcode, packet)) = read_frame_with_cipher(
-                    &mut rd,
-                    Option::<&mut TlsWriter>::None,
-                    &mut frame_buf,
-                    Some(&c),
-                )
-                .await?
-                else {
-                    break;
-                };
-                if opcode != 2 {
-                    recycle_encode_buf(packet);
-                    continue;
-                }
-                let Ok((target, _payload)) = parse_socks5_udp_datagram(&packet) else {
-                    recycle_encode_buf(packet);
-                    continue;
-                };
-                if check_target_policy(cfg.block_local, &target).is_err() {
-                    recycle_encode_buf(packet);
-                    continue;
-                }
-                let peer_opt = *latest_client.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(peer) = peer_opt {
-                    let n = packet.len();
-                    let _ = batch_writer.send(&packet, peer).await;
-                    crate::stats::add_bytes(0, n as i64);
-                }
-                recycle_encode_buf(packet);
-            }
-            let _ = batch_writer.flush().await;
-            Ok::<(), anyhow::Error>(())
-        } => {}
-    }
-    recycle_encode_buf(frame_buf);
-    upload.abort();
-    let _ = control.shutdown().await;
-    Ok(())
 }
 
 type NonMuxWssPool = NonMuxPool<WssConfig, TlsReader, TlsWriter>;
@@ -14687,6 +14580,7 @@ impl WssSessionState {
         struct OpenWssStreamGuard<'a> {
             session: &'a WssSessionState,
             id: u32,
+            gate: Arc<CreditGate>,
             syn_sent: bool,
             armed: bool,
         }
@@ -14703,13 +14597,14 @@ impl WssSessionState {
                             self.session.obfs,
                         );
                     }
-                    self.session.close_stream_sync(self.id);
+                    self.session.close_stream_if_same(self.id, &self.gate);
                 }
             }
         }
         let mut open_guard = OpenWssStreamGuard {
             session: self,
             id,
+            gate: gate.clone(),
             syn_sent: false,
             armed: true,
         };
@@ -14758,6 +14653,17 @@ impl WssSessionState {
             entry.gate.close();
             self.dec_active(1);
             self.capacity_notify.notify_waiters();
+        }
+    }
+    fn close_stream_if_same(&self, id: u32, gate: &Arc<CreditGate>) {
+        let mut guard = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        if guard.get(&id).is_some_and(|e| Arc::ptr_eq(&e.gate, gate)) {
+            if let Some(entry) = guard.remove(&id) {
+                entry.gate.close();
+                self.dec_active(1);
+                drop(guard);
+                self.capacity_notify.notify_waiters();
+            }
         }
     }
 }
@@ -15122,10 +15028,11 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     };
     let initial_data = crate::common::peek_initial_payload(&mut local, req.initial_payload).await;
-    let (session, stream_id, mut rx, gate) = pool.acquire(&req.target, initial_data).await?;
+    let (session, stream_id, rx, gate) = pool.acquire(&req.target, initial_data).await?;
     struct ActiveWssStreamGuard {
         session: Arc<WssSessionState>,
         id: u32,
+        gate: Arc<CreditGate>,
         armed: bool,
     }
     impl Drop for ActiveWssStreamGuard {
@@ -15141,226 +15048,31 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
                         self.session.obfs,
                     );
                 }
-                self.session.close_stream_sync(self.id);
+                self.session.close_stream_if_same(self.id, &self.gate);
             }
         }
     }
     let mut stream_guard = ActiveWssStreamGuard {
         session: session.clone(),
         id: stream_id,
+        gate: gate.clone(),
         armed: true,
     };
-    let writer = session.writer.clone();
-    let cipher = session.cipher.clone();
-    let obfs = session.obfs;
-    let (mut local_rd, mut local_wr) = local.into_split();
-    let buffer_size = pool.cfg.buffer_size;
-    let fin_sent = Arc::new(AtomicBool::new(false));
-    let fin_sent_up = fin_sent.clone();
-    let upload = crate::common::AbortOnDrop(tokio::spawn(async move {
-        let mut buf = relay_buf(buffer_size).await;
-        let mut frame_scratch = Vec::new();
-        let res = async {
-            loop {
-                let n = match local_rd.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let _ = send_mux_parts_reuse(
-                            &writer,
-                            &cipher,
-                            stream_id,
-                            MuxCommand::Rst,
-                            &[],
-                            &mut frame_scratch,
-                            obfs,
-                        )
-                        .await;
-                        return Err(e.into());
-                    }
-                };
-                if n == 0 {
-                    if !fin_sent_up.swap(true, Ordering::AcqRel) {
-                        let _ = send_mux_parts_reuse(
-                            &writer,
-                            &cipher,
-                            stream_id,
-                            MuxCommand::Fin,
-                            &[],
-                            &mut frame_scratch,
-                            obfs,
-                        )
-                        .await;
-                    }
-                    break;
-                }
-                crate::stats::add_bytes(n as i64, 0);
-                let mut off = 0;
-                while off < n {
-                    let end = (off + u16::MAX as usize).min(n);
-                    gate.acquire(end - off).await;
-                    send_mux_parts_reuse(
-                        &writer,
-                        &cipher,
-                        stream_id,
-                        MuxCommand::Data,
-                        &buf[off..end],
-                        &mut frame_scratch,
-                        obfs,
-                    )
-                    .await?;
-                    off = end
-                }
-            }
-            Result::<()>::Ok(())
-        }
-        .await;
-        recycle_encode_buf(frame_scratch);
-        recycle_buf(buf).await;
-        res
-    }));
-    let mut upload = upload;
-    let mut upload_done = false;
-    let mut refund_pending: u32 = 0;
-    let mut result = Result::<()>::Ok(());
-    let mut remote_fin = false;
-    let mut remote_rst = false;
-    let mut data_batch: Vec<OwnedMuxFrame> = Vec::with_capacity(16);
-    let mut deferred_ctrl: Option<OwnedMuxFrame> = None;
-    loop {
-        let frame = if let Some(ctrl) = deferred_ctrl.take() {
-            ctrl
-        } else if !upload_done {
-            tokio::select! {
-                maybe_frame = rx.recv() => match maybe_frame {
-                    Some(f) => f,
-                    None => break,
-                },
-                up_res = &mut upload => {
-                    upload_done = true;
-                    match up_res {
-                        Ok(Ok(())) => match rx.recv().await {
-                            Some(f) => f,
-                            None => break,
-                        },
-                        Ok(Err(e)) => {
-                            result = Err(e);
-                            break;
-                        }
-                        Err(e) => {
-                            result = Err(anyhow!("upload task panicked: {e}"));
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            match rx.recv().await {
-                Some(f) => f,
-                None => break,
-            }
-        };
-        match frame.command {
-            MuxCommand::Data => {
-                data_batch.push(frame);
-                while data_batch.len() < 16 {
-                    match rx.try_recv() {
-                        Ok(next) if next.command == MuxCommand::Data => data_batch.push(next),
-                        Ok(other) => {
-                            deferred_ctrl = Some(other);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let write_res = write_owned_frames_vectored(&mut local_wr, &data_batch).await;
-                recycle_encode_bufs(data_batch.drain(..).map(OwnedMuxFrame::into_storage));
-                let written = match write_res {
-                    Ok(n) => n,
-                    Err(e) => {
-                        if let Some(ctrl) = deferred_ctrl.take() {
-                            recycle_encode_buf(ctrl.into_storage());
-                        }
-                        result = Err(e.into());
-                        break;
-                    }
-                };
-                if written > 0 {
-                    crate::stats::add_bytes(0, written as i64);
-                    let negotiated = session.peer_window_kib.load(Ordering::Relaxed) > 0;
-                    if negotiated {
-                        refund_pending = refund_pending.saturating_add(written as u32);
-                        if refund_pending as usize >= mux_window_refresh() {
-                            let credit = std::mem::take(&mut refund_pending);
-                            crate::common::try_send_mux_parts(
-                                &session.writer,
-                                &session.cipher,
-                                stream_id,
-                                MuxCommand::Window,
-                                &encode_window_payload(credit),
-                                session.obfs,
-                            );
-                        }
-                    } else {
-                        refund_pending = 0;
-                    }
-                }
-            }
-            MuxCommand::Fin => {
-                recycle_encode_buf(frame.into_storage());
-                let _ = local_wr.shutdown().await;
-                remote_fin = true;
-                break;
-            }
-            MuxCommand::Rst => {
-                recycle_encode_buf(frame.into_storage());
-                remote_rst = true;
-                result = Err(anyhow!("upstream reset after CONNECT established"));
-                break;
-            }
-            MuxCommand::Syn | MuxCommand::Version | MuxCommand::Window => {
-                recycle_encode_buf(frame.into_storage());
-            }
-        }
-    }
-    if remote_fin {
-        if !upload_done {
-            let drain_wait = Duration::from_secs(pool.cfg.connection_timeout.max(5));
-            if timeout(drain_wait, &mut upload).await.is_err() {
-                upload.abort();
-            }
-        }
-        if !fin_sent.swap(true, Ordering::AcqRel) {
-            let _ = send_mux_parts(
-                &session.writer,
-                &session.cipher,
-                stream_id,
-                MuxCommand::Fin,
-                &[],
-                session.obfs,
-            )
-            .await;
-        }
-    } else {
-        if !upload_done {
-            upload.abort();
-        }
-        if result.is_err() && !remote_rst {
-            crate::common::try_send_mux_parts(
-                &session.writer,
-                &session.cipher,
-                stream_id,
-                MuxCommand::Rst,
-                &[],
-                session.obfs,
-            );
-        }
-    }
-
-    while let Ok(f) = rx.try_recv() {
-        recycle_encode_buf(f.into_storage());
-    }
+    let result = crate::common::relay_client_mux_stream(
+        local,
+        stream_id,
+        rx,
+        gate.clone(),
+        session.writer.clone(),
+        session.cipher.clone(),
+        session.obfs,
+        &session.peer_window_kib,
+        pool.cfg.buffer_size,
+        pool.cfg.connection_timeout,
+    )
+    .await;
     stream_guard.armed = false;
-    session.close_stream_sync(stream_id);
+    session.close_stream_if_same(stream_id, &gate);
     result
 }
 

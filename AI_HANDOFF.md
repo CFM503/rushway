@@ -1761,3 +1761,55 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.66`.
+
+
+## Release: v0.0.67 (2026-10-20) — SOCKS5 UDP Anti-Hijacking Security, MUX Stream Teardown Race Safety & Full-Stack Relay De-duplication
+
+### Context & User Directives
+- **Directives:** "更新日志，更新AI接力交接日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **SOCKS5 UDP Anti-Hijacking Security (RFC 1928 §7 Compliance):**
+    - Introduced `udp_client_allowed` and `normalize_ip` to validate datagram source addresses against client `bind_hint` (port and non-unspecified IP) and control connection peer IP. Locked down the authorized peer upon receiving the first valid datagram. Applied across WS, WSS, and QUIC UDP proxy tunnels, neutralizing UDP ephemeral port hijacking risks.
+  - **Relay Pipeline De-duplication & Architecture Unification (DRY Principle):**
+    - Extracted duplicate WebSocket client UDP relay pipelines (`udp_relay::handle_local_udp_proxy` and `wss_client::handle_udp_proxy`) into generic `crate::common::relay_udp_ws`.
+    - Consolidated duplicate MUX client stream forwarding loops (`mux_pool::handle_tcp_proxy` and `wss_client::handle_connection`) into `crate::common::relay_client_mux_stream`.
+    - Reused `runtime::handle_server_tcp_parts` in `nonmux::handle_server`, eliminating over 900 lines of duplicated logic across the codebase.
+  - **Atomic CreditGate-Matched MUX Stream Deregistration (ABA Race Prevention):**
+    - Replaced unconditional stream ID map removal with `close_stream_if_same(id, &gate)` verifying `Arc::ptr_eq(&entry.gate, gate)`. Eliminates race conditions where asynchronous cleanup tasks erroneously evict newly allocated streams that reused the same stream ID.
+  - **Non-MUX Error Path Encode Buffer Reclamation:**
+    - Ensured `target_frame` buffer is unconditionally returned to `ENCODE_POOL` via `recycle_encode_buf` even when UTF-8 decoding or authority parsing fails in `handle_server_tcp_parts`.
+  - **UDP Batch Writer Fast-Path & Push Argument Correction:**
+    - Passed raw `addr` into `push` within `UdpBatchWriter::send` to prevent redundant destination normalization. Added immediate non-blocking fallback to asynchronous `send_to.await` when `try_send_to` returns `WouldBlock` on an empty batch queue.
+  - **Regression Risk:** Zero. Clean syntax and architectural integrity verified.
+
+### Changes Implemented
+1. **RFC 1928 UDP Associate Security (`src/main.rs:udp_client_allowed`, `normalize_ip`, `relay_udp_ws`, `relay_quic_udp`)**:
+   - RFC 1928 address validation, IPv4-mapped IPv6 normalization, and first-packet peer lock-in.
+2. **WebSocket UDP Relay Consolidation (`src/main.rs:relay_udp_ws`)**:
+   - Generic bidirectional UDP forwarding loop unifying plain WS and WSS tunnels.
+3. **Client MUX Stream Relay Consolidation (`src/main.rs:relay_client_mux_stream`)**:
+   - Centralized MUX stream multiplexing, rate limiting, credit refunds, and shutdown coordination.
+4. **MUX Stream Teardown Race Prevention (`src/main.rs:close_stream_if_same`)**:
+   - Guard-validated stream closure matching `CreditGate` pointer identity before removal.
+5. **Non-MUX Server TCP Handling & Leak Prevention (`src/main.rs:nonmux::handle_server`, `runtime::handle_server_tcp_parts`)**:
+   - Reused shared TCP forwarder; guaranteed `target_frame` buffer recycling on parse errors.
+6. **UDP Batch Writer Fast Path (`src/main.rs:UdpBatchWriter::send`)**:
+   - Directly awaited `send_to` on `WouldBlock`; forwarded original address to `push`.
+7. **Encode Buffer Acquisition Heuristic (`src/main.rs:ws::read_frame`)**:
+   - Lowered pool reuse threshold from 32 KiB to 4 KiB (`total > 4096`).
+8. **Version & Documentation**:
+   - Bumped version to `0.0.67` across `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.67 - SOCKS5 UDP anti-hijacking security, MUX stream teardown race safety, and full-stack relay de-duplication`
+- Tag: `v0.0.67`
+
+### Status
+- Completed and released as `v0.0.67`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.67`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.67`.
