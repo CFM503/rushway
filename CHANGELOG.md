@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.66] - 2026-10-20
+
+### Architecture Consolidation, Lock-Free UDP Hot-Path, Buffer Leak Fix & Unified Stream Cleanup
+
+- **Major Architecture Consolidation & Codebase De-duplication (`src/main.rs:open_ws_upstream`, `connect_ws_with_fallback`, `local_udp_bind_ip`, `peek_initial_payload`)** — Extracted shared WebSocket dial, Cloudflare edge fallback, and handshake logic across `mux_pool`, `nonmux`, and `udp_relay` into centralized helpers (`open_ws_upstream`, `connect_ws_with_fallback`). Unified SOCKS5 `UDP ASSOCIATE` local bind address derivation (`local_udp_bind_ip`) and 0-RTT initial payload pre-reading (`peek_initial_payload`), eliminating over 1,100 lines of duplicated boilerplate without functional regression.
+- **UDP Hot-Path Lock-Free Single-Buffer Optimization (`src/main.rs:handle_local_udp_proxy`, `handle_udp_proxy`)** — Replaced high-frequency 80 KiB buffer pool acquisition/recycling on every inbound datagram with dedicated per-task 2 KB scratch buffers (`Vec::with_capacity(2048)`), eliminating global `ENCODE_POOL` mutex contention on high-throughput UDP relay paths.
+- **MuxFrameWriter Buffer Leak Reclamation on Failure (`src/main.rs:MuxFrameWriter::send_frame`)** — Explicitly recycled outbound frame buffers (`recycle_encode_buf`) back to the global pool when the writer channel is closed or `tx.send` fails, preventing orphaned buffer retention on connection shutdown.
+- **Unified Server MUX Stream Cleanup & Residual Buffer Reclamation (`src/main.rs:cleanup_stream_entry`, `handle_server`)** — Centralized stream deregistration across dial failures, client resets, and cancellations into `cleanup_stream_entry`, proactively draining and recycling lingering frames from both the pre-dial pending vector and the unconsumed `rx` channel.
+- **Synchronous System Control Frame Dispatch (`src/main.rs:send_reset_encrypted`, `maybe_send_window`)** — Converted `send_reset_encrypted` and `maybe_send_window` from `async fn` to synchronous `fn`, removing superfluous Future state-machine generation on non-blocking writer paths.
+- **Bounded Ingress Stream Queue Permit Reservation (`src/main.rs:client_reader_loop`, `wss_reader_loop`)** — Refactored MUX inbound frame delivery to use `tx.reserve()` with timeout fallbacks, guaranteeing immediate buffer pool recycling on channel saturation or cancellation.
+
 ## [v0.0.65] - 2026-10-20
 
 ### MUX Burst Backpressure Buffering, Server Concurrency Isolation, RAII Task Abort & DNS Invalidation

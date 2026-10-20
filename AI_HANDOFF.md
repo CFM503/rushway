@@ -1714,3 +1714,50 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.65`.
+
+
+## Release: v0.0.66 (2026-10-20) — Architecture Consolidation, Lock-Free UDP Hot-Path, Buffer Leak Fix & Unified Stream Cleanup
+
+### Context & User Directives
+- **Directives:** "更新版本号0.0.66更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Major Architectural Consolidation (DRY Principle):**
+    - Extracted duplicate WebSocket connection, Cloudflare fallback, and HTTP upgrade handshake routines scattered across `mux_pool`, `nonmux`, and `udp_relay` into shared `crate::common` primitives: `open_ws_upstream`, `connect_ws_with_fallback`, `local_udp_bind_ip`, and `peek_initial_payload`.
+    - Eliminated over 1,100 lines of redundant code while preserving 100% protocol fidelity.
+  - **UDP Hot-Path Lock-Free Single-Buffer Optimization:**
+    - Eliminated per-packet acquisition and recycling from the global 80 KiB `ENCODE_POOL` inside `handle_local_udp_proxy` and `handle_udp_proxy`. Introduced per-coroutine reusable 2 KB scratch buffers (`Vec::with_capacity(2048)`), eliminating global mutex contention and memory fragmentation during high-throughput UDP relay.
+  - **MuxFrameWriter Outbound Buffer Reclamation (Audit Bug 8):**
+    - Added explicit `recycle_encode_buf` calls in `MuxFrameWriter::send_frame` when the writer channel is closed or `self.tx.send` fails, preventing buffer leaks during session termination.
+  - **Unified Stream Cleanup & Residual Buffer Reclamation:**
+    - Centralized stream cancellation, credit gate closing, and buffer drainage into `cleanup_stream_entry`, guaranteeing that unconsumed data frames remaining in stream `rx` channels are always returned to the buffer pool on dial errors or client resets.
+  - **Synchronous Control Frame Dispatch:**
+    - Converted `send_reset_encrypted` and `maybe_send_window` from `async fn` to non-blocking synchronous `fn`, removing redundant Future state-machine allocations.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **Common Upstream Abstractions (`src/main.rs:open_ws_upstream`, `connect_ws_with_fallback`, `local_udp_bind_ip`, `peek_initial_payload`)**:
+   - Centralized plain-WS dial, Cloudflare fallback, UDP associate local IP extraction, and initial payload peeking.
+2. **UDP Hot-Path Optimization (`src/main.rs:handle_local_udp_proxy`, `handle_udp_proxy`)**:
+   - Local reusable 2 KB packet buffer replacing high-turnover global pool borrowing.
+3. **MuxFrameWriter Buffer Leak Fix (`src/main.rs:MuxFrameWriter::send_frame`)**:
+   - Immediate recycling of frame bytes on channel closure or send failure.
+4. **Unified Stream Teardown (`src/main.rs:cleanup_stream_entry`, `handle_server`)**:
+   - Comprehensive drainage of pending and channel-queued frames on stream termination.
+5. **Synchronous Frame Dispatch (`src/main.rs:send_reset_encrypted`, `maybe_send_window`)**:
+   - Synchronous invocation removing async overhead for non-blocking control frame enqueues.
+6. **Version & Documentation**:
+   - Bumped version to `0.0.66` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.66 - architecture consolidation, lock-free UDP hot-path, buffer leak fix, and unified stream cleanup`
+- Tag: `v0.0.66`
+
+### Status
+- Completed and released as `v0.0.66`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.66`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.66`.
