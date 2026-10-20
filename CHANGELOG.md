@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.61] - 2026-10-20
+
+### QUIC Graceful Stream Drain, Robust Target Resolution & Proactive MUX Reset Signaling
+
+- **QUIC Client Downstream Graceful Upload Drain (`src/main.rs:relay_quic`)** — Added clean remote EOF tracking during downstream QUIC ingress; upon receiving peer termination, grants the upload worker a graceful drain window (`connection_timeout.max(5)`) before socket abort, ensuring in-flight client data frames are completely delivered on half-closed streams.
+- **Resilient QUIC Server UDP Target Resolution (`src/main.rs:handle_server_udp_stream`)** — Guarded UDP target resolution failures with non-fatal `continue`, isolating unresolvable DNS queries or probe datagrams from tearing down the entire active server UDP session.
+- **Proactive MUX Destination Dial & Write Failure RST Dispatch (`src/main.rs:handle_server`)** — Emits explicit MUX `Rst` control frames to upstream clients immediately when destination dial fails or target stream writes abort (`write_failed`), eliminating client-side hang stalls and accelerating local resource cleanup.
+
 ## [v0.0.60] - 2026-10-19
 
 ### Concurrent Stream Table ABA Protection, Immediate RST Pruning & Dual-Stack QUIC Binding

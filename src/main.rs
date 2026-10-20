@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.60";
+pub const APP_VERSION: &str = "0.0.61";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -7228,19 +7228,35 @@ async fn relay_quic(
     });
     let mut lw2 = lw;
     let mut buf = relay_buf(buffer_size).await;
-    loop {
-        match recv.read(&mut buf).await? {
-            Some(0) | None => break,
-            Some(n) => {
-                crate::stats::add_bytes(0, n as i64);
-                lw2.write_all(&buf[..n]).await?
+    let mut remote_eof = false;
+    let down_res: Result<()> = async {
+        loop {
+            match recv.read(&mut buf).await? {
+                Some(0) | None => {
+                    remote_eof = true;
+                    break;
+                }
+                Some(n) => {
+                    crate::stats::add_bytes(0, n as i64);
+                    lw2.write_all(&buf[..n]).await?;
+                }
             }
         }
+        Ok(())
     }
+    .await;
     let _ = lw2.shutdown().await;
-    upload.abort();
     recycle_buf(buf).await;
-    Ok(())
+    if remote_eof {
+        let mut upload = upload;
+        let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
+        if timeout(drain_wait, &mut upload).await.is_err() {
+            upload.abort();
+        }
+    } else {
+        upload.abort();
+    }
+    down_res
 }
 async fn relay_quic_udp(
     mut control: TcpStream,
@@ -7732,7 +7748,10 @@ async fn handle_server_udp_stream(
                 if enforce_target_policy(&cfg, &target).is_err() {
                     continue;
                 }
-                let addr = resolve_target(cfg.block_local, &target.host, target.port).await?;
+                let Ok(addr) = resolve_target(cfg.block_local, &target.host, target.port).await
+                else {
+                    continue;
+                };
                 // Recorded before the first payload leaves, so a reply can
                 // never arrive ahead of its target joining the known set.
                 {
@@ -9137,6 +9156,13 @@ where
                                 }
                             }
                             Err(_) => {
+                                let _ = send_reset_encrypted(
+                                    &writer_task,
+                                    &cipher_task,
+                                    stream_id,
+                                    cfg_task.obfs,
+                                )
+                                .await;
                                 remove_if_same_stream(&streams_task, stream_id, &gate_task);
                                 return;
                             }
@@ -9153,6 +9179,7 @@ where
                         gate_task.clone(),
                     ));
 
+                    let mut write_failed = false;
                     if client_fin {
                         let _ = wr_target.shutdown().await;
                     } else {
@@ -9225,7 +9252,10 @@ where
                                                         .await;
                                                     }
                                                 }
-                                                Err(_) => break,
+                                                Err(_) => {
+                                                    write_failed = true;
+                                                    break;
+                                                }
                                             }
                                         }
                                         Ok(other) => {
@@ -9237,6 +9267,7 @@ where
                                                 frame.into_storage(),
                                             );
                                             if write_res.is_err() {
+                                                write_failed = true;
                                                 break;
                                             }
                                             crate::stats::add_bytes(len as i64, 0);
@@ -9259,6 +9290,7 @@ where
                                                 frame.into_storage(),
                                             );
                                             if write_res.is_err() {
+                                                write_failed = true;
                                                 break;
                                             }
                                             crate::stats::add_bytes(len as i64, 0);
@@ -9311,6 +9343,15 @@ where
                         }
                     } else {
                         reader.abort();
+                        if write_failed && !*cancelled.borrow() {
+                            let _ = send_reset_encrypted(
+                                &writer_task,
+                                &cipher_task,
+                                stream_id,
+                                cfg_task.obfs,
+                            )
+                            .await;
+                        }
                     }
 
                     while let Ok(cmd) = rx.try_recv() {

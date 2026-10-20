@@ -1470,5 +1470,47 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.60`.
 
+## Release: v0.0.61 (2026-10-20) — QUIC Graceful Stream Drain, Robust Target Resolution & Proactive MUX Reset Signaling
+
+### Context & User Directives
+- **Directives:** "更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **QUIC Stream Graceful Drain on Downstream Remote EOF:**
+    - When a server downstream terminates its response flow, the client downstream read loop terminates on clean EOF (`None` or `Some(0)`).
+    - Previously, `upload.abort()` was unconditionally executed immediately, severing remaining in-flight upload frames or pipelined requests.
+    - Updated `relay_quic` to introduce `remote_eof` state tracking: on clean EOF, grants the upload task a graceful drain timeout (`connection_timeout.max(5)`) before socket abort. Abnormal terminations abort immediately, and `down_res` is faithfully propagated.
+  - **Resilient QUIC Server UDP Target Resolution:**
+    - `handle_server_udp_stream` previously propagated target DNS resolution errors via `?`, which abruptly aborted the server UDP stream loop and terminated all active client datagram flows.
+    - Replaced with non-fatal `continue`, isolating invalid domains or transient DNS errors from interrupting the active session.
+  - **Proactive MUX Reset Signaling on Destination Failure:**
+    - When a multiplexed connection fails during target dial (`connect_target`), an explicit `Rst` frame is now emitted to upstream clients (`send_reset_encrypted`) prior to stream entry unmapping.
+    - Tracked destination socket write errors (`write_failed`) during relay loops; if destination writes fail while the stream is uncancelled, an `Rst` frame is proactively emitted to unblock awaiting clients.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **QUIC Client Downstream Graceful Drain (`src/main.rs:relay_quic`)**:
+   - Added `remote_eof` state tracking with bounded drain timeout.
+2. **QUIC Server UDP Error Isolation (`src/main.rs:handle_server_udp_stream`)**:
+   - Replaced resolution error abort with non-fatal `continue`.
+3. **Proactive MUX RST Dispatch (`src/main.rs:handle_server`)**:
+   - Emitted RST on dial failure and destination write abortion.
+4. **Version & Documentation**:
+   - Bumped version to `0.0.61` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.61 - QUIC graceful stream drain, robust target resolution, and proactive MUX reset signaling`
+- Tag: `v0.0.61`
+
+### Status
+- Completed and released as `v0.0.61`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.61`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.61`.
+
+
 
 
