@@ -1660,3 +1660,57 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.64`.
+
+
+## Release: v0.0.65 (2026-10-20) — MUX Burst Backpressure Buffering, Server Concurrency Isolation, RAII Task Abort & DNS Invalidation
+
+### Context & User Directives
+- **Directives:** "更新版本号0.0.65更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Inbound Stream Backpressure & Control Frame Preservation:**
+    - Replaced the instantaneous stream reset on full inbound queues in `client_reader_loop`, `wss_reader_loop`, and `handle_server` with a 250ms buffered retry (`timeout(250ms, tx.send(f))`). Eliminates false-positive `Rst` frame emission during burst traffic and large transfers, while preserving non-Data control frames (`Fin`, `Window`) via asynchronous background dispatch.
+  - **Server Concurrency Decoupling & Deadlock Prevention (Audit Bug 5):**
+    - Removed `tokio::join!(runtime::run_server, quic::run_server)` in `run_forwarding`. QUIC server is now supervised as a background task via `AbortOnDrop`, driven by the primary TCP listener. TCP port conflicts now fail and exit immediately rather than causing process deadlock.
+  - **RAII Child Task Abort Guard:**
+    - Implemented `AbortOnDrop<T>` RAII wrapper around `tokio::task::JoinHandle<T>` across client upload tasks, destination readers, and background monitors, ensuring child coroutines are cleanly aborted upon parent connection termination rather than becoming orphaned tasks.
+  - **Failure-Triggered DNS Invalidation & FQDN Validation:**
+    - Added proactive DNS cache invalidation (`dns::invalidate_host`) on upstream connection failures and timeouts across WS, non-MUX, WSS, and QUIC paths to expedite failover. Handled trailing dots (`trim_end_matches('.')`) in DNS response question validation.
+  - **Dynamic QUIC Upstream Re-resolution:**
+    - Stored upstream host and port in `QuicClientPool` to dynamically re-resolve target addresses (`current_or_resolve_addr`) on connection initialization, invalidating stale cache entries on failure. Guarded `open_bi` with explicit timeout controls.
+  - **MUX Session Dual-Task Exit Coordination & Heartbeat Cancellation:**
+    - Linked writer task termination directly into the reader loop event selector, automatically triggering session teardown, credit gate closure, and cancelling active heartbeat ping timers upon writer failure. Added RAII reset guards (`OpenStreamGuard`, `ActiveStreamGuard`) on pending streams.
+  - **Accurate Console DNS Display (Audit Bug 10):**
+    - Sourced banner `dns_display` from `dns::configured_server()` rather than `args.dns`, accurately reporting DNS servers configured via JSON configuration files.
+  - **Buffer Size Unit Heuristic Guard:**
+    - Added defensive auto-scaling for JSON `buffer_size` configurations below 16 KiB by multiplying by 1024, protecting configurations specifying buffer size in KiB units from allocating degenerate byte-sized buffers.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **MUX Queue Backpressure (`src/main.rs:client_reader_loop`, `wss_reader_loop`, `handle_server`)**:
+   - 250ms buffered retry on queue saturation; asynchronous control frame delivery.
+2. **Server Concurrency Architecture (`src/main.rs:run_forwarding`)**:
+   - TCP-driven lifecycle supervising QUIC server with `AbortOnDrop`.
+3. **RAII Task Cancellation (`src/main.rs:AbortOnDrop`)**:
+   - Automated child task abort on drop for uploads, readers, and monitors.
+4. **DNS Invalidation on Failure (`src/main.rs:dns::invalidate_host`, `validate_question_section`)**:
+   - Eviction of failed upstream IPs from DNS cache; FQDN trailing dot normalization.
+5. **QUIC Pool Dynamic Resolution (`src/main.rs:QuicClientPool`)**:
+   - Dynamic DNS re-resolution and `open_bi` timeouts.
+6. **Session Lifecycle & Guard Co-scheduling (`src/main.rs:SessionState`, `WssSessionState`)**:
+   - Writer task exit linking, heartbeat cancellation, and RAII reset guards.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.65` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.65 - MUX burst backpressure buffering, server concurrency isolation, RAII task abort, and DNS invalidation`
+- Tag: `v0.0.65`
+
+### Status
+- Completed and released as `v0.0.65`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.65`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.65`.

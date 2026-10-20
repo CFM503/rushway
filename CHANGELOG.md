@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.65] - 2026-10-20
+
+### MUX Burst Backpressure Buffering, Server Concurrency Isolation, RAII Task Abort & DNS Invalidation
+
+- **MUX Inbound Queue Burst Backpressure Buffering (`src/main.rs:client_reader_loop`, `wss_reader_loop`, `handle_server`)** — Replaced instantaneous stream reset on full inbound queues with a 250ms buffered retry window (`timeout(250ms, tx.send(f))`), eliminating false-positive `Rst` frame emission and stream drops during bursty network traffic or transient client backpressure. Preserved non-Data control frames (`Fin`, `Window`) via asynchronous background delivery.
+- **Server Concurrency Isolation & Deadlock Prevention (`src/main.rs:run_forwarding`)** — Decoupled concurrent TCP and QUIC server listening from `tokio::join!`, supervising the QUIC server as an `AbortOnDrop` task driven by the primary TCP listener. Ensures TCP port binding errors immediately fail and exit cleanly rather than causing the process to hang indefinitely.
+- **RAII Child Task Abort Guard (`src/main.rs:AbortOnDrop`)** — Introduced `AbortOnDrop<T>` RAII wrapper around `tokio::task::JoinHandle<T>` across client upload tasks, destination readers, and background monitors, ensuring child coroutines are cleanly aborted upon parent connection termination rather than becoming orphaned tasks.
+- **Failure-Triggered DNS Invalidation & FQDN Question Validation (`src/main.rs:dns::invalidate_host`, `validate_question_section`)** — Triggered proactive DNS cache invalidation (`dns::invalidate_host`) on upstream connection failures and timeouts across WS, non-MUX, WSS, and QUIC paths, expediting recovery and failover. Handled trailing dots (`trim_end_matches('.')`) in DNS response question section validation.
+- **Dynamic QUIC Upstream Re-resolution & Open-Bi Timeout (`src/main.rs:QuicClientPool`)** — Stored upstream host/port within `QuicClientPool` and dynamically re-resolved target addresses (`current_or_resolve_addr`) on connection initialization, invalidating stale cache entries on failure. Guarded `open_bi` with explicit timeout controls.
+- **MUX Session Dual-Task Exit Coordination & Heartbeat Cancellation (`src/main.rs:SessionState`, `WssSessionState`)** — Linked writer task termination directly into the reader loop event selector, automatically triggering session teardown, credit gate closure, and cancelling active heartbeat ping timers upon writer failure. Added RAII reset guards (`OpenStreamGuard`, `ActiveStreamGuard`) on pending streams.
+- **Accurate Console DNS Display (`src/main.rs:main`)** — Derived banner `dns_display` from `dns::configured_server()` rather than `args.dns`, accurately reporting DNS servers configured via JSON configuration files.
+- **Buffer Size Unit Heuristic Guard (`src/main.rs:load_json`)** — Added defensive auto-scaling for JSON `buffer_size` configurations below 16 KiB by multiplying by 1024, protecting configurations specifying buffer size in KiB units from allocating degenerate byte-sized buffers.
+
 ## [v0.0.64] - 2026-10-20
 
 ### Dual-Stack UDP Forwarding, QUIC Fakehost SNI, Robust HTTP Parsing & Initial Payload Accounting
