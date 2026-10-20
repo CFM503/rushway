@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.68] - 2026-10-20
+
+### Handshake Pong Auto-Reply, MUX 0-RTT CreditGate Flow Control, UDP State Anti-Thrashing & Stale DNS Fallback
+
+- **WebSocket Handshake Pong Auto-Reply (`src/main.rs:relay_udp_ws`, `relay_non_mux_ws`, `handle_server`, `handle_server_udp_parts`, `SessionState::connect`, `WssSessionState::connect`)** — Supplied active write halves (`Some(&mut wr)` / `read_frame_mux` with `&writer`) during initial WebSocket handshake frame reads across UDP relay, non-MUX, and MUX connection paths. Ensures incoming WebSocket Ping control frames (opcode 9) from edge CDNs (e.g. Cloudflare) or reverse proxies are immediately answered with Pong replies (opcode 0xA), preventing premature edge connection resets during handshake latency windows.
+- **MUX 0-RTT Initial Payload CreditGate Accounting (`src/main.rs:SessionState::open_stream`, `WssSessionState::open_stream`)** — Guarded pipelined initial data (`syn_initial` and `remaining_initial`) with explicit `gate.acquire(len).await` quota deductions before emitting `Syn` and follow-up `Data` frames. Fixes flow control window bypass where early application data violated upstream MUX receiver windows, preventing peer RST drops under heavy payload pipelining.
+- **UDP Server Known Targets Anti-Thrashing Optimization (`src/main.rs:handle_server_udp_stream`, `handle_server_udp_parts`)** — Guarded `known_targets` hash set operations with an existence check (`if !guard.contains(&addr)`). Prevents high-frequency active destinations (e.g., DNS or real-time voice endpoints) from repeatedly triggering threshold resets (`guard.clear()`) once the cache reaches 4096 entries, eliminating transient downlink UDP packet drops.
+- **DNS Stale-While-Revalidate Fallback for Multi-IPv4 Resolution (`src/main.rs:resolve_all_ipv4`)** — Added a 30-minute stale cache fallback (`STALE_TTL`) in `resolve_all_ipv4` matching `resolve_host`. Returns cached IPs when live DNS queries fail or timeout, providing network partition resilience for upstream multi-IP dials.
+- **Unified Target Security Policy Enforcement (`src/main.rs:handle_server_udp_parts`)** — Consolidated ad-hoc local host filtering in `handle_server_udp_parts` into `enforce_target_policy(&cfg, &target)`, enforcing zero-port rejection and consistent loopback/LAN boundary defense.
+
 ## [v0.0.67] - 2026-10-20
 
 ### SOCKS5 UDP Anti-Hijacking Security, MUX Stream Teardown Race Safety & Full-Stack Relay De-duplication

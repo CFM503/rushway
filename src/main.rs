@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.67";
+pub const APP_VERSION: &str = "0.0.68";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -530,7 +530,7 @@ where
     let mut frame_buf = Vec::new();
     let ok_res = timeout(
         conn_timeout,
-        read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf),
+        read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
     )
     .await
     .map_err(|_| anyhow!("{err_prefix} UDP handshake OK timed out"))?;
@@ -1167,7 +1167,7 @@ where
             write_frame(&mut wr, &hello, 2, true).await?;
             let ok_res = timeout(
                 Duration::from_secs(15),
-                read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf),
+                read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
             )
             .await
             .map_err(|_| anyhow!(spec.closed_error))?;
@@ -2300,10 +2300,15 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         std::borrow::Cow::Borrowed(trimmed)
     };
     // Fast path: synchronous read lock, zero tokio yield, zero key allocation on lowercase cache hit
+    let mut stale_fallback: Option<Vec<Ipv4Addr>> = None;
     if let Ok(guard) = all_v4_cache().read() {
         if let Some((ips, expires)) = guard.get(key.as_ref()) {
-            if *expires > Instant::now() && !ips.is_empty() {
+            let now = Instant::now();
+            if *expires > now && !ips.is_empty() {
                 return Ok(ips.clone());
+            }
+            if !ips.is_empty() && now.duration_since(*expires) < STALE_TTL {
+                stale_fallback = Some(ips.clone());
             }
         }
     }
@@ -2327,6 +2332,9 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         }
     }
     if unique.is_empty() {
+        if let Some(stale) = stale_fallback {
+            return Ok(stale);
+        }
         bail!("no IPv4 addresses resolved for {host}");
     }
     let mut guard = all_v4_cache().write().unwrap_or_else(|e| e.into_inner());
@@ -3179,17 +3187,14 @@ use crate::runtime::{
     wait_shutdown, RuntimeConfig,
 };
 use crate::udp_relay::handle_local_udp_proxy;
-use crate::ws::{encode_ws_frame, read_frame};
+use crate::ws::encode_ws_frame;
 use anyhow::{anyhow, bail, Result};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::io::AsyncWriteExt;
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpListener, TcpStream,
-};
+use tokio::net::{tcp::OwnedReadHalf, TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 
@@ -3244,11 +3249,7 @@ impl SessionState {
         let mut frame_buf = Vec::new();
         let read_res = timeout(
             hs_timeout,
-            read_frame(
-                &mut rd,
-                Option::<&mut OwnedWriteHalf>::None,
-                &mut frame_buf,
-            ),
+            crate::ws::read_frame_mux(&mut rd, &writer, true, &mut frame_buf, None),
         )
         .await
         .map_err(|_| anyhow!("upstream MUX handshake OK timed out"));
@@ -3461,6 +3462,9 @@ impl SessionState {
             armed: true,
         };
 
+        if !syn_initial.is_empty() {
+            gate.acquire(syn_initial.len()).await;
+        }
         let send_syn_res = send_mux_parts(
             &self.writer,
             &self.cipher,
@@ -3478,6 +3482,7 @@ impl SessionState {
         open_guard.syn_sent = true;
 
         if !remaining_initial.is_empty() {
+            gate.acquire(remaining_initial.len()).await;
             if let Err(e) = send_mux_parts(
                 &self.writer,
                 &self.cipher,
@@ -5549,12 +5554,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let first_frame_timeout = Duration::from_secs(cfg.connection_timeout.max(45));
     let target_res = timeout(
         first_frame_timeout,
-        read_frame_with_cipher(
-            &mut rd,
-            Option::<&mut OwnedWriteHalf>::None,
-            &mut frame_buf,
-            Some(&c),
-        ),
+        read_frame_with_cipher(&mut rd, Some(&mut wr), &mut frame_buf, Some(&c)),
     )
     .await
     .map_err(|_| anyhow!("non-MUX target frame timed out"))?;
@@ -8313,10 +8313,12 @@ async fn handle_server_udp_stream(
                 // never arrive ahead of its target joining the known set.
                 {
                     let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.len() >= 4096 {
-                        guard.clear();
+                    if !guard.contains(&addr) {
+                        if guard.len() >= 4096 {
+                            guard.clear();
+                        }
+                        guard.insert(addr);
                     }
-                    guard.insert(addr);
                 }
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
@@ -10184,7 +10186,7 @@ where
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 };
-                if cfg.block_local && is_blocked_local_host(&target.host) {
+                if enforce_target_policy(&cfg, &target).is_err() {
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
@@ -10197,10 +10199,12 @@ where
                 };
                 {
                     let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.len() >= 4096 {
-                        guard.clear();
+                    if !guard.contains(&addr) {
+                        if guard.len() >= 4096 {
+                            guard.clear();
+                        }
+                        guard.insert(addr);
                     }
-                    guard.insert(addr);
                 }
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
@@ -10237,7 +10241,7 @@ where
     let first_frame_timeout = Duration::from_secs(cfg.connection_timeout.max(45));
     let first_res = timeout(
         first_frame_timeout,
-        read_frame_with_cipher(&mut rd, Option::<&mut W>::None, &mut buf, Some(&cipher)),
+        read_frame_with_cipher(&mut rd, Some(&mut wr), &mut buf, Some(&cipher)),
     )
     .await
     .context("transport handshake frame timeout")?;
@@ -14382,7 +14386,7 @@ impl WssSessionState {
         let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
         let read_result = timeout(
             mux_timeout,
-            read_frame(&mut rd, Option::<&mut TlsWriter>::None, &mut frame_buf),
+            read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
         )
         .await
         .context("MUX OK timeout");
@@ -14606,6 +14610,9 @@ impl WssSessionState {
             armed: true,
         };
 
+        if !syn_initial.is_empty() {
+            gate.acquire(syn_initial.len()).await;
+        }
         let send_syn_res = send_mux_parts(
             &self.writer,
             &self.cipher,
@@ -14623,6 +14630,7 @@ impl WssSessionState {
         open_guard.syn_sent = true;
 
         if !remaining_initial.is_empty() {
+            gate.acquire(remaining_initial.len()).await;
             if let Err(error) = send_mux_parts(
                 &self.writer,
                 &self.cipher,

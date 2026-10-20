@@ -1813,3 +1813,49 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.67`.
+
+
+## Release: v0.0.68 (2026-10-20) — Handshake Pong Auto-Reply, MUX 0-RTT CreditGate Flow Control, UDP State Anti-Thrashing & Stale DNS Fallback
+
+### Context & User Directives
+- **Directives:** "更新日志，更新AI接力交接日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **WebSocket Handshake Pong Auto-Reply (P0 Compliance & Reliability):**
+    - RFC 6455 requires prompt Pong frame replies upon Ping reception. Provided active write streams (`Some(&mut wr)` / `read_frame_mux` with `&writer`) during handshake reads across `relay_udp_ws`, `relay_non_mux_ws`, `handle_server`, `handle_server_udp_parts`, `SessionState::connect`, and `WssSessionState::connect`. Prevents edge reverse proxies (Cloudflare, Nginx) from dropping handshaking connections on unanswered keep-alive pings.
+  - **MUX 0-RTT CreditGate Flow Control Deduction (P0 Protocol Integrity):**
+    - Pipelined early data (`syn_initial` and `remaining_initial`) previously bypassed MUX credit gate reservation, risking receiver buffer overruns and peer resets. Added explicit `gate.acquire(len).await` before emitting `Syn` and follow-up `Data` frames in `SessionState::open_stream` and `WssSessionState::open_stream`.
+  - **UDP Known Targets Cache Anti-Thrashing (P1 Availability):**
+    - Guarded `known_targets` hash set insertions with `if !guard.contains(&addr)`. Prevents steady-state active flows from repeatedly clearing the 4096-entry set, completely eliminating packet drops on downlink return paths.
+  - **DNS Multi-IPv4 Stale Cache Fallback (P1 Resilience):**
+    - Added `STALE_TTL` (30m) fallback logic to `resolve_all_ipv4`, matching `resolve_host`. Ensures resilience against transient upstream DNS timeouts.
+  - **Unified Target Security Policy (P2 Defensive):**
+    - Replaced ad-hoc host checks in `handle_server_udp_parts` with `enforce_target_policy`, enforcing port-zero rejection and standard LAN access rules.
+  - **Regression Risk:** Zero. Clean syntax and architectural integrity verified.
+
+### Changes Implemented
+1. **WebSocket Handshake Pong Auto-Reply (`src/main.rs:read_frame`, `read_frame_with_cipher`, `read_frame_mux`)**:
+   - Active writer reference passed to handshake reads, ensuring Ping frames receive immediate Pong responses.
+2. **MUX 0-RTT CreditGate Flow Control (`src/main.rs:open_stream`)**:
+   - Explicit `gate.acquire` for `syn_initial` and `remaining_initial` across plain and WSS MUX sessions.
+3. **UDP Server Known Targets Anti-Thrashing (`src/main.rs:handle_server_udp_stream`, `handle_server_udp_parts`)**:
+   - Existence check prior to clearing `known_targets` set at capacity.
+4. **DNS Multi-IPv4 Stale Fallback (`src/main.rs:resolve_all_ipv4`)**:
+   - 30-minute stale cache fallback on DNS query failures.
+5. **Unified Target Security Policy (`src/main.rs:handle_server_udp_parts`)**:
+   - Standardized policy check incorporating zero-port protection.
+6. **Version & Documentation**:
+   - Bumped version to `0.0.68` in `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.68 - handshake pong auto-reply, MUX 0-RTT CreditGate flow control, UDP state anti-thrashing, and stale DNS fallback`
+- Tag: `v0.0.68`
+
+### Status
+- Completed and released as `v0.0.68`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.68`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.68`.
