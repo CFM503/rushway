@@ -503,10 +503,9 @@ pub(crate) fn udp_client_allowed(
 }
 
 /// Shared WebSocket (`ws://` and `wss://`) client UDP relay loop: sends the
-/// XOR-encrypted `"UDP
-"` handshake, verifies `"OK
-"`, and relays SOCKS5 UDP
+/// XOR-encrypted `"UDP\n"` handshake, verifies `"OK\n"`, and relays SOCKS5 UDP
 /// datagrams bidirectionally while enforcing target policy and source address locking.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn relay_udp_ws<R, W>(
     mut control: TcpStream,
     udp: Arc<tokio::net::UdpSocket>,
@@ -525,8 +524,7 @@ where
     let control_peer_ip = control.peer_addr().ok().map(|a| a.ip());
     let hint = bind_hint.clone();
     let c = configured_cipher(key);
-    let mut hello = b"UDP
-".to_vec();
+    let mut hello = b"UDP\n".to_vec();
     c.apply(&mut hello);
     write_frame(&mut wr, &hello, 2, true).await?;
     let mut frame_buf = Vec::new();
@@ -549,8 +547,7 @@ where
         bail!("invalid {err_prefix} UDP handshake response opcode")
     }
     c.apply(&mut ok);
-    let is_ok = ok == b"OK
-";
+    let is_ok = ok == b"OK\n";
     crate::mux_writer::recycle_encode_buf(ok);
     if !is_ok {
         crate::mux_writer::recycle_encode_buf(frame_buf);
@@ -8611,7 +8608,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::{timeout, Duration};
 
