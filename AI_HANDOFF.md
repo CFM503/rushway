@@ -1556,3 +1556,53 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 
 
+
+
+## Release: v0.0.63 (2026-10-20) — IPv6 Authority & Origin Compliance, DNS SingleFlight Retry, QUIC Handshake Timeout & Stream Drain Co-scheduling
+
+### Context & User Directives
+- **Directives:** "更新版本号0.0.63更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **IPv6 RFC 3986 Compliance Across Host/Origin Headers:**
+    - Fixed naive `.split(':').next()` which truncated IPv6 strings at the first colon (e.g. `2001:db8::1` -> `2001`). Added `extract_host_only` and `format_origin_host` to correctly bracket IPv6 addresses in `Origin` and `Host` headers. Corrected `parse_ws_url_with_port` to recognize IPv6 bracketed hosts without ports.
+  - **DNS SingleFlight Coordination & Cancellation Resilience:**
+    - Transitioned `IN_FLIGHT` to tri-state `watch::Receiver<Option<Option<IpAddr>>>`. Waiters distinguish between resolution failure and task cancellation/drop. Implemented a leader re-election loop in `resolve_host_fresh` preventing false-negative DNS resolution failures.
+  - **Bi-directional Stream Upload Completion & Drain Co-scheduling:**
+    - Integrated `up_res = &mut upload` directly into the stream select loops (`handle_tcp_proxy`, `handle_connection`, `nonmux::handle_server`, `relay_quic`) with `upload_done` state tracking. Bypasses redundant 5s drain delays and abort calls when the upload task has already concluded prior to peer EOF.
+  - **QUIC Handshake Timeout & Buffer Forwarding:**
+    - Added `hs_timeout` to QUIC client/server header parsing, terminating hung handshake coroutines under keep-alive. Implemented `extra_down` extraction from initial QUIC line reading to forward trailing bytes to local sockets.
+  - **Memory Buffer Recycling & Stream Table Cleanup:**
+    - Ensured `MuxFrame::decode_owned` recycles `buf` back to `ENCODE_POOL` on header parse error. Evicted reset streams immediately on `MuxCommand::Rst`.
+  - **CLI Legacy Normalization & Server Concurrency Error Aggregation:**
+    - Suppressed generation of non-existent `--no-allow-open` / `--no-tui` flags when `-allow-open=false` or `-tui=false` is passed. Aggregated QUIC/TCP results in `run_forwarding` via `tcp_result.and(quic_result)`.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **RFC 3986 IPv6 Formatting (`src/main.rs:extract_host_only`, `format_origin_host`, `parse_ws_url_with_port`)**:
+   - Safe authority parsing and Origin header bracket wrapping for IPv6.
+2. **DNS SingleFlight Coordination (`src/main.rs:resolve_host_fresh`)**:
+   - Tri-state watch channel encoding with retry loop on leader task cancellation.
+3. **Stream Upload Termination & Drain (`src/main.rs:handle_tcp_proxy`, `handle_connection`, `nonmux::handle_server`, `relay_quic`)**:
+   - Direct integration of upload completion in main event loops; skipped drain delays on completed uploads.
+4. **QUIC Handshake Timeout & Downlink Tail Forwarding (`src/main.rs:relay_quic`, `relay_quic_udp`, `handle_server_stream`, `quic::run_server`)**:
+   - Handshake timeouts and `extra_down` payload forwarding.
+5. **Buffer Reclamation & Stream Eviction (`src/main.rs:MuxFrame::decode_owned`, `handle_server`)**:
+   - Buffer recycling on parse error and immediate RST stream table pruning.
+6. **CLI Argument Normalization & Server Concurrency (`src/main.rs:normalize_legacy_args`, `run_forwarding`)**:
+   - Safe flag normalization and aggregated listening results.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.63` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.63 - IPv6 authority/origin compliance, DNS SingleFlight retry, QUIC handshake timeout, and stream drain co-scheduling`
+- Tag: `v0.0.63`
+
+### Status
+- Completed and released as `v0.0.63`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.63`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.63`.

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.63] - 2026-10-20
+
+### IPv6 Authority & Origin Compliance, DNS SingleFlight Retry, QUIC Handshake Timeout & Stream Drain Co-scheduling
+
+- **RFC 3986 IPv6 Authority & Origin Header Compliance (`src/main.rs:extract_host_only`, `format_origin_host`, `parse_ws_url_with_port`)** — Introduced `extract_host_only` and `format_origin_host` to safely isolate hostnames and IP literals without truncating IPv6 addresses at the first colon. Correctly wrapped bare IPv6 literals in brackets `[ipv6]` for HTTP/WebSocket `Origin` and `Host` headers across MUX, WSS, and non-MUX paths. Updated `parse_ws_url_with_port` to recognize bracketed IPv6 URLs without ports (`ws://[::1]/ws`) and properly append `:80`.
+- **DNS SingleFlight Tri-State Coordination & Cancellation Resilient Leader Re-election (`src/main.rs:resolve_host_fresh`)** — Refactored `IN_FLIGHT` channel coordination to use tri-state encoding (`None` = inflight/cancelled, `Some(Some(ip))` = success, `Some(None)` = failed lookup). Added an election retry loop in `resolve_host_fresh`, allowing waiting queries to elect a new leader instead of failing when a previous leader coroutine is aborted before completion.
+- **Bi-directional Stream Termination & Upload Drain Co-scheduling (`src/main.rs:handle_tcp_proxy`, `handle_connection`, `nonmux::handle_server`, `relay_quic`)** — Integrated background upload worker completion directly into the primary `tokio::select!` event loop with `upload_done` tracking. When upload finishes before peer termination, subsequent peer EOF events bypass redundant 5-second drain waits and aborts, accelerating resource cleanup and teardown responsiveness. In non-MUX server mode, emits WebSocket Close frames (opcode 8) upon upload EOF.
+- **QUIC Stream Handshake Timeout & Downlink Tail Forwarding (`src/main.rs:relay_quic`, `relay_quic_udp`, `handle_server_stream`, `quic::run_server`)** — Guarded QUIC stream handshake line reads with explicit timeouts (`connection_timeout.max(1)`), preventing goroutine/stream hang leaks under 15-second keep-alive intervals. Extracted and immediately forwarded trailing downlink payload bytes (`extra_down`) from QUIC handshake replies to local clients with bandwidth accounting. Added rejection signaling on handshake failure and DNS resolution fallback for server bind addresses.
+- **Memory Buffer Reclamation & Stream Table Reset Pruning (`src/main.rs:MuxFrame::decode_owned`, `handle_server`)** — Explicitly recycled input buffers back to `ENCODE_POOL` via `recycle_encode_buf` on `MuxHeader::parse` errors in `decode_owned`, preventing buffer pool leakage on malformed ingress frames. Immediately evicted reset stream IDs (`streams.write().remove(&stream_id)`) upon receiving `MuxCommand::Rst`.
+- **CLI Legacy Argument Normalization & Server Concurrency Error Aggregation (`src/main.rs:normalize_legacy_args`, `run_forwarding`)** — Fixed clap argument parsing crash when passing `-allow-open=false` or `-tui=false` by suppressing generation of non-existent `--no-*` flags. Added support for `--flag=true/false` double-dash boolean arguments. Aggregated QUIC and TCP server listening outcomes in `run_forwarding` using `tcp_result.and(quic_result)` with error logging.
+- **Non-MUX Server UDP Handshake Dispatch (`src/main.rs:nonmux::handle_server`)** — Added explicit inspection for `target_frame == b"UDP\n"` in non-MUX server connections, dispatching incoming UDP tunnels directly to `handle_server_udp_parts`.
+
 ## [v0.0.62] - 2026-10-20
 
 ### MUX Asymmetric RST Loop Suppression, Bi-directional Server Drain & Unconsumed Frame Recycling

@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.62";
+pub const APP_VERSION: &str = "0.0.63";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -250,12 +250,47 @@ pub(crate) fn split_ws_url(input: &str, scheme_error: &str) -> Result<(String, S
     Ok((authority, path))
 }
 
+/// Extracts the bare hostname or IP literal from an authority/host string,
+/// safely handling `[ipv6]:port`, `[ipv6]`, raw `ipv6`, and `host:port`.
+pub(crate) fn extract_host_only(input: &str) -> &str {
+    let trimmed = input.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    if trimmed.matches(':').count() == 1 {
+        if let Some((host, _port)) = trimmed.rsplit_once(':') {
+            return host;
+        }
+    }
+    trimmed
+}
+
+/// Formats a host or IP literal for use in an HTTP `Origin` URL authority,
+/// wrapping bare IPv6 literals in brackets per RFC 3986.
+pub(crate) fn format_origin_host(host: &str) -> std::borrow::Cow<'_, str> {
+    let clean = extract_host_only(host);
+    if clean.contains(':') {
+        std::borrow::Cow::Owned(format!("[{clean}]"))
+    } else {
+        std::borrow::Cow::Borrowed(clean)
+    }
+}
+
 /// [`split_ws_url`] plus the port default shared by the pooled MUX client
 /// and the UDP relay: an authority without a port gets `:80`.
 pub(crate) fn parse_ws_url_with_port(input: &str, scheme_error: &str) -> Result<(String, String)> {
     let (authority, path) = split_ws_url(input, scheme_error)?;
-    let authority = if authority.contains(':') {
+    let has_port = if authority.starts_with('[') {
+        authority.contains("]:")
+    } else {
+        authority.matches(':').count() == 1
+    };
+    let authority = if has_port {
         authority
+    } else if authority.contains(':') && !authority.starts_with('[') {
+        format!("[{}]:80", authority)
     } else {
         format!("{}:80", authority)
     };
@@ -1431,7 +1466,7 @@ const CACHE_MAX_ENTRIES: usize = 4096;
 static SERVER: RwLock<Option<IpAddr>> = RwLock::new(None);
 static CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::new();
 static ALL_V4_CACHE: OnceLock<RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>>> = OnceLock::new();
-static IN_FLIGHT: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<IpAddr>>>>> =
+static IN_FLIGHT: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<Option<IpAddr>>>>>> =
     OnceLock::new();
 
 fn cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
@@ -1442,7 +1477,7 @@ fn all_v4_cache() -> &'static RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>> 
     ALL_V4_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<IpAddr>>>> {
+fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<Option<IpAddr>>>>> {
     IN_FLIGHT.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -1547,45 +1582,48 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
 
 async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAddr> {
     // SingleFlight coordination: deduplicate concurrent in-flight DNS lookups for the same host.
-    let mut waiter = None;
-    let mut tx = None;
-    {
-        let mut inflight = in_flight().lock().unwrap_or_else(|e| e.into_inner());
-        // Double check cache inside lock
-        if let Ok(guard) = cache().read() {
-            if let Some(&(ip, expires)) = guard.get(&key) {
-                if expires > Instant::now() {
-                    return Ok(ip);
+    // State encoding in `watch`:
+    //   `None`             -> leader still running (or dropped/cancelled before completion)
+    //   `Some(Some(ip))`   -> leader succeeded with `ip`
+    //   `Some(None)`       -> leader completed and DNS resolution failed
+    let tx = loop {
+        let mut waiter = None;
+        let mut leader_tx = None;
+        {
+            let mut inflight = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(guard) = cache().read() {
+                if let Some(&(ip, expires)) = guard.get(&key) {
+                    if expires > Instant::now() {
+                        return Ok(ip);
+                    }
                 }
             }
+            if let Some(rx) = inflight.get(&key) {
+                waiter = Some(rx.clone());
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                inflight.insert(key.clone(), receiver);
+                leader_tx = Some(sender);
+            }
         }
-        if let Some(rx) = inflight.get(&key) {
-            waiter = Some(rx.clone());
-        } else {
-            let (sender, receiver) = watch::channel(None);
-            inflight.insert(key.clone(), receiver);
-            tx = Some(sender);
-        }
-    }
 
-    if let Some(mut rx) = waiter {
-        while rx.borrow().is_none() {
-            if rx.changed().await.is_err() {
-                break;
+        if let Some(mut rx) = waiter {
+            while rx.borrow().is_none() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
             }
-        }
-        if let Some(ip) = *rx.borrow() {
-            return Ok(ip);
-        }
-        if let Ok(guard) = cache().read() {
-            if let Some(&(ip, expires)) = guard.get(&key) {
-                if expires > Instant::now() {
-                    return Ok(ip);
+            match *rx.borrow() {
+                Some(Some(ip)) => return Ok(ip),
+                Some(None) => bail!("concurrent DNS resolution failed for {host}"),
+                None => {
+                    // Leader task was cancelled/aborted before completing; retry to elect a new leader.
+                    continue;
                 }
             }
         }
-        bail!("concurrent DNS resolution failed for {host}");
-    }
+        break leader_tx;
+    };
 
     struct InFlightGuard<'a>(&'a str);
     impl<'a> Drop for InFlightGuard<'a> {
@@ -1614,13 +1652,13 @@ async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAd
             let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
             bounded_insert(&mut guard, key.clone(), (resolved, Instant::now() + CACHE_TTL));
             if let Some(sender) = tx {
-                let _ = sender.send(Some(resolved));
+                let _ = sender.send(Some(Some(resolved)));
             }
             Ok(resolved)
         }
         Err(e) => {
             if let Some(sender) = tx {
-                let _ = sender.send(None);
+                let _ = sender.send(Some(None));
             }
             Err(e)
         }
@@ -2647,10 +2685,10 @@ impl SessionState {
         let sni_base = cfg
             .fakehost
             .as_deref()
-            .map(|s| s.split(':').next().unwrap_or(s))
+            .map(crate::common::extract_host_only)
             .unwrap_or(&target.host);
-        let header_base = actual_host.split(':').next().unwrap_or(&actual_host);
-        let origin = Some(format!("http://{}", sni_base));
+        let header_base = crate::common::extract_host_only(&actual_host);
+        let origin = Some(format!("http://{}", crate::common::format_origin_host(sni_base)));
         let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
             "same-origin"
         } else {
@@ -3273,6 +3311,8 @@ async fn handle_tcp_proxy(
         recycle_buf(buf).await;
         res
     });
+    let mut upload = upload;
+    let mut upload_done = false;
     let mut result = Result::<()>::Ok(());
     let mut remote_fin = false;
     let mut remote_rst = false;
@@ -3282,6 +3322,30 @@ async fn handle_tcp_proxy(
     loop {
         let frame = if let Some(ctrl) = deferred_ctrl.take() {
             ctrl
+        } else if !upload_done {
+            tokio::select! {
+                maybe_frame = rx.recv() => match maybe_frame {
+                    Some(f) => f,
+                    None => break,
+                },
+                up_res = &mut upload => {
+                    upload_done = true;
+                    match up_res {
+                        Ok(Ok(())) => match rx.recv().await {
+                            Some(f) => f,
+                            None => break,
+                        },
+                        Ok(Err(e)) => {
+                            result = Err(e);
+                            break;
+                        }
+                        Err(e) => {
+                            result = Err(anyhow!("upload task panicked: {e}"));
+                            break;
+                        }
+                    }
+                }
+            }
         } else {
             match rx.recv().await {
                 Some(f) => f,
@@ -3352,10 +3416,11 @@ async fn handle_tcp_proxy(
         }
     }
     if remote_fin {
-        let mut upload = upload;
-        let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
-        if timeout(drain_wait, &mut upload).await.is_err() {
-            upload.abort();
+        if !upload_done {
+            let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
+            if timeout(drain_wait, &mut upload).await.is_err() {
+                upload.abort();
+            }
         }
         if !fin_sent.swap(true, Ordering::AcqRel) {
             let _ = send_mux_parts(
@@ -3369,7 +3434,9 @@ async fn handle_tcp_proxy(
             .await;
         }
     } else {
-        upload.abort();
+        if !upload_done {
+            upload.abort();
+        }
         if result.is_err() && !remote_rst {
             crate::common::try_send_mux_parts(
                 &session.writer,
@@ -4910,17 +4977,28 @@ async fn open_upstream(cfg: &RuntimeConfig) -> Result<(OwnedReadHalf, OwnedWrite
         .ok_or_else(|| anyhow!("client mode requires upstream"))?;
     let (addr, path) = parse_ws_url(upstream)?;
     let target = parse_authority_with_default(&addr, 80).map_err(|e| anyhow!(e.to_string()))?;
-    let header_host = cfg.fakehost.as_deref().unwrap_or(&target.host).to_string();
+    let default_host_hdr = if target.port == 80 {
+        if target.host.contains(':') {
+            format!("[{}]", target.host)
+        } else {
+            target.host.clone()
+        }
+    } else if target.host.contains(':') {
+        format!("[{}]:{}", target.host, target.port)
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+    let header_host = cfg.fakehost.as_deref().unwrap_or(&default_host_hdr).to_string();
     let sni_base = cfg
         .fakehost
         .as_deref()
-        .map(|s| s.split(':').next().unwrap_or(s))
+        .map(crate::common::extract_host_only)
         .unwrap_or(&target.host);
     let tcp = connect_ws_with_fallback(cfg, &target.host, target.port).await?;
     apply_socket_options(&tcp, cfg);
     let (mut rd, mut wr) = tcp.into_split();
-    let header_base = header_host.split(':').next().unwrap_or(&header_host);
-    let origin = format!("http://{}", sni_base);
+    let header_base = crate::common::extract_host_only(&header_host);
+    let origin = format!("http://{}", crate::common::format_origin_host(sni_base));
     let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
         "same-origin"
     } else {
@@ -5127,6 +5205,11 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         crate::mux_writer::recycle_encode_buf(frame_buf);
         bail!("invalid non-MUX target opcode")
     };
+    if target_frame == b"UDP\n" {
+        crate::mux_writer::recycle_encode_buf(target_frame);
+        crate::mux_writer::recycle_encode_buf(frame_buf);
+        return crate::runtime::handle_server_udp_parts(rd, wr, cfg, c).await;
+    }
     let target_addr = match std::str::from_utf8(&target_frame) {
         Ok(text) => match parse_target_authority(text.trim()) {
             Ok(addr) => addr,
@@ -5167,6 +5250,7 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
+                let _ = write_frame(&mut wr, &[], 8, false).await;
                 break;
             }
             crate::stats::add_bytes(0, n as i64);
@@ -5176,49 +5260,78 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
         recycle_buf(buf).await;
         Result::<()>::Ok(())
     });
+    let mut download_done = false;
+    let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
     let result = async {
         loop {
-            tokio::select! {
-                _ = &mut download => {
-                    break;
+            let res = if !download_done {
+                tokio::select! {
+                    dl_res = &mut download => {
+                        download_done = true;
+                        match dl_res {
+                            Ok(Ok(())) => continue,
+                            _ => break,
+                        }
+                    }
+                    r = read_frame(
+                        &mut rd,
+                        Option::<&mut OwnedWriteHalf>::None,
+                        &mut frame_buf,
+                    ) => r,
                 }
-                res = read_frame(
-                    &mut rd,
-                    Option::<&mut OwnedWriteHalf>::None,
-                    &mut frame_buf,
-                ) => {
-                    let Some((opcode, payload)) = res? else {
-                        let _ = target_wr.shutdown().await;
-                        let _ = timeout(Duration::from_secs(cfg.connection_timeout.max(5)), &mut download).await;
-                        break;
-                    };
-                    if opcode == 8 {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        let _ = target_wr.shutdown().await;
-                        let _ = timeout(Duration::from_secs(cfg.connection_timeout.max(5)), &mut download).await;
-                        break;
-                    }
-                    if opcode != 2 {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        continue;
-                    }
-                    // Non-MUX data frames are plaintext per GoWay server.
-                    let len = payload.len();
-                    let write_res = target_wr.write_all(&payload).await;
-                    crate::mux_writer::recycle_encode_buf(payload);
-                    if write_res.is_err() {
-                        break;
-                    }
-                    crate::stats::add_bytes(len as i64, 0);
+            } else {
+                match timeout(
+                    drain_wait,
+                    read_frame(
+                        &mut rd,
+                        Option::<&mut OwnedWriteHalf>::None,
+                        &mut frame_buf,
+                    ),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => break,
                 }
+            };
+            let Some((opcode, payload)) = res? else {
+                let _ = target_wr.shutdown().await;
+                if !download_done {
+                    let _ = timeout(drain_wait, &mut download).await;
+                    download_done = true;
+                }
+                break;
+            };
+            if opcode == 8 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                let _ = target_wr.shutdown().await;
+                if !download_done {
+                    let _ = timeout(drain_wait, &mut download).await;
+                    download_done = true;
+                }
+                break;
             }
+            if opcode != 2 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                continue;
+            }
+            // Non-MUX data frames are plaintext per GoWay server.
+            let len = payload.len();
+            let write_res = target_wr.write_all(&payload).await;
+            crate::mux_writer::recycle_encode_buf(payload);
+            if write_res.is_err() {
+                break;
+            }
+            crate::stats::add_bytes(len as i64, 0);
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
     crate::mux_writer::recycle_encode_buf(frame_buf);
     let _ = target_wr.shutdown().await;
-    download.abort();
+    if !download_done {
+        download.abort();
+    }
     result
 }
 } // mod nonmux
@@ -5640,7 +5753,13 @@ impl MuxFrame {
     }
 
     pub fn decode_owned(buf: Vec<u8>) -> Result<OwnedMuxFrame, ProtocolError> {
-        let header = MuxHeader::parse(&buf)?;
+        let header = match MuxHeader::parse(&buf) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::mux_writer::recycle_encode_buf(buf);
+                return Err(e);
+            }
+        };
         Ok(OwnedMuxFrame {
             stream_id: header.stream_id,
             command: header.command,
@@ -7161,7 +7280,9 @@ async fn relay_quic(
     let key = cfg.key.as_ref().map(|k| Zeroizing::new(k.clone()));
     let target = format_target(&req.target);
     let mut response = String::new();
+    let mut extra_down = Vec::new();
     let mut retried = pool.plaintext_needed();
+    let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
     loop {
         let header = match key.as_deref() {
             Some(k) if retried => format!("{} {}\n", k, target),
@@ -7170,13 +7291,21 @@ async fn relay_quic(
         };
         send.write_all(header.as_bytes()).await?;
         let mut no_response = false;
-        match read_quic_line(&mut recv, 8192).await {
-            Ok(line) => response = line,
-            Err(error) => {
+        match timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192)).await {
+            Ok(Ok((line, extra))) => {
+                response = line;
+                extra_down = extra;
+            }
+            Ok(Err(error)) => {
                 if key.is_none() || retried {
+                    quic_reject_local(&mut local, req.is_socks5).await?;
                     return Err(error);
                 }
                 no_response = true;
+            }
+            Err(_) => {
+                quic_reject_local(&mut local, req.is_socks5).await?;
+                bail!("QUIC upstream target handshake timed out");
             }
         }
         if response == "OK" || key.is_none() || retried {
@@ -7210,39 +7339,80 @@ async fn relay_quic(
     } else if req.is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?
     }
+    if !extra_down.is_empty() {
+        local.write_all(&extra_down).await?;
+        crate::stats::add_bytes(0, extra_down.len() as i64);
+    }
     if let Some(initial) = req.initial_payload {
         send.write_all(&initial).await?;
     }
     let (lr, lw) = local.into_split();
     let buffer_size = cfg.buffer_size;
-    let upload = tokio::spawn(async move {
+    let mut upload = tokio::spawn(async move {
         let mut r = lr;
         let mut buf = relay_buf(buffer_size).await;
-        loop {
-            let n = r.read(&mut buf).await?;
-            if n == 0 {
-                let _ = send.finish();
-                break;
+        let res: Result<()> = async {
+            loop {
+                match r.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = send.finish();
+                        break;
+                    }
+                    Ok(n) => {
+                        crate::stats::add_bytes(n as i64, 0);
+                        send.write_all(&buf[..n]).await?;
+                    }
+                    Err(e) => {
+                        let _ = send.reset(0u32.into());
+                        return Err(e.into());
+                    }
+                }
             }
-            crate::stats::add_bytes(n as i64, 0);
-            send.write_all(&buf[..n]).await?
+            Ok(())
         }
+        .await;
         recycle_buf(buf).await;
-        Result::<()>::Ok(())
+        res
     });
     let mut lw2 = lw;
     let mut buf = relay_buf(buffer_size).await;
     let mut remote_eof = false;
+    let mut upload_done = false;
     let down_res: Result<()> = async {
         loop {
-            match recv.read(&mut buf).await? {
-                Some(0) | None => {
-                    remote_eof = true;
-                    break;
+            if !upload_done {
+                tokio::select! {
+                    read_res = recv.read(&mut buf) => {
+                        match read_res? {
+                            Some(0) | None => {
+                                remote_eof = true;
+                                break;
+                            }
+                            Some(n) => {
+                                crate::stats::add_bytes(0, n as i64);
+                                lw2.write_all(&buf[..n]).await?;
+                            }
+                        }
+                    }
+                    up_res = &mut upload => {
+                        upload_done = true;
+                        match up_res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            Err(e) => return Err(anyhow!("QUIC upload task panicked: {e}")),
+                        }
+                    }
                 }
-                Some(n) => {
-                    crate::stats::add_bytes(0, n as i64);
-                    lw2.write_all(&buf[..n]).await?;
+            } else {
+                match recv.read(&mut buf).await? {
+                    Some(0) | None => {
+                        remote_eof = true;
+                        break;
+                    }
+                    Some(n) => {
+                        crate::stats::add_bytes(0, n as i64);
+                        lw2.write_all(&buf[..n]).await?;
+                    }
                 }
             }
         }
@@ -7252,12 +7422,13 @@ async fn relay_quic(
     let _ = lw2.shutdown().await;
     recycle_buf(buf).await;
     if remote_eof {
-        let mut upload = upload;
-        let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
-        if timeout(drain_wait, &mut upload).await.is_err() {
-            upload.abort();
+        if !upload_done {
+            let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
+            if timeout(drain_wait, &mut upload).await.is_err() {
+                upload.abort();
+            }
         }
-    } else {
+    } else if !upload_done {
         upload.abort();
     }
     down_res
@@ -7298,14 +7469,16 @@ async fn relay_quic_udp(
         };
         send.write_all(header.as_bytes()).await?;
         let mut no_response = false;
-        match read_quic_line(&mut recv, 8192).await {
-            Ok(line) => ok = line,
-            Err(error) => {
+        let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+        match timeout(hs_timeout, read_quic_line(&mut recv, 8192)).await {
+            Ok(Ok(line)) => ok = line,
+            Ok(Err(error)) => {
                 if key.is_none() || retried {
                     return Err(error);
                 }
                 no_response = true;
             }
+            Err(_) => bail!("QUIC UDP upstream handshake timed out"),
         }
         if ok == "OK" || key.is_none() || retried {
             break;
@@ -7513,7 +7686,10 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
 }
 
 pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
-    let bind: std::net::SocketAddr = crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port).parse()?;
+    let bind: std::net::SocketAddr = match crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port).parse() {
+        Ok(addr) => addr,
+        Err(_) => dns::resolve_socket(&cfg.proxy_host, cfg.proxy_port).await?,
+    };
     let socket_buf = quic_socket_buffer_bytes(&cfg);
     let std_socket = bound_udp_socket(bind, socket_buf)?;
     let endpoint = Endpoint::new(
@@ -7576,7 +7752,10 @@ async fn handle_server_stream(
     mut recv: RecvStream,
     cfg: RuntimeConfig,
 ) -> Result<()> {
-    let (line, extra_initial) = read_quic_line_with_extra(&mut recv, 8192).await?;
+    let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let (line, extra_initial) = timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192))
+        .await
+        .context("QUIC server stream header timeout")??;
     let target_str = if let Some(key) = cfg.key.as_ref().map(|k| Zeroizing::new(k.clone())) {
         let mut parts = line.splitn(2, ' ');
         let k = parts.next().unwrap_or("");
@@ -7640,35 +7819,54 @@ async fn handle_server_stream(
     });
     let mut buf = relay_buf(buffer_size).await;
     let mut recv_eof = false;
+    let mut send_done = false;
+    let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
     loop {
-        tokio::select! {
-            _ = &mut send_task => {
-                break;
-            }
-            res = recv.read(&mut buf) => {
-                match res? {
-                    Some(0) | None => {
-                        recv_eof = true;
-                        break;
-                    }
-                    Some(n) => {
-                        if target_wr.write_all(&buf[..n]).await.is_err() {
+        if !send_done {
+            tokio::select! {
+                _ = &mut send_task => {
+                    send_done = true;
+                    continue;
+                }
+                res = recv.read(&mut buf) => {
+                    match res? {
+                        Some(0) | None => {
+                            recv_eof = true;
                             break;
                         }
-                        crate::stats::add_bytes(n as i64, 0);
+                        Some(n) => {
+                            if target_wr.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                            crate::stats::add_bytes(n as i64, 0);
+                        }
                     }
                 }
+            }
+        } else {
+            match timeout(drain_wait, recv.read(&mut buf)).await {
+                Ok(Ok(Some(0) | None)) => {
+                    recv_eof = true;
+                    break;
+                }
+                Ok(Ok(Some(n))) => {
+                    if target_wr.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    crate::stats::add_bytes(n as i64, 0);
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break,
             }
         }
     }
     let _ = target_wr.shutdown().await;
     recycle_buf(buf).await;
-    if recv_eof {
-        let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
+    if recv_eof && !send_done {
         if timeout(drain_wait, &mut send_task).await.is_err() {
             send_task.abort();
         }
-    } else {
+    } else if !send_done {
         send_task.abort();
     }
     Ok(())
@@ -9456,15 +9654,14 @@ where
             MuxCommand::Rst => {
                 let stream_id = frame.stream_id;
                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                let target = streams
-                    .read()
+                let removed = streams
+                    .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .get(&stream_id)
-                    .map(|s| (s.tx.clone(), s.cancel.clone(), s.gate.clone()));
-                if let Some((tx, cancel, gate)) = target {
-                    gate.close();
-                    let _ = tx.try_send(StreamCommand::Reset);
-                    let _ = cancel.send(true);
+                    .remove(&stream_id);
+                if let Some(old) = removed {
+                    old.gate.close();
+                    let _ = old.tx.try_send(StreamCommand::Reset);
+                    let _ = old.cancel.send(true);
                 }
             }
 
@@ -9550,6 +9747,7 @@ where
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
+                let _ = write_frame(&mut wr, &[], 8, false).await;
                 break;
             }
             crate::stats::add_bytes(0, n as i64);
@@ -9559,53 +9757,76 @@ where
         Result::<()>::Ok(())
     });
     let mut frame_buf = Vec::new();
+    let mut download_done = false;
+    let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
     let result = async {
         loop {
-            tokio::select! {
-                _ = &mut download => break,
-                res = read_frame(
-                    &mut rd,
-                    Option::<&mut W>::None,
-                    &mut frame_buf,
-                ) => {
-                    let Some((opcode, payload)) = res? else {
-                        let _ = target_wr.shutdown().await;
-                        let _ = timeout(
-                            Duration::from_secs(cfg.connection_timeout.max(5)),
-                            &mut download,
-                        )
-                        .await;
-                        break;
-                    };
-                    if opcode == 8 {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        let _ = target_wr.shutdown().await;
-                        let _ = timeout(
-                            Duration::from_secs(cfg.connection_timeout.max(5)),
-                            &mut download,
-                        )
-                        .await;
-                        break;
+            let res = if !download_done {
+                tokio::select! {
+                    dl_res = &mut download => {
+                        download_done = true;
+                        match dl_res {
+                            Ok(Ok(())) => continue,
+                            _ => break,
+                        }
                     }
-                    if opcode != 2 {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        continue;
-                    }
-                    if target_wr.write_all(&payload).await.is_err() {
-                        crate::mux_writer::recycle_encode_buf(payload);
-                        break;
-                    }
-                    crate::stats::add_bytes(payload.len() as i64, 0);
-                    crate::mux_writer::recycle_encode_buf(payload);
+                    r = read_frame(
+                        &mut rd,
+                        Option::<&mut W>::None,
+                        &mut frame_buf,
+                    ) => r,
                 }
+            } else {
+                match timeout(
+                    drain_wait,
+                    read_frame(
+                        &mut rd,
+                        Option::<&mut W>::None,
+                        &mut frame_buf,
+                    ),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => break,
+                }
+            };
+            let Some((opcode, payload)) = res? else {
+                let _ = target_wr.shutdown().await;
+                if !download_done {
+                    let _ = timeout(drain_wait, &mut download).await;
+                    download_done = true;
+                }
+                break;
+            };
+            if opcode == 8 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                let _ = target_wr.shutdown().await;
+                if !download_done {
+                    let _ = timeout(drain_wait, &mut download).await;
+                    download_done = true;
+                }
+                break;
             }
+            if opcode != 2 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                continue;
+            }
+            if target_wr.write_all(&payload).await.is_err() {
+                crate::mux_writer::recycle_encode_buf(payload);
+                break;
+            }
+            crate::stats::add_bytes(payload.len() as i64, 0);
+            crate::mux_writer::recycle_encode_buf(payload);
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
     crate::mux_writer::recycle_encode_buf(frame_buf);
     let _ = target_wr.shutdown().await;
-    download.abort();
+    if !download_done {
+        download.abort();
+    }
     result
 }
 async fn resolve_udp_target(block_local: bool, target: &TargetAddr) -> Result<SocketAddr> {
@@ -9632,7 +9853,7 @@ fn udp_envelope(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
-async fn handle_server_udp_parts<R, W>(
+pub(crate) async fn handle_server_udp_parts<R, W>(
     mut rd: R,
     mut wr: W,
     cfg: RuntimeConfig,
@@ -12032,10 +12253,10 @@ pub async fn handle_local_udp_proxy(
     let sni_base = cfg
         .fakehost
         .as_deref()
-        .map(|s| s.split(':').next().unwrap_or(s))
+        .map(crate::common::extract_host_only)
         .unwrap_or(&target.host);
-    let header_base = actual_host.split(':').next().unwrap_or(&actual_host);
-    let origin = Some(format!("http://{}", sni_base));
+    let header_base = crate::common::extract_host_only(&actual_host);
+    let origin = Some(format!("http://{}", crate::common::format_origin_host(sni_base)));
     let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
         "same-origin"
     } else {
@@ -12351,29 +12572,20 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
     timeout_duration: std::time::Duration,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
+    let mut byte = [0u8; 1];
 
     let read_loop = async {
         loop {
-            let max_read = (MAX_HTTP_HEADER_SIZE + 1 - out.len()).min(chunk.len());
-            match r.read(&mut chunk[..max_read]).await {
+            match r.read(&mut byte).await {
                 Ok(0) => {
                     return Err(anyhow::Error::from(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "early eof",
                     )));
                 }
-                Ok(n) => {
-                    let prev_len = out.len();
-                    out.extend_from_slice(&chunk[..n]);
-                    let scan_start = prev_len.saturating_sub(3);
-                    let tail = &out[scan_start..];
-                    if tail.windows(4).any(|w| w == b"\r\n\r\n")
-                        || tail.windows(2).any(|w| w == b"\n\n")
-                    {
-                        if out.len() > MAX_HTTP_HEADER_SIZE {
-                            bail!("header too large");
-                        }
+                Ok(_) => {
+                    out.push(byte[0]);
+                    if out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n") {
                         return Ok(());
                     }
                     if out.len() >= MAX_HTTP_HEADER_SIZE {
@@ -13761,9 +13973,18 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
     let sni_hostname = cfg
         .fakehost
         .as_deref()
-        .map(|s| s.split(':').next().unwrap_or(s))
+        .map(crate::common::extract_host_only)
         .unwrap_or(&host);
-    let header_host = cfg.fakehost.as_deref().unwrap_or(&host);
+    let default_header_host = if dns_port == 443 {
+        if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        }
+    } else {
+        addr.clone()
+    };
+    let header_host = cfg.fakehost.as_deref().unwrap_or(&default_header_host);
     let tls_name = sni_hostname;
     let profile_idx = crate::ws::pick_browser_profile_index();
 
@@ -13790,8 +14011,8 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
     };
 
     let (mut rd, mut wr) = tokio::io::split(tls_stream);
-    let origin = format!("https://{}", tls_name);
-    let header_host_name = header_host.split(':').next().unwrap_or(header_host);
+    let origin = format!("https://{}", crate::common::format_origin_host(tls_name));
+    let header_host_name = crate::common::extract_host_only(header_host);
     let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host_name) {
         "same-origin"
     } else {
@@ -14758,6 +14979,8 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         recycle_buf(buf).await;
         res
     });
+    let mut upload = upload;
+    let mut upload_done = false;
     let mut refund_pending: u32 = 0;
     let mut result = Result::<()>::Ok(());
     let mut remote_fin = false;
@@ -14767,6 +14990,30 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     loop {
         let frame = if let Some(ctrl) = deferred_ctrl.take() {
             ctrl
+        } else if !upload_done {
+            tokio::select! {
+                maybe_frame = rx.recv() => match maybe_frame {
+                    Some(f) => f,
+                    None => break,
+                },
+                up_res = &mut upload => {
+                    upload_done = true;
+                    match up_res {
+                        Ok(Ok(())) => match rx.recv().await {
+                            Some(f) => f,
+                            None => break,
+                        },
+                        Ok(Err(e)) => {
+                            result = Err(e);
+                            break;
+                        }
+                        Err(e) => {
+                            result = Err(anyhow!("upload task panicked: {e}"));
+                            break;
+                        }
+                    }
+                }
+            }
         } else {
             match rx.recv().await {
                 Some(f) => f,
@@ -14837,10 +15084,11 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         }
     }
     if remote_fin {
-        let mut upload = upload;
-        let drain_wait = Duration::from_secs(pool.cfg.connection_timeout.max(5));
-        if timeout(drain_wait, &mut upload).await.is_err() {
-            upload.abort();
+        if !upload_done {
+            let drain_wait = Duration::from_secs(pool.cfg.connection_timeout.max(5));
+            if timeout(drain_wait, &mut upload).await.is_err() {
+                upload.abort();
+            }
         }
         if !fin_sent.swap(true, Ordering::AcqRel) {
             let _ = send_mux_parts(
@@ -14854,7 +15102,9 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             .await;
         }
     } else {
-        upload.abort();
+        if !upload_done {
+            upload.abort();
+        }
         if result.is_err() && !remote_rst {
             crate::common::try_send_mux_parts(
                 &session.writer,
@@ -15338,7 +15588,11 @@ where
                 if arg == exact {
                     return format!("--{name}");
                 }
-                if let Some(value) = arg.strip_prefix(&format!("{exact}=")) {
+                let double_exact = format!("--{name}");
+                if let Some(value) = arg
+                    .strip_prefix(&format!("{exact}="))
+                    .or_else(|| arg.strip_prefix(&format!("{double_exact}=")))
+                {
                     let bool_value = match value.to_ascii_lowercase().as_str() {
                         "true" => Some(true),
                         "false" => Some(false),
@@ -15346,14 +15600,14 @@ where
                     };
                     if let Some(value) = bool_value {
                         match *name {
-                            "mux" | "block-local" | "allow-open" | "verify-ssl" | "tui" => {
+                            "mux" | "block-local" | "verify-ssl" => {
                                 return if value {
                                     format!("--{name}")
                                 } else {
                                     format!("--no-{name}")
                                 };
                             }
-                            "obfs" | "wss-server" => {
+                            "allow-open" | "tui" | "obfs" | "wss-server" => {
                                 return if value {
                                     format!("--{name}")
                                 } else {
@@ -15842,13 +16096,19 @@ async fn run_forwarding(cfg: RuntimeConfig, args: &Args, mux_sessions: usize) ->
         return run_wss_server(cfg).await;
     }
     if cfg.mux {
-        let (tcp_result, _quic_result) =
+        let (tcp_result, quic_result) =
             tokio::join!(runtime::run_server(cfg.clone()), quic::run_server(cfg));
-        tcp_result
+        if let Err(ref e) = quic_result {
+            tracing::warn!(error = %e, "QUIC server exited with error");
+        }
+        tcp_result.and(quic_result)
     } else {
-        let (tcp_result, _quic_result) =
+        let (tcp_result, quic_result) =
             tokio::join!(nonmux::run_server(cfg.clone()), quic::run_server(cfg));
-        tcp_result
+        if let Err(ref e) = quic_result {
+            tracing::warn!(error = %e, "QUIC server exited with error");
+        }
+        tcp_result.and(quic_result)
     }
 }
 
