@@ -1511,6 +1511,48 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.61`.
 
+## Release: v0.0.62 (2026-10-20) — MUX Asymmetric RST Loop Suppression, Bi-directional Server Drain & Unconsumed Frame Recycling
+
+### Context & User Directives
+- **Directives:** "更新版本号0.0.62更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Asymmetric MUX RST Reflection Loop Elimination:**
+    - When a peer emitted `MuxCommand::Rst`, client streams marked `result = Err(...)`. During teardown cleanup, `if result.is_err()` subsequently emitted another RST back to the sender, producing redundant ping-pong RST frames and extra write traffic on closing sessions.
+    - Added `remote_rst = true` tracking in `handle_tcp_proxy` and `handle_connection`, gating outgoing RST emission with `if result.is_err() && !remote_rst`.
+    - Swapped blocking `send_mux_parts(...).await` for non-blocking `crate::common::try_send_mux_parts(...)`.
+  - **Teardown Frame Buffer Reclamation:**
+    - Stream channel queues frequently retain lingering `Data` frames enqueued by the session demuxer prior to stream reset.
+    - Added `while let Ok(f) = rx.try_recv() { recycle_encode_buf(f.into_storage()); }` across client teardown paths, returning pooled memory back to the allocator.
+  - **Bi-directional Destination Completion Sensing & Bounded Drain:**
+    - Server MUX streams previously only awaited destination `reader` coroutines after client-side FIN was received, leaving server streams hanging if destination targets completed responses first without client activity.
+    - Added clean EOF return to `target_to_mux` (`-> bool`) and integrated `res = &mut reader` into `handle_server`'s main event select loop. Clean destination EOF switches the stream into a bounded drain loop (`connection_timeout.max(5)`), and read errors terminate promptly with RST dispatch.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **RST Ping-Pong Loop Suppression (`src/main.rs:handle_tcp_proxy`, `handle_connection`)**:
+   - Added `remote_rst` flag and non-blocking `try_send_mux_parts` reset dispatch.
+2. **Channel Buffer Recycling (`src/main.rs:handle_tcp_proxy`, `handle_connection`)**:
+   - Drained and recycled unconsumed frames from `rx` during stream exit.
+3. **Server Destination Reader Integration & Drain (`src/main.rs:target_to_mux`, `handle_server`)**:
+   - Added `bool` return to `target_to_mux` and integrated reader completion with bounded drain into `handle_server` select loop.
+4. **Version & Documentation**:
+   - Bumped version to `0.0.62` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.62 - MUX asymmetric RST loop suppression, bi-directional server drain, and frame recycling`
+- Tag: `v0.0.62`
+
+### Status
+- Completed and released as `v0.0.62`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.62`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.62`.
+
+
 
 
 

@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.61";
+pub const APP_VERSION: &str = "0.0.62";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -3275,6 +3275,7 @@ async fn handle_tcp_proxy(
     });
     let mut result = Result::<()>::Ok(());
     let mut remote_fin = false;
+    let mut remote_rst = false;
     let mut refund_pending: u32 = 0;
     let mut data_batch: Vec<OwnedMuxFrame> = Vec::with_capacity(16);
     let mut deferred_ctrl: Option<OwnedMuxFrame> = None;
@@ -3341,6 +3342,7 @@ async fn handle_tcp_proxy(
             }
             MuxCommand::Rst => {
                 recycle_encode_buf(frame.into_storage());
+                remote_rst = true;
                 result = Err(anyhow!("upstream reset after CONNECT established"));
                 break;
             }
@@ -3368,19 +3370,21 @@ async fn handle_tcp_proxy(
         }
     } else {
         upload.abort();
-        if result.is_err() {
-            let _ = send_mux_parts(
+        if result.is_err() && !remote_rst {
+            crate::common::try_send_mux_parts(
                 &session.writer,
                 &session.cipher,
                 id,
                 MuxCommand::Rst,
                 &[],
                 session.obfs,
-            )
-            .await;
+            );
         }
     }
 
+    while let Ok(f) = rx.try_recv() {
+        recycle_encode_buf(f.into_storage());
+    }
     session.close_stream(id).await;
     result
 }
@@ -8605,10 +8609,10 @@ async fn target_to_mux(
     cipher: XorCipher,
     obfs: bool,
     gate: Arc<CreditGate>,
-) {
+) -> bool {
     let mut buf = relay_buf(buffer_size).await;
     let mut frame_scratch = Vec::new();
-    loop {
+    let clean_eof = loop {
         match target.read(&mut buf).await {
             Ok(0) => {
                 let _ = send_mux_parts_encrypted_reuse(
@@ -8621,7 +8625,7 @@ async fn target_to_mux(
                     obfs,
                 )
                 .await;
-                break;
+                break true;
             }
             Ok(n) => {
                 crate::stats::add_bytes(0, n as i64);
@@ -8643,19 +8647,20 @@ async fn target_to_mux(
                     {
                         crate::mux_writer::recycle_encode_buf(frame_scratch);
                         recycle_buf(buf).await;
-                        return;
+                        return false;
                     }
                     off = end
                 }
             }
             Err(_) => {
                 let _ = send_reset_encrypted(&writer, &cipher, id, obfs).await;
-                break;
+                break false;
             }
         }
-    }
+    };
     crate::mux_writer::recycle_encode_buf(frame_scratch);
     recycle_buf(buf).await;
+    clean_eof
 }
 /// Accumulates consumed bytes per stream and emits a WINDOW refund once
 /// the refresh threshold is reached. Refund accounting only runs after the
@@ -9180,6 +9185,8 @@ where
                     ));
 
                     let mut write_failed = false;
+                    let mut reader_eof = false;
+                    let drain_wait = Duration::from_secs(cfg_task.connection_timeout.max(5));
                     if client_fin {
                         let _ = wr_target.shutdown().await;
                     } else {
@@ -9191,10 +9198,35 @@ where
                             }
                             let command = match deferred.take() {
                                 Some(c) => c,
-                                None => tokio::select! {
+                                None if !reader_eof => tokio::select! {
                                     cmd = rx.recv() => match cmd {
                                         Some(c) => c,
                                         None => break,
+                                    },
+                                    changed = cancelled.changed() => {
+                                        if changed.is_err() || *cancelled.borrow() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    res = &mut reader => {
+                                        match res {
+                                            Ok(true) => {
+                                                reader_eof = true;
+                                                continue;
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                },
+                                None => tokio::select! {
+                                    res = timeout(drain_wait, rx.recv()) => match res {
+                                        Ok(Some(c)) => c,
+                                        Ok(None) => break,
+                                        Err(_) => {
+                                            write_failed = true;
+                                            break;
+                                        }
                                     },
                                     changed = cancelled.changed() => {
                                         if changed.is_err() || *cancelled.borrow() {
@@ -9317,7 +9349,7 @@ where
                         }
                     }
 
-                    if client_fin && !*cancelled.borrow() {
+                    if client_fin && !*cancelled.borrow() && !reader_eof {
                         loop {
                             tokio::select! {
                                 _ = &mut reader => break,
@@ -14729,6 +14761,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     let mut refund_pending: u32 = 0;
     let mut result = Result::<()>::Ok(());
     let mut remote_fin = false;
+    let mut remote_rst = false;
     let mut data_batch: Vec<OwnedMuxFrame> = Vec::with_capacity(16);
     let mut deferred_ctrl: Option<OwnedMuxFrame> = None;
     loop {
@@ -14794,6 +14827,7 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
             }
             MuxCommand::Rst => {
                 recycle_encode_buf(frame.into_storage());
+                remote_rst = true;
                 result = Err(anyhow!("upstream reset after CONNECT established"));
                 break;
             }
@@ -14821,19 +14855,21 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
         }
     } else {
         upload.abort();
-        if result.is_err() {
-            let _ = send_mux_parts(
+        if result.is_err() && !remote_rst {
+            crate::common::try_send_mux_parts(
                 &session.writer,
                 &session.cipher,
                 stream_id,
                 MuxCommand::Rst,
                 &[],
                 session.obfs,
-            )
-            .await;
+            );
         }
     }
 
+    while let Ok(f) = rx.try_recv() {
+        recycle_encode_buf(f.into_storage());
+    }
     session.close_stream(stream_id).await;
     result
 }

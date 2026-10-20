@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.62] - 2026-10-20
+
+### MUX Asymmetric RST Loop Suppression, Bi-directional Server Drain & Unconsumed Frame Recycling
+
+- **MUX Asymmetric RST Loop Suppression (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — Introduced `remote_rst` state tracking across WS and WSS client handlers; when a stream is terminated via incoming peer `Rst` frame, outgoing RST emission on task exit is inhibited, eliminating ping-pong RST reflection loops. Replaced blocking teardown sends with non-blocking `try_send_mux_parts`.
+- **Unconsumed Ingress MUX Frame Buffer Reclamation (`src/main.rs:handle_tcp_proxy`, `handle_connection`)** — Drained lingering `OwnedMuxFrame` messages from stream receive channels (`rx.try_recv()`) during teardown, recycling underlying payload buffers (`recycle_encode_buf`) back to the global pool and eliminating orphaned allocation retention.
+- **Bi-directional Server Target Reader Integration (`src/main.rs:target_to_mux`, `handle_server`)** — Updated `target_to_mux` to return clean EOF status (`-> bool`) and integrated reader coroutine completion directly into the server stream's main `tokio::select!` loop. Aborts promptly upon destination read errors and triggers a bounded upload drain window (`connection_timeout.max(5)`) upon clean destination EOF, preventing half-closed server streams from hanging indefinitely.
+
 ## [v0.0.61] - 2026-10-20
 
 ### QUIC Graceful Stream Drain, Robust Target Resolution & Proactive MUX Reset Signaling
