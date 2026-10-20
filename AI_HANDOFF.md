@@ -1606,3 +1606,57 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.63`.
+
+
+## Release: v0.0.64 (2026-10-20) — Dual-Stack UDP Forwarding, QUIC Fakehost SNI, Robust HTTP Parsing & Initial Payload Accounting
+
+### Context & User Directives
+- **Directives:** "更新版本号0.0.64更新日志，更新AI接力交接日志，测试编译，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Dual-Stack UDP Forwarding & Address Normalization (Audit Bug 3):**
+    - Bound server UDP relay sockets to dual-stack `[::]:0` with `only_v6 = false` (`bind_dual_stack_udp_unspecified`), falling back to `0.0.0.0:0` on IPv4-only hosts.
+    - Implemented `normalize_peer_addr` and `target_for_socket` to map between IPv4 and IPv6 dual-stack representations, enabling server UDP packet forwarding to IPv6 targets without socket errors or address family mismatches.
+  - **QUIC Fakehost SNI Alignment (Audit Bug 4):**
+    - Corrected `quic::run_client` to check `cfg.fakehost` and use it as the TLS SNI rather than defaulting exclusively to the upstream target hostname.
+  - **HTTP Proxy Parsing Resilience & Early Traffic Accounting (Audit Bug 9):**
+    - Enhanced `parse_http_proxy_request` with case-insensitive scheme matching (`http://` / `https://`), query string stripping (`['/', '?']`) to prevent query parameters from corrupting destination hostnames, and case-insensitive `Host:` header parsing.
+    - Added `stats::add_bytes` for `initial_payload` in `relay_non_mux_ws`, `handle_tcp_proxy`, `handle_connection`, and `relay_quic`.
+  - **QUIC UDP Datagram Stash & Prefetch Buffer:**
+    - Added `read_len_prefixed_udp_buffered` and `read_exact_with_stash` to preserve and consume trailing bytes after QUIC handshake lines, eliminating initial UDP packet loss.
+  - **Non-MUX Connection Pool Reconnection:**
+    - Added retry logic in `relay_non_mux_ws` when pre-warmed connections encounter idle EOF or handshake errors, dialling a fresh connection automatically.
+  - **MUX Session Stream Count Underflow Protection & Scheduler Frame Purging:**
+    - Protected `active` stream counters with saturating subtraction (`dec_active`). Purged pending FIN frames on stream reset in `Scheduler::push` and recycled all queued buffers during scheduler shutdown.
+  - **SOCKS5 Blank Domain Guard & TUI UTF-8 Safety:**
+    - Blocked empty SOCKS5 domain targets. Upgraded TUI `visible_len` to Unicode `chars()` to prevent splitting multi-byte UTF-8 sequences.
+  - **Regression Risk:** Zero. All 137 unit tests pass cleanly.
+
+### Changes Implemented
+1. **Dual-Stack UDP Sockets (`src/main.rs:bind_dual_stack_udp_unspecified`, `normalize_peer_addr`, `target_for_socket`)**:
+   - Dual-stack UDP relay socket binding for IPv4/IPv6 parity.
+2. **QUIC Fakehost SNI (`src/main.rs:quic::run_client`)**:
+   - SNI override honoring `--fakehost`.
+3. **HTTP Proxy Parsing & Stats (`src/main.rs:parse_http_proxy_request`, `relay_non_mux_ws`, `handle_tcp_proxy`, `handle_connection`, `relay_quic`)**:
+   - Flexible HTTP parsing and upload stats accounting for `initial_payload`.
+4. **QUIC UDP Stash Buffering (`src/main.rs:read_len_prefixed_udp_buffered`, `read_exact_with_stash`)**:
+   - Pre-buffered datagram read eliminating handshake tail packet drops.
+5. **Non-MUX Pool Resilience (`src/main.rs:relay_non_mux_ws`, `NonMuxPool::get_or_dial_tagged`)**:
+   - Stale connection retry and bidirectional upload completion.
+6. **MUX Stream Counter & Scheduler Purge (`src/main.rs:SessionState::dec_active`, `WssSessionState::dec_active`, `Scheduler::push`)**:
+   - Saturating stream count decrements and RST priority queue purging.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.64` in `Cargo.toml`, `Cargo.lock`, and `src/main.rs`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.64 - dual-stack UDP forwarding, QUIC fakehost SNI, robust HTTP parsing, and initial payload accounting`
+- Tag: `v0.0.64`
+
+### Status
+- Completed and released as `v0.0.64`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.64`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.64`.

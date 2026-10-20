@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.64] - 2026-10-20
+
+### Dual-Stack UDP Forwarding, QUIC Fakehost SNI, Robust HTTP Parsing & Initial Payload Accounting
+
+- **Dual-Stack UDP Server Forwarding & Peer Address Normalization (`src/main.rs:bind_dual_stack_udp_unspecified`, `normalize_peer_addr`, `target_for_socket`, `UdpBatchWriter`)** — Replaced hardcoded `0.0.0.0:0` socket binding in server UDP forwarders (`handle_server_udp_stream`, `handle_server_udp_parts`) with dual-stack `[::]:0` (`only_v6 = false`), enabling seamless forwarding to both IPv4 and IPv6 UDP destinations with automatic IPv4-only fallback. Added `normalize_peer_addr` and `target_for_socket` to map dual-stack addresses and ensure SOCKS5 `known_targets` hash lookups match across address families.
+- **QUIC Client Fakehost SNI Integration (`src/main.rs:quic::run_client`)** — Configured QUIC client connection pool to prioritize `cfg.fakehost` (processed via `extract_host_only`) as the TLS Server Name Indication (SNI), aligning QUIC mode with WebSocket and TLS FakeHost routing behavior.
+- **Robust HTTP Proxy Authority & Header Parsing (`src/main.rs:parse_http_proxy_request`)** — Upgraded HTTP proxy request parser to match `http://` and `https://` case-insensitively, correctly split authority from query strings (`['/', '?']`) to prevent appending query parameters into destination host lookups, and flexibly parsed `Host:` headers regardless of casing or surrounding whitespace.
+- **End-to-End Initial Payload Traffic Accounting (`src/main.rs:relay_non_mux_ws`, `handle_tcp_proxy`, `handle_connection`, `relay_quic`)** — Added explicit `stats::add_bytes` calls for pre-parsed `initial_payload` data across non-MUX, MUX, WSS, and QUIC client forwarding paths, ensuring early data and pipelined HTTP requests are accurately accounted in total upload traffic metrics.
+- **QUIC UDP Datagram Stash & Buffered Ingress (`src/main.rs:read_len_prefixed_udp_buffered`, `read_exact_with_stash`, `relay_quic_udp`, `handle_server_udp_stream`)** — Introduced `read_len_prefixed_udp_buffered` to consume leftover trailing bytes (`stash` / `extra_initial`) from upstream handshake frames before reading the raw stream, eliminating initial UDP packet loss on multiplexed QUIC streams.
+- **Resilient Non-MUX Pre-Warmed Connection Reconnect (`src/main.rs:relay_non_mux_ws`, `NonMuxPool::get_or_dial_tagged`)** — Added automatic fallback retry (`dial_fresh()`) when a pre-warmed connection in the non-MUX pool encounters an unexpected EOF or handshake error, eliminating connection dropouts caused by idle server timeouts. Co-scheduled upload completion with bidirectional drain logic.
+- **MUX Session Stream Count Underflow Protection & Scheduler Clean Teardown (`src/main.rs:SessionState::dec_active`, `WssSessionState::dec_active`, `Scheduler::push`)** — Replaced raw `fetch_sub` with `saturating_sub` (`dec_active`) across MUX session states, preventing stream counter underflows on abnormal session termination. Enhanced `Scheduler::push` on RST frames to purge any lingering `yield_to_data` FIN frames from the priority queue and comprehensively reclaimed memory buffers during scheduler teardown.
+- **SOCKS5 Blank Domain Guard, Listen Parsing & TUI UTF-8 Safety (`src/main.rs:parse_socks5_request`, `parse_socks5_udp_datagram`, `apply_listen_arg`, `visible_len`)** — Added validation to reject zero-length or whitespace-only domain names in SOCKS5 TCP and UDP associate requests. Improved CLI listen address parsing with `SocketAddr` fallback, and upgraded TUI `visible_len` to use Unicode `chars()` to prevent splitting multi-byte UTF-8 sequences when calculating ANSI-escaped terminal widths.
+
 ## [v0.0.63] - 2026-10-20
 
 ### IPv6 Authority & Origin Compliance, DNS SingleFlight Retry, QUIC Handshake Timeout & Stream Drain Co-scheduling
