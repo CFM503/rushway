@@ -1907,3 +1907,47 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.69`.
 
+## Release: v0.0.70 (2026-10-21) — MUX Session Teardown Writer Abort, Stale Frame Buffer Reclamation & ABA-Proof Stream Eviction
+
+### Context & User Directives
+- **Directives:** "我手动修改了代码，对比一下修改前和修改后是不是正向优化", "更新版本号0.0.70,更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Symmetric Physical Session Task Cancellation (`writer_task.abort()`):**
+    - In `MuxClientSession::spawn_from_parts`, the session supervisor watches both `reader_loop` and `writer_task`. When a remote peer resets or drops the TCP/TLS connection, the reader loop exits cleanly; however, the `writer_task` could remain indefinitely blocked on `rx.recv()` because its channel sender is retained by active stream guards and pool references. Added explicit `writer_task.abort()` immediately upon reader completion, eliminating orphaned writer tasks on dead transports.
+  - **Stale/Torn-Down Stream Frame Memory Recycling:**
+    - When frames arrive for unknown or already-closed stream IDs (`streams.get(&id)` returns `None`), they were previously dropped directly to the global allocator. Added explicit `recycle_encode_buf(frame.into_storage())` in `mux_client_reader_loop`, preserving `ENCODE_POOL` capacity and eliminating dynamic allocator thrashing during connection teardown.
+  - **Exhaustive ABA-Proof Stream Closure & Ingress Control Frame Timeout Fallback:**
+    - Replaced all remaining raw stream ID removals in `mux_client_reader_loop` with pointer-identity verified `close_stream_if_same(id, &gate)` (`Arc::ptr_eq`), protecting against erroneous eviction if an ID is reused during delayed frame handling.
+    - Added guaranteed stream teardown if delivery of non-Data control frames (FIN/RST) to a full inbound queue times out after 10 seconds, preventing stranded stream slots and unrefunded credit gates.
+  - **Server-Side Orphaned FIN Delivery Teardown:**
+    - In `handle_server`, asynchronous delivery of `StreamCommand::Fin` to a saturated channel was previously fire-and-forget. If the 10-second timeout elapsed, the stream entry remained trapped in the active map. Added pointer-identity verified stream removal, CreditGate closure, and cancellation signaling upon timeout, eliminating server-side zombie streams.
+  - **Regression Risk:** Zero. All 137 unit and integration tests passing in 0.33s. Zero dead code warnings on `close_stream_sync`.
+
+### Changes Implemented
+1. **Physical Session Writer Abort (`src/main.rs:MuxClientSession::spawn_from_parts`)**:
+   - Explicit `writer_task.abort()` on reader exit.
+2. **Buffer Pool Recycling on Unknown Stream Frames (`src/main.rs:mux_client_reader_loop`)**:
+   - Recycled unclaimed incoming frame storage back to `ENCODE_POOL`.
+3. **Identity-Checked Stream Closure & Control Frame Timeout Safeguard (`src/main.rs:mux_client_reader_loop`)**:
+   - Pointer-identity matched stream closure across all error branches; guaranteed cleanup on control frame timeout.
+4. **Server Zombie Stream Eviction on FIN Timeout (`src/main.rs:handle_server`)**:
+   - Identity-checked removal and cancellation on 10s FIN dispatch timeout.
+5. **Dead Code Cleanup (`src/main.rs:close_stream_sync`)**:
+   - Marked legacy `close_stream_sync` with `#[allow(dead_code)]`.
+6. **Version & Documentation**:
+   - Bumped version to `0.0.70` across `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.70 - MUX session teardown writer abort, stale frame buffer reclamation, and ABA-proof stream eviction`
+- Tag: `v0.0.70`
+
+### Status
+- Completed and released as `v0.0.70`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.70`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.70`.
+

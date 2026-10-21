@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.69";
+pub const APP_VERSION: &str = "0.0.70";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -334,6 +334,10 @@ impl MuxClientSession {
                     tracing::debug!("{log_tag} writer stopped; closing session streams");
                 }
             }
+            // If the read half ends first, the write task can otherwise remain
+            // blocked on the still-live MuxFrameWriter sender retained by the pool.
+            // Abort is harmless when the writer branch already completed.
+            writer_task.abort();
             heartbeat_handle.abort();
             reader_state.closed.store(true, Ordering::Release);
             let mut streams = reader_state
@@ -539,6 +543,7 @@ impl MuxClientSession {
         Ok((id, rx, gate))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn close_stream_sync(&self, id: u32) {
         if let Some(entry) = self
             .streams
@@ -638,19 +643,34 @@ where
             let id = frame.stream_id;
             let send_res = {
                 let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
-                streams.get(&id).map(|entry| match entry.tx.try_send(frame) {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err((entry.tx.clone(), err)),
-                })
+                match streams.get(&id) {
+                    Some(entry) => Some(match entry.tx.try_send(frame) {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err((entry.tx.clone(), entry.gate.clone(), err)),
+                    }),
+                    None => {
+                        // Unknown/stale stream IDs are normal during teardown; return
+                        // their pooled storage instead of dropping it to the allocator.
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                        None
+                    }
+                }
             };
             match send_res {
                 Some(Ok(())) | None => {}
-                Some(Err((tx, mpsc::error::TrySendError::Full(f)))) => {
+                Some(Err((tx, gate, mpsc::error::TrySendError::Full(f)))) => {
                     if f.command != MuxCommand::Data {
+                        let state_for_cleanup = state.clone();
                         tokio::spawn(async move {
                             match timeout(Duration::from_secs(10), tx.reserve()).await {
                                 Ok(Ok(permit)) => permit.send(f),
-                                _ => crate::mux_writer::recycle_encode_buf(f.into_storage()),
+                                _ => {
+                                    crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                    // A lost FIN/RST must not leave the session's stream slot
+                                    // and credit gate live forever. Pointer identity avoids
+                                    // closing a newer stream if an ID is ever reused.
+                                    state_for_cleanup.close_stream_if_same(id, &gate);
+                                }
                             }
                         });
                     } else {
@@ -658,7 +678,7 @@ where
                             Ok(Ok(permit)) => permit.send(f),
                             Ok(Err(_)) => {
                                 crate::mux_writer::recycle_encode_buf(f.into_storage());
-                                state.close_stream_sync(id);
+                                state.close_stream_if_same(id, &gate);
                             }
                             Err(_) => {
                                 crate::mux_writer::recycle_encode_buf(f.into_storage());
@@ -674,14 +694,14 @@ where
                                     &[],
                                     state.obfs,
                                 );
-                                state.close_stream_sync(id);
+                                state.close_stream_if_same(id, &gate);
                             }
                         }
                     }
                 }
-                Some(Err((_, mpsc::error::TrySendError::Closed(f)))) => {
+                Some(Err((_, gate, mpsc::error::TrySendError::Closed(f)))) => {
                     crate::mux_writer::recycle_encode_buf(f.into_storage());
-                    state.close_stream_sync(id);
+                    state.close_stream_if_same(id, &gate);
                 }
             }
         }
@@ -9991,15 +10011,36 @@ where
                         let guard = streams.read().unwrap_or_else(|e| e.into_inner());
                         match guard.get(&id) {
                             Some(s) => match s.tx.try_send(StreamCommand::Fin) {
-                                Err(mpsc::error::TrySendError::Full(_)) => Some(s.tx.clone()),
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    Some((s.tx.clone(), s.gate.clone()))
+                                }
                                 _ => None,
                             },
                             None => None,
                         }
                     };
-                    if let Some(tx) = full_tx {
+                    if let Some((tx, gate)) = full_tx {
+                        let streams_for_cleanup = streams.clone();
                         tokio::spawn(async move {
-                            let _ = timeout(Duration::from_secs(10), tx.send(StreamCommand::Fin)).await;
+                            if !matches!(
+                                timeout(Duration::from_secs(10), tx.send(StreamCommand::Fin)).await,
+                                Ok(Ok(()))
+                            ) {
+                                // A FIN that silently disappears can strand a server stream.
+                                // Remove only the same stream entry; a newer entry must survive.
+                                let mut guard = streams_for_cleanup
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if guard
+                                    .get(&id)
+                                    .is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate))
+                                {
+                                    if let Some(old) = guard.remove(&id) {
+                                        old.gate.close();
+                                        let _ = old.cancel.send(true);
+                                    }
+                                }
+                            }
                         });
                     }
                 }

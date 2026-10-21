@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.70] - 2026-10-21
+
+### MUX Session Teardown Writer Abort, Stale Frame Buffer Reclamation & ABA-Proof Stream Eviction
+
+- **Proactive MUX Writer Task Termination on Reader Exit (`src/main.rs:MuxClientSession::spawn_from_parts`)** — Added explicit `writer_task.abort()` when the client reader loop terminates before the writer half. Prevents orphaned background frame writer tasks from remaining indefinitely suspended on pool-retained channel senders upon unexpected remote connection drops.
+- **Stale/Unknown Stream MUX Frame Buffer Pool Recycling (`src/main.rs:mux_client_reader_loop`)** — Recycled inbound MUX data and control frame storage back to `ENCODE_POOL` via `recycle_encode_buf` when the target stream ID is no longer present in the active stream map, preventing allocator churn and pool depletion during connection teardown.
+- **Pointer-Identity Matched Stream Closure & Control Frame Timeout Safeguard (`src/main.rs:mux_client_reader_loop`)** — Replaced raw stream ID removal with identity-checked `close_stream_if_same(id, &gate)` across all frame reception failure branches, eliminating ABA stream teardown races on ID reuse. Guaranteed slot deregistration and credit gate closure if non-Data control frame (FIN/RST) delivery times out after 10 seconds.
+- **Server-Side FIN Delivery Timeout & Zombie Stream Eviction (`src/main.rs:handle_server`)** — Guarded asynchronous `StreamCommand::Fin` dispatch with timeout failure validation. If 10-second delivery fails due to a blocked client queue, verifies pointer identity (`Arc::ptr_eq`) and proactively removes the orphaned stream entry, closes its CreditGate, and triggers cancellation to eliminate zombie server streams.
+
 ## [v0.0.69] - 2026-10-21
 
 ### MUX Client Session Architecture Unification, Standardized Proxy Rejection & Server Task Leak Prevention
