@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.71] - 2026-10-21
+
+### MUX Single-Flight Bounded Control Queue & Strict Ingress Order Preservation
+
+- **Single-Flight Bounded Ingress Control Queue (`src/main.rs:ClientStreamEntry::pending_ctrl`, `mux_client_reader_loop`)** — Introduced per-stream `pending_ctrl` atomic state flags. Restricts asynchronous 10-second control frame (FIN) dispatch to strictly at most one in-flight task per stream, immediately recycling redundant or late control frames to `ENCODE_POOL` to eliminate task and memory accumulation under queue saturation.
+- **Strict Per-Stream Frame Order Preservation (`src/main.rs:mux_client_reader_loop`)** — Enforced FIFO arrival semantics by blocking subsequent DATA frames from invoking `try_send` or bypassing an in-flight pending control frame while it awaits queue permits. Guarantees that late DATA cannot overtake prior FIN frames without causing head-of-line blocking on the shared physical connection reader loop.
+- **Immediate Ingress RST Eviction on Saturated Queues (`src/main.rs:mux_client_reader_loop`)** — Short-circuited `MuxCommand::Rst` on saturated streams to immediately recycle the frame buffer and invoke pointer-verified `close_stream_if_same`, eliminating wasteful 10-second reservation waits and promptly terminating dead streams.
+- **Regression Verification Test Suite (`src/main.rs:common::tests`)** — Added dedicated concurrency regression tests `verify_mux_control_frame_strict_ordering` and `verify_mux_control_frame_bounded_task` validating strict arrival ordering and bounded task behavior under queue pressure.
+
 ## [v0.0.70] - 2026-10-21
 
 ### MUX Session Teardown Writer Abort, Stale Frame Buffer Reclamation & ABA-Proof Stream Eviction

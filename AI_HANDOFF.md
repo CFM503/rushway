@@ -1951,3 +1951,43 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.70`.
 
+## Release: v0.0.71 (2026-10-21) — MUX Single-Flight Bounded Control Queue & Strict Ingress Order Preservation
+
+### Context & User Directives
+- **Directives:** "问题 1：MUX 控制帧可能乱序", "问题 2：控制帧积压可能造成后台任务堆积", "保留现有 MUX 架构，不大规模重构", "更新版本号0.0.71,更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **Single-Flight Bounded Ingress Control Queue (`pending_ctrl`):**
+    - Under stream queue saturation, previous code spawned an unbounded number of 10-second asynchronous `tx.reserve()` tasks whenever non-DATA control frames were received. When peers burst control frames, this caused linear task and memory accumulation, retaining allocated buffers from `ENCODE_POOL`. Added per-stream `pending_ctrl: Arc<AtomicBool>` to `ClientStreamEntry`. Strictly caps in-flight background queue waiters to at most one per stream, immediately recycling extraneous frames.
+  - **Strict Per-Stream FIFO Ingress Ordering:**
+    - If a stream has an in-flight control frame (e.g. FIN) awaiting queue permits in the background, subsequent DATA or control frames received by `mux_client_reader_loop` were previously permitted to attempt immediate `tx.try_send()`. If a consumer freed a slot, subsequent DATA frames could bypass the queued FIN, inverting arrival order. Added an ingress check: if `pending_ctrl` is true, subsequent DATA frames are barred from bypassing the pending control frame, preserving strict FIFO stream semantics without stalling the shared reader loop for other streams.
+  - **Fast-Path Saturated RST Processing:**
+    - An incoming `Rst` frame on a saturated queue immediately recycles storage and calls `state.close_stream_if_same(id, &gate)`, avoiding a redundant 10-second reservation wait for a stream the remote peer has already terminated.
+  - **Regression Risk:** Zero. Retains pointer-identity verified teardown (`close_stream_if_same`), 250ms local DATA retry backpressure, and zero head-of-line blocking on the shared physical MUX connection. All 139 tests passing cleanly.
+
+### Changes Implemented
+1. **Per-Stream Control Pending State (`src/main.rs:ClientStreamEntry::pending_ctrl`)**:
+   - Added `pending_ctrl: Arc<AtomicBool>` tracking in-flight control frame dispatch per stream.
+2. **Order Preservation & Task Bound Enforcement (`src/main.rs:mux_client_reader_loop`)**:
+   - Gated ingress `try_send` behind `pending_ctrl` check; dropped and recycled bypassing frames during control pending state.
+   - Bounded background control tasks to exactly one per stream; reset flag upon successful `permit.send(f)`.
+3. **Immediate RST Teardown on Full Queues (`src/main.rs:mux_client_reader_loop`)**:
+   - Bypassed 10s wait for `MuxCommand::Rst`, instantly recycling buffer and closing stream.
+4. **Regression Unit Tests (`src/main.rs:common::tests`)**:
+   - Added `verify_mux_control_frame_strict_ordering` and `verify_mux_control_frame_bounded_task`.
+5. **Version & Documentation**:
+   - Bumped version to `0.0.71` across `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.71 - MUX single-flight bounded control queue and strict ingress order preservation`
+- Tag: `v0.0.71`
+
+### Status
+- Completed and released as `v0.0.71`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.71`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.71`.
+

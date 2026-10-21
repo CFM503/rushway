@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.70";
+pub const APP_VERSION: &str = "0.0.71";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -254,6 +254,7 @@ pub(crate) const MAX_MUX_STREAMS_PER_SESSION: usize = 2048;
 pub(crate) struct ClientStreamEntry {
     pub(crate) tx: tokio::sync::mpsc::Sender<crate::protocol::OwnedMuxFrame>,
     pub(crate) gate: Arc<crate::flow::CreditGate>,
+    pub(crate) pending_ctrl: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Shared client-side physical MUX session state used by both `mux_pool` (`ws://`)
@@ -467,6 +468,7 @@ impl MuxClientSession {
                 ClientStreamEntry {
                     tx,
                     gate: gate.clone(),
+                    pending_ctrl: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
             );
             stream_id
@@ -644,10 +646,27 @@ where
             let send_res = {
                 let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
                 match streams.get(&id) {
-                    Some(entry) => Some(match entry.tx.try_send(frame) {
-                        Ok(()) => Ok(()),
-                        Err(err) => Err((entry.tx.clone(), entry.gate.clone(), err)),
-                    }),
+                    Some(entry) => {
+                        if entry.pending_ctrl.load(Ordering::Acquire) {
+                            // A prior control frame is already queued in the background for this stream.
+                            // To preserve strict per-stream FIFO order and prevent unbounded task accumulation,
+                            // subsequent frames must not bypass the queued control frame or spawn new tasks.
+                            if frame.command == MuxCommand::Rst {
+                                let gate = entry.gate.clone();
+                                drop(streams);
+                                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                state.close_stream_if_same(id, &gate);
+                            } else {
+                                crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                            }
+                            None
+                        } else {
+                            Some(match entry.tx.try_send(frame) {
+                                Ok(()) => Ok(()),
+                                Err(err) => Err((entry.tx.clone(), entry.gate.clone(), entry.pending_ctrl.clone(), err)),
+                            })
+                        }
+                    }
                     None => {
                         // Unknown/stale stream IDs are normal during teardown; return
                         // their pooled storage instead of dropping it to the allocator.
@@ -658,21 +677,34 @@ where
             };
             match send_res {
                 Some(Ok(())) | None => {}
-                Some(Err((tx, gate, mpsc::error::TrySendError::Full(f)))) => {
+                Some(Err((tx, gate, pending_ctrl, mpsc::error::TrySendError::Full(f)))) => {
                     if f.command != MuxCommand::Data {
-                        let state_for_cleanup = state.clone();
-                        tokio::spawn(async move {
-                            match timeout(Duration::from_secs(10), tx.reserve()).await {
-                                Ok(Ok(permit)) => permit.send(f),
-                                _ => {
-                                    crate::mux_writer::recycle_encode_buf(f.into_storage());
-                                    // A lost FIN/RST must not leave the session's stream slot
-                                    // and credit gate live forever. Pointer identity avoids
-                                    // closing a newer stream if an ID is ever reused.
-                                    state_for_cleanup.close_stream_if_same(id, &gate);
+                        if f.command == MuxCommand::Rst {
+                            // An incoming RST on a saturated queue immediately aborts the stream;
+                            // queuing another 10s wait is pointless and risks stale channel retention.
+                            crate::mux_writer::recycle_encode_buf(f.into_storage());
+                            state.close_stream_if_same(id, &gate);
+                        } else {
+                            // Exactly one pending control frame is permitted per stream.
+                            pending_ctrl.store(true, Ordering::Release);
+                            let state_for_cleanup = state.clone();
+                            let pending_ctrl_for_task = pending_ctrl.clone();
+                            tokio::spawn(async move {
+                                match timeout(Duration::from_secs(10), tx.reserve()).await {
+                                    Ok(Ok(permit)) => {
+                                        permit.send(f);
+                                        pending_ctrl_for_task.store(false, Ordering::Release);
+                                    }
+                                    _ => {
+                                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                        // A lost FIN/RST must not leave the session's stream slot
+                                        // and credit gate live forever. Pointer identity avoids
+                                        // closing a newer stream if an ID is ever reused.
+                                        state_for_cleanup.close_stream_if_same(id, &gate);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     } else {
                         match timeout(Duration::from_millis(250), tx.reserve()).await {
                             Ok(Ok(permit)) => permit.send(f),
@@ -699,7 +731,7 @@ where
                         }
                     }
                 }
-                Some(Err((_, gate, mpsc::error::TrySendError::Closed(f)))) => {
+                Some(Err((_, gate, _, mpsc::error::TrySendError::Closed(f)))) => {
                     crate::mux_writer::recycle_encode_buf(f.into_storage());
                     state.close_stream_if_same(id, &gate);
                 }
@@ -1803,6 +1835,129 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn verify_mux_control_frame_strict_ordering() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+        use tokio::io::AsyncWriteExt;
+
+        let (mock_writer_sink, _) = tokio::io::duplex(65536);
+        let (writer, _writer_task) = MuxFrameWriter::spawn(mock_writer_sink);
+        let state = Arc::new(MuxClientSession {
+            writer,
+            cipher: XorCipher::new(""),
+            obfs: false,
+            streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
+            peer_window_kib: AtomicU32::new(0),
+            next_id: AtomicU32::new(1),
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            capacity_notify: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let stream_id = 101u32;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let gate = crate::flow::CreditGate::new();
+        state.streams.write().unwrap().insert(
+            stream_id,
+            ClientStreamEntry {
+                tx: tx.clone(),
+                gate,
+                pending_ctrl: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        // Fill channel
+        let dummy = crate::protocol::OwnedMuxFrame::from_parts(stream_id, MuxCommand::Data, &[]).unwrap();
+        tx.try_send(dummy).expect("fill");
+
+        let (mut client_rd, mut upstream_wr) = tokio::io::duplex(65536);
+        let state_clone = state.clone();
+        let reader_handle = tokio::spawn(async move {
+            let _ = mux_client_reader_loop(&mut client_rd, state_clone).await;
+        });
+
+        let c = XorCipher::new("");
+        // 1. Send FIN (control frame)
+        let mut frame_fin = Vec::new();
+        crate::mux_writer::encode_mux_ws_frame(&mut frame_fin, stream_id, MuxCommand::Fin, &[], &c, false, false).unwrap();
+        upstream_wr.write_all(&frame_fin).await.unwrap();
+
+        // Give reader loop a slice to process FIN, discover full queue, and set pending_ctrl=true
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // 2. Send DATA frame - this must NOT overtake the pending FIN
+        let mut frame_data = Vec::new();
+        crate::mux_writer::encode_mux_ws_frame(&mut frame_data, stream_id, MuxCommand::Data, b"LATE_DATA", &c, false, false).unwrap();
+        upstream_wr.write_all(&frame_data).await.unwrap();
+
+        // 3. Consumer consumes the dummy frame to free a slot
+        let first = rx.recv().await.expect("dummy");
+        assert_eq!(first.command, MuxCommand::Data);
+
+        // 4. The pending FIN must be delivered into the freed slot, NOT the late DATA!
+        let second = timeout(Duration::from_millis(500), rx.recv()).await.expect("timeout").expect("second");
+        assert_eq!(second.command, MuxCommand::Fin, "FIN must precede late DATA in arrival order");
+
+        reader_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn verify_mux_control_frame_bounded_task() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        let (mock_writer_sink, _) = tokio::io::duplex(65536);
+        let (writer, _writer_task) = MuxFrameWriter::spawn(mock_writer_sink);
+        let state = Arc::new(MuxClientSession {
+            writer,
+            cipher: XorCipher::new(""),
+            obfs: false,
+            streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
+            peer_window_kib: AtomicU32::new(0),
+            next_id: AtomicU32::new(1),
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            capacity_notify: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let stream_id = 202u32;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let gate = crate::flow::CreditGate::new();
+        let pending_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.streams.write().unwrap().insert(
+            stream_id,
+            ClientStreamEntry {
+                tx: tx.clone(),
+                gate,
+                pending_ctrl: pending_flag.clone(),
+            },
+        );
+
+        let dummy = crate::protocol::OwnedMuxFrame::from_parts(stream_id, MuxCommand::Data, &[]).unwrap();
+        tx.try_send(dummy).expect("fill");
+
+        let (mut client_rd, mut upstream_wr) = tokio::io::duplex(1024 * 1024);
+        let state_clone = state.clone();
+        let reader_handle = tokio::spawn(async move {
+            let _ = mux_client_reader_loop(&mut client_rd, state_clone).await;
+        });
+
+        let c = XorCipher::new("");
+        let mut frame_fin = Vec::new();
+        crate::mux_writer::encode_mux_ws_frame(&mut frame_fin, stream_id, MuxCommand::Fin, &[], &c, false, false).unwrap();
+
+        // Blast 200 FIN control frames into saturated stream
+        for _ in 0..200 {
+            upstream_wr.write_all(&frame_fin).await.unwrap();
+        }
+        upstream_wr.flush().await.unwrap();
+        drop(upstream_wr);
+
+        // Reader finishes promptly and pending_flag is marked true
+        let _ = timeout(Duration::from_millis(500), reader_handle).await;
+        assert!(pending_flag.load(Ordering::Acquire));
+    }
 
     #[test]
     fn pooled_transports_expire_by_age_and_idleness() {
