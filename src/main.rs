@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.68";
+pub const APP_VERSION: &str = "0.0.69";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -234,6 +234,463 @@ pub(crate) const HTTP_200_CONNECTION_ESTABLISHED: &[u8] =
     b"HTTP/1.1 200 Connection Established\r\n\r\n";
 pub(crate) const HTTP_502_BAD_GATEWAY: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// Writes a SOCKS5 general failure reply or HTTP `502 Bad Gateway` to the local
+/// proxy client and shuts down the write half cleanly.
+pub(crate) async fn reject_local_proxy(local: &mut TcpStream, is_socks5: bool) -> Result<()> {
+    if is_socks5 {
+        local
+            .write_all(&crate::proxy::socks5_failure_response())
+            .await?;
+    } else {
+        local.write_all(HTTP_502_BAD_GATEWAY).await?;
+    }
+    let _ = local.shutdown().await;
+    Ok(())
+}
+
+pub(crate) const MAX_MUX_STREAMS_PER_SESSION: usize = 2048;
+
+pub(crate) struct ClientStreamEntry {
+    pub(crate) tx: tokio::sync::mpsc::Sender<crate::protocol::OwnedMuxFrame>,
+    pub(crate) gate: Arc<crate::flow::CreditGate>,
+}
+
+/// Shared client-side physical MUX session state used by both `mux_pool` (`ws://`)
+/// and `wss_client` (`wss://`).
+pub(crate) struct MuxClientSession {
+    pub(crate) writer: Arc<MuxFrameWriter>,
+    pub(crate) cipher: XorCipher,
+    pub(crate) obfs: bool,
+    pub(crate) streams: Arc<std::sync::RwLock<crate::protocol::U32HashMap<ClientStreamEntry>>>,
+    pub(crate) peer_window_kib: std::sync::atomic::AtomicU32,
+    next_id: std::sync::atomic::AtomicU32,
+    pub(crate) active: std::sync::atomic::AtomicUsize,
+    pub(crate) closed: std::sync::atomic::AtomicBool,
+    pub(crate) capacity_notify: Arc<tokio::sync::Notify>,
+}
+
+impl MuxClientSession {
+    pub(crate) async fn spawn_from_parts<R>(
+        mut rd: R,
+        writer: Arc<MuxFrameWriter>,
+        mut writer_task: tokio::task::JoinHandle<()>,
+        cipher: XorCipher,
+        obfs: bool,
+        capacity_notify: Arc<tokio::sync::Notify>,
+        log_tag: &'static str,
+    ) -> Result<Arc<Self>>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+        let version_payload =
+            crate::protocol::encode_version_payload(crate::protocol::mux_initial_window_kib());
+        send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload, obfs).await?;
+        let state = Arc::new(Self {
+            writer: writer.clone(),
+            cipher,
+            obfs,
+            streams: Arc::new(std::sync::RwLock::new(
+                crate::protocol::U32HashMap::default(),
+            )),
+            peer_window_kib: AtomicU32::new(0),
+            next_id: AtomicU32::new(1),
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            capacity_notify,
+        });
+        let heartbeat_state = state.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(25));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if heartbeat_state.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let ping = match crate::ws::encode_ws_frame(&[], 9, true) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        heartbeat_state.closed.store(true, Ordering::Release);
+                        break;
+                    }
+                };
+                if heartbeat_state.writer.send(ping).await.is_err() {
+                    heartbeat_state.closed.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        });
+        let reader_state = state.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                res = mux_client_reader_loop(&mut rd, reader_state.clone()) => {
+                    if let Err(error) = res {
+                        tracing::debug!(%error, "{log_tag} reader stopped; closing session streams");
+                    }
+                }
+                _ = &mut writer_task => {
+                    tracing::debug!("{log_tag} writer stopped; closing session streams");
+                }
+            }
+            heartbeat_handle.abort();
+            reader_state.closed.store(true, Ordering::Release);
+            let mut streams = reader_state
+                .streams
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let drained = streams.len();
+            for entry in streams.values() {
+                entry.gate.close();
+            }
+            streams.clear();
+            reader_state.dec_active(drained);
+            drop(streams);
+            reader_state.capacity_notify.notify_waiters();
+        });
+        Ok(state)
+    }
+
+    #[inline]
+    pub(crate) fn is_dead(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.closed.load(Ordering::Acquire) || self.writer.is_closed()
+    }
+
+    #[inline]
+    pub(crate) fn available(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.is_dead() && self.active.load(Ordering::Acquire) < MAX_MUX_STREAMS_PER_SESSION
+    }
+
+    pub(crate) fn dec_active(&self, n: usize) {
+        use std::sync::atomic::Ordering;
+        if n == 0 {
+            return;
+        }
+        let _ = self
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(n))
+            });
+    }
+
+    pub(crate) fn try_reserve(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.is_dead() {
+            return false;
+        }
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_MUX_STREAMS_PER_SESSION).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) async fn open_stream(
+        self: &Arc<Self>,
+        target: &TargetAddr,
+        initial_data: &[u8],
+    ) -> Result<(
+        u32,
+        tokio::sync::mpsc::Receiver<crate::protocol::OwnedMuxFrame>,
+        Arc<crate::flow::CreditGate>,
+    )> {
+        use std::sync::atomic::Ordering;
+        if !self.try_reserve() {
+            bail!("MUX session is full or closed")
+        }
+        let port_digits = if target.port >= 10000 {
+            5
+        } else if target.port >= 1000 {
+            4
+        } else if target.port >= 100 {
+            3
+        } else if target.port >= 10 {
+            2
+        } else {
+            1
+        };
+        let ipv6_brackets = if target.host.contains(':') && !target.host.starts_with('[') {
+            2
+        } else {
+            0
+        };
+        let target_len = target.host.len() + ipv6_brackets + 1 + port_digits;
+        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
+        let (syn_initial, remaining_initial) =
+            initial_data.split_at(initial_data.len().min(max_syn_initial));
+
+        let syn_payload =
+            match crate::protocol::SynPayload::encode_parts(&target.host, target.port, syn_initial)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.dec_active(1);
+                    self.capacity_notify.notify_waiters();
+                    return Err(anyhow!(e.to_string()));
+                }
+            };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::protocol::mux_stream_queue_cap());
+        let gate = crate::flow::CreditGate::new();
+
+        let id = {
+            let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
+            if self.is_dead() {
+                crate::mux_writer::recycle_encode_buf(syn_payload);
+                self.dec_active(1);
+                self.capacity_notify.notify_waiters();
+                bail!("MUX session is closed")
+            }
+            let mut stream_id;
+            loop {
+                stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if stream_id == 0 {
+                    stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                }
+                if !streams.contains_key(&stream_id) {
+                    break;
+                }
+            }
+            let kib = self.peer_window_kib.load(Ordering::Acquire);
+            if kib > 0 {
+                gate.enable(i64::from(kib) * 1024);
+            }
+            streams.insert(
+                stream_id,
+                ClientStreamEntry {
+                    tx,
+                    gate: gate.clone(),
+                },
+            );
+            stream_id
+        };
+
+        struct OpenStreamGuard<'a> {
+            session: &'a MuxClientSession,
+            id: u32,
+            gate: Arc<crate::flow::CreditGate>,
+            syn_sent: bool,
+            armed: bool,
+        }
+        impl<'a> Drop for OpenStreamGuard<'a> {
+            fn drop(&mut self) {
+                if self.armed {
+                    if self.syn_sent && !self.session.is_dead() {
+                        try_send_mux_parts(
+                            &self.session.writer,
+                            &self.session.cipher,
+                            self.id,
+                            MuxCommand::Rst,
+                            &[],
+                            self.session.obfs,
+                        );
+                    }
+                    self.session.close_stream_if_same(self.id, &self.gate);
+                }
+            }
+        }
+        let mut open_guard = OpenStreamGuard {
+            session: self,
+            id,
+            gate: gate.clone(),
+            syn_sent: false,
+            armed: true,
+        };
+
+        if !syn_initial.is_empty() {
+            gate.acquire(syn_initial.len()).await;
+        }
+        let send_syn_res = send_mux_parts(
+            &self.writer,
+            &self.cipher,
+            id,
+            MuxCommand::Syn,
+            &syn_payload,
+            self.obfs,
+        )
+        .await;
+        crate::mux_writer::recycle_encode_buf(syn_payload);
+        if let Err(e) = send_syn_res {
+            self.closed.store(true, Ordering::Release);
+            return Err(e);
+        }
+        open_guard.syn_sent = true;
+
+        if !remaining_initial.is_empty() {
+            gate.acquire(remaining_initial.len()).await;
+            if let Err(e) = send_mux_parts(
+                &self.writer,
+                &self.cipher,
+                id,
+                MuxCommand::Data,
+                remaining_initial,
+                self.obfs,
+            )
+            .await
+            {
+                self.closed.store(true, Ordering::Release);
+                return Err(e);
+            }
+        }
+        open_guard.armed = false;
+        Ok((id, rx, gate))
+    }
+
+    pub(crate) fn close_stream_sync(&self, id: u32) {
+        if let Some(entry) = self
+            .streams
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            entry.gate.close();
+            self.dec_active(1);
+            self.capacity_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn close_stream_if_same(&self, id: u32, gate: &Arc<crate::flow::CreditGate>) {
+        let mut guard = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        if guard.get(&id).is_some_and(|e| Arc::ptr_eq(&e.gate, gate)) {
+            if let Some(entry) = guard.remove(&id) {
+                entry.gate.close();
+                self.dec_active(1);
+                drop(guard);
+                self.capacity_notify.notify_waiters();
+            }
+        }
+    }
+}
+
+pub(crate) async fn mux_client_reader_loop<R>(
+    rd: &mut R,
+    state: Arc<MuxClientSession>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc;
+    let mut frame_buf = Vec::new();
+    let res = async {
+        loop {
+            let Some((opcode, payload)) = crate::ws::read_frame_mux(
+                rd,
+                &state.writer,
+                true,
+                &mut frame_buf,
+                Some(&state.cipher),
+            )
+            .await?
+            else {
+                break;
+            };
+            if opcode != 2 {
+                crate::mux_writer::recycle_encode_buf(payload);
+                continue;
+            }
+            let frame = match crate::protocol::MuxFrame::decode_owned(payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match frame.command {
+                MuxCommand::Version => {
+                    let decoded = crate::protocol::decode_version_payload(frame.payload());
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if let Some((version, kib)) = decoded {
+                        if version >= 1 {
+                            let prev = state.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
+                            if prev == 0 {
+                                let streams =
+                                    state.streams.read().unwrap_or_else(|e| e.into_inner());
+                                let window = i64::from(kib) * 1024;
+                                for entry in streams.values() {
+                                    entry.gate.enable(window);
+                                }
+                                drop(streams);
+                                tracing::debug!(kib, "peer VERSION received; send window enabled");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                MuxCommand::Window => {
+                    let stream_id = frame.stream_id;
+                    let decoded = crate::protocol::decode_window_payload(frame.payload());
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if let Some(credit) = decoded {
+                        if let Some(entry) = state
+                            .streams
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&stream_id)
+                        {
+                            entry.gate.release(i64::from(credit));
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let id = frame.stream_id;
+            let send_res = {
+                let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
+                streams.get(&id).map(|entry| match entry.tx.try_send(frame) {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err((entry.tx.clone(), err)),
+                })
+            };
+            match send_res {
+                Some(Ok(())) | None => {}
+                Some(Err((tx, mpsc::error::TrySendError::Full(f)))) => {
+                    if f.command != MuxCommand::Data {
+                        tokio::spawn(async move {
+                            match timeout(Duration::from_secs(10), tx.reserve()).await {
+                                Ok(Ok(permit)) => permit.send(f),
+                                _ => crate::mux_writer::recycle_encode_buf(f.into_storage()),
+                            }
+                        });
+                    } else {
+                        match timeout(Duration::from_millis(250), tx.reserve()).await {
+                            Ok(Ok(permit)) => permit.send(f),
+                            Ok(Err(_)) => {
+                                crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                state.close_stream_sync(id);
+                            }
+                            Err(_) => {
+                                crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                tracing::warn!(
+                                    stream_id = id,
+                                    "mux RST: stream queue full; resetting stalled stream"
+                                );
+                                try_send_mux_parts(
+                                    &state.writer,
+                                    &state.cipher,
+                                    id,
+                                    MuxCommand::Rst,
+                                    &[],
+                                    state.obfs,
+                                );
+                                state.close_stream_sync(id);
+                            }
+                        }
+                    }
+                }
+                Some(Err((_, mpsc::error::TrySendError::Closed(f)))) => {
+                    crate::mux_writer::recycle_encode_buf(f.into_storage());
+                    state.close_stream_sync(id);
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    crate::mux_writer::recycle_encode_buf(frame_buf);
+    res
+}
 
 /// Builds the 10-byte SOCKS5 UDP ASSOCIATE reply advertising `bound`.
 /// A non-IPv4 bind address leaves BND.ADDR zeroed, as before.
@@ -1158,7 +1615,13 @@ where
     };
     c.apply(&mut hello);
 
-    let (mut rd, mut wr, was_pooled) = pool.get_or_dial_tagged().await?;
+    let (mut rd, mut wr, was_pooled) = match pool.get_or_dial_tagged().await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = reject_local_proxy(&mut local, is_socks5).await;
+            return Err(e);
+        }
+    };
     let mut frame_buf = Vec::new();
 
     let mut attempt_pooled = was_pooled;
@@ -1187,6 +1650,7 @@ where
                     Ok(v) => v,
                     Err(dial_err) => {
                         crate::mux_writer::recycle_encode_buf(frame_buf);
+                        let _ = reject_local_proxy(&mut local, is_socks5).await;
                         return Err(dial_err);
                     }
                 };
@@ -1195,6 +1659,7 @@ where
             }
             Err(e) => {
                 crate::mux_writer::recycle_encode_buf(frame_buf);
+                let _ = reject_local_proxy(&mut local, is_socks5).await;
                 return Err(e);
             }
         }
@@ -1202,6 +1667,7 @@ where
     if opcode != 2 {
         crate::mux_writer::recycle_encode_buf(ok);
         crate::mux_writer::recycle_encode_buf(frame_buf);
+        let _ = reject_local_proxy(&mut local, is_socks5).await;
         bail!(spec.bad_opcode_error)
     };
     c.apply(&mut ok);
@@ -1210,7 +1676,10 @@ where
     if !is_ok {
         crate::mux_writer::recycle_encode_buf(frame_buf);
         match spec.ok_rejection {
-            NonMuxOkRejection::Propagate(error) => bail!(error),
+            NonMuxOkRejection::Propagate(error) => {
+                let _ = reject_local_proxy(&mut local, is_socks5).await;
+                bail!(error)
+            }
             NonMuxOkRejection::RespondLocal { socks5_failure } => {
                 if is_socks5 {
                     local.write_all(&socks5_failure).await?
@@ -3168,17 +3637,14 @@ pub mod mux_pool {
 //! fallback, are handled authoritatively by [`crate::wss_client::WssSessionPool`].
 
 use crate::common::{
-    configured_cipher, send_mux_parts, HTTP_200_CONNECTION_ESTABLISHED,
+    configured_cipher, MuxClientSession, HTTP_200_CONNECTION_ESTABLISHED,
+    MAX_MUX_STREAMS_PER_SESSION,
 };
 #[cfg(test)]
 use crate::common::parse_ws_url_with_port;
-use crate::crypto::XorCipher;
 use crate::flow::CreditGate;
 use crate::mux_writer::{recycle_encode_buf, MuxFrameWriter};
-use crate::protocol::{
-    decode_version_payload, decode_window_payload, encode_version_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
-};
+use crate::protocol::{MuxCommand, OwnedMuxFrame};
 use crate::proxy::{
     read_client_proxy_request, socks5_success_response, SocksCommand, TargetAddr,
 };
@@ -3190,16 +3656,17 @@ use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::encode_ws_frame;
 use anyhow::{anyhow, bail, Result};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use tokio::io::AsyncWriteExt;
-use tokio::net::{tcp::OwnedReadHalf, TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 
 const MAX_SESSION_COUNT: usize = 64;
-const MAX_STREAMS_PER_SESSION: usize = 2048;
+const MAX_STREAMS_PER_SESSION: usize = MAX_MUX_STREAMS_PER_SESSION;
+type SessionState = MuxClientSession;
 
 #[cfg(test)]
 fn parse_upstream(input: &str) -> Result<(String, String)> {
@@ -3209,441 +3676,54 @@ fn parse_upstream(input: &str) -> Result<(String, String)> {
     parse_ws_url_with_port(input, "pooled client requires ws:// upstream")
 }
 
-struct ClientStreamEntry {
-    tx: mpsc::Sender<OwnedMuxFrame>,
-    gate: Arc<CreditGate>,
-}
-
-struct SessionState {
-    writer: Arc<MuxFrameWriter>,
-    cipher: XorCipher,
-    obfs: bool,
-    // Read-mostly under concurrency (one shared lookup per DATA or WINDOW frame),
-    // so a single RwLock<U32HashMap> holds both the downstream channel and upload gate.
-    streams: Arc<std::sync::RwLock<U32HashMap<ClientStreamEntry>>>,
-    /// Peer-advertised receive window in KiB once its VERSION arrived
-    /// (0 => un-negotiated: v1 unbounded sends, no WINDOW refunds).
-    peer_window_kib: AtomicU32,
-    next_id: AtomicU32,
-    active: AtomicUsize,
-    closed: AtomicBool,
-    /// Pool-shared notifier: stream release and session close wake up
-    /// `acquire` waiters parked on session capacity.
+async fn connect_plain_mux_session(
+    cfg: &RuntimeConfig,
     capacity_notify: Arc<Notify>,
-}
-impl SessionState {
-    async fn connect(cfg: &RuntimeConfig, capacity_notify: Arc<Notify>) -> Result<Arc<Self>> {
-        if cfg.upstream.as_deref().is_some_and(|u| u.starts_with("wss://")) {
-            bail!("pooled client in mux_pool requires ws:// upstream; use wss_client for wss://");
-        }
-        let (mut rd, wr) =
-            crate::common::open_ws_upstream(cfg, "pooled client requires ws:// upstream").await?;
-        let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-        let (writer, mut writer_task) = MuxFrameWriter::spawn(wr);
-        let cipher = configured_cipher(&cfg.key);
-        let mut hello = b"MUX\n".to_vec();
-        cipher.apply(&mut hello);
-        writer
-            .send(encode_ws_frame(&hello, 2, true).map_err(|e| anyhow!(e.to_string()))?)
-            .await?;
-        let mut frame_buf = Vec::new();
-        let read_res = timeout(
-            hs_timeout,
-            crate::ws::read_frame_mux(&mut rd, &writer, true, &mut frame_buf, None),
-        )
-        .await
-        .map_err(|_| anyhow!("upstream MUX handshake OK timed out"));
-        recycle_encode_buf(frame_buf);
-        let Some((opcode, mut ok)) = read_res?? else {
-            bail!("upstream closed during MUX handshake")
-        };
-        if opcode != 2 {
-            recycle_encode_buf(ok);
-            bail!("invalid MUX handshake response opcode")
-        };
-        cipher.apply(&mut ok);
-        let is_ok = ok == b"OK\n";
-        recycle_encode_buf(ok);
-        if !is_ok {
-            bail!("upstream rejected MUX handshake")
-        };
-        let version_payload = encode_version_payload(mux_initial_window_kib());
-        send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload, cfg.obfs)
-            .await?;
-        let state = Arc::new(Self {
-            writer: writer.clone(),
-            cipher: cipher.clone(),
-            obfs: cfg.obfs,
-            streams: Arc::new(std::sync::RwLock::new(U32HashMap::default())),
-            peer_window_kib: AtomicU32::new(0),
-            next_id: AtomicU32::new(1),
-            active: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
-            capacity_notify,
-        });
-        let heartbeat_state = state.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(25));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if heartbeat_state.closed.load(Ordering::Acquire) {
-                    break;
-                }
-                let ping = match encode_ws_frame(&[], 9, true) {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        heartbeat_state.closed.store(true, Ordering::Release);
-                        break;
-                    }
-                };
-                if heartbeat_state.writer.send(ping).await.is_err() {
-                    heartbeat_state.closed.store(true, Ordering::Release);
-                    break;
-                }
-            }
-        });
-        let reader_state = state.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                res = client_reader_loop(rd, reader_state.clone()) => {
-                    if let Err(e) = res {
-                        tracing::warn!(error=%e,"pooled MUX reader stopped; closing session streams");
-                    }
-                }
-                _ = &mut writer_task => {
-                    tracing::warn!("pooled MUX writer stopped; closing session streams");
-                }
-            }
-            heartbeat_handle.abort();
-            reader_state.closed.store(true, Ordering::Release);
-            let mut streams = reader_state
-                .streams
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let drained = streams.len();
-            for entry in streams.values() {
-                entry.gate.close();
-            }
-            streams.clear();
-            reader_state.dec_active(drained);
-            drop(streams);
-            reader_state.capacity_notify.notify_waiters();
-        });
-        Ok(state)
+) -> Result<Arc<SessionState>> {
+    if cfg.upstream.as_deref().is_some_and(|u| u.starts_with("wss://")) {
+        bail!("pooled client in mux_pool requires ws:// upstream; use wss_client for wss://");
     }
-    fn is_dead(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.writer.is_closed()
-    }
-    fn available(&self) -> bool {
-        !self.is_dead() && self.active.load(Ordering::Acquire) < MAX_STREAMS_PER_SESSION
-    }
-    fn dec_active(&self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let _ = self
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(n))
-            });
-    }
-    fn try_reserve(&self) -> bool {
-        if self.closed.load(Ordering::Acquire) || self.writer.is_closed() {
-            return false;
-        }
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < MAX_STREAMS_PER_SESSION).then_some(current + 1)
-            })
-            .is_ok()
-    }
-    async fn open_stream(
-        self: &Arc<Self>,
-        target: &TargetAddr,
-        initial_data: &[u8],
-    ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>, Arc<CreditGate>)> {
-        if !self.try_reserve() {
-            bail!("MUX session is full or closed")
-        }
-
-        let port_digits = if target.port >= 10000 {
-            5
-        } else if target.port >= 1000 {
-            4
-        } else if target.port >= 100 {
-            3
-        } else if target.port >= 10 {
-            2
-        } else {
-            1
-        };
-        let ipv6_brackets = if target.host.contains(':') && !target.host.starts_with('[') { 2 } else { 0 };
-        let target_len = target.host.len() + ipv6_brackets + 1 + port_digits;
-        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
-        let (syn_initial, remaining_initial) =
-            initial_data.split_at(initial_data.len().min(max_syn_initial));
-
-        let syn_payload = match SynPayload::encode_parts(&target.host, target.port, syn_initial) {
-            Ok(v) => v,
-            Err(e) => {
-                self.dec_active(1);
-                self.capacity_notify.notify_waiters();
-                return Err(anyhow!(e.to_string()));
-            }
-        };
-
-        let (tx, rx) = mpsc::channel(crate::protocol::mux_stream_queue_cap());
-        let gate = CreditGate::new();
-
-        let id = {
-            let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
-
-            if self.is_dead() {
-                recycle_encode_buf(syn_payload);
-                self.dec_active(1);
-                self.capacity_notify.notify_waiters();
-                bail!("MUX session is closed")
-            }
-
-            let mut id;
-            loop {
-                id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                if id == 0 {
-                    id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                }
-                if !streams.contains_key(&id) {
-                    break;
-                }
-            }
-            let kib = self.peer_window_kib.load(Ordering::Acquire);
-            if kib > 0 {
-                gate.enable(i64::from(kib) * 1024);
-            }
-            streams.insert(
-                id,
-                ClientStreamEntry {
-                    tx,
-                    gate: gate.clone(),
-                },
-            );
-            id
-        };
-
-        struct OpenStreamGuard<'a> {
-            session: &'a SessionState,
-            id: u32,
-            gate: Arc<CreditGate>,
-            syn_sent: bool,
-            armed: bool,
-        }
-        impl<'a> Drop for OpenStreamGuard<'a> {
-            fn drop(&mut self) {
-                if self.armed {
-                    if self.syn_sent && !self.session.is_dead() {
-                        crate::common::try_send_mux_parts(
-                            &self.session.writer,
-                            &self.session.cipher,
-                            self.id,
-                            MuxCommand::Rst,
-                            &[],
-                            self.session.obfs,
-                        );
-                    }
-                    self.session.close_stream_if_same(self.id, &self.gate);
-                }
-            }
-        }
-        let mut open_guard = OpenStreamGuard {
-            session: self,
-            id,
-            gate: gate.clone(),
-            syn_sent: false,
-            armed: true,
-        };
-
-        if !syn_initial.is_empty() {
-            gate.acquire(syn_initial.len()).await;
-        }
-        let send_syn_res = send_mux_parts(
-            &self.writer,
-            &self.cipher,
-            id,
-            MuxCommand::Syn,
-            &syn_payload,
-            self.obfs,
-        )
-        .await;
-        recycle_encode_buf(syn_payload);
-        if let Err(e) = send_syn_res {
-            self.closed.store(true, Ordering::Release);
-            return Err(e);
-        }
-        open_guard.syn_sent = true;
-
-        if !remaining_initial.is_empty() {
-            gate.acquire(remaining_initial.len()).await;
-            if let Err(e) = send_mux_parts(
-                &self.writer,
-                &self.cipher,
-                id,
-                MuxCommand::Data,
-                remaining_initial,
-                self.obfs,
-            )
-            .await
-            {
-                self.closed.store(true, Ordering::Release);
-                return Err(e);
-            }
-        }
-
-        open_guard.armed = false;
-        Ok((id, rx, gate))
-    }
-    fn close_stream_sync(&self, id: u32) {
-        if let Some(entry) = self
-            .streams
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
-        {
-            entry.gate.close();
-            self.dec_active(1);
-            self.capacity_notify.notify_waiters();
-        }
-    }
-    fn close_stream_if_same(&self, id: u32, gate: &Arc<CreditGate>) {
-        let mut guard = self.streams.write().unwrap_or_else(|e| e.into_inner());
-        if guard.get(&id).is_some_and(|e| Arc::ptr_eq(&e.gate, gate)) {
-            if let Some(entry) = guard.remove(&id) {
-                entry.gate.close();
-                self.dec_active(1);
-                drop(guard);
-                self.capacity_notify.notify_waiters();
-            }
-        }
-    }
-}
-async fn client_reader_loop(mut rd: OwnedReadHalf, state: Arc<SessionState>) -> Result<()> {
+    let (mut rd, wr) =
+        crate::common::open_ws_upstream(cfg, "pooled client requires ws:// upstream").await?;
+    let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let (writer, writer_task) = MuxFrameWriter::spawn(wr);
+    let cipher = configured_cipher(&cfg.key);
+    let mut hello = b"MUX\n".to_vec();
+    cipher.apply(&mut hello);
+    writer
+        .send(encode_ws_frame(&hello, 2, true).map_err(|e| anyhow!(e.to_string()))?)
+        .await?;
     let mut frame_buf = Vec::new();
-    let res = async {
-        loop {
-            let Some((opcode, payload)) = crate::ws::read_frame_mux(
-                &mut rd,
-                &state.writer,
-                true,
-                &mut frame_buf,
-                Some(&state.cipher),
-            )
-            .await?
-            else {
-                break;
-            };
-            if opcode != 2 {
-                recycle_encode_buf(payload);
-                continue;
-            }
-            let frame = match MuxFrame::decode_owned(payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            match frame.command {
-                MuxCommand::Version => {
-                    let decoded = decode_version_payload(frame.payload());
-                    recycle_encode_buf(frame.into_storage());
-                    if let Some((version, kib)) = decoded {
-                        if version >= 1 {
-                            let prev = state.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
-                            if prev == 0 {
-                                let streams = state
-                                    .streams
-                                    .read()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                let window = i64::from(kib) * 1024;
-                                for entry in streams.values() {
-                                    entry.gate.enable(window);
-                                }
-                                drop(streams);
-                                tracing::debug!(kib, "peer VERSION received; send window enabled");
-                            }
-                        }
-                    }
-                    continue;
-                }
-                MuxCommand::Window => {
-                    let stream_id = frame.stream_id;
-                    let decoded = decode_window_payload(frame.payload());
-                    recycle_encode_buf(frame.into_storage());
-                    if let Some(credit) = decoded {
-                        if let Some(entry) = state
-                            .streams
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&stream_id)
-                        {
-                            entry.gate.release(i64::from(credit));
-                        }
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            let id = frame.stream_id;
-            let send_res = {
-                let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
-                streams.get(&id).map(|entry| match entry.tx.try_send(frame) {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err((entry.tx.clone(), err)),
-                })
-            };
-            match send_res {
-                Some(Ok(())) | None => {}
-                Some(Err((tx, mpsc::error::TrySendError::Full(f)))) => {
-                    if f.command != MuxCommand::Data {
-                        tokio::spawn(async move {
-                            match timeout(Duration::from_secs(10), tx.reserve()).await {
-                                Ok(Ok(permit)) => permit.send(f),
-                                _ => recycle_encode_buf(f.into_storage()),
-                            }
-                        });
-                    } else {
-                        match timeout(Duration::from_millis(250), tx.reserve()).await {
-                            Ok(Ok(permit)) => permit.send(f),
-                            Ok(Err(_)) => {
-                                recycle_encode_buf(f.into_storage());
-                                state.close_stream_sync(id);
-                            }
-                            Err(_) => {
-                                recycle_encode_buf(f.into_storage());
-                                tracing::warn!(
-                                    stream_id = id,
-                                    "mux RST: stream queue full; resetting stalled stream"
-                                );
-                                crate::common::try_send_mux_parts(
-                                    &state.writer,
-                                    &state.cipher,
-                                    id,
-                                    MuxCommand::Rst,
-                                    &[],
-                                    state.obfs,
-                                );
-                                state.close_stream_sync(id);
-                            }
-                        }
-                    }
-                }
-                Some(Err((_, mpsc::error::TrySendError::Closed(f)))) => {
-                    recycle_encode_buf(f.into_storage());
-                    state.close_stream_sync(id);
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
+    let read_res = timeout(
+        hs_timeout,
+        crate::ws::read_frame_mux(&mut rd, &writer, true, &mut frame_buf, None),
+    )
+    .await
+    .map_err(|_| anyhow!("upstream MUX handshake OK timed out"));
     recycle_encode_buf(frame_buf);
-    res
+    let Some((opcode, mut ok)) = read_res?? else {
+        bail!("upstream closed during MUX handshake")
+    };
+    if opcode != 2 {
+        recycle_encode_buf(ok);
+        bail!("invalid MUX handshake response opcode")
+    };
+    cipher.apply(&mut ok);
+    let is_ok = ok == b"OK\n";
+    recycle_encode_buf(ok);
+    if !is_ok {
+        bail!("upstream rejected MUX handshake")
+    };
+    MuxClientSession::spawn_from_parts(
+        rd,
+        writer,
+        writer_task,
+        cipher,
+        cfg.obfs,
+        capacity_notify,
+        "pooled MUX",
+    )
+    .await
 }
 struct MuxSessionPool {
     cfg: RuntimeConfig,
@@ -3684,7 +3764,7 @@ impl MuxSessionPool {
         for _ in 0..missing {
             let cfg = self.cfg.clone();
             let notify = self.capacity_notify.clone();
-            set.spawn(async move { SessionState::connect(&cfg, notify).await });
+            set.spawn(async move { connect_plain_mux_session(&cfg, notify).await });
         }
         let mut added = 0usize;
         while let Some(res) = set.join_next().await {
@@ -3787,7 +3867,7 @@ impl MuxSessionPool {
             }
             drop(sessions);
 
-            let s = match SessionState::connect(&self.cfg, self.capacity_notify.clone()).await {
+            let s = match connect_plain_mux_session(&self.cfg, self.capacity_notify.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
                     recycle_encode_buf(initial_data);
@@ -3839,7 +3919,10 @@ async fn handle_tcp_proxy(
     if req.command != SocksCommand::Connect {
         bail!("MUX client supports CONNECT or UDP ASSOCIATE only")
     }
-    enforce_target_policy(&cfg, &req.target)?;
+    if let Err(e) = enforce_target_policy(&cfg, &req.target) {
+        let _ = crate::common::reject_local_proxy(&mut local, req.is_socks5).await;
+        return Err(e);
+    }
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else if req.is_connect {
@@ -5401,12 +5484,15 @@ const PLAIN_NON_MUX_RELAY: NonMuxRelaySpec = NonMuxRelaySpec {
 };
 
 async fn relay_client(
-    local: TcpStream,
+    mut local: TcpStream,
     cfg: RuntimeConfig,
     req: ClientProxyRequest,
     pool: Arc<PlainNonMuxPool>,
 ) -> Result<()> {
-    enforce_target_policy(&cfg, &req.target)?;
+    if let Err(e) = enforce_target_policy(&cfg, &req.target) {
+        let _ = crate::common::reject_local_proxy(&mut local, req.is_socks5).await;
+        return Err(e);
+    }
     relay_non_mux_ws(
         local,
         &req.target,
@@ -7079,12 +7165,12 @@ pub mod quic {
 //! GoWay v1.8.4-compatible QUIC transport.
 
 use crate::common::{
-    socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED, HTTP_502_BAD_GATEWAY,
+    socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED,
 };
 use crate::dns;
 use crate::proxy::{
     parse_authority_with_default, parse_socks5_udp_datagram, parse_target_authority,
-    read_client_proxy_request, socks5_failure_response, socks5_success_response,
+    read_client_proxy_request, socks5_success_response,
     ClientProxyRequest, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
@@ -7376,13 +7462,7 @@ fn is_auth_rejection(response: &str) -> bool {
 
 /// Writes the failure response to the local proxy client and closes it.
 async fn quic_reject_local(local: &mut TcpStream, is_socks5: bool) -> Result<()> {
-    if is_socks5 {
-        local.write_all(&socks5_failure_response()).await?
-    } else {
-        local.write_all(HTTP_502_BAD_GATEWAY).await?
-    }
-    local.shutdown().await.ok();
-    Ok(())
+    crate::common::reject_local_proxy(local, is_socks5).await
 }
 /// Reads one length-prefixed datagram into `buf` and returns its length.
 ///
@@ -8073,14 +8153,22 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                         Ok(Ok(connection)) => {
                             let _permit = permit;
                             let mut stream_tasks = tokio::task::JoinSet::new();
-                            while let Ok((send, recv)) = connection.accept_bi().await {
-                                let cfg3 = cfg2.clone();
-                                while stream_tasks.try_join_next().is_some() {}
-                                stream_tasks.spawn(async move {
-                                    if let Err(error) = handle_server_stream(send, recv, cfg3).await {
-                                        tracing::debug!(%error,"QUIC stream closed")
+                            loop {
+                                tokio::select! {
+                                    bi = connection.accept_bi() => {
+                                        let Ok((send, recv)) = bi else {
+                                            break;
+                                        };
+                                        let cfg3 = cfg2.clone();
+                                        while stream_tasks.try_join_next().is_some() {}
+                                        stream_tasks.spawn(async move {
+                                            if let Err(error) = handle_server_stream(send, recv, cfg3).await {
+                                                tracing::debug!(%error,"QUIC stream closed")
+                                            }
+                                        });
                                     }
-                                });
+                                    Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}
+                                }
                             }
                             stream_tasks.abort_all();
                         }
@@ -9365,6 +9453,9 @@ where
                     writer_dead = true;
                     break;
                 }
+                Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                    continue;
+                }
             };
             let Some((opcode, payload)) = next_ws else {
                 break;
@@ -9998,9 +10089,24 @@ where
         Err(_) => Err(anyhow!("invalid non-MUX target UTF-8")),
     };
     crate::mux_writer::recycle_encode_buf(target_frame);
-    let target = target_res?;
-    enforce_target_policy(&cfg, &target)?;
-    let target_stream = dial_target(&target, cfg.connection_timeout, &cfg).await?;
+    let target = match target_res.and_then(|t| enforce_target_policy(&cfg, &t).map(|()| t)) {
+        Ok(t) => t,
+        Err(e) => {
+            let mut err_frame = b"ERR\n".to_vec();
+            cipher.apply(&mut err_frame);
+            let _ = write_frame(&mut wr, &err_frame, 2, false).await;
+            return Err(e);
+        }
+    };
+    let target_stream = match dial_target(&target, cfg.connection_timeout, &cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            let mut err_frame = b"ERR\n".to_vec();
+            cipher.apply(&mut err_frame);
+            let _ = write_frame(&mut wr, &err_frame, 2, false).await;
+            return Err(e);
+        }
+    };
     let mut ok = b"OK\n".to_vec();
     cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
@@ -12743,7 +12849,9 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
                 }
                 Ok(_) => {
                     out.push(byte[0]);
-                    if out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n") {
+                    if byte[0] == b'\n'
+                        && (out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n"))
+                    {
                         return Ok(());
                     }
                     if out.len() >= MAX_HTTP_HEADER_SIZE {
@@ -13909,21 +14017,17 @@ pub mod wss_client {
 //! WSS client paths for GoWay-compatible upstreams.
 
 use crate::common::{
-    configured_cipher, relay_non_mux_ws, send_mux_parts,
-    socks5_udp_associate_reply, HTTP_200_CONNECTION_ESTABLISHED, non_mux_pool_size,
-    NonMuxOkRejection, NonMuxPool, NonMuxRelaySpec,
+    configured_cipher, non_mux_pool_size, relay_non_mux_ws, socks5_udp_associate_reply,
+    MuxClientSession, NonMuxOkRejection, NonMuxPool, NonMuxRelaySpec,
+    HTTP_200_CONNECTION_ESTABLISHED,
 };
-use crate::crypto::XorCipher;
 use crate::dns;
 use crate::flow::CreditGate;
 use crate::mux_writer::{recycle_encode_buf, MuxFrameWriter};
-use crate::protocol::{
-    decode_version_payload, decode_window_payload, encode_version_payload,
-    MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
-};
+use crate::protocol::{MuxCommand, OwnedMuxFrame};
 use crate::proxy::{
-    parse_authority_with_default, read_client_proxy_request,
-    socks5_success_response, SocksCommand, TargetAddr,
+    parse_authority_with_default, read_client_proxy_request, socks5_success_response,
+    SocksCommand, TargetAddr,
 };
 use crate::runtime::{
     apply_listener_options, apply_socket_options_raw, check_target_policy, drain_join_set,
@@ -13931,15 +14035,15 @@ use crate::runtime::{
 };
 use crate::tls;
 use crate::ws::{
-    encode_ws_frame, read_frame, read_http_headers_timeout,
-    redact_handshake_request, validate_client_handshake_response, write_frame,
+    read_frame, read_http_headers_timeout, redact_handshake_request,
+    validate_client_handshake_response, write_frame,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -13951,7 +14055,6 @@ pub(crate) type TlsReader = ReadHalf<tls::RushTlsStream>;
 pub(crate) type TlsWriter = WriteHalf<tls::RushTlsStream>;
 
 const MAX_SESSION_COUNT: usize = 64;
-const MAX_STREAMS_PER_SESSION: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WssConfig {
@@ -14274,7 +14377,10 @@ async fn handle_non_mux_connection(
     };
     // WSS client paths had no target policy; enforce `-block-local` here so
     // the flag behaves the same as on the plain-WS and QUIC clients.
-    check_target_policy(cfg.block_local, &req.target)?;
+    if let Err(e) = check_target_policy(cfg.block_local, &req.target) {
+        let _ = crate::common::reject_local_proxy(&mut local, req.is_socks5).await;
+        return Err(e);
+    }
     relay_non_mux_ws(
         local,
         &req.target,
@@ -14351,443 +14457,58 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
     Ok(())
 }
 
-struct ClientStreamEntry {
-    tx: mpsc::Sender<OwnedMuxFrame>,
-    gate: Arc<CreditGate>,
-}
+type WssSessionState = MuxClientSession;
 
-struct WssSessionState {
-    writer: Arc<MuxFrameWriter>,
-    cipher: XorCipher,
-    obfs: bool,
-    // Read-mostly under concurrency (one shared lookup per DATA or WINDOW frame),
-    // so a single RwLock<U32HashMap> holds both the downstream channel and upload gate.
-    streams: Arc<std::sync::RwLock<U32HashMap<ClientStreamEntry>>>,
-    /// Peer-advertised receive window in KiB once its VERSION arrived
-    /// (0 => un-negotiated: v1 unbounded sends, no WINDOW refunds).
-    peer_window_kib: AtomicU32,
-    next_id: AtomicU32,
-    active: AtomicUsize,
-    closed: AtomicBool,
+async fn connect_wss_mux_session(
+    cfg: &WssConfig,
     capacity_notify: Arc<Notify>,
-}
-impl WssSessionState {
-    async fn connect(cfg: &WssConfig, capacity_notify: Arc<Notify>) -> Result<Arc<Self>> {
-        let (mut rd, mut wr) = open_upstream(cfg).await?;
-        let c = configured_cipher(&cfg.key);
-        let mut hello = b"MUX\n".to_vec();
-        c.apply(&mut hello);
+) -> Result<Arc<WssSessionState>> {
+    let (mut rd, mut wr) = open_upstream(cfg).await?;
+    let c = configured_cipher(&cfg.key);
+    let mut hello = b"MUX\n".to_vec();
+    c.apply(&mut hello);
 
-        tracing::debug!("[WSS] Sending MUX handshake");
-        write_frame(&mut wr, &hello, 2, true)
-            .await
-            .context("MUX handshake request write failed")?;
-        let mut frame_buf = Vec::new();
-        let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-        let read_result = timeout(
-            mux_timeout,
-            read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
-        )
+    tracing::debug!("[WSS] Sending MUX handshake");
+    write_frame(&mut wr, &hello, 2, true)
         .await
-        .context("MUX OK timeout");
-        recycle_encode_buf(frame_buf);
-        let read_result = read_result??;
-
-        let Some((opcode, mut ok)) = read_result else {
-            bail!("WSS upstream closed during MUX handshake")
-        };
-        if opcode != 2 {
-            recycle_encode_buf(ok);
-            bail!("invalid WSS MUX response opcode: {opcode}")
-        };
-        c.apply(&mut ok);
-        if ok != b"OK\n" {
-            let msg = String::from_utf8_lossy(&ok).trim().to_string();
-            recycle_encode_buf(ok);
-            bail!("MUX rejected: {msg:?}")
-        };
-        recycle_encode_buf(ok);
-        tracing::debug!("[WSS] MUX handshake completed");
-        let (writer, mut writer_task) = MuxFrameWriter::spawn(wr);
-        let cipher_for_version = c.clone();
-        let obfs_for_version = cfg.obfs;
-        let session = Arc::new(Self {
-            writer: writer.clone(),
-            cipher: c.clone(),
-            obfs: cfg.obfs,
-            streams: Arc::new(std::sync::RwLock::new(U32HashMap::default())),
-            peer_window_kib: AtomicU32::new(0),
-            next_id: AtomicU32::new(1),
-            active: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
-            capacity_notify,
-        });
-        let version_payload = encode_version_payload(mux_initial_window_kib());
-        send_mux_parts(
-            &writer,
-            &cipher_for_version,
-            0,
-            MuxCommand::Version,
-            &version_payload,
-            obfs_for_version,
-        )
-        .await?;
-        let heartbeat_session = session.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(25));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if heartbeat_session.closed.load(Ordering::Acquire) {
-                    break;
-                }
-                let ping = match encode_ws_frame(&[], 9, true) {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        heartbeat_session.closed.store(true, Ordering::Release);
-                        break;
-                    }
-                };
-                if heartbeat_session.writer.send(ping).await.is_err() {
-                    heartbeat_session.closed.store(true, Ordering::Release);
-                    break;
-                }
-            }
-        });
-        let reader_session = session.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                res = wss_reader_loop(&mut rd, reader_session.clone()) => {
-                    if let Err(error) = res {
-                        tracing::debug!(%error,"WSS physical session reader stopped")
-                    }
-                }
-                _ = &mut writer_task => {
-                    tracing::debug!("WSS physical session writer stopped")
-                }
-            }
-            heartbeat_handle.abort();
-            reader_session.closed.store(true, Ordering::Release);
-            let mut streams = reader_session
-                .streams
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let drained = streams.len();
-            for entry in streams.values() {
-                entry.gate.close();
-            }
-            streams.clear();
-            reader_session.dec_active(drained);
-            drop(streams);
-            reader_session.capacity_notify.notify_waiters();
-        });
-        Ok(session)
-    }
-    fn is_dead(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.writer.is_closed()
-    }
-    fn available(&self) -> bool {
-        !self.is_dead() && self.active.load(Ordering::Acquire) < MAX_STREAMS_PER_SESSION
-    }
-    fn dec_active(&self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let _ = self
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(n))
-            });
-    }
-    fn try_reserve(&self) -> bool {
-        if self.closed.load(Ordering::Acquire) || self.writer.is_closed() {
-            return false;
-        }
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < MAX_STREAMS_PER_SESSION).then_some(current + 1)
-            })
-            .is_ok()
-    }
-    async fn open_stream(
-        self: &Arc<Self>,
-        target: &TargetAddr,
-        initial_data: &[u8],
-    ) -> Result<(u32, mpsc::Receiver<OwnedMuxFrame>, Arc<CreditGate>)> {
-        if !self.try_reserve() {
-            bail!("WSS physical session is full or closed")
-        };
-        let port_digits = if target.port >= 10000 {
-            5
-        } else if target.port >= 1000 {
-            4
-        } else if target.port >= 100 {
-            3
-        } else if target.port >= 10 {
-            2
-        } else {
-            1
-        };
-        let ipv6_brackets = if target.host.contains(':') && !target.host.starts_with('[') { 2 } else { 0 };
-        let target_len = target.host.len() + ipv6_brackets + 1 + port_digits;
-        let max_syn_initial = (u16::MAX as usize).saturating_sub(2 + target_len);
-        let (syn_initial, remaining_initial) =
-            initial_data.split_at(initial_data.len().min(max_syn_initial));
-
-        let syn_payload = match SynPayload::encode_parts(&target.host, target.port, syn_initial) {
-            Ok(v) => v,
-            Err(e) => {
-                self.dec_active(1);
-                self.capacity_notify.notify_waiters();
-                return Err(anyhow!(e.to_string()));
-            }
-        };
-
-        let (tx, rx) = mpsc::channel(crate::protocol::mux_stream_queue_cap());
-        let gate = CreditGate::new();
-
-        let id = {
-            let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
-            if self.is_dead() {
-                recycle_encode_buf(syn_payload);
-                self.dec_active(1);
-                self.capacity_notify.notify_waiters();
-                bail!("WSS physical session closed")
-            }
-            let mut stream_id;
-            loop {
-                stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                if stream_id == 0 {
-                    stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                }
-                if !streams.contains_key(&stream_id) {
-                    break;
-                }
-            }
-            let kib = self.peer_window_kib.load(Ordering::Acquire);
-            if kib > 0 {
-                gate.enable(i64::from(kib) * 1024);
-            }
-            streams.insert(
-                stream_id,
-                ClientStreamEntry {
-                    tx,
-                    gate: gate.clone(),
-                },
-            );
-            stream_id
-        };
-
-        struct OpenWssStreamGuard<'a> {
-            session: &'a WssSessionState,
-            id: u32,
-            gate: Arc<CreditGate>,
-            syn_sent: bool,
-            armed: bool,
-        }
-        impl<'a> Drop for OpenWssStreamGuard<'a> {
-            fn drop(&mut self) {
-                if self.armed {
-                    if self.syn_sent && !self.session.is_dead() {
-                        crate::common::try_send_mux_parts(
-                            &self.session.writer,
-                            &self.session.cipher,
-                            self.id,
-                            MuxCommand::Rst,
-                            &[],
-                            self.session.obfs,
-                        );
-                    }
-                    self.session.close_stream_if_same(self.id, &self.gate);
-                }
-            }
-        }
-        let mut open_guard = OpenWssStreamGuard {
-            session: self,
-            id,
-            gate: gate.clone(),
-            syn_sent: false,
-            armed: true,
-        };
-
-        if !syn_initial.is_empty() {
-            gate.acquire(syn_initial.len()).await;
-        }
-        let send_syn_res = send_mux_parts(
-            &self.writer,
-            &self.cipher,
-            id,
-            MuxCommand::Syn,
-            &syn_payload,
-            self.obfs,
-        )
-        .await;
-        recycle_encode_buf(syn_payload);
-        if let Err(error) = send_syn_res {
-            self.closed.store(true, Ordering::Release);
-            return Err(error);
-        }
-        open_guard.syn_sent = true;
-
-        if !remaining_initial.is_empty() {
-            gate.acquire(remaining_initial.len()).await;
-            if let Err(error) = send_mux_parts(
-                &self.writer,
-                &self.cipher,
-                id,
-                MuxCommand::Data,
-                remaining_initial,
-                self.obfs,
-            )
-            .await
-            {
-                self.closed.store(true, Ordering::Release);
-                return Err(error);
-            }
-        }
-        open_guard.armed = false;
-        Ok((id, rx, gate))
-    }
-    fn close_stream_sync(&self, id: u32) {
-        if let Some(entry) = self
-            .streams
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
-        {
-            entry.gate.close();
-            self.dec_active(1);
-            self.capacity_notify.notify_waiters();
-        }
-    }
-    fn close_stream_if_same(&self, id: u32, gate: &Arc<CreditGate>) {
-        let mut guard = self.streams.write().unwrap_or_else(|e| e.into_inner());
-        if guard.get(&id).is_some_and(|e| Arc::ptr_eq(&e.gate, gate)) {
-            if let Some(entry) = guard.remove(&id) {
-                entry.gate.close();
-                self.dec_active(1);
-                drop(guard);
-                self.capacity_notify.notify_waiters();
-            }
-        }
-    }
-}
-async fn wss_reader_loop(rd: &mut TlsReader, session: Arc<WssSessionState>) -> Result<()> {
+        .context("MUX handshake request write failed")?;
     let mut frame_buf = Vec::new();
-    let res = async {
-        loop {
-            let Some((opcode, payload)) = crate::ws::read_frame_mux(
-                rd,
-                &session.writer,
-                true,
-                &mut frame_buf,
-                Some(&session.cipher),
-            )
-            .await?
-            else {
-                return Ok(());
-            };
-            if opcode != 2 {
-                recycle_encode_buf(payload);
-                continue;
-            }
-            let frame = match MuxFrame::decode_owned(payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            match frame.command {
-                MuxCommand::Version => {
-                    let decoded = decode_version_payload(frame.payload());
-                    recycle_encode_buf(frame.into_storage());
-                    if let Some((version, kib)) = decoded {
-                        if version >= 1 {
-                            let prev = session.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
-                            if prev == 0 {
-                                let streams = session
-                                    .streams
-                                    .read()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                let window = i64::from(kib) * 1024;
-                                for entry in streams.values() {
-                                    entry.gate.enable(window);
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                MuxCommand::Window => {
-                    let stream_id = frame.stream_id;
-                    let decoded = decode_window_payload(frame.payload());
-                    recycle_encode_buf(frame.into_storage());
-                    if let Some(credit) = decoded {
-                        if let Some(entry) = session
-                            .streams
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&stream_id)
-                        {
-                            entry.gate.release(i64::from(credit));
-                        }
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            let id = frame.stream_id;
-            let send_res = {
-                let streams = session.streams.read().unwrap_or_else(|e| e.into_inner());
-                streams.get(&id).map(|entry| match entry.tx.try_send(frame) {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err((entry.tx.clone(), err)),
-                })
-            };
-            match send_res {
-                Some(Ok(())) | None => {}
-                Some(Err((tx, mpsc::error::TrySendError::Full(f)))) => {
-                    if f.command != MuxCommand::Data {
-                        tokio::spawn(async move {
-                            match timeout(Duration::from_secs(10), tx.reserve()).await {
-                                Ok(Ok(permit)) => permit.send(f),
-                                _ => recycle_encode_buf(f.into_storage()),
-                            }
-                        });
-                    } else {
-                        match timeout(Duration::from_millis(250), tx.reserve()).await {
-                            Ok(Ok(permit)) => permit.send(f),
-                            Ok(Err(_)) => {
-                                recycle_encode_buf(f.into_storage());
-                                session.close_stream_sync(id);
-                            }
-                            Err(_) => {
-                                recycle_encode_buf(f.into_storage());
-                                tracing::warn!(
-                                    stream_id = id,
-                                    "mux RST: stream queue full; resetting stalled stream"
-                                );
-                                crate::common::try_send_mux_parts(
-                                    &session.writer,
-                                    &session.cipher,
-                                    id,
-                                    MuxCommand::Rst,
-                                    &[],
-                                    session.obfs,
-                                );
-                                session.close_stream_sync(id);
-                            }
-                        }
-                    }
-                }
-                Some(Err((_, mpsc::error::TrySendError::Closed(f)))) => {
-                    recycle_encode_buf(f.into_storage());
-                    session.close_stream_sync(id);
-                }
-            }
-        }
-    }
-    .await;
+    let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let read_result = timeout(
+        mux_timeout,
+        read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
+    )
+    .await
+    .context("MUX OK timeout");
     recycle_encode_buf(frame_buf);
-    res
+    let read_result = read_result??;
+
+    let Some((opcode, mut ok)) = read_result else {
+        bail!("WSS upstream closed during MUX handshake")
+    };
+    if opcode != 2 {
+        recycle_encode_buf(ok);
+        bail!("invalid WSS MUX response opcode: {opcode}")
+    };
+    c.apply(&mut ok);
+    if ok != b"OK\n" {
+        let msg = String::from_utf8_lossy(&ok).trim().to_string();
+        recycle_encode_buf(ok);
+        bail!("MUX rejected: {msg:?}")
+    };
+    recycle_encode_buf(ok);
+    tracing::debug!("[WSS] MUX handshake completed");
+    let (writer, writer_task) = MuxFrameWriter::spawn(wr);
+    MuxClientSession::spawn_from_parts(
+        rd,
+        writer,
+        writer_task,
+        c,
+        cfg.obfs,
+        capacity_notify,
+        "WSS physical session",
+    )
+    .await
 }
 
 struct WssSessionPool {
@@ -14829,7 +14550,7 @@ impl WssSessionPool {
         for _ in 0..missing {
             let cfg = self.cfg.clone();
             let notify = self.capacity_notify.clone();
-            set.spawn(async move { WssSessionState::connect(&cfg, notify).await });
+            set.spawn(async move { connect_wss_mux_session(&cfg, notify).await });
         }
         let mut added = 0usize;
         let mut last_err = None;
@@ -14961,7 +14682,7 @@ impl WssSessionPool {
             }
             drop(sessions);
 
-            let session = match WssSessionState::connect(&self.cfg, self.capacity_notify.clone()).await {
+            let session = match connect_wss_mux_session(&self.cfg, self.capacity_notify.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
                     recycle_encode_buf(initial_data);
@@ -15026,7 +14747,10 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     if req.command != SocksCommand::Connect {
         bail!("WSS path only supports CONNECT or UDP ASSOCIATE")
     };
-    check_target_policy(pool.cfg.block_local, &req.target)?;
+    if let Err(e) = check_target_policy(pool.cfg.block_local, &req.target) {
+        let _ = crate::common::reject_local_proxy(&mut local, req.is_socks5).await;
+        return Err(e);
+    }
     if req.is_socks5 {
         local.write_all(&socks5_success_response()).await?;
     } else if req.is_connect {
@@ -15320,7 +15044,7 @@ mod tests {
             block_local: false,
         };
 
-        let session = WssSessionState::connect(&cfg, Arc::new(Notify::new())).await.unwrap();
+        let session = connect_wss_mux_session(&cfg, Arc::new(Notify::new())).await.unwrap();
         assert_eq!(session.active.load(Ordering::Acquire), 0);
         assert!(!session.closed.load(Ordering::Acquire));
 

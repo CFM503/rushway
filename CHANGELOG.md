@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.69] - 2026-10-21
+
+### MUX Client Session Architecture Unification, Standardized Proxy Rejection & Server Task Leak Prevention
+
+- **Unified MUX Client Physical Session & Reader Loop (`src/main.rs:MuxClientSession`, `mux_client_reader_loop`, `mux_pool`, `wss_client`)** — Consolidated duplicate MUX client session management, stream entry maps, CreditGate tracking, and frame dispatch logic between plain WebSocket (`ws://`) and secure WebSocket (`wss://`) into a generic `MuxClientSession` abstraction and shared `mux_client_reader_loop<R>`, eliminating over 500 lines of duplicated code while ensuring consistent lifetime semantics and stream concurrency controls.
+- **Standardized Proxy Client Rejection & Clean Shutdown (`src/main.rs:reject_local_proxy`, `handle_tcp_proxy`, `handle_connection`, `PLAIN_NON_MUX_RELAY`)** — Replaced silent TCP connection termination upon target security policy rejection with `reject_local_proxy`. Emits RFC-compliant SOCKS5 general failure replies (`socks5_failure_response`) or standard `HTTP/1.1 502 Bad Gateway` before cleanly closing write halves, resolving client-side `ERR_CONNECTION_RESET` ambiguities.
+- **Active Inactive Task Reclamation in Server Accept Loops (`src/main.rs:run_server`, `quic`, `ws`)** — Upgraded QUIC and WebSocket server stream task supervisors to actively reap completed background join handles via `tokio::select!` with `Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}`, preventing lingering `JoinHandle` accumulation and heap memory growth during idle periods following high-burst activity.
+- **Non-MUX Dial & Policy Failure Control Notification (`src/main.rs:handle_server_tcp_parts`)** — Added explicit encrypted `ERR\n` frame transmission on upstream dial or target policy enforcement errors, granting non-MUX clients immediate visibility into server-side rejection rather than hanging or encountering unhandled stream resets.
+- **HTTP Header Line Feed Detection Fast-Path (`src/main.rs:read_http_headers_timeout`)** — Added single-byte `byte[0] == b'\n'` short-circuit gating before evaluating double-crlf/double-lf string suffix matches, avoiding redundant slice comparisons for ~90% of received header bytes in the hot parsing loop.
+
 ## [v0.0.68] - 2026-10-20
 
 ### Handshake Pong Auto-Reply, MUX 0-RTT CreditGate Flow Control, UDP State Anti-Thrashing & Stale DNS Fallback

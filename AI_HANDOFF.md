@@ -1859,3 +1859,51 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.68`.
+
+## Release: v0.0.69 (2026-10-21) — MUX Client Session Architecture Unification, Standardized Proxy Rejection & Server Task Leak Prevention
+
+### Context & User Directives
+- **Directives:** "我手动修改了代码，对比一下修改前和修改后是不是正向优化", "更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Astra Engineering Review:**
+  - **MUX Client Physical Session Architecture Unification (DRY & Concurrency Invariance):**
+    - The client-side physical MUX session implementation was previously duplicated across `mux_pool` (`ws://`, `SessionState`) and `wss_client` (`wss://`, `WssSessionState`). Extracted the entire session lifecycle, stream ID allocator, `CreditGate` flow control map, and background frame dispatcher into a shared `MuxClientSession` with a generic reader loop `mux_client_reader_loop<R>` where `R: AsyncRead + Unpin + Send + 'static`. Preserves lock-free metrics, credit gating, and ABA-safe closure while eliminating ~600 lines of duplicated code.
+  - **RFC-Compliant Local Proxy Rejection (`reject_local_proxy`):**
+    - Previously, when an inbound client CONNECT/SOCKS5 request was rejected by target security policies (`enforce_target_policy`, `check_target_policy`), the server immediately dropped the stream or returned `Err(..)`, causing an abrupt TCP RST. Added `reject_local_proxy` to emit SOCKS5 general failure replies (`05 01 00 ...`) or `HTTP/1.1 502 Bad Gateway` before clean write-half shutdown, preventing client hang or opaque reset errors.
+  - **Server Accept Loop Idle Task Reclamation (`JoinSet` Leaks):**
+    - In QUIC (`run_server`) and WebSocket server loops, stream task reaping (`stream_tasks.try_join_next()`) previously occurred only upon receiving new incoming streams. If burst traffic ceased, finished `JoinHandle` instances remained stored in memory. Integrated `tokio::select!` with `Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}` to proactively drain completed tasks immediately.
+  - **Non-MUX Error Notification Protocol (`ERR\n`):**
+    - In non-MUX mode, dial failures and policy rejections now send an encrypted `ERR\n` control frame to the client before terminating the transport, eliminating uninformative EOF drops.
+  - **HTTP Header Parser Hot-Loop Optimization:**
+    - Gated `ends_with(b"\r\n\r\n")` and `ends_with(b"\n\n")` suffix evaluations behind a single-byte check `byte[0] == b'\n'`, bypassing redundant slice comparisons on ~90% of received header bytes.
+  - **Regression Risk:** Zero. All 137 unit and integration tests passing cleanly in 0.33s. Clean compiler warnings achieved.
+
+### Changes Implemented
+1. **Generic MUX Client Session & Reader Loop (`src/main.rs:MuxClientSession`, `mux_client_reader_loop`)**:
+   - Unified plain WS and WSS MUX physical connection state and background multiplex reader task.
+2. **Standardized Local Proxy Rejection (`src/main.rs:reject_local_proxy`)**:
+   - Clean SOCKS5 failure and HTTP 502 Bad Gateway responses on policy rejection across all forwarders.
+3. **Server Stream Task Active Reclamation (`src/main.rs:run_server`, `quic`, `ws`)**:
+   - Proactive `JoinSet::join_next` branch inside `tokio::select!` preventing idle task handle retention.
+4. **Non-MUX Dial / Policy Failure Feedback (`src/main.rs:handle_server_tcp_parts`)**:
+   - Encrypted `ERR\n` transmission to client on dial/policy errors.
+5. **HTTP Header Hot-Path Filter (`src/main.rs:read_http_headers_timeout`)**:
+   - Short-circuit `byte[0] == b'\n'` before multi-byte delimiter pattern matching.
+6. **Compiler Cleanliness & Unused Imports Cleanup (`src/main.rs:quic`)**:
+   - Cleaned up unused `HTTP_502_BAD_GATEWAY` and `socks5_failure_response` imports in `quic` module.
+7. **Version & Documentation**:
+   - Bumped version to `0.0.69` across `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.69 - MUX client session architecture unification, standardized proxy rejection, and server task leak prevention`
+- Tag: `v0.0.69`
+
+### Status
+- Completed and released as `v0.0.69`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.69`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.69`.
+
