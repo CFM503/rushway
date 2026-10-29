@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.72] - 2026-10-29
+
+### Server-Side MUX Ingress Single-Flight Parity, Zero-HoL Physical Reader Loop, WS Zombie Connection Termination, UDP Anti-Thrashing Eviction & Multi-IPv4 DNS SingleFlight
+
+- **Server-Side MUX Ingress Single-Flight & Strict FIFO Order Preservation (`src/main.rs:StreamEntry::pending_ctrl`, `handle_mux_parts`)** — Brought the server-side MUX reader loop into full protocol parity with v0.0.71. Added `pending_ctrl: Arc<AtomicBool>` to server `StreamEntry` to bound in-flight FIN control tasks to strictly at most one per stream under channel backpressure. Barred subsequent DATA frames from overtaking pending FINs, eliminating TCP FIN inversion and bounded task memory accumulation under bursty traffic.
+- **Physical MUX Reader Zero-HoL Decoupled Backpressure (`src/main.rs:mux_client_reader_loop`, `handle_mux_parts`)** — Eliminated 250ms synchronous reader loop stalling under stream channel saturation on both client and server. Replaced blocking inline reservation with cooperative runtime yielding (`tokio::task::yield_now().await`) followed by a strictly bounded 15ms micro-burst absorption window. Eliminates head-of-line blocking on healthy multiplexed streams sharing the physical TCP/TLS connection, preventing latency spikes and keepalive timeouts.
+- **WebSocket Half-Open Zombie Connection Detection & Auto-Teardown (`src/main.rs:MuxFrameWriter`, `read_frame_inner`, `MuxClientSession`)** — Added active heartbeat Pong tracking (`MuxFrameWriter::notify_pong`, `inc_unacked_pings`). Incoming WebSocket Pong frames (opcode 10) and data frames now continuously clear unacknowledged ping counters. If a physical connection experiences two consecutive unacknowledged ping cycles (50s) due to silent WAN/NAT drop or server termination, the session is proactively closed and evicted from the connection pool, eliminating 30-60s proxy stalls on dead sessions.
+- **UDP Server Known Targets Generational Eviction (`src/main.rs:handle_server_udp_stream`, `handle_server_udp_parts`)** — Replaced catastrophic `guard.clear()` on the 4096-entry `known_targets` hash set with generational 25% partial eviction (retaining 3072 active targets). Prevents complete state wipeout and subsequent 100% inbound packet drop storms on high-throughput UDP proxies during destination churn.
+- **Multi-IPv4 DNS SingleFlight Coalescing (`src/main.rs:dns::resolve_all_ipv4`)** — Extended SingleFlight deduplication (`IN_FLIGHT_V4`) to `resolve_all_ipv4`. Concurrent DNS lookups for the same domain now coalesce onto a single leader task, preventing DNS stampedes and upstream resolver rate-limiting during burst proxy dialing.
+- **MUX Connection Pool Read/Write Lock Concurrency Optimization (`src/main.rs:MuxSessionPool`, `WssSessionPool`)** — Upgraded session pool collections from exclusive `Mutex` to `RwLock`. The proxy stream acquisition hot-path now executes entirely under shared read locks with zero lock contention across worker threads, eliminating convoy effects under high concurrent connection setup.
+
 ## [v0.0.71] - 2026-10-21
 
 ### MUX Single-Flight Bounded Control Queue & Strict Ingress Order Preservation

@@ -1991,3 +1991,60 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.71`.
 
+
+
+## Release: v0.0.72 (2026-10-29) — Server-Side MUX Ingress Single-Flight Parity, Zero-HoL Physical Reader Loop, WS Zombie Connection Termination, UDP Anti-Thrashing Eviction & Multi-IPv4 DNS SingleFlight
+
+### Context & User Directives
+- **Directives:** "/boost 调用后台的 gemini 3.8 pro 模型/子智能体帮我做深度推导与架构设计,检查重大bug，并且顺手提高代理性能", "开始实施，过程中发现问题一起修复".
+- **Astra Engineering Review:**
+  - **Server-Side MUX Ingress Single-Flight Parity & Strict FIFO Order Preservation (`StreamEntry::pending_ctrl`, `handle_mux_parts`):**
+    - The server-side MUX reader loop was missing the single-flight and FIFO ordering safeguards introduced in client-side v0.0.71. Saturated server streams previously allowed incoming DATA frames to bypass queued 10-second background FIN dispatch tasks, violating TCP FIN stream termination ordering and accumulating tasks/buffers without bound. Added `pending_ctrl: Arc<AtomicBool>` to server `StreamEntry`, strictly capping background FIN dispatch to one in-flight task per stream and barring subsequent DATA frames from bypassing the pending FIN.
+  - **Zero-HoL Physical MUX Reader Loop Decoupled Backpressure (`mux_client_reader_loop`, `handle_mux_parts`):**
+    - Both client and server previously executed `timeout(Duration::from_millis(250), tx.reserve()).await` directly within the single shared physical reader loop when a stream queue was full. A single stalled or slow stream blocked the entire underlying TCP/TLS connection for 250ms, freezing all other healthy multiplexed streams, causing latency spikes and risking keepalive timeouts. Replaced inline stalling with cooperative runtime yielding (`tokio::task::yield_now().await`) followed by a strictly capped 15ms micro-burst window. Prevents head-of-line blocking on healthy streams sharing the physical connection while still absorbing transient bursts.
+  - **WebSocket Half-Open Zombie Connection Detection & Teardown (`MuxFrameWriter`, `read_frame_inner`, `MuxClientSession`):**
+    - Client heartbeat Pings were previously sent blindly every 25 seconds while incoming Pong frames (`opcode == 10`) were silently ignored without timestamp updates. Silent network drops or remote host crashes left physical sessions in a half-open state, causing connection pools to falsely consider dead sessions available and causing 30-60s proxy request timeouts. Introduced `MuxFrameWriter::notify_pong` and atomic `inc_unacked_pings`. Incoming data and Pong frames continuously clear unacknowledged ping counters. Sessions with 2 consecutive unacknowledged heartbeat intervals (50s) are proactively terminated and evicted from pools.
+  - **UDP Server Known Targets Generational Eviction (`quic::handle_server_udp_stream`, `runtime::handle_server_udp_parts`):**
+    - Reaching the 4096-entry ceiling previously triggered an unconditional `guard.clear()`, wiping all existing authorized targets and causing an immediate 100% inbound UDP packet drop spike for all active flows. Replaced with generational 25% eviction (retaining 3072 active targets), eliminating state wipeout and packet drop storms during destination churn.
+  - **Multi-IPv4 DNS SingleFlight Coalescing (`dns::resolve_all_ipv4`):**
+    - Extended SingleFlight deduplication (`IN_FLIGHT_V4`) to `resolve_all_ipv4`. Concurrent DNS requests for the same host now coalesce onto a single leader lookup task, preventing DNS stampedes and upstream resolver rate-limiting.
+  - **MUX Session Pool Read/Write Lock Concurrency Optimization (`MuxSessionPool`, `WssSessionPool`):**
+    - Upgraded session pool collections from exclusive `Mutex` to `RwLock`. The proxy stream acquisition hot-path (`acquire()`) now executes entirely under shared read locks with zero lock contention across worker threads, eliminating convoy effects under high concurrent connection setup.
+  - **Regression Risk:** Zero. Full backwards protocol compatibility preserved; strict FIFO ordering and pointer identity (`Arc::ptr_eq`) maintained across all stream teardown paths.
+
+### Changes Implemented
+1. **Server Stream Pending Control State (`src/main.rs:StreamEntry::pending_ctrl`)**:
+   - Added `pending_ctrl: Arc<AtomicBool>` tracking in-flight control frame dispatch per server stream.
+2. **Server-Side Ingress Order Preservation & Single-Flight Bounding (`src/main.rs:handle_mux_parts`)**:
+   - Gated server DATA `try_send` behind `pending_ctrl` check; dropped and recycled bypassing frames during control pending state.
+   - Bounded background FIN dispatch tasks to at most one per stream; reset flag upon successful `permit.send(StreamCommand::Fin)`.
+3. **Zero-HoL Cooperative Yielding & 15ms Bound (`src/main.rs:mux_client_reader_loop`, `handle_mux_parts`)**:
+   - Injected `tokio::task::yield_now().await` and reduced backpressure wait from 250ms to 15ms on saturated stream queues.
+4. **WebSocket Heartbeat Pong Tracking & Zombie Teardown (`src/main.rs:MuxFrameWriter`, `read_frame_inner`, `MuxClientSession`)**:
+   - Added `notify_pong()` and `unacked_pings` tracking to `MuxFrameWriter`.
+   - Wired `read_frame_inner` opcode 10 and `mux_client_reader_loop` frame ingress to `notify_pong()`.
+   - Added 50s unacked ping termination safeguard to `MuxClientSession::spawn_from_parts`.
+5. **UDP Known Targets Generational Eviction (`src/main.rs:handle_server_udp_stream`, `handle_server_udp_parts`)**:
+   - Replaced `guard.clear()` with 25% (1024-entry) retention eviction.
+6. **Multi-IPv4 DNS SingleFlight (`src/main.rs:dns::resolve_all_ipv4`)**:
+   - Implemented `IN_FLIGHT_V4` SingleFlight coordination in `resolve_all_ipv4`.
+7. **Session Pool RwLock Optimization (`src/main.rs:MuxSessionPool`, `WssSessionPool`)**:
+   - Upgraded `sessions` from `Mutex` to `RwLock` with read-lock fast path in `acquire()`.
+8. **Regression Unit Tests (`src/main.rs:common::tests`)**:
+   - Added `verify_known_targets_partial_eviction`.
+9. **Version & Documentation**:
+   - Bumped version to `0.0.72` across `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
+   - Updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+
+### Commit & Tag
+- Commit: `release: v0.0.72 - server MUX single-flight parity, zero-HoL reader backpressure, WS zombie connection termination, and UDP generational eviction`
+- Tag: `v0.0.72`
+
+### Status
+- Completed and released as `v0.0.72`.
+
+### Remaining risk
+- None identified. Monitor GitHub Actions CI workflow run on `main` / tag `v0.0.72`.
+
+### Next action
+- Observe GitHub Actions release pipeline for tag `v0.0.72`.

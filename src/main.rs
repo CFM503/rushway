@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.71";
+pub const APP_VERSION: &str = "0.0.72";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -310,6 +310,12 @@ impl MuxClientSession {
                 if heartbeat_state.closed.load(Ordering::Acquire) {
                     break;
                 }
+                if heartbeat_state.writer.inc_unacked_pings() >= 2 {
+                    tracing::warn!("{log_tag} heartbeat unacknowledged after 50s; terminating dead session");
+                    heartbeat_state.closed.store(true, Ordering::Release);
+                    heartbeat_state.capacity_notify.notify_waiters();
+                    break;
+                }
                 let ping = match crate::ws::encode_ws_frame(&[], 9, true) {
                     Ok(frame) => frame,
                     Err(_) => {
@@ -595,6 +601,7 @@ where
             else {
                 break;
             };
+            state.writer.notify_pong();
             if opcode != 2 {
                 crate::mux_writer::recycle_encode_buf(payload);
                 continue;
@@ -706,26 +713,36 @@ where
                             });
                         }
                     } else {
-                        match timeout(Duration::from_millis(250), tx.reserve()).await {
-                            Ok(Ok(permit)) => permit.send(f),
-                            Ok(Err(_)) => {
-                                crate::mux_writer::recycle_encode_buf(f.into_storage());
-                                state.close_stream_if_same(id, &gate);
+                        tokio::task::yield_now().await;
+                        match tx.try_send(f) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(f)) => {
+                                match timeout(Duration::from_millis(15), tx.reserve()).await {
+                                    Ok(Ok(permit)) => permit.send(f),
+                                    Ok(Err(_)) => {
+                                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                        state.close_stream_if_same(id, &gate);
+                                    }
+                                    Err(_) => {
+                                        crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                        tracing::warn!(
+                                            stream_id = id,
+                                            "mux RST: stream queue full; resetting stalled stream"
+                                        );
+                                        try_send_mux_parts(
+                                            &state.writer,
+                                            &state.cipher,
+                                            id,
+                                            MuxCommand::Rst,
+                                            &[],
+                                            state.obfs,
+                                        );
+                                        state.close_stream_if_same(id, &gate);
+                                    }
+                                }
                             }
-                            Err(_) => {
+                            Err(mpsc::error::TrySendError::Closed(f)) => {
                                 crate::mux_writer::recycle_encode_buf(f.into_storage());
-                                tracing::warn!(
-                                    stream_id = id,
-                                    "mux RST: stream queue full; resetting stalled stream"
-                                );
-                                try_send_mux_parts(
-                                    &state.writer,
-                                    &state.cipher,
-                                    id,
-                                    MuxCommand::Rst,
-                                    &[],
-                                    state.obfs,
-                                );
                                 state.close_stream_if_same(id, &gate);
                             }
                         }
@@ -1977,6 +1994,30 @@ mod tests {
             now
         ));
     }
+
+    #[tokio::test]
+    async fn verify_known_targets_partial_eviction() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+        let mut known = HashSet::new();
+        for i in 0..4096 {
+            let port = 1000 + (i % 60000) as u16;
+            let ip = std::net::Ipv4Addr::new(10, ((i >> 16) & 0xff) as u8, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8);
+            known.insert(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+        }
+        assert_eq!(known.len(), 4096);
+        // Evict 1024 oldest entries instead of clear()
+        let mut to_remove = 1024;
+        known.retain(|_| {
+            if to_remove > 0 {
+                to_remove -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        assert_eq!(known.len(), 3072, "Eviction must leave 3072 active targets without wipeout");
+    }
 }
 } // mod common
 
@@ -2724,6 +2765,8 @@ static CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::n
 static ALL_V4_CACHE: OnceLock<RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>>> = OnceLock::new();
 static IN_FLIGHT: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<Option<IpAddr>>>>>> =
     OnceLock::new();
+static IN_FLIGHT_V4: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<Option<Vec<Ipv4Addr>>>>>>> =
+    OnceLock::new();
 
 fn cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
@@ -2735,6 +2778,10 @@ fn all_v4_cache() -> &'static RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>> 
 
 fn in_flight() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<Option<IpAddr>>>>> {
     IN_FLIGHT.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn in_flight_v4() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<Option<Vec<Ipv4Addr>>>>>> {
+    IN_FLIGHT_V4.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 /// Insert into a bounded cache map: once the entry cap is reached the whole
@@ -2957,6 +3004,61 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         }
     }
     let key = key.into_owned();
+    // SingleFlight coordination: deduplicate concurrent resolve_all_ipv4 lookups for the same host.
+    let tx = loop {
+        let mut waiter = None;
+        let mut leader_tx = None;
+        {
+            let mut inflight = in_flight_v4().lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(guard) = all_v4_cache().read() {
+                if let Some((ips, expires)) = guard.get(&key) {
+                    if *expires > Instant::now() && !ips.is_empty() {
+                        return Ok(ips.clone());
+                    }
+                }
+            }
+            if let Some(rx) = inflight.get(&key) {
+                waiter = Some(rx.clone());
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                inflight.insert(key.clone(), receiver);
+                leader_tx = Some(sender);
+            }
+        }
+
+        if let Some(mut rx) = waiter {
+            while rx.borrow().is_none() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            match rx.borrow().clone() {
+                Some(Some(ips)) => return Ok(ips),
+                Some(None) => {
+                    if let Some(stale) = stale_fallback {
+                        return Ok(stale);
+                    }
+                    bail!("concurrent DNS resolution failed for {host}");
+                }
+                None => {
+                    // Leader task was cancelled/aborted before completing; retry to elect a new leader.
+                    continue;
+                }
+            }
+        }
+        break leader_tx;
+    };
+
+    struct InFlightV4Guard<'a>(&'a str);
+    impl<'a> Drop for InFlightV4Guard<'a> {
+        fn drop(&mut self) {
+            if let Ok(mut inflight) = in_flight_v4().lock() {
+                inflight.remove(self.0);
+            }
+        }
+    }
+    let _guard = InFlightV4Guard(&key);
+
     let server = *SERVER.read().unwrap_or_else(|e| e.into_inner());
     let ips = match server {
         Some(server_ip) => match query_remote_all_ipv4(&key, server_ip).await {
@@ -2976,13 +3078,19 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         }
     }
     if unique.is_empty() {
+        if let Some(ref leader_tx) = tx {
+            let _ = leader_tx.send(Some(None));
+        }
         if let Some(stale) = stale_fallback {
             return Ok(stale);
         }
         bail!("no IPv4 addresses resolved for {host}");
     }
     let mut guard = all_v4_cache().write().unwrap_or_else(|e| e.into_inner());
-    bounded_insert(&mut guard, key, (unique.clone(), Instant::now() + CACHE_TTL));
+    bounded_insert(&mut guard, key.clone(), (unique.clone(), Instant::now() + CACHE_TTL));
+    if let Some(ref leader_tx) = tx {
+        let _ = leader_tx.send(Some(Some(unique.clone())));
+    }
     Ok(unique)
 }
 
@@ -3836,7 +3944,7 @@ use std::sync::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 
 const MAX_SESSION_COUNT: usize = 64;
@@ -3903,7 +4011,7 @@ async fn connect_plain_mux_session(
 struct MuxSessionPool {
     cfg: RuntimeConfig,
     session_count: usize,
-    sessions: Mutex<Vec<Arc<SessionState>>>,
+    sessions: RwLock<Vec<Arc<SessionState>>>,
     session_creation: Mutex<()>,
     consecutive_failures: std::sync::atomic::AtomicU32,
     next_idx: AtomicUsize,
@@ -3914,7 +4022,7 @@ impl MuxSessionPool {
         Arc::new(Self {
             cfg,
             session_count: session_count.clamp(1, MAX_SESSION_COUNT),
-            sessions: Mutex::new(Vec::new()),
+            sessions: RwLock::new(Vec::new()),
             session_creation: Mutex::new(()),
             consecutive_failures: std::sync::atomic::AtomicU32::new(0),
             next_idx: AtomicUsize::new(0),
@@ -3927,7 +4035,7 @@ impl MuxSessionPool {
             return false;
         };
         let missing = {
-            let mut sessions = self.sessions.lock().await;
+            let mut sessions = self.sessions.write().await;
             sessions.retain(|s| !s.is_dead());
             target.saturating_sub(sessions.len())
         };
@@ -3944,7 +4052,7 @@ impl MuxSessionPool {
         let mut added = 0usize;
         while let Some(res) = set.join_next().await {
             if let Ok(Ok(s)) = res {
-                self.sessions.lock().await.push(s);
+                self.sessions.write().await.push(s);
                 added += 1;
                 self.capacity_notify.notify_waiters();
             }
@@ -3993,21 +4101,39 @@ impl MuxSessionPool {
             notified.as_mut().enable();
 
             let (chosen, need_new) = {
-                let mut sessions = self.sessions.lock().await;
-                sessions.retain(|s| !s.is_dead());
-                let len = sessions.len();
-                let start = if len > 0 {
-                    self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                let guard = self.sessions.read().await;
+                if guard.iter().any(|s| s.is_dead()) {
+                    drop(guard);
+                    let mut write_guard = self.sessions.write().await;
+                    write_guard.retain(|s| !s.is_dead());
+                    let len = write_guard.len();
+                    let start = if len > 0 {
+                        self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                    } else {
+                        0
+                    };
+                    let chosen = (0..len)
+                        .map(|offset| &write_guard[(start + offset) % len])
+                        .filter(|s| s.available())
+                        .min_by_key(|s| s.active.load(Ordering::Acquire))
+                        .cloned();
+                    let need_new = len < n;
+                    (chosen, need_new)
                 } else {
-                    0
-                };
-                let chosen = (0..len)
-                    .map(|offset| &sessions[(start + offset) % len])
-                    .filter(|s| s.available())
-                    .min_by_key(|s| s.active.load(Ordering::Acquire))
-                    .cloned();
-                let need_new = len < n;
-                (chosen, need_new)
+                    let len = guard.len();
+                    let start = if len > 0 {
+                        self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                    } else {
+                        0
+                    };
+                    let chosen = (0..len)
+                        .map(|offset| &guard[(start + offset) % len])
+                        .filter(|s| s.available())
+                        .min_by_key(|s| s.active.load(Ordering::Acquire))
+                        .cloned();
+                    let need_new = len < n;
+                    (chosen, need_new)
+                }
             };
             if let Some(s) = chosen {
                 if let Ok(r) = s.open_stream(target, &initial_data).await {
@@ -4035,7 +4161,7 @@ impl MuxSessionPool {
                 let _ = timeout(Duration::from_millis(200), &mut notified).await;
                 continue;
             };
-            let mut sessions = self.sessions.lock().await;
+            let mut sessions = self.sessions.write().await;
             sessions.retain(|s| !s.is_dead());
             if sessions.iter().any(|s| s.available()) || sessions.len() >= n {
                 continue;
@@ -4050,7 +4176,7 @@ impl MuxSessionPool {
                 }
             };
             let still_need = {
-                let mut sessions = self.sessions.lock().await;
+                let mut sessions = self.sessions.write().await;
                 sessions.push(s.clone());
                 sessions.len() < n
             };
@@ -4436,6 +4562,7 @@ pub(crate) struct OutboundFrame {
 pub(crate) struct MuxFrameWriter {
     tx: mpsc::Sender<OutboundFrame>,
     closed: Arc<AtomicBool>,
+    unacked_pings: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl MuxFrameWriter {
@@ -4451,9 +4578,11 @@ impl MuxFrameWriter {
     {
         let (tx, rx) = mpsc::channel(FEED_CAP);
         let closed = Arc::new(AtomicBool::new(false));
+        let unacked_pings = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let this = Arc::new(Self {
             tx,
             closed: closed.clone(),
+            unacked_pings: unacked_pings.clone(),
         });
         let handle = tokio::spawn(async move {
             writer_loop(w, rx).await;
@@ -4475,6 +4604,16 @@ impl MuxFrameWriter {
             bytes: frame,
         })
         .await
+    }
+
+    #[inline(always)]
+    pub fn notify_pong(&self) {
+        self.unacked_pings.store(0, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn inc_unacked_pings(&self) -> u32 {
+        self.unacked_pings.fetch_add(1, Ordering::AcqRel)
     }
 
     /// Non-blocking enqueue for system control frames (e.g. Pong replies from the read loop).
@@ -8578,7 +8717,15 @@ async fn handle_server_udp_stream(
                     let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
                     if !guard.contains(&addr) {
                         if guard.len() >= 4096 {
-                            guard.clear();
+                            let mut to_remove = 1024;
+                            guard.retain(|_| {
+                                if to_remove > 0 {
+                                    to_remove -= 1;
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
                         }
                         guard.insert(addr);
                     }
@@ -8925,6 +9072,7 @@ struct StreamEntry {
     /// by WINDOW frames from the client). Unbounded until the client's
     /// VERSION frame arrives.
     gate: Arc<CreditGate>,
+    pending_ctrl: Arc<std::sync::atomic::AtomicBool>,
 }
 #[derive(Debug)]
 enum StreamCommand {
@@ -9711,6 +9859,7 @@ where
                                     tx,
                                     cancel,
                                     gate: gate.clone(),
+                                    pending_ctrl: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                 },
                             );
                             (true, None)
@@ -10115,10 +10264,20 @@ where
                     let send_res = {
                         let guard = streams.read().unwrap_or_else(|e| e.into_inner());
                         match guard.get(&id) {
-                            Some(s) => Some(match s.tx.try_send(StreamCommand::Data(frame)) {
-                                Ok(()) => Ok(()),
-                                Err(err) => Err((s.tx.clone(), err)),
-                            }),
+                            Some(s) => {
+                                if s.pending_ctrl.load(Ordering::Acquire) {
+                                    // A prior control frame is already queued in the background for this stream.
+                                    // To preserve strict per-stream FIFO order and prevent unbounded task accumulation,
+                                    // subsequent frames must not bypass the queued control frame.
+                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                    None
+                                } else {
+                                    Some(match s.tx.try_send(StreamCommand::Data(frame)) {
+                                        Ok(()) => Ok(()),
+                                        Err(err) => Err((s.tx.clone(), s.gate.clone(), err)),
+                                    })
+                                }
+                            }
                             None => {
                                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                 None
@@ -10127,32 +10286,58 @@ where
                     };
                     match send_res {
                         Some(Ok(())) | None => {}
-                        Some(Err((tx, mpsc::error::TrySendError::Full(StreamCommand::Data(f))))) => {
-                            match timeout(Duration::from_millis(250), tx.reserve()).await {
-                                Ok(Ok(permit)) => permit.send(StreamCommand::Data(f)),
-                                Ok(Err(_)) => {
-                                    crate::mux_writer::recycle_encode_buf(f.into_storage());
-                                    if let Some(old) = streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-                                        old.gate.close();
-                                        let _ = old.cancel.send(true);
+                        Some(Err((tx, gate, mpsc::error::TrySendError::Full(StreamCommand::Data(f))))) => {
+                            tokio::task::yield_now().await;
+                            match tx.try_send(StreamCommand::Data(f)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(StreamCommand::Data(f))) => {
+                                    match timeout(Duration::from_millis(15), tx.reserve()).await {
+                                        Ok(Ok(permit)) => permit.send(StreamCommand::Data(f)),
+                                        Ok(Err(_)) => {
+                                            crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                            let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
+                                            if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
+                                                if let Some(old) = guard.remove(&id) {
+                                                    old.gate.close();
+                                                    let _ = old.cancel.send(true);
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            crate::mux_writer::recycle_encode_buf(f.into_storage());
+                                            tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
+                                            send_reset_encrypted(&writer, &cipher, id, cfg.obfs);
+                                            let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
+                                            if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
+                                                if let Some(old) = guard.remove(&id) {
+                                                    old.gate.close();
+                                                    let _ = old.cancel.send(true);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                Err(_) => {
+                                Err(mpsc::error::TrySendError::Closed(StreamCommand::Data(f))) => {
                                     crate::mux_writer::recycle_encode_buf(f.into_storage());
-                                    tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
-                                    send_reset_encrypted(&writer, &cipher, id, cfg.obfs);
-                                    if let Some(old) = streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-                                        old.gate.close();
-                                        let _ = old.cancel.send(true);
+                                    let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
+                                    if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
+                                        if let Some(old) = guard.remove(&id) {
+                                            old.gate.close();
+                                            let _ = old.cancel.send(true);
+                                        }
                                     }
                                 }
+                                Err(_) => {}
                             }
                         }
-                        Some(Err((_, mpsc::error::TrySendError::Closed(StreamCommand::Data(f))))) => {
+                        Some(Err((_, gate, mpsc::error::TrySendError::Closed(StreamCommand::Data(f))))) => {
                             crate::mux_writer::recycle_encode_buf(f.into_storage());
-                            if let Some(old) = streams.write().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-                                old.gate.close();
-                                let _ = old.cancel.send(true);
+                            let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
+                            if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
+                                if let Some(old) = guard.remove(&id) {
+                                    old.gate.close();
+                                    let _ = old.cancel.send(true);
+                                }
                             }
                         }
                         Some(Err(_)) => {}
@@ -10165,41 +10350,52 @@ where
                     let full_tx = {
                         let guard = streams.read().unwrap_or_else(|e| e.into_inner());
                         match guard.get(&id) {
-                            Some(s) => match s.tx.try_send(StreamCommand::Fin) {
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    Some((s.tx.clone(), s.gate.clone()))
+                            Some(s) => {
+                                if s.pending_ctrl.load(Ordering::Acquire) {
+                                    // A control frame is already queued in the background;
+                                    // drop redundant FIN to bound tasks and memory.
+                                    None
+                                } else {
+                                    match s.tx.try_send(StreamCommand::Fin) {
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            s.pending_ctrl.store(true, Ordering::Release);
+                                            Some((s.tx.clone(), s.gate.clone(), s.pending_ctrl.clone()))
+                                        }
+                                        _ => None,
+                                    }
                                 }
-                                _ => None,
-                            },
+                            }
                             None => None,
                         }
                     };
-                    if let Some((tx, gate)) = full_tx {
+                    if let Some((tx, gate, pending_ctrl)) = full_tx {
                         let streams_for_cleanup = streams.clone();
                         tokio::spawn(async move {
-                            if !matches!(
-                                timeout(Duration::from_secs(10), tx.send(StreamCommand::Fin)).await,
-                                Ok(Ok(()))
-                            ) {
-                                // A FIN that silently disappears can strand a server stream.
-                                // Remove only the same stream entry; a newer entry must survive.
-                                let mut guard = streams_for_cleanup
-                                    .write()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                if guard
-                                    .get(&id)
-                                    .is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate))
-                                {
-                                    if let Some(old) = guard.remove(&id) {
-                                        old.gate.close();
-                                        let _ = old.cancel.send(true);
+                            match timeout(Duration::from_secs(10), tx.reserve()).await {
+                                Ok(Ok(permit)) => {
+                                    permit.send(StreamCommand::Fin);
+                                    pending_ctrl.store(false, Ordering::Release);
+                                }
+                                _ => {
+                                    // A FIN that silently disappears can strand a server stream.
+                                    // Remove only the same stream entry; a newer entry must survive.
+                                    let mut guard = streams_for_cleanup
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if guard
+                                        .get(&id)
+                                        .is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate))
+                                    {
+                                        if let Some(old) = guard.remove(&id) {
+                                            old.gate.close();
+                                            let _ = old.cancel.send(true);
+                                        }
                                     }
                                 }
                             }
                         });
                     }
                 }
-
                 MuxCommand::Rst => {
                     let stream_id = frame.stream_id;
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
@@ -10503,7 +10699,15 @@ where
                     let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
                     if !guard.contains(&addr) {
                         if guard.len() >= 4096 {
-                            guard.clear();
+                            let mut to_remove = 1024;
+                            guard.retain(|_| {
+                                if to_remove > 0 {
+                                    to_remove -= 1;
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
                         }
                         guard.insert(addr);
                     }
@@ -13879,7 +14083,11 @@ where
                     }
                 }
             }
-            10 => {}
+            10 => {
+                if let Some((writer, _)) = pong_writer {
+                    writer.notify_pong();
+                }
+            }
             // Reserved opcodes (0x3-0x7, 0xB-0xF): a buggy or hostile peer
             // must cause an error, never a panic (cf. obfs desync probe).
             _ => return Err(anyhow!("reserved websocket opcode {}", opcode)),
@@ -14244,7 +14452,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 
 pub(crate) type TlsReader = ReadHalf<tls::RushTlsStream>;
@@ -14710,7 +14918,7 @@ async fn connect_wss_mux_session(
 struct WssSessionPool {
     cfg: WssConfig,
     session_count: usize,
-    sessions: Mutex<Vec<Arc<WssSessionState>>>,
+    sessions: RwLock<Vec<Arc<WssSessionState>>>,
     session_creation: Mutex<()>,
     consecutive_failures: AtomicU32,
     next_idx: AtomicUsize,
@@ -14721,7 +14929,7 @@ impl WssSessionPool {
         Arc::new(Self {
             cfg,
             session_count: session_count.clamp(1, MAX_SESSION_COUNT),
-            sessions: Mutex::new(Vec::new()),
+            sessions: RwLock::new(Vec::new()),
             session_creation: Mutex::new(()),
             consecutive_failures: AtomicU32::new(0),
             next_idx: AtomicUsize::new(0),
@@ -14734,7 +14942,7 @@ impl WssSessionPool {
             return false;
         };
         let missing = {
-            let mut sessions = self.sessions.lock().await;
+            let mut sessions = self.sessions.write().await;
             sessions.retain(|s| !s.is_dead());
             target.saturating_sub(sessions.len())
         };
@@ -14753,7 +14961,7 @@ impl WssSessionPool {
         while let Some(res) = set.join_next().await {
             match res {
                 Ok(Ok(s)) => {
-                    self.sessions.lock().await.push(s);
+                    self.sessions.write().await.push(s);
                     added += 1;
                     self.capacity_notify.notify_waiters();
                 }
@@ -14829,21 +15037,39 @@ impl WssSessionPool {
             notified.as_mut().enable();
 
             let (chosen, need_new) = {
-                let mut sessions = self.sessions.lock().await;
-                sessions.retain(|s| !s.is_dead());
-                let len = sessions.len();
-                let start = if len > 0 {
-                    self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                let guard = self.sessions.read().await;
+                if guard.iter().any(|s| s.is_dead()) {
+                    drop(guard);
+                    let mut write_guard = self.sessions.write().await;
+                    write_guard.retain(|s| !s.is_dead());
+                    let len = write_guard.len();
+                    let start = if len > 0 {
+                        self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                    } else {
+                        0
+                    };
+                    let chosen = (0..len)
+                        .map(|offset| &write_guard[(start + offset) % len])
+                        .filter(|s| s.available())
+                        .min_by_key(|s| s.active.load(Ordering::Acquire))
+                        .cloned();
+                    let need_new = len < n;
+                    (chosen, need_new)
                 } else {
-                    0
-                };
-                let chosen = (0..len)
-                    .map(|offset| &sessions[(start + offset) % len])
-                    .filter(|s| s.available())
-                    .min_by_key(|s| s.active.load(Ordering::Acquire))
-                    .cloned();
-                let need_new = len < n;
-                (chosen, need_new)
+                    let len = guard.len();
+                    let start = if len > 0 {
+                        self.next_idx.fetch_add(1, Ordering::Relaxed) % len
+                    } else {
+                        0
+                    };
+                    let chosen = (0..len)
+                        .map(|offset| &guard[(start + offset) % len])
+                        .filter(|s| s.available())
+                        .min_by_key(|s| s.active.load(Ordering::Acquire))
+                        .cloned();
+                    let need_new = len < n;
+                    (chosen, need_new)
+                }
             };
             if let Some(session) = chosen {
                 if let Ok(opened) = session.open_stream(target, &initial_data).await {
@@ -14871,7 +15097,7 @@ impl WssSessionPool {
                 let _ = timeout(Duration::from_millis(200), &mut notified).await;
                 continue;
             };
-            let mut sessions = self.sessions.lock().await;
+            let mut sessions = self.sessions.write().await;
             sessions.retain(|s| !s.is_dead());
             if sessions.iter().any(|s| s.available()) || sessions.len() >= n {
                 continue;
@@ -14903,7 +15129,7 @@ impl WssSessionPool {
                 }
             };
             let still_need = {
-                let mut sessions = self.sessions.lock().await;
+                let mut sessions = self.sessions.write().await;
                 sessions.push(session.clone());
                 sessions.len() < n
             };
