@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.73] - 2026-11-01
+
+### Zombie Session Supervisor Wakeup, Lock-Free QUIC Stream Dialing, Zero-Alloc Borrowed UDP Parsing, Fused UDP WS Framing & Hot-Path Simplification
+
+- **Zombie MUX Session Supervisor Immediate Teardown (`src/main.rs:MuxClientSession::spawn_from_parts`)** — Added `_ = &mut heartbeat_handle` to the session supervisor's `tokio::select!` loop. When a physical connection encounters a silent WAN/NAT blackhole and exits after two consecutive unacknowledged heartbeat intervals (50s), the supervisor immediately wakes up, aborts the writer task, drops the underlying read half, closes all per-stream `CreditGate`s, and clears the active stream map so in-flight proxy streams fail fast instead of hanging indefinitely.
+- **Concurrent QUIC Stream Opening & Non-Blocking Pool State (`src/main.rs:QuicClientPool`)** — Replaced the single async `tokio::sync::Mutex<Option<Connection>>` held across `connecting.await` and `connection.open_bi().await` with `Arc<StdMutex<Option<Connection>>>` (locked only for nanoseconds to clone the `quinn::Connection` handle), a Double-Checked Locking `dial_lock: Arc<Mutex<()>>` for connection establishment, and `AtomicBool` for `needs_plaintext`. Eliminates global head-of-line blocking when concurrent QUIC streams open in parallel, and preserves upstream DNS cache entries when `open_bi()` times out on a still-live connection.
+- **Idle `JoinSet` Task Reclamation Across All Accept Loops (`src/main.rs:mux_pool`, `nonmux`, `quic`, `runtime`, `wss_client`, `run_wss_server`)** — Added `Some(_) = set.join_next(), if !set.is_empty() => {}` to all 9 top-level listener `tokio::select!` loops, ensuring completed connection tasks and coroutine stacks are reaped immediately during idle periods following traffic bursts.
+- **Resilient MUX Pool Scale-Out Fallback (`src/main.rs:MuxSessionPool::acquire`, `WssSessionPool::acquire`)** — When all existing sessions are temporarily at capacity and an on-demand scale-out dial fails transiently, `acquire()` now continues waiting for a slot on existing healthy sessions up to `deadline` rather than failing the client request immediately.
+- **Zero-Allocation Borrowed SOCKS5 UDP Parsing & `RwLock` Target Cache (`src/main.rs:BorrowedUdpTarget`, `parse_socks5_udp_datagram_borrowed`, `check_udp_target_policy`, `resolve_borrowed_udp_target`, `record_known_udp_target`)** — Eliminated per-packet `format!("{}.{}.{}.{}", ...)` heap allocations and redundant `IpAddr` string parsing across all 4 UDP relay hot paths (`common::relay_udp_ws`, `quic::relay_quic_udp`, `quic::handle_server_udp_stream`, `runtime::handle_server_udp_parts`). Upgraded server `known_targets` to `std::sync::RwLock<HashSet<SocketAddr>>` with a per-task `last_addr` fast path, and cached `local_established` / `cached_peer` on client UDP relays.
+- **Single-Pass Fused UDP WS Frame Encoding & Fast `-obfs` Padding (`src/main.rs:common::relay_udp_ws`, `mux_writer::encode_mux_ws_frame`)** — Fused WebSocket header construction, masking key generation, and `crypto::apply_fused_xor` into a single contiguous buffer write in `relay_udp_ws`, and replaced zero-fill `resize` + per-4-byte TLS RNG calls in `-obfs` padding with an inline 8-byte `xorshift64` word loop.
+- **Hot-Path Simplification & Counterproductive Option Removal (`src/main.rs:peek_initial_payload`, `relay_client_mux_stream`, `apply_socket_options_raw`, `dial_target`)** — Removed the artificial 2ms timer sleep before `MuxCommand::Syn` in `peek_initial_payload` in favor of a zero-wait `try_read_buf` check; consolidated duplicate `ActiveStreamGuard` / `ActiveWssStreamGuard` into `relay_client_mux_stream`; removed `connect_hedged` (which heap-boxed futures and emitted duplicate SYNs on >200ms WAN links) and removed `SO_BUSY_POLL` / `TCP_NOTSENT_LOWAT = 65536` from `apply_socket_options_raw`; added an ASCII domain fast-path in `is_blocked_local_host`.
+
 ## [v0.0.72] - 2026-10-29
 
 ### Server-Side MUX Ingress Single-Flight Parity, Zero-HoL Physical Reader Loop, WS Zombie Connection Termination, UDP Anti-Thrashing Eviction & Multi-IPv4 DNS SingleFlight
@@ -1004,6 +1016,6 @@ All notable changes to this project will be documented in this file.
 
 - No RushWay code change this entry. Documenting the paired goway change so interop/CI expectations stay accurate:
   - GoWay server MUX `SendFrame` now uses a dedicated `muxOutboundWriter` (unmasked fused encode) instead of `writeMu` + two-pass cipher.
-  - Wire format unchanged �� RushWay client/server need no protocol bump to interoperate.
+  - Wire format unchanged — RushWay client/server need no protocol bump to interoperate.
   - See `D:\SOFT\AI\github\way\goway\AI_HANDOFF.md` and `D:\SOFT\AI\github\way\CHANGELOG.md` for full change/validation.
 - Cross-repo handoff: Phase 1 (TUI/log-file/cpuprofile/STATS) remains the RushWay-side UX delivery; Phase 4 joint bench is the next shared milestone.

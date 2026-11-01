@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.72";
+pub const APP_VERSION: &str = "0.0.73";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -302,7 +302,7 @@ impl MuxClientSession {
             capacity_notify,
         });
         let heartbeat_state = state.clone();
-        let heartbeat_handle = tokio::spawn(async move {
+        let mut heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(25));
             interval.tick().await;
             loop {
@@ -339,6 +339,9 @@ impl MuxClientSession {
                 }
                 _ = &mut writer_task => {
                     tracing::debug!("{log_tag} writer stopped; closing session streams");
+                }
+                _ = &mut heartbeat_handle => {
+                    tracing::debug!("{log_tag} heartbeat stopped; closing session streams");
                 }
             }
             // If the read half ends first, the write task can otherwise remain
@@ -1086,6 +1089,7 @@ where
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut batch = crate::udp_batch::UdpBatchReader::new(udp_send);
         let mut packet = Vec::with_capacity(2048);
+        let mut local_established: Option<SocketAddr> = None;
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
@@ -1093,29 +1097,39 @@ where
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                let established = *latest_send.lock().unwrap_or_else(|e| e.into_inner());
-                if !udp_client_allowed(peer, control_peer_ip, &hint, established) {
+                if !udp_client_allowed(peer, control_peer_ip, &hint, local_established) {
                     tracing::debug!(%peer, "UDP associate dropped datagram from unauthorized local peer");
                     continue;
                 }
-                let Ok((target, _)) = crate::proxy::parse_socks5_udp_datagram(pkt) else {
+                let Ok((target, _)) = crate::proxy::parse_socks5_udp_datagram_borrowed(pkt) else {
                     continue;
                 };
-                if let Err(e) = crate::runtime::check_target_policy(block_local, &target) {
+                if let Err(e) = crate::runtime::check_udp_target_policy(block_local, &target) {
                     tracing::debug!(error = %e, "UDP datagram dropped by target policy");
                     continue;
                 }
-                if established.is_none() {
+                if local_established.is_none() {
+                    local_established = Some(peer);
                     *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 }
+                let mut ws_hdr = [0u8; 14];
+                let hdr_len = crate::ws::ws_header_into(&mut ws_hdr, pkt.len(), 2, true);
+                let mask_key = crate::ws::next_mask();
                 packet.clear();
+                packet.reserve(hdr_len + 4 + pkt.len());
+                packet.extend_from_slice(&ws_hdr[..hdr_len]);
+                packet.extend_from_slice(&mask_key);
+                let payload_start = packet.len();
                 packet.extend_from_slice(pkt);
-                c_send.apply(&mut packet);
-                crate::stats::add_bytes(packet.len() as i64, 0);
-                if write_frame_borrowed(&mut wr, &mut packet, 2, true)
-                    .await
-                    .is_err()
-                {
+                let body = &mut packet[payload_start..];
+                let ks = c_send.keystream();
+                if ks.is_empty() {
+                    crate::ws::apply_ws_mask(body, mask_key);
+                } else {
+                    crate::crypto::apply_fused_xor(body, ks, mask_key);
+                }
+                crate::stats::add_bytes(pkt.len() as i64, 0);
+                if wr.write_all(&packet).await.is_err() || wr.flush().await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -1124,6 +1138,7 @@ where
     }));
     let mut dummy = [0u8; 1];
     let mut batch_writer = crate::udp_batch::UdpBatchWriter::new(udp);
+    let mut cached_peer: Option<SocketAddr> = None;
     tokio::select! {
         _ = control.read(&mut dummy) => {}
         _ = &mut upload => {}
@@ -1143,15 +1158,22 @@ where
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                let Ok((target, _payload)) = crate::proxy::parse_socks5_udp_datagram(&packet) else {
+                let Ok((target, _payload)) = crate::proxy::parse_socks5_udp_datagram_borrowed(&packet) else {
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 };
-                if crate::runtime::check_target_policy(block_local, &target).is_err() {
+                if crate::runtime::check_udp_target_policy(block_local, &target).is_err() {
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                let peer_opt = match cached_peer {
+                    Some(p) => Some(p),
+                    None => {
+                        let p = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                        cached_peer = p;
+                        p
+                    }
+                };
                 if let Some(peer) = peer_opt {
                     let n = packet.len();
                     let _ = batch_writer.send(&packet, peer).await;
@@ -1171,20 +1193,50 @@ where
 
 /// Shared client-side MUX stream bidirectional relay loop used by both `mux_pool`
 /// (`ws://`) and `wss_client` (`wss://`).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn relay_client_mux_stream(
     local: TcpStream,
+    session: Arc<MuxClientSession>,
     id: u32,
     mut rx: tokio::sync::mpsc::Receiver<crate::protocol::OwnedMuxFrame>,
     gate: Arc<crate::flow::CreditGate>,
-    writer: Arc<MuxFrameWriter>,
-    cipher: XorCipher,
-    obfs: bool,
-    peer_window_kib: & std::sync::atomic::AtomicU32,
     buffer_size: usize,
     connection_timeout: u64,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
+    struct ActiveStreamGuard {
+        session: Arc<MuxClientSession>,
+        id: u32,
+        gate: Arc<crate::flow::CreditGate>,
+        armed: bool,
+    }
+    impl Drop for ActiveStreamGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                if !self.session.is_dead() {
+                    try_send_mux_parts(
+                        &self.session.writer,
+                        &self.session.cipher,
+                        self.id,
+                        MuxCommand::Rst,
+                        &[],
+                        self.session.obfs,
+                    );
+                }
+                self.session.close_stream_if_same(self.id, &self.gate);
+            }
+        }
+    }
+    let mut stream_guard = ActiveStreamGuard {
+        session: session.clone(),
+        id,
+        gate: gate.clone(),
+        armed: true,
+    };
+    let writer = session.writer.clone();
+    let cipher = session.cipher.clone();
+    let obfs = session.obfs;
+    let peer_window_kib = &session.peer_window_kib;
+    let gate_up = gate.clone();
     let (mut local_rd, mut local_wr) = local.into_split();
     let writer_up = writer.clone();
     let cipher_up = cipher.clone();
@@ -1230,7 +1282,7 @@ pub(crate) async fn relay_client_mux_stream(
                 let mut off = 0;
                 while off < n {
                     let end = (off + u16::MAX as usize).min(n);
-                    gate.acquire(end - off).await;
+                    gate_up.acquire(end - off).await;
                     send_mux_parts_reuse(
                         &writer_up,
                         &cipher_up,
@@ -1382,39 +1434,30 @@ pub(crate) async fn relay_client_mux_stream(
     while let Ok(f) = rx.try_recv() {
         crate::mux_writer::recycle_encode_buf(f.into_storage());
     }
+    stream_guard.armed = false;
+    session.close_stream_if_same(id, &gate);
     result
 }
 
-/// Coalesces any pipelined initial payload or awaits up to 2ms for the client's
-/// first application packet so it can be Piggybacked inside the MUX `SYN` frame.
-pub(crate) async fn peek_initial_payload(
-    local: &mut TcpStream,
+/// Captures any pipelined or immediately readable initial client payload without
+/// adding timer delay, allowing it to be piggybacked inside the MUX `SYN` frame.
+pub(crate) fn peek_initial_payload(
+    local: &TcpStream,
     initial_payload: Option<Vec<u8>>,
 ) -> Vec<u8> {
-    let mut initial_data = initial_payload.unwrap_or_default();
+    let initial_data = initial_payload.unwrap_or_default();
     if !initial_data.is_empty() {
         crate::stats::add_bytes(initial_data.len() as i64, 0);
         return initial_data;
     }
-    let _ = timeout(Duration::from_millis(2), async {
-        loop {
-            if local.readable().await.is_err() {
-                break;
-            }
-            let mut first_pkt = Vec::with_capacity(16384);
-            match local.try_read_buf(&mut first_pkt) {
-                Ok(n) if n > 0 => {
-                    crate::stats::add_bytes(first_pkt.len() as i64, 0);
-                    initial_data = first_pkt;
-                    break;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                _ => break,
-            }
+    let mut first_pkt = Vec::with_capacity(16384);
+    if let Ok(n) = local.try_read_buf(&mut first_pkt) {
+        if n > 0 {
+            crate::stats::add_bytes(n as i64, 0);
+            return first_pkt;
         }
-    })
-    .await;
-    initial_data
+    }
+    Vec::new()
 }
 
 /// Encodes one MUX frame into a pooled scratch buffer and queues it on the
@@ -4166,11 +4209,16 @@ impl MuxSessionPool {
             if sessions.iter().any(|s| s.available()) || sessions.len() >= n {
                 continue;
             }
+            let has_live_sessions = !sessions.is_empty();
             drop(sessions);
 
             let s = match connect_plain_mux_session(&self.cfg, self.capacity_notify.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
+                    self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
+                    if has_live_sessions && tokio::time::Instant::now() < deadline {
+                        continue;
+                    }
                     recycle_encode_buf(initial_data);
                     return Err(e);
                 }
@@ -4229,53 +4277,18 @@ async fn handle_tcp_proxy(
     } else if req.is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     }
-    let initial_data = crate::common::peek_initial_payload(&mut local, req.initial_payload).await;
+    let initial_data = crate::common::peek_initial_payload(&local, req.initial_payload);
     let (session, id, rx, gate) = pool.acquire(&req.target, initial_data).await?;
-    struct ActiveStreamGuard {
-        session: Arc<SessionState>,
-        id: u32,
-        gate: Arc<CreditGate>,
-        armed: bool,
-    }
-    impl Drop for ActiveStreamGuard {
-        fn drop(&mut self) {
-            if self.armed {
-                if !self.session.is_dead() {
-                    crate::common::try_send_mux_parts(
-                        &self.session.writer,
-                        &self.session.cipher,
-                        self.id,
-                        MuxCommand::Rst,
-                        &[],
-                        self.session.obfs,
-                    );
-                }
-                self.session.close_stream_if_same(self.id, &self.gate);
-            }
-        }
-    }
-    let mut stream_guard = ActiveStreamGuard {
-        session: session.clone(),
-        id,
-        gate: gate.clone(),
-        armed: true,
-    };
-    let result = crate::common::relay_client_mux_stream(
+    crate::common::relay_client_mux_stream(
         local,
+        session,
         id,
         rx,
-        gate.clone(),
-        session.writer.clone(),
-        session.cipher.clone(),
-        session.obfs,
-        &session.peer_window_kib,
+        gate,
         cfg.buffer_size,
         cfg.connection_timeout,
     )
-    .await;
-    stream_guard.armed = false;
-    session.close_stream_if_same(id, &gate);
-    result
+    .await
 }
 
 pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> {
@@ -4295,6 +4308,7 @@ pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> 
                 tracing::info!("shutdown requested, draining pooled client connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
@@ -4995,11 +5009,24 @@ pub(crate) fn encode_mux_ws_frame(
     // Pad lands inside the WS payload and gets masked/ciphered with the
     // rest; the receiver slices by the declared MUX length and ignores it.
     if pad_len > 0 {
-        let start = out.len();
-        out.resize(start + pad_len, 0);
-        for chunk in out[start..].chunks_mut(4) {
-            let m = next_mask();
-            chunk.copy_from_slice(&m[..chunk.len()]);
+        let mut seed = u64::from_ne_bytes({
+            let a = next_mask();
+            let b = next_mask();
+            [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
+        });
+        let full_words = pad_len / 8;
+        for _ in 0..full_words {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            out.extend_from_slice(&seed.to_ne_bytes());
+        }
+        let rem = pad_len & 7;
+        if rem > 0 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            out.extend_from_slice(&seed.to_ne_bytes()[..rem]);
         }
     }
     // Single pass over the payload: cipher keystream XOR WS mask.
@@ -5861,6 +5888,7 @@ pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
                 tracing::info!("shutdown requested, draining non-MUX client connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
@@ -5910,6 +5938,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 tracing::info!("shutdown requested, draining non-MUX server connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
@@ -6878,14 +6907,28 @@ pub fn socks5_failure_response() -> [u8; 10] {
     [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
 }
 
-pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), ProxyParseError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowedUdpHost<'a> {
+    Ip(std::net::IpAddr),
+    Domain(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorrowedUdpTarget<'a> {
+    pub host: BorrowedUdpHost<'a>,
+    pub port: u16,
+}
+
+/// Zero-allocation SOCKS5 UDP datagram header parser for forwarding hot paths.
+/// Extracts IPv4/IPv6 literals directly as `IpAddr` and domain names as a
+/// borrowed `&str` slice without heap allocation.
+pub fn parse_socks5_udp_datagram_borrowed(
+    buf: &[u8],
+) -> Result<(BorrowedUdpTarget<'_>, &[u8]), ProxyParseError> {
     if buf.len() < 4 {
         return Err(ProxyParseError::Truncated);
     }
-    if buf[0] != 0 || buf[1] != 0 {
-        return Err(ProxyParseError::InvalidHttpRequest);
-    }
-    if buf[2] != 0 {
+    if buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
         return Err(ProxyParseError::InvalidHttpRequest);
     }
     let (host, consumed) = match buf[3] {
@@ -6893,7 +6936,8 @@ pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), Prox
             if buf.len() < 10 {
                 return Err(ProxyParseError::Truncated);
             }
-            (format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]), 8)
+            let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            (BorrowedUdpHost::Ip(std::net::IpAddr::V4(ip)), 8)
         }
         0x03 => {
             if buf.len() < 5 {
@@ -6907,12 +6951,11 @@ pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), Prox
                 return Err(ProxyParseError::Truncated);
             }
             let h = std::str::from_utf8(&buf[5..5 + n])
-                .map_err(|_| ProxyParseError::InvalidUtf8)?
-                .to_owned();
+                .map_err(|_| ProxyParseError::InvalidUtf8)?;
             if h.trim().is_empty() {
                 return Err(ProxyParseError::InvalidHttpRequest);
             }
-            (h, 5 + n)
+            (BorrowedUdpHost::Domain(h), 5 + n)
         }
         0x04 => {
             if buf.len() < 22 {
@@ -6920,7 +6963,8 @@ pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), Prox
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&buf[4..20]);
-            (std::net::Ipv6Addr::from(octets).to_string(), 20)
+            let ip = std::net::Ipv6Addr::from(octets);
+            (BorrowedUdpHost::Ip(std::net::IpAddr::V6(ip)), 20)
         }
         other => return Err(ProxyParseError::UnsupportedAddressType(other)),
     };
@@ -6931,7 +6975,17 @@ pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), Prox
     if port == 0 {
         return Err(ProxyParseError::InvalidPort);
     }
-    Ok((TargetAddr { host, port }, &buf[consumed + 2..]))
+    Ok((BorrowedUdpTarget { host, port }, &buf[consumed + 2..]))
+}
+
+#[cfg(test)]
+pub fn parse_socks5_udp_datagram(buf: &[u8]) -> Result<(TargetAddr, &[u8]), ProxyParseError> {
+    let (target, payload) = parse_socks5_udp_datagram_borrowed(buf)?;
+    let host = match target.host {
+        BorrowedUdpHost::Ip(ip) => ip.to_string(),
+        BorrowedUdpHost::Domain(d) => d.to_owned(),
+    };
+    Ok((TargetAddr { host, port: target.port }, payload))
 }
 
 pub fn parse_target_authority(authority: &str) -> Result<TargetAddr, ProxyParseError> {
@@ -7472,6 +7526,27 @@ mod tests {
         assert!(parse_target_authority("2001:db8::1").is_err());
         assert!(parse_authority_with_default("2001:db8::1", 80).is_err());
     }
+
+    #[test]
+    fn test_parse_socks5_udp_datagram_borrowed_variants() {
+        let mut pkt_v4 = vec![0, 0, 0, 1, 8, 8, 8, 8, 0, 53];
+        pkt_v4.extend_from_slice(b"dns-query");
+        let (target_v4, payload_v4) = parse_socks5_udp_datagram_borrowed(&pkt_v4).unwrap();
+        assert_eq!(target_v4.host, BorrowedUdpHost::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert_eq!(target_v4.port, 53);
+        assert_eq!(payload_v4, b"dns-query");
+
+        let mut pkt_dom = vec![0, 0, 0, 3, 11];
+        pkt_dom.extend_from_slice(b"example.com");
+        pkt_dom.extend_from_slice(&443u16.to_be_bytes());
+        pkt_dom.extend_from_slice(b"quic");
+        let (target_dom, payload_dom) = parse_socks5_udp_datagram_borrowed(&pkt_dom).unwrap();
+        assert_eq!(target_dom.host, BorrowedUdpHost::Domain("example.com"));
+        assert_eq!(target_dom.port, 443);
+        assert_eq!(payload_dom, b"quic");
+
+        assert!(parse_socks5_udp_datagram_borrowed(&[0, 0, 1, 1, 8, 8, 8, 8, 0, 53]).is_err());
+    }
 }
 } // mod proxy
 
@@ -7483,13 +7558,14 @@ use crate::common::{
 };
 use crate::dns;
 use crate::proxy::{
-    parse_authority_with_default, parse_socks5_udp_datagram, parse_target_authority,
+    parse_authority_with_default, parse_socks5_udp_datagram_borrowed, parse_target_authority,
     read_client_proxy_request, socks5_success_response,
     ClientProxyRequest, SocksCommand, TargetAddr,
 };
 use crate::runtime::{
-    apply_listener_options, apply_socket_options, dial_target, drain_join_set,
-    enforce_target_policy, recycle_buf, relay_buf, resolve_target, wait_shutdown, RuntimeConfig,
+    apply_listener_options, apply_socket_options, check_udp_target_policy, dial_target,
+    drain_join_set, enforce_target_policy, record_known_udp_target, recycle_buf, relay_buf,
+    resolve_borrowed_udp_target, resolve_target, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use anyhow::{anyhow, bail, Context, Result};
@@ -7869,12 +7945,13 @@ struct QuicClientPool {
     upstream_port: u16,
     server_addr: Arc<StdMutex<std::net::SocketAddr>>,
     server_name: String,
-    connection: Arc<Mutex<Option<Connection>>>,
+    connection: Arc<StdMutex<Option<Connection>>>,
+    dial_lock: Arc<Mutex<()>>,
     timeout_secs: u64,
     /// Latched once an upstream explicitly rejects the key digest with an
     /// auth error: later connections start on the legacy inline key so the
     /// failed digest handshake is paid once per process, not per connection.
-    needs_plaintext: Arc<StdMutex<bool>>,
+    needs_plaintext: Arc<std::sync::atomic::AtomicBool>,
 }
 impl QuicClientPool {
     fn new(
@@ -7891,9 +7968,10 @@ impl QuicClientPool {
             upstream_port,
             server_addr: Arc::new(StdMutex::new(server_addr)),
             server_name,
-            connection: Arc::new(Mutex::new(None)),
+            connection: Arc::new(StdMutex::new(None)),
+            dial_lock: Arc::new(Mutex::new(())),
             timeout_secs,
-            needs_plaintext: Arc::new(StdMutex::new(false)),
+            needs_plaintext: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
     async fn current_or_resolve_addr(&self) -> std::net::SocketAddr {
@@ -7907,37 +7985,63 @@ impl QuicClientPool {
     async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         let wait_timeout = Duration::from_secs(self.timeout_secs.max(1));
         for _ in 0..2 {
-            let connection = {
-                let mut guard = self.connection.lock().await;
-                if let Some(existing) = guard
-                    .as_ref()
-                    .filter(|c| c.close_reason().is_none())
-                    .cloned()
-                {
-                    existing
-                } else {
-                    let addr = self.current_or_resolve_addr().await;
-                    let connecting = self.endpoint.connect(addr, &self.server_name)?;
-                    let conn = match timeout(wait_timeout, connecting).await {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => {
-                            dns::invalidate_host(&self.upstream_host);
-                            return Err(e.into());
-                        }
-                        Err(_) => {
-                            dns::invalidate_host(&self.upstream_host);
-                            bail!("QUIC connection handshake timed out to {addr}");
-                        }
-                    };
-                    *guard = Some(conn.clone());
-                    conn
+            let existing = self
+                .connection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .filter(|c| c.close_reason().is_none())
+                .cloned();
+            let connection = match existing {
+                Some(c) => c,
+                None => {
+                    let _dial_guard = self.dial_lock.lock().await;
+                    let rechecked = self
+                        .connection
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .filter(|c| c.close_reason().is_none())
+                        .cloned();
+                    if let Some(c) = rechecked {
+                        c
+                    } else {
+                        let addr = self.current_or_resolve_addr().await;
+                        let connecting = self.endpoint.connect(addr, &self.server_name)?;
+                        let conn = match timeout(wait_timeout, connecting).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
+                                dns::invalidate_host(&self.upstream_host);
+                                return Err(e.into());
+                            }
+                            Err(_) => {
+                                dns::invalidate_host(&self.upstream_host);
+                                bail!("QUIC connection handshake timed out to {addr}");
+                            }
+                        };
+                        *self.connection.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(conn.clone());
+                        conn
+                    }
                 }
             };
             match timeout(wait_timeout, connection.open_bi()).await {
                 Ok(Ok(pair)) => return Ok(pair),
-                _ => {
+                Ok(Err(_)) => {
                     dns::invalidate_host(&self.upstream_host);
-                    let mut guard = self.connection.lock().await;
+                    let mut guard = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard
+                        .as_ref()
+                        .is_some_and(|c| c.stable_id() == connection.stable_id())
+                    {
+                        guard.take();
+                    }
+                }
+                Err(_) => {
+                    if connection.close_reason().is_some() {
+                        dns::invalidate_host(&self.upstream_host);
+                    }
+                    let mut guard = self.connection.lock().unwrap_or_else(|e| e.into_inner());
                     if guard
                         .as_ref()
                         .is_some_and(|c| c.stable_id() == connection.stable_id())
@@ -7952,17 +8056,13 @@ impl QuicClientPool {
     /// Whether an earlier connection learned (via an explicit auth rejection
     /// of the key digest) that this upstream is plaintext-only.
     fn plaintext_needed(&self) -> bool {
-        *self
-            .needs_plaintext
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.needs_plaintext
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     /// Latches the plaintext-only marker (idempotent).
     fn mark_plaintext_needed(&self) {
-        *self
-            .needs_plaintext
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = true;
+        self.needs_plaintext
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 fn format_target(target: &TargetAddr) -> String {
@@ -8222,6 +8322,7 @@ async fn relay_quic_udp(
     let mut upload = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
         let mut scratch = Vec::with_capacity(2048);
+        let mut local_established: Option<std::net::SocketAddr> = None;
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
@@ -8229,19 +8330,19 @@ async fn relay_quic_udp(
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
-                let established = *latest_send.lock().unwrap_or_else(|e| e.into_inner());
-                if !crate::common::udp_client_allowed(peer, control_peer_ip, &bind_hint, established) {
+                if !crate::common::udp_client_allowed(peer, control_peer_ip, &bind_hint, local_established) {
                     tracing::debug!(%peer, "QUIC UDP associate dropped datagram from unauthorized local peer");
                     continue;
                 }
-                let Ok((target, _)) = parse_socks5_udp_datagram(pkt) else {
+                let Ok((target, _)) = parse_socks5_udp_datagram_borrowed(pkt) else {
                     continue;
                 };
-                if let Err(e) = crate::runtime::check_target_policy(block_local, &target) {
+                if let Err(e) = check_udp_target_policy(block_local, &target) {
                     tracing::debug!(error = %e, "QUIC UDP datagram dropped by target policy");
                     continue;
                 }
-                if established.is_none() {
+                if local_established.is_none() {
+                    local_established = Some(peer);
                     *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 }
                 crate::stats::add_bytes(pkt.len() as i64, 0);
@@ -8259,6 +8360,7 @@ async fn relay_quic_udp(
     let mut dummy = [0u8; 1];
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
     let mut stash: &[u8] = &extra_down;
+    let mut cached_peer: Option<std::net::SocketAddr> = None;
     tokio::select! {
         _ = control.read(&mut dummy) => {}
         _ = &mut upload => {}
@@ -8270,13 +8372,20 @@ async fn relay_quic_udp(
                     break;
                 };
                 let packet = &frame_buf[..packet_len];
-                let Ok((target, _payload)) = parse_socks5_udp_datagram(packet) else {
+                let Ok((target, _payload)) = parse_socks5_udp_datagram_borrowed(packet) else {
                     continue;
                 };
-                if enforce_target_policy(&cfg, &target).is_err() {
+                if check_udp_target_policy(cfg.block_local, &target).is_err() {
                     continue;
                 }
-                let peer_opt = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                let peer_opt = match cached_peer {
+                    Some(p) => Some(p),
+                    None => {
+                        let p = *latest.lock().unwrap_or_else(|e| e.into_inner());
+                        cached_peer = p;
+                        p
+                    }
+                };
                 if let Some(peer) = peer_opt {
                     let _ = batch_writer.send(packet, peer).await;
                     crate::stats::add_bytes(0, packet_len as i64);
@@ -8364,6 +8473,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 tracing::info!("shutdown requested, draining QUIC client connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (mut stream, peer) = match res {
                     Ok(v) => v,
@@ -8449,6 +8559,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 tracing::info!("shutdown requested, draining QUIC server connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
                     break;
@@ -8638,8 +8749,8 @@ async fn handle_server_udp_stream(
     // Same gate as the WS UDP relay: the socket is unconnected, so only
     // datagrams whose source is an address this session actually dialed may
     // reach the client's downstream; anything else is dropped as untrusted.
-    let known_targets: Arc<StdMutex<HashSet<std::net::SocketAddr>>> =
-        Arc::new(StdMutex::new(HashSet::new()));
+    let known_targets: Arc<std::sync::RwLock<HashSet<std::net::SocketAddr>>> =
+        Arc::new(std::sync::RwLock::new(HashSet::new()));
     let udp_send = udp.clone();
     let known_send = known_targets.clone();
     let mut sender = crate::common::AbortOnDrop(tokio::spawn(async move {
@@ -8653,7 +8764,7 @@ async fn handle_server_udp_stream(
             for i in 0..count {
                 let (pkt, src) = batch.packet(i);
                 if !known_send
-                    .lock()
+                    .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .contains(&src)
                 {
@@ -8694,6 +8805,7 @@ async fn handle_server_udp_stream(
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
     let mut stash: &[u8] = &extra_initial;
+    let mut last_addr: Option<std::net::SocketAddr> = None;
     tokio::select! {
         _ = &mut sender => {}
         _ = async {
@@ -8701,35 +8813,19 @@ async fn handle_server_udp_stream(
                 read_len_prefixed_udp_buffered(&mut recv, &mut stash, &mut frame_buf).await?
             {
                 let packet = &frame_buf[..packet_len];
-                let Ok((target, payload)) = parse_socks5_udp_datagram(packet) else {
+                let Ok((target, payload)) = parse_socks5_udp_datagram_borrowed(packet) else {
                     continue;
                 };
-                if enforce_target_policy(&cfg, &target).is_err() {
+                if check_udp_target_policy(cfg.block_local, &target).is_err() {
                     continue;
                 }
-                let Ok(addr) = resolve_target(cfg.block_local, &target.host, target.port).await
+                let Ok(addr) = resolve_borrowed_udp_target(cfg.block_local, &target).await
                 else {
                     continue;
                 };
                 // Recorded before the first payload leaves, so a reply can
                 // never arrive ahead of its target joining the known set.
-                {
-                    let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
-                    if !guard.contains(&addr) {
-                        if guard.len() >= 4096 {
-                            let mut to_remove = 1024;
-                            guard.retain(|_| {
-                                if to_remove > 0 {
-                                    to_remove -= 1;
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                        guard.insert(addr);
-                    }
-                }
+                record_known_udp_target(&known_targets, &mut last_addr, addr);
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
             }
@@ -9006,7 +9102,7 @@ use crate::protocol::{
     MuxCommand, MuxFrame, OwnedMuxFrame, SynPayload, U32HashMap, mux_initial_window_kib,
     mux_window_refresh,
 };
-use crate::proxy::{parse_socks5_udp_datagram, parse_target_authority, TargetAddr};
+use crate::proxy::{parse_socks5_udp_datagram_borrowed, parse_target_authority, TargetAddr};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame, read_frame_with_cipher,
@@ -9096,6 +9192,17 @@ pub(crate) fn is_blocked_local_host(host: &str) -> bool {
     };
     if is_localhost {
         return true;
+    }
+    // Fast path for domain names: an IPv4 literal must start with an ASCII digit
+    // and contain only digits and dots; an IPv6 literal must contain ':'.
+    // Skipping `clean.parse::<IpAddr>()` for regular domain names avoids two failed
+    // IP parser passes on every connection and UDP target check.
+    let bytes = clean.as_bytes();
+    let maybe_ip = bytes.contains(&b':')
+        || (bytes.first().is_some_and(|b| b.is_ascii_digit())
+            && bytes.iter().all(|b| b.is_ascii_digit() || *b == b'.'));
+    if !maybe_ip {
+        return false;
     }
     match clean.parse::<IpAddr>() {
         Ok(ip) => is_blocked_local_ip(ip),
@@ -9301,6 +9408,74 @@ pub(crate) fn check_target_policy(block_local: bool, target: &TargetAddr) -> Res
     Ok(())
 }
 
+pub(crate) fn check_udp_target_policy(
+    block_local: bool,
+    target: &crate::proxy::BorrowedUdpTarget<'_>,
+) -> Result<()> {
+    if block_local {
+        let blocked = match target.host {
+            crate::proxy::BorrowedUdpHost::Ip(ip) => is_blocked_local_ip(ip),
+            crate::proxy::BorrowedUdpHost::Domain(h) => is_blocked_local_host(h),
+        };
+        if blocked {
+            bail!("local/LAN target blocked by target policy");
+        }
+    }
+    if target.port == 0 {
+        bail!("target port must be non-zero");
+    }
+    Ok(())
+}
+
+pub(crate) async fn resolve_borrowed_udp_target(
+    block_local: bool,
+    target: &crate::proxy::BorrowedUdpTarget<'_>,
+) -> Result<SocketAddr> {
+    match target.host {
+        crate::proxy::BorrowedUdpHost::Ip(ip) => {
+            if block_local && is_blocked_local_ip(ip) {
+                bail!("local/LAN address blocked by target policy: {ip}");
+            }
+            Ok(SocketAddr::new(ip, target.port))
+        }
+        crate::proxy::BorrowedUdpHost::Domain(host) => {
+            resolve_target(block_local, host, target.port).await
+        }
+    }
+}
+
+pub(crate) fn record_known_udp_target(
+    known_targets: &std::sync::RwLock<HashSet<SocketAddr>>,
+    last_addr: &mut Option<SocketAddr>,
+    addr: SocketAddr,
+) {
+    if *last_addr == Some(addr) {
+        return;
+    }
+    let already_known = known_targets
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&addr);
+    if !already_known {
+        let mut guard = known_targets.write().unwrap_or_else(|e| e.into_inner());
+        if !guard.contains(&addr) {
+            if guard.len() >= 4096 {
+                let mut to_remove = 1024;
+                guard.retain(|_| {
+                    if to_remove > 0 {
+                        to_remove -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            guard.insert(addr);
+        }
+    }
+    *last_addr = Some(addr);
+}
+
 /// Resolves a *target* hostname and re-checks the address that will actually
 /// be dialed.
 ///
@@ -9351,21 +9526,7 @@ pub(crate) fn apply_socket_options_raw(
         use std::os::fd::AsRawFd;
         let fd = stream.as_raw_fd();
 
-        // 1. TCP_NOTSENT_LOWAT bounds unsent bytes buffered in the kernel send
-        // queue before poll/epoll reports writable (64 KiB balances MUX batching & low latency).
-        let lowat: libc::c_uint = 65536;
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                &lowat as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&lowat) as libc::socklen_t,
-            );
-        }
-
-        // 2. TCP_CONGESTION: Set BBR congestion control algorithm.
-        // Best-effort: if BBR is unavailable in the kernel, setsockopt fails gracefully.
+        // 1. TCP_CONGESTION: Set BBR congestion control algorithm (best-effort).
         let bbr = b"bbr\0";
         unsafe {
             let _ = libc::setsockopt(
@@ -9377,9 +9538,8 @@ pub(crate) fn apply_socket_options_raw(
             );
         }
 
-        // 4. TCP_USER_TIMEOUT (RFC 5482): Forcefully resets dead connections after
-        // 30 seconds of unacknowledged transmitted data, eliminating 15-minute kernel
-        // retransmission hangs during silent network disconnects.
+        // 2. TCP_USER_TIMEOUT (RFC 5482): Forcefully resets dead connections after
+        // 30 seconds of unacknowledged transmitted data.
         let user_timeout_ms: libc::c_uint = 30000;
         unsafe {
             let _ = libc::setsockopt(
@@ -9388,20 +9548,6 @@ pub(crate) fn apply_socket_options_raw(
                 libc::TCP_USER_TIMEOUT,
                 &user_timeout_ms as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&user_timeout_ms) as libc::socklen_t,
-            );
-        }
-
-        // 5. SO_BUSY_POLL: Low-latency socket polling in microseconds (Linux 3.11+).
-        // Polls the device driver receive queue for incoming packets for 50µs before
-        // sleeping, drastically cutting tail latency and context switch overhead on busy servers.
-        let busy_poll_us: libc::c_int = 50;
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BUSY_POLL,
-                &busy_poll_us as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&busy_poll_us) as libc::socklen_t,
             );
         }
     }
@@ -9446,27 +9592,6 @@ pub(crate) fn format_listen_addr(host: &str, port: u16) -> String {
 pub(crate) fn apply_socket_options(stream: &TcpStream, cfg: &RuntimeConfig) {
     apply_socket_options_raw(stream, cfg.tcp_nodelay, cfg.socket_buffer, cfg.tcp_keepalive);
 }
-async fn connect_hedged(addr: SocketAddr) -> std::io::Result<TcpStream> {
-    let mut primary = Box::pin(TcpStream::connect(addr));
-    match timeout(Duration::from_millis(200), &mut primary).await {
-        Ok(res) => res,
-        Err(_) => {
-            // Hedged SYN: if the initial SYN was dropped on the WAN, fire a parallel
-            // connection at 200ms instead of waiting for the 1000ms OS SYN retransmit timer.
-            let mut secondary = Box::pin(TcpStream::connect(addr));
-            tokio::select! {
-                res1 = &mut primary => match res1 {
-                    Ok(s) => Ok(s),
-                    Err(_) => secondary.await,
-                },
-                res2 = &mut secondary => match res2 {
-                    Ok(s) => Ok(s),
-                    Err(_) => primary.await,
-                },
-            }
-        }
-    }
-}
 
 pub(crate) async fn dial_target(
     target: &TargetAddr,
@@ -9477,7 +9602,7 @@ pub(crate) async fn dial_target(
         let addr = resolve_target(cfg.block_local, &target.host, target.port)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        match connect_hedged(addr).await {
+        match TcpStream::connect(addr).await {
             Ok(s) => Ok(s),
             Err(first_err) => {
                 crate::dns::invalidate_host(&target.host);
@@ -9486,7 +9611,7 @@ pub(crate) async fn dial_target(
                         resolve_target(cfg.block_local, &target.host, target.port).await
                     {
                         if fresh_addr != addr {
-                            if let Ok(s) = connect_hedged(fresh_addr).await {
+                            if let Ok(s) = TcpStream::connect(fresh_addr).await {
                                 return Ok(s);
                             }
                         }
@@ -10591,9 +10716,6 @@ where
     }
     result
 }
-async fn resolve_udp_target(block_local: bool, target: &TargetAddr) -> Result<SocketAddr> {
-    resolve_target(block_local, &target.host, target.port).await
-}
 fn udp_envelope_into(out: &mut Vec<u8>, source: SocketAddr, payload: &[u8]) {
     out.clear();
     out.reserve(22 + payload.len());
@@ -10625,7 +10747,8 @@ where
     cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
     let udp = Arc::new(crate::udp_batch::bind_dual_stack_udp_unspecified()?);
-    let known_targets: Arc<StdMutex<HashSet<SocketAddr>>> = Arc::new(StdMutex::new(HashSet::new()));
+    let known_targets: Arc<std::sync::RwLock<HashSet<SocketAddr>>> =
+        Arc::new(std::sync::RwLock::new(HashSet::new()));
     let udp_send = udp.clone();
     let known_send = known_targets.clone();
     let cipher_send = cipher.clone();
@@ -10640,7 +10763,7 @@ where
             for i in 0..count {
                 let (pkt, source) = batch.packet(i);
                 if !known_send
-                    .lock()
+                    .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .contains(&source)
                 {
@@ -10662,6 +10785,7 @@ where
     }));
     let mut frame_buf = Vec::new();
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
+    let mut last_addr: Option<SocketAddr> = None;
     let result = tokio::select! {
         _ = &mut send_task => Ok::<(), anyhow::Error>(()),
         res = async {
@@ -10680,38 +10804,22 @@ where
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 };
-                let Ok((target, payload)) = parse_socks5_udp_datagram(&packet) else {
+                let Ok((target, payload)) = parse_socks5_udp_datagram_borrowed(&packet) else {
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 };
-                if enforce_target_policy(&cfg, &target).is_err() {
+                if check_udp_target_policy(cfg.block_local, &target).is_err() {
                     crate::mux_writer::recycle_encode_buf(packet);
                     continue;
                 }
-                let addr = match resolve_udp_target(cfg.block_local, &target).await {
+                let addr = match resolve_borrowed_udp_target(cfg.block_local, &target).await {
                     Ok(v) => v,
                     Err(_) => {
                         crate::mux_writer::recycle_encode_buf(packet);
                         continue;
                     }
                 };
-                {
-                    let mut guard = known_targets.lock().unwrap_or_else(|e| e.into_inner());
-                    if !guard.contains(&addr) {
-                        if guard.len() >= 4096 {
-                            let mut to_remove = 1024;
-                            guard.retain(|_| {
-                                if to_remove > 0 {
-                                    to_remove -= 1;
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                        guard.insert(addr);
-                    }
-                }
+                record_known_udp_target(&known_targets, &mut last_addr, addr);
                 crate::stats::add_bytes(payload.len() as i64, 0);
                 let _ = batch_writer.send(payload, addr).await;
                 crate::mux_writer::recycle_encode_buf(packet);
@@ -10786,6 +10894,7 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 tracing::info!("shutdown requested, draining server connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
@@ -13254,7 +13363,7 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
                     {
                         return Ok(());
                     }
-                    if out.len() >= MAX_HTTP_HEADER_SIZE {
+                    if out.len() > MAX_HTTP_HEADER_SIZE {
                         bail!("header too large");
                     }
                 }
@@ -14822,6 +14931,7 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
                 tracing::info!("shutdown requested, draining WSS non-MUX connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
@@ -15102,12 +15212,13 @@ impl WssSessionPool {
             if sessions.iter().any(|s| s.available()) || sessions.len() >= n {
                 continue;
             }
+            let has_live_sessions = !sessions.is_empty();
             drop(sessions);
 
             let session = match connect_wss_mux_session(&self.cfg, self.capacity_notify.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
-                    recycle_encode_buf(initial_data);
+                    self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
                     let (_, host, path) = parse_wss_url(&self.cfg.upstream).unwrap_or_default();
                     let sni = self
                         .cfg
@@ -15125,6 +15236,10 @@ impl WssSessionPool {
                         path = %path,
                         "WSS physical session creation on-demand failed"
                     );
+                    if has_live_sessions && tokio::time::Instant::now() < deadline {
+                        continue;
+                    }
+                    recycle_encode_buf(initial_data);
                     return Err(e);
                 }
             };
@@ -15178,53 +15293,18 @@ async fn handle_connection(mut local: TcpStream, pool: Arc<WssSessionPool>) -> R
     } else if req.is_connect {
         local.write_all(HTTP_200_CONNECTION_ESTABLISHED).await?;
     };
-    let initial_data = crate::common::peek_initial_payload(&mut local, req.initial_payload).await;
+    let initial_data = crate::common::peek_initial_payload(&local, req.initial_payload);
     let (session, stream_id, rx, gate) = pool.acquire(&req.target, initial_data).await?;
-    struct ActiveWssStreamGuard {
-        session: Arc<WssSessionState>,
-        id: u32,
-        gate: Arc<CreditGate>,
-        armed: bool,
-    }
-    impl Drop for ActiveWssStreamGuard {
-        fn drop(&mut self) {
-            if self.armed {
-                if !self.session.is_dead() {
-                    crate::common::try_send_mux_parts(
-                        &self.session.writer,
-                        &self.session.cipher,
-                        self.id,
-                        MuxCommand::Rst,
-                        &[],
-                        self.session.obfs,
-                    );
-                }
-                self.session.close_stream_if_same(self.id, &self.gate);
-            }
-        }
-    }
-    let mut stream_guard = ActiveWssStreamGuard {
-        session: session.clone(),
-        id: stream_id,
-        gate: gate.clone(),
-        armed: true,
-    };
-    let result = crate::common::relay_client_mux_stream(
+    crate::common::relay_client_mux_stream(
         local,
+        session,
         stream_id,
         rx,
-        gate.clone(),
-        session.writer.clone(),
-        session.cipher.clone(),
-        session.obfs,
-        &session.peer_window_kib,
+        gate,
         pool.cfg.buffer_size,
         pool.cfg.connection_timeout,
     )
-    .await;
-    stream_guard.armed = false;
-    session.close_stream_if_same(stream_id, &gate);
-    result
+    .await
 }
 
 pub async fn run_client_from_config(
@@ -15253,6 +15333,7 @@ pub async fn run_client_from_config(
                 tracing::info!("shutdown requested, draining WSS client connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
@@ -15908,6 +15989,7 @@ async fn run_wss_server(cfg: RuntimeConfig) -> Result<()> {
                 tracing::info!("shutdown requested, draining WSS server connections");
                 break;
             }
+            Some(_) = set.join_next(), if !set.is_empty() => {}
             res = listener.accept() => {
                 let (stream, peer) = match res {
                     Ok(v) => v,
