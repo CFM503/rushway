@@ -2088,6 +2088,10 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 8. **Version & Documentation**:
    - Bumped version to `0.0.73` across `src/main.rs`, `Cargo.toml`, and `Cargo.lock`.
    - Fixed corrupted UTF-8 characters and updated `CHANGELOG.md` and `AI_HANDOFF.md`.
+9. **CI Compilation Fix & Universal CI/Release Guard (`src/main.rs`, `scripts/ci_guard.py`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`)**:
+   - **Bug:** GitHub Actions `RushWay CI` (`Run 41317847191`, job `124881586184`) and `RushWay Release Artifacts` (`Run 41317848283`) failed on `ae3afb7` (`v0.0.73`) during `cargo check --all-targets --all-features`.
+   - **Root cause:** (1) `quic::run_client` background warm-up task (`src/main.rs:8446`) still called `warm_pool.connection.lock().await` after `QuicClientPool.connection` was converted from `tokio::sync::Mutex` to `StdMutex` (`E0277`); (2) `proxy::tests::test_parse_socks5_udp_datagram_borrowed_variants` (`src/main.rs:7535`) used unqualified `IpAddr::V4(Ipv4Addr::new(...))` without `std::net::{IpAddr, Ipv4Addr}` imported in `mod proxy::tests` (`E0433` under `--all-targets`); (3) 3 unused imports (`MuxCommand` in `mux_pool` and `wss_client`, `resolve_target` in `quic`).
+   - **Fix:** Updated the `warm_pool` pre-warm task in `quic::run_client` to coordinate via `warm_pool.dial_lock.lock().await` and lock `warm_pool.connection` synchronously; qualified `std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))` in `proxy::tests`; removed the 3 unused imports; created `scripts/ci_guard.py` (with `--install-hook` and `--release` modes) and gated `release.yml` matrix jobs on `needs: check`.
 
 ### Commit & Tag
 - Commit: `release: v0.0.73 - zombie session teardown, concurrent QUIC stream opening, zero-alloc UDP parsing, and hot-path simplification`

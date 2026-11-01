@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: Static & version guard
+        run: python3 scripts/ci_guard.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0

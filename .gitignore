@@ -14,4 +14,5 @@ tmp/
 # ZCode workspace metadata (workflow drafts/runs).
 .zcode/
 *.py
+!scripts/*.py
 *.bak

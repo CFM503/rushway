@@ -3970,7 +3970,7 @@ use crate::common::{
 use crate::common::parse_ws_url_with_port;
 use crate::flow::CreditGate;
 use crate::mux_writer::{recycle_encode_buf, MuxFrameWriter};
-use crate::protocol::{MuxCommand, OwnedMuxFrame};
+use crate::protocol::OwnedMuxFrame;
 use crate::proxy::{
     read_client_proxy_request, socks5_success_response, SocksCommand, TargetAddr,
 };
@@ -7532,7 +7532,10 @@ mod tests {
         let mut pkt_v4 = vec![0, 0, 0, 1, 8, 8, 8, 8, 0, 53];
         pkt_v4.extend_from_slice(b"dns-query");
         let (target_v4, payload_v4) = parse_socks5_udp_datagram_borrowed(&pkt_v4).unwrap();
-        assert_eq!(target_v4.host, BorrowedUdpHost::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert_eq!(
+            target_v4.host,
+            BorrowedUdpHost::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)))
+        );
         assert_eq!(target_v4.port, 53);
         assert_eq!(payload_v4, b"dns-query");
 
@@ -7565,7 +7568,7 @@ use crate::proxy::{
 use crate::runtime::{
     apply_listener_options, apply_socket_options, check_udp_target_policy, dial_target,
     drain_join_set, enforce_target_policy, record_known_udp_target, recycle_buf, relay_buf,
-    resolve_borrowed_udp_target, resolve_target, wait_shutdown, RuntimeConfig,
+    resolve_borrowed_udp_target, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use anyhow::{anyhow, bail, Context, Result};
@@ -8443,8 +8446,14 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
     );
     let warm_pool = pool.clone();
     tokio::spawn(async move {
-        let mut guard = warm_pool.connection.lock().await;
-        if guard.as_ref().is_none_or(|c| c.close_reason().is_some()) {
+        let _dial_guard = warm_pool.dial_lock.lock().await;
+        let alive = warm_pool
+            .connection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|c| c.close_reason().is_none());
+        if !alive {
             let addr = warm_pool.current_or_resolve_addr().await;
             if let Ok(connecting) = warm_pool.endpoint.connect(addr, &warm_pool.server_name) {
                 if let Ok(Ok(conn)) = timeout(
@@ -8453,7 +8462,10 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 )
                 .await
                 {
-                    *guard = Some(conn);
+                    *warm_pool
+                        .connection
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(conn);
                 }
             }
         }
@@ -14537,7 +14549,7 @@ use crate::common::{
 use crate::dns;
 use crate::flow::CreditGate;
 use crate::mux_writer::{recycle_encode_buf, MuxFrameWriter};
-use crate::protocol::{MuxCommand, OwnedMuxFrame};
+use crate::protocol::OwnedMuxFrame;
 use crate::proxy::{
     parse_authority_with_default, read_client_proxy_request, socks5_success_response,
     SocksCommand, TargetAddr,
