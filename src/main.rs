@@ -10165,9 +10165,9 @@ where
                         tracing::warn!("server mux session idle timeout; terminating dead peer");
                         break;
                     }
-                    let mut ping_buf = [0u8; 2];
-                    let _ = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
-                    writer.try_send_system(ping_buf.to_vec());
+                    let mut ping_buf = [0u8; 14];
+                    let hlen = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
+                    writer.try_send_system(ping_buf[..hlen].to_vec());
                     continue;
                 }
                 _ = &mut writer_task, if !writer_dead => {
@@ -13114,7 +13114,6 @@ impl UdpBatchWriter {
             return Ok(0);
         }
         let mut total = 0;
-        let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
         let mut offset = 0;
         while offset < self.count {
             self.sock.writable().await?;
