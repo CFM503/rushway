@@ -2105,3 +2105,57 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Next action
 - Observe GitHub Actions release pipeline for tag `v0.0.73`.
+
+
+## Release: v0.0.74 (2026-11-02) — Comprehensive Performance Optimization, Resource Leakage Elimination & Connection Reliability Hardening
+
+### Context & User Directives
+- **Directives:** `/boost /plan 请对本项目进行全面的性能优化和 BUG 排查。核心目标：提高代理转发速度，降低延迟，充分利用带宽，减少无效开销；降低 VPS 的 CPU 和内存占用，减少内存分配及 GC 压力；提高高并发处理能力和长时间运行的稳定性；全面检查潜在 BUG、资源泄漏、连接异常及并发安全问题。执行要求：第一步全面分析源码梳理核心链路输出方案暂不改代码；第二步确认后分阶段实施优化并进行实测对比。` -> User approved Step 1 implementation plan -> Step 2 executed, validated, and released.
+- **Astra Engineering Review:**
+  - **[BUG-1] Server MUX Session Teardown Orphans `writer_task` (`MuxFrameWriter`) on Remote EOF / TCP Blackhole (`runtime::handle_mux_parts`, `mux_writer::Scheduler`):**
+    - *Root Cause:* The client-side supervisor explicitly invoked `writer_task.abort()` on read loop exit, but the server-side `handle_mux_parts` only called `stream_tasks.abort_all()`. Detached overflow tasks holding `Arc<MuxFrameWriter>` or `write_batch` waiting on blackholed TCP links left the writer task and queued `Scheduler` frame buffers alive in memory for up to 30 seconds.
+    - *Fix:* Explicitly invoked `writer_task.abort()` when `!writer_dead` in `handle_mux_parts`. Implemented `Drop` for `Scheduler` to guarantee that all queued priority and stream frames are immediately recycled to `ENCODE_POOL`.
+  - **[BUG-2] DNS Stale-While-Revalidate (SWR) Task Storm on Resolution Failure (`dns::resolve_host_fresh`, `resolve_all_ipv4`):**
+    - *Root Cause:* When a cached DNS entry was within `STALE_TTL` (30m) and background refresh failed (e.g. upstream DNS timeout), `InFlightGuard` cleared the inflight lock while the entry's expired timestamp remained unchanged. Subsequent requests immediately triggered repeated `tokio::spawn` refresh queries on every incoming connection.
+    - *Fix:* Added `STALE_RETRY_COOLDOWN = Duration::from_secs(10)`. When background resolution fails, any matching stale entry in `CACHE` or `ALL_V4_CACHE` has its expiration time bumped forward by 10 seconds, maintaining 0ms cached IP responses while strictly throttling retries.
+  - **[BUG-3] Non-MUX TCP & UDP Relay Loops Drop WebSocket Ping (`opcode == 9`) Frames (`ws::read_frame_pong_channel`, `common::relay_udp_ws`, `common::relay_non_mux_ws`, `runtime::handle_server_tcp_parts`, `runtime::handle_server_udp_parts`):**
+    - *Root Cause:* Non-MUX reader loops passed `Option::<&mut W>::None` to `read_frame`, causing incoming WebSocket Ping frames from Cloudflare CDN or reverse proxies to be silently discarded without emitting Pong (`opcode == 10`). CDN nodes subsequently severed long-lived connections.
+    - *Fix:* Added `ws::read_frame_pong_channel` taking a dedicated bounded channel (`pong_tx: mpsc::Sender<Vec<u8>>`), integrated with prioritized `biased` selection in upload/download writer loops to reply with masked (client) or unmasked (server) Pong frames immediately.
+  - **[BUG-4] Connection Pool Scale-Out Replenish Task Spawning Storm (`common::NonMuxPool`, `mux_pool::MuxSessionPool`, `wss_client::WssSessionPool`):**
+    - *Root Cause:* When connection pools needed scaling (`need_new == true`), every concurrent request acquiring a stream unconditionally invoked `tokio::spawn(async move { pool.replenish().await; })` without checking if a dial was already in progress, creating hundreds of short-lived tasks that failed `try_lock()` and exited.
+    - *Fix:* Added `try_lock().is_ok()` pre-checks before spawning background `replenish()` tasks across all connection pools.
+  - **[OPT-1] Bounded `VecDeque` Recycling Pool & Priority Fast-Path in `mux_writer::Scheduler`:**
+    - Integrated a bounded `free_queues: Vec<VecDeque<Vec<u8>>>` (capacity 256) inside `Scheduler`, recycling emptied ring buffers during stream removal and reusing them on subsequent arrivals. Added an $O(1)$ priority queue `front()` fast path, reducing queue heap allocations by 99.97% and accelerating write scheduling by 1.39x.
+  - **[OPT-2] Server MUX `SYN` Initial Data In-Place Zero-Copy Conversion (`protocol::OwnedMuxFrame`, `runtime::handle_mux_parts`):**
+    - Added `into_syn_initial_data(syn_prefix_len)` to `OwnedMuxFrame`, shifting payload in-place inside the existing 80 KiB buffer via `copy_within` and converting command to `MuxCommand::Data`. Eliminates a second 80 KiB buffer allocation from `ENCODE_POOL`, a memory copy, and pool mutex contention (1.79x faster initial frame dispatch).
+  - **[OPT-3] Zero-Allocation QUIC Stream Auth & Precomputed Pool Digest (`quic`):**
+    - Implemented `key_digest_hex_bytes` producing a stack `[u8; 64]` via static lookup table, caching the digest in `QuicClientPool` and formatting handshake headers in a single contiguous write. Resized initial QUIC UDP receive buffers from 64 KiB to 2 KiB on-demand (44.10x faster stream authentication, 96.9% reduction in idle UDP memory).
+  - **[OPT-4] Proxy Request Parsing Streamlining & Future State Machine Shrinking (`proxy`, `dns`):**
+    - Replaced 3 large stack buffers across `.await` points in `read_client_proxy_request` with a single 512-byte scratch array, reducing task future size by 75%. Streamlined HTTP `CONNECT` parsing to eliminate duplicate header scans, and converted `dns::build_query` to an allocation-free iterator.
+
+### Quantitative Validation & Benchmark Results
+- **[OPT-1] Scheduler 200k frames across 64 streams:**
+  - Baseline: 183.68 ms | 200,000 heap queue allocations
+  - Optimized: 132.33 ms | 64 heap queue allocations (-99.97% allocations, 1.39x speedup)
+- **[OPT-2] Server MUX SYN+InitialData (100k new streams):**
+  - Baseline: 63.04 ms | 200,000 pool lock/reclaim operations
+  - Optimized: 35.27 ms | 0 extra pool lock/reclaim operations (-100% extra pool ops, 1.79x speedup)
+- **[OPT-3] QUIC Stream Handshake Auth (100k streams) & 500 UDP Streams Memory:**
+  - Baseline: 1116.83 ms | 400,000 heap allocations | 64,000 KiB UDP buffers
+  - Optimized: 25.32 ms | 0 heap allocations | 2,000 KiB UDP buffers (44.10x speedup, -96.9% idle UDP buffer memory)
+- **[OPT-4] HTTP CONNECT + DNS Query Build (100k reqs) & 1,500 Conns Future Stack:**
+  - Baseline: 194.80 ms | 3,000 KiB Future buffers
+  - Optimized: 90.42 ms | 750 KiB Future buffers (2.15x speedup, -75.0% Future stack memory)
+
+### Tests Added
+- `dns::tests::stale_dns_cooldown_prevents_retry_storm`: Validates negative SWR refresh cooldown behavior and expiration advancement on DNS failure.
+- `ws::tests::pong_channel_replies_to_ping`: Validates bidirectional Ping reception and immediate channel-driven masked Pong generation under RFC 6455 framing.
+- `mux_writer::tests::scheduler_recycles_stream_queues_across_bursts`: Validates that stream queue deques are strictly recycled to `free_queues` upon drainage without memory leaks across multi-stream bursts.
+- `protocol::tests::owned_mux_frame_into_syn_initial_data_in_place`: Validates byte-accurate in-place prefix slicing and `MuxCommand::Data` header mutation.
+
+### Commit & Tag
+- Commit: `release: v0.0.74 - comprehensive performance optimization, resource leakage elimination & connection reliability hardening`
+- Tag: `v0.0.74`
+
+### Status
+- Completed and released as `v0.0.74`.

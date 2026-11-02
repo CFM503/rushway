@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.73";
+pub const APP_VERSION: &str = "0.0.74";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -1086,14 +1086,24 @@ where
     let udp_send = udp.clone();
     let c_send = c.clone();
     let latest_send = latest.clone();
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut batch = crate::udp_batch::UdpBatchReader::new(udp_send);
         let mut packet = Vec::with_capacity(2048);
         let mut local_established: Option<SocketAddr> = None;
         loop {
-            let count = match batch.recv().await {
-                Ok(n) => n,
-                Err(_) => break,
+            let count = tokio::select! {
+                biased;
+                Some(pong) = pong_rx.recv() => {
+                    if wr.write_all(&pong).await.is_err() || wr.flush().await.is_err() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    continue;
+                }
+                res = batch.recv() => match res {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
             };
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
@@ -1144,9 +1154,10 @@ where
         _ = &mut upload => {}
         _ = async {
             loop {
-                let Some((opcode, packet)) = crate::ws::read_frame_with_cipher(
+                let Some((opcode, packet)) = crate::ws::read_frame_pong_channel(
                     &mut rd,
-                    Option::<&mut W>::None,
+                    &pong_tx,
+                    true,
                     &mut frame_buf,
                     Some(&c),
                 )
@@ -1606,7 +1617,7 @@ where
             let low = conns.len() < non_mux_pool_size() / 2;
             (p, low)
         };
-        if need_refill {
+        if need_refill && self.creation.try_lock().is_ok() {
             let pool = self.clone();
             tokio::spawn(async move {
                 pool.replenish().await;
@@ -1815,11 +1826,20 @@ where
         crate::stats::add_bytes(initial.len() as i64, 0);
         write_frame(&mut wr, &initial, 2, true).await?;
     }
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         let res: Result<()> = async {
             loop {
-                let n = local_rd.read(&mut buf).await?;
+                let n = tokio::select! {
+                    biased;
+                    Some(pong) = pong_rx.recv() => {
+                        wr.write_all(&pong).await?;
+                        wr.flush().await?;
+                        continue;
+                    }
+                    r = local_rd.read(&mut buf) => r?,
+                };
                 if n == 0 {
                     let _ = write_frame(&mut wr, &[], 8, true).await;
                     break;
@@ -1839,7 +1859,7 @@ where
         loop {
             let next_frame = if !upload_done {
                 tokio::select! {
-                    r = read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf) => r?,
+                    r = crate::ws::read_frame_pong_channel(&mut rd, &pong_tx, true, &mut frame_buf, None) => r?,
                     up_res = &mut upload => {
                         upload_done = true;
                         match up_res {
@@ -1850,7 +1870,7 @@ where
                     }
                 }
             } else {
-                read_frame(&mut rd, Option::<&mut W>::None, &mut frame_buf).await?
+                crate::ws::read_frame_pong_channel(&mut rd, &pong_tx, true, &mut frame_buf, None).await?
             };
             let Some((opcode, payload)) = next_frame else {
                 remote_eof = true;
@@ -2799,6 +2819,7 @@ use tokio::time::timeout;
 const RESOLVE_TIMEOUT: Duration = Duration::from_millis(1500);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const STALE_TTL: Duration = Duration::from_secs(30 * 60);
+const STALE_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
 const CACHE_MAX_ENTRIES: usize = 4096;
@@ -3007,6 +3028,14 @@ async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAd
             Ok(resolved)
         }
         Err(e) => {
+            if let Ok(mut guard) = cache().write() {
+                let now = Instant::now();
+                if let Some(entry) = guard.get_mut(&key) {
+                    if entry.1 <= now && now.duration_since(entry.1) < STALE_TTL {
+                        entry.1 = now + STALE_RETRY_COOLDOWN;
+                    }
+                }
+            }
             if let Some(sender) = tx {
                 let _ = sender.send(Some(None));
             }
@@ -3125,6 +3154,14 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
             let _ = leader_tx.send(Some(None));
         }
         if let Some(stale) = stale_fallback {
+            if let Ok(mut guard) = all_v4_cache().write() {
+                let now = Instant::now();
+                if let Some(entry) = guard.get_mut(&key) {
+                    if entry.1 <= now && now.duration_since(entry.1) < STALE_TTL {
+                        entry.1 = now + STALE_RETRY_COOLDOWN;
+                    }
+                }
+            }
             return Ok(stale);
         }
         bail!("no IPv4 addresses resolved for {host}");
@@ -3327,24 +3364,23 @@ fn validate_transaction_id(buf: &[u8], expected: u16) -> Result<()> {
 }
 
 fn build_query(host: &str, qtype: u16) -> Result<Vec<u8>> {
-    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
-    if labels.is_empty()
-        || labels
-            .iter()
-            .any(|label| label.is_empty() || label.len() > 63)
-    {
+    let trimmed = host.trim_end_matches('.');
+    if trimmed.is_empty() {
         bail!("invalid DNS hostname: {host}");
     }
     let mut id_bytes = [0u8; 2];
     rand::thread_rng().fill_bytes(&mut id_bytes);
-    let mut out = Vec::with_capacity(64);
+    let mut out = Vec::with_capacity(18 + trimmed.len());
     out.extend_from_slice(&id_bytes);
     out.extend_from_slice(&0x0100u16.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
-    for label in labels {
+    for label in trimmed.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            bail!("invalid DNS hostname: {host}");
+        }
         out.push(label.len() as u8);
         out.extend_from_slice(label.as_bytes());
     }
@@ -3684,6 +3720,32 @@ mod tests {
 
         let v4_list = resolve_all_ipv4("[::1]").await.unwrap();
         assert!(v4_list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_dns_cooldown_prevents_retry_storm() {
+        let host = "nonexistent-swr-test-cooldown.invalid";
+        let cached_ip: IpAddr = "198.51.100.42".parse().unwrap();
+        {
+            let mut guard = cache().write().unwrap();
+            guard.insert(
+                host.to_string(),
+                (cached_ip, Instant::now() - Duration::from_secs(5)),
+            );
+        }
+        // Directly invoke resolve_host_fresh for an invalid domain: it must fail
+        // and advance the stale entry's expiration by STALE_RETRY_COOLDOWN.
+        let res = resolve_host_fresh(host, host, host.to_string()).await;
+        assert!(res.is_err());
+        let refreshed_expires = {
+            let guard = cache().read().unwrap();
+            guard.get(host).copied().unwrap().1
+        };
+        assert!(
+            refreshed_expires > Instant::now(),
+            "failed SWR refresh must set retry cooldown in the future"
+        );
+        invalidate_host(host);
     }
 }
 } // mod dns
@@ -4181,7 +4243,7 @@ impl MuxSessionPool {
             if let Some(s) = chosen {
                 if let Ok(r) = s.open_stream(target, &initial_data).await {
                     recycle_encode_buf(initial_data);
-                    if need_new {
+                    if need_new && self.session_creation.try_lock().is_ok() {
                         let pool = self.clone();
                         tokio::spawn(async move {
                             pool.replenish().await;
@@ -4733,6 +4795,8 @@ impl MuxFrameWriter {
     }
 }
 
+const FREE_STREAM_QUEUES_CAP: usize = 256;
+
 struct StreamQueue {
     frames: VecDeque<Vec<u8>>,
     deficit: usize,
@@ -4749,16 +4813,30 @@ struct Scheduler {
     priority: VecDeque<(Option<u32>, bool, Vec<u8>)>,
     streams: U32HashMap<StreamQueue>,
     rotation: Vec<u32>,
+    free_queues: Vec<VecDeque<Vec<u8>>>,
     pos: usize,
     total: usize,
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if self.total == 0 && self.priority.is_empty() && self.streams.is_empty() {
+            return;
+        }
+        recycle_encode_bufs(self.priority.drain(..).map(|(_, _, b)| b));
+        for (_, q) in self.streams.drain() {
+            recycle_encode_bufs(q.frames);
+        }
+    }
 }
 
 impl Scheduler {
     fn new() -> Self {
         Self {
-            priority: VecDeque::new(),
+            priority: VecDeque::with_capacity(16),
             streams: U32HashMap::default(),
-            rotation: Vec::new(),
+            rotation: Vec::with_capacity(32),
+            free_queues: Vec::with_capacity(32),
             pos: 0,
             total: 0,
         }
@@ -4785,10 +4863,6 @@ impl Scheduler {
         if frame.priority {
             if frame.is_rst {
                 if let Some(sid) = frame.stream_id {
-                    if let Some(q) = self.streams.remove(&sid) {
-                        self.total = self.total.saturating_sub(q.frames.len());
-                        recycle_encode_bufs(q.frames);
-                    }
                     self.remove_stream(&sid);
                     // Purge any pending FIN (yield_to_data) for `sid` in `priority`
                     // so a reset stream never emits a clean FIN ahead of RST after its
@@ -4818,10 +4892,15 @@ impl Scheduler {
             self.total += 1;
             return;
         };
+        let free_queues = &mut self.free_queues;
+        let rotation = &mut self.rotation;
         let q = self.streams.entry(stream_id).or_insert_with(|| {
-            self.rotation.push(stream_id);
+            rotation.push(stream_id);
+            let frames = free_queues
+                .pop()
+                .unwrap_or_else(|| VecDeque::with_capacity(4));
             StreamQueue {
-                frames: VecDeque::new(),
+                frames,
                 deficit: 0,
             }
         });
@@ -4839,7 +4918,21 @@ impl Scheduler {
     /// DATA as unknown-stream. System frames (`None`) and controls for
     /// streams with empty queues jump immediately.
     fn next(&mut self) -> Option<Vec<u8>> {
-        if !self.priority.is_empty() {
+        if let Some(&(sid, yield_to_data, _)) = self.priority.front() {
+            let front_blocked = yield_to_data
+                && sid.is_some_and(|id| {
+                    self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
+                });
+            if !front_blocked {
+                let (sid_opt, yield_flag, frame) = self.priority.pop_front().unwrap();
+                self.total -= 1;
+                if yield_flag {
+                    if let Some(id) = sid_opt {
+                        self.remove_stream(&id);
+                    }
+                }
+                return Some(frame);
+            }
             let ready_idx =
                 self.priority
                     .iter()
@@ -4925,8 +5018,14 @@ impl Scheduler {
     }
 
     fn remove_stream(&mut self, sid: &u32) {
-        if let Some(q) = self.streams.remove(sid) {
+        if let Some(mut q) = self.streams.remove(sid) {
             self.total = self.total.saturating_sub(q.frames.len());
+            if !q.frames.is_empty() {
+                recycle_encode_bufs(q.frames.drain(..));
+            }
+            if self.free_queues.len() < FREE_STREAM_QUEUES_CAP && q.frames.capacity() <= 64 {
+                self.free_queues.push(q.frames);
+            }
         }
         if let Some(idx) = self.rotation.iter().position(|s| s == sid) {
             self.rotation.remove(idx);
@@ -5774,6 +5873,19 @@ mod tests {
         }
         assert_eq!(order, vec![2, 3, 1]);
     }
+
+    #[test]
+    fn scheduler_recycles_stream_queues_across_bursts() {
+        let mut sched = Scheduler::new();
+        for round in 0..10 {
+            for sid in 1..=16u32 {
+                sched.push(drr_frame(sid, false, 1024, (round + sid) as u8));
+            }
+            while sched.next().is_some() {}
+            assert_eq!(sched.live_stream_count(), 0);
+            assert_eq!(sched.free_queues.len(), 16);
+        }
+    }
 }
 } // mod mux_writer
 
@@ -6387,6 +6499,22 @@ impl OwnedMuxFrame {
         &self.storage[MUX_HEADER_LEN..MUX_HEADER_LEN + self.payload_len]
     }
 
+    /// Converts a `SYN` frame in-place into a `DATA` frame holding only its
+    /// trailing `initial_data` (skipping the `2 + target_len` SYN header prefix),
+    /// avoiding a second 80 KiB pool buffer acquisition and copy.
+    pub fn into_syn_initial_data(mut self, syn_prefix_len: usize) -> Self {
+        let data_len = self.payload_len.saturating_sub(syn_prefix_len);
+        let src_start = MUX_HEADER_LEN + syn_prefix_len;
+        self.storage
+            .copy_within(src_start..src_start + data_len, MUX_HEADER_LEN);
+        self.storage.truncate(MUX_HEADER_LEN + data_len);
+        self.command = MuxCommand::Data;
+        self.payload_len = data_len;
+        self.storage[4] = MuxCommand::Data.as_u8();
+        self.storage[5..7].copy_from_slice(&(data_len as u16).to_be_bytes());
+        self
+    }
+
     #[allow(dead_code)]
     pub fn into_storage(self) -> Vec<u8> {
         self.storage
@@ -6733,6 +6861,23 @@ mod tests {
         assert_eq!(frame.stream_id, 42);
         assert_eq!(frame.command, MuxCommand::Data);
         assert_eq!(frame.payload(), b"hello world");
+    }
+
+    #[test]
+    fn owned_mux_frame_into_syn_initial_data_in_place() {
+        let mut syn_body = Vec::new();
+        syn_body.extend_from_slice(&(15u16).to_be_bytes());
+        syn_body.extend_from_slice(b"example.com:443");
+        syn_body.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        let syn_frame = OwnedMuxFrame::from_parts(7, MuxCommand::Syn, &syn_body).unwrap();
+        let (target, initial) = SynPayload::decode_slices(syn_frame.payload()).unwrap();
+        assert_eq!(target, b"example.com:443");
+        assert_eq!(initial, b"GET / HTTP/1.1\r\n\r\n");
+        let prefix_len = 2 + target.len();
+        let data_frame = syn_frame.into_syn_initial_data(prefix_len);
+        assert_eq!(data_frame.stream_id, 7);
+        assert_eq!(data_frame.command, MuxCommand::Data);
+        assert_eq!(data_frame.payload(), b"GET / HTTP/1.1\r\n\r\n");
     }
 }
 } // mod protocol
@@ -7158,7 +7303,7 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
     }
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let target = parse_http_connect(buf)?;
+        let target = parse_target_authority(uri)?;
         let initial_payload = if buf.len() > end {
             Some(buf[end..].to_vec())
         } else {
@@ -7220,57 +7365,61 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
     })
 }
 
+#[inline]
+fn has_http_header_terminator(slice: &[u8]) -> bool {
+    slice.windows(4).any(|w| w == b"\r\n\r\n") || slice.windows(2).any(|w| w == b"\n\n")
+}
+
 pub async fn read_client_proxy_request<R>(stream: &mut R) -> anyhow::Result<ClientProxyRequest>
 where
     R: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    let mut initial = [0u8; 512];
-    let mut n = stream.read(&mut initial).await?;
+    let mut scratch = [0u8; 512];
+    let mut n = stream.read(&mut scratch).await?;
     if n == 0 {
         anyhow::bail!("early EOF reading client proxy request");
     }
-    if initial[0] == SOCKS5_VERSION {
+    if scratch[0] == SOCKS5_VERSION {
         while n < 2 {
-            let r = stream.read(&mut initial[n..]).await?;
+            let r = stream.read(&mut scratch[n..]).await?;
             if r == 0 {
                 anyhow::bail!("truncated SOCKS5 greeting");
             }
             n += r;
         }
-        let mlen = initial[1] as usize;
+        let mlen = scratch[1] as usize;
         let greet_len = 2 + mlen;
         while n < greet_len {
-            let r = stream.read(&mut initial[n..]).await?;
+            let r = stream.read(&mut scratch[n..]).await?;
             if r == 0 {
                 anyhow::bail!("truncated SOCKS5 auth methods");
             }
             n += r;
         }
-        if !initial[2..greet_len].contains(&0) {
+        if !scratch[2..greet_len].contains(&0) {
             stream.write_all(&[5, 0xff]).await?;
             anyhow::bail!("SOCKS5 no-auth unavailable")
         }
         stream.write_all(&[5, 0]).await?;
 
-        let mut req_buf = [0u8; 512];
         let mut req_n = n - greet_len;
         if req_n > 0 {
-            req_buf[..req_n].copy_from_slice(&initial[greet_len..n]);
+            scratch.copy_within(greet_len..n, 0);
         }
         while req_n < 5 {
-            let r = stream.read(&mut req_buf[req_n..]).await?;
+            let r = stream.read(&mut scratch[req_n..]).await?;
             if r == 0 {
                 anyhow::bail!("truncated SOCKS5 request header");
             }
             req_n += r;
         }
-        if req_buf[1] != SOCKS5_CONNECT && req_buf[1] != SOCKS5_UDP_ASSOCIATE {
+        if scratch[1] != SOCKS5_CONNECT && scratch[1] != SOCKS5_UDP_ASSOCIATE {
             stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
             anyhow::bail!("unsupported SOCKS5 command")
         }
-        let req_len = match req_buf[3] {
+        let req_len = match scratch[3] {
             1 => 10,
-            3 => 5 + (req_buf[4] as usize) + 2,
+            3 => 5 + (scratch[4] as usize) + 2,
             4 => 22,
             _ => {
                 stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
@@ -7278,13 +7427,13 @@ where
             }
         };
         while req_n < req_len {
-            let r = stream.read(&mut req_buf[req_n..]).await?;
+            let r = stream.read(&mut scratch[req_n..]).await?;
             if r == 0 {
                 anyhow::bail!("truncated SOCKS5 request target");
             }
             req_n += r;
         }
-        let parsed = match parse_socks5_request(&req_buf[..req_len]) {
+        let parsed = match parse_socks5_request(&scratch[..req_len]) {
             Ok(v) => v,
             Err(e) => {
                 let _ = stream.write_all(&socks5_failure_response()).await;
@@ -7292,7 +7441,7 @@ where
             }
         };
         let initial_payload = if req_n > req_len {
-            Some(req_buf[req_len..req_n].to_vec())
+            Some(scratch[req_len..req_n].to_vec())
         } else {
             None
         };
@@ -7306,23 +7455,18 @@ where
     }
 
     let mut buf = Vec::with_capacity(512);
-    buf.extend_from_slice(&initial[..n]);
-    let mut temp = [0u8; 1024];
-    while !(buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n"))
-        && buf.len() < 8192
-    {
+    buf.extend_from_slice(&scratch[..n]);
+    let mut complete = has_http_header_terminator(&buf);
+    while !complete && buf.len() < 8192 {
         let prev_len = buf.len();
-        let max_to_read = (8192 - prev_len).min(temp.len());
-        let r = stream.read(&mut temp[..max_to_read]).await?;
+        let max_to_read = (8192 - prev_len).min(scratch.len());
+        let r = stream.read(&mut scratch[..max_to_read]).await?;
         if r == 0 {
             break;
         }
-        buf.extend_from_slice(&temp[..r]);
+        buf.extend_from_slice(&scratch[..r]);
         let scan_start = prev_len.saturating_sub(3);
-        let tail = &buf[scan_start..];
-        if tail.windows(4).any(|w| w == b"\r\n\r\n") || tail.windows(2).any(|w| w == b"\n\n") {
-            break;
-        }
+        complete = has_http_header_terminator(&buf[scan_start..]);
     }
     let req = parse_http_proxy_request(&buf).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(ClientProxyRequest {
@@ -7816,16 +7960,24 @@ async fn read_quic_line_with_extra(
 }
 
 
+/// SHA-256 of `key` as 64 lowercase ASCII hex bytes on the stack (zero heap allocation).
+fn key_digest_hex_bytes(key: &str) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+    let mut out = [0u8; 64];
+    for (i, &b) in digest.as_ref().iter().enumerate() {
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    out
+}
+
 /// SHA-256 of `key` as lowercase hex: the only key form a client puts on the
 /// wire, so a plaintext key never traverses an untrusted hop.
+#[allow(dead_code)]
 fn key_digest_hex(key: &str) -> String {
-    use std::fmt::Write as _;
-    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
-    let mut hex = String::with_capacity(2 * digest.as_ref().len());
-    for byte in digest.as_ref() {
-        let _ = write!(hex, "{:02x}", byte);
-    }
-    hex
+    let bytes = key_digest_hex_bytes(key);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 /// Byte-wise XOR-fold equality for the auth line (std-only; the fold avoids
 /// memcmp's early-exit on key material).
@@ -7835,16 +7987,22 @@ fn line_eq(a: &str, b: &str) -> bool {
 /// First-line QUIC auth: the SHA-256 hex digest of the configured key is the
 /// primary form; the legacy inline plaintext key stays accepted for
 /// plaintext-only peers (GoWay interop).
-fn quic_auth_matches(presented: &str, configured: &Zeroizing<String>) -> bool {
-    if line_eq(presented, &key_digest_hex(configured)) {
+fn quic_auth_matches_str(presented: &str, configured: &str) -> bool {
+    let digest_bytes = key_digest_hex_bytes(configured);
+    let digest_str = std::str::from_utf8(&digest_bytes).unwrap_or("");
+    if line_eq(presented, digest_str) {
         return true;
     }
-    if line_eq(presented, configured.as_str()) {
+    if line_eq(presented, configured) {
         tracing::warn!("QUIC peer authenticated with a legacy inline plaintext key");
         true
     } else {
         false
     }
+}
+#[allow(dead_code)]
+fn quic_auth_matches(presented: &str, configured: &Zeroizing<String>) -> bool {
+    quic_auth_matches_str(presented, configured.as_str())
 }
 /// True when a first-line response reads as an auth rejection ("...AUTH...")
 /// rather than a downstream failure (dial, target policy): only this shape
@@ -7951,6 +8109,7 @@ struct QuicClientPool {
     connection: Arc<StdMutex<Option<Connection>>>,
     dial_lock: Arc<Mutex<()>>,
     timeout_secs: u64,
+    key_digest: Option<[u8; 64]>,
     /// Latched once an upstream explicitly rejects the key digest with an
     /// auth error: later connections start on the legacy inline key so the
     /// failed digest handshake is paid once per process, not per connection.
@@ -7964,6 +8123,7 @@ impl QuicClientPool {
         server_addr: std::net::SocketAddr,
         server_name: String,
         timeout_secs: u64,
+        key: Option<&str>,
     ) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
@@ -7974,8 +8134,14 @@ impl QuicClientPool {
             connection: Arc::new(StdMutex::new(None)),
             dial_lock: Arc::new(Mutex::new(())),
             timeout_secs,
+            key_digest: key.map(key_digest_hex_bytes),
             needs_plaintext: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+    fn key_digest_str(&self) -> Option<&str> {
+        self.key_digest
+            .as_ref()
+            .and_then(|b| std::str::from_utf8(b).ok())
     }
     async fn current_or_resolve_addr(&self) -> std::net::SocketAddr {
         if let Ok(addr) = dns::resolve_socket(&self.upstream_host, self.upstream_port).await {
@@ -8104,13 +8270,27 @@ async fn relay_quic(
     let mut extra_down = Vec::new();
     let mut retried = pool.plaintext_needed();
     let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
+    let mut header_buf = Vec::with_capacity(128);
     loop {
-        let header = match key.as_deref() {
-            Some(k) if retried => format!("{} {}\n", k, target),
-            Some(k) => format!("{} {}\n", key_digest_hex(k), target),
-            None => format!("{}\n", target),
-        };
-        send.write_all(header.as_bytes()).await?;
+        header_buf.clear();
+        match key.as_deref() {
+            Some(k) if retried => {
+                header_buf.extend_from_slice(k.as_bytes());
+                header_buf.push(b' ');
+            }
+            Some(k) => {
+                if let Some(cached) = pool.key_digest_str() {
+                    header_buf.extend_from_slice(cached.as_bytes());
+                } else {
+                    header_buf.extend_from_slice(&key_digest_hex_bytes(k));
+                }
+                header_buf.push(b' ');
+            }
+            None => {}
+        }
+        header_buf.extend_from_slice(target.as_bytes());
+        header_buf.push(b'\n');
+        send.write_all(&header_buf).await?;
         let mut no_response = false;
         match timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192)).await {
             Ok(Ok((line, extra))) => {
@@ -8277,13 +8457,25 @@ async fn relay_quic_udp(
     let mut ok = String::new();
     let mut extra_down = Vec::new();
     let mut retried = pool.plaintext_needed();
+    let mut header_buf = Vec::with_capacity(80);
     loop {
-        let header = match key.as_deref() {
-            Some(k) if retried => format!("{} UDP\n", k),
-            Some(k) => format!("{} UDP\n", key_digest_hex(k)),
-            None => "UDP\n".to_string(),
-        };
-        send.write_all(header.as_bytes()).await?;
+        header_buf.clear();
+        match key.as_deref() {
+            Some(k) if retried => {
+                header_buf.extend_from_slice(k.as_bytes());
+                header_buf.extend_from_slice(b" UDP\n");
+            }
+            Some(k) => {
+                if let Some(cached) = pool.key_digest_str() {
+                    header_buf.extend_from_slice(cached.as_bytes());
+                } else {
+                    header_buf.extend_from_slice(&key_digest_hex_bytes(k));
+                }
+                header_buf.extend_from_slice(b" UDP\n");
+            }
+            None => header_buf.extend_from_slice(b"UDP\n"),
+        }
+        send.write_all(&header_buf).await?;
         let mut no_response = false;
         let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
         match timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192)).await {
@@ -8359,7 +8551,7 @@ async fn relay_quic_udp(
         }
         Ok::<(), anyhow::Error>(())
     }));
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = Vec::with_capacity(2048);
     let mut dummy = [0u8; 1];
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
     let mut stash: &[u8] = &extra_down;
@@ -8443,6 +8635,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         server_addr,
         server_name,
         cfg.connection_timeout,
+        cfg.key.as_deref(),
     );
     let warm_pool = pool.clone();
     tokio::spawn(async move {
@@ -8630,11 +8823,11 @@ async fn handle_server_stream(
     let (line, extra_initial) = timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192))
         .await
         .context("QUIC server stream header timeout")??;
-    let target_str = if let Some(key) = cfg.key.as_ref().map(|k| Zeroizing::new(k.clone())) {
+    let target_str = if let Some(key) = cfg.key.as_deref() {
         let mut parts = line.splitn(2, ' ');
         let k = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
-        if !quic_auth_matches(k, &key) {
+        if !quic_auth_matches_str(k, key) {
             send.write_all(b"ERR: AUTH_FAILED\n").await?;
             let _ = send.finish();
             bail!("QUIC authentication failed");
@@ -8814,7 +9007,7 @@ async fn handle_server_udp_stream(
         }
         Ok::<(), anyhow::Error>(())
     }));
-    let mut frame_buf = Vec::with_capacity(64 * 1024);
+    let mut frame_buf = Vec::with_capacity(2048);
     let mut batch_writer = UdpBatchWriter::new(udp.clone());
     let mut stash: &[u8] = &extra_initial;
     let mut last_addr: Option<std::net::SocketAddr> = None;
@@ -9117,7 +9310,7 @@ use crate::protocol::{
 use crate::proxy::{parse_socks5_udp_datagram_borrowed, parse_target_authority, TargetAddr};
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
 use crate::ws::{
-    build_server_handshake_response, encode_ws_frame, read_frame, read_frame_with_cipher,
+    build_server_handshake_response, encode_ws_frame, read_frame_with_cipher,
     validate_server_handshake, write_frame, write_frame_borrowed,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -10013,14 +10206,10 @@ where
                         continue;
                     }
 
-                    let initial_frame = if !initial_data.is_empty() {
-                        let res = OwnedMuxFrame::from_parts(
-                            stream_id,
-                            MuxCommand::Data,
-                            initial_data,
-                        );
-                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                        Some(res.map_err(|e| anyhow!(e.to_string()))?)
+                    let syn_prefix_len = 2 + target_bytes.len();
+                    let has_initial_data = !initial_data.is_empty();
+                    let initial_frame = if has_initial_data {
+                        Some(frame.into_syn_initial_data(syn_prefix_len))
                     } else {
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         None
@@ -10594,6 +10783,9 @@ where
     }
 
     stream_tasks.abort_all();
+    if !writer_dead {
+        writer_task.abort();
+    }
 
     streams.write().unwrap_or_else(|e| e.into_inner()).clear();
 
@@ -10641,10 +10833,19 @@ where
     write_frame(&mut wr, &ok, 2, false).await?;
     let (mut target_rd, mut target_wr) = target_stream.into_split();
     let buffer_size = cfg.buffer_size;
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let mut download = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         loop {
-            let n = target_rd.read(&mut buf).await?;
+            let n = tokio::select! {
+                biased;
+                Some(pong) = pong_rx.recv() => {
+                    wr.write_all(&pong).await?;
+                    wr.flush().await?;
+                    continue;
+                }
+                r = target_rd.read(&mut buf) => r?,
+            };
             if n == 0 {
                 let _ = write_frame(&mut wr, &[], 8, false).await;
                 break;
@@ -10669,19 +10870,23 @@ where
                             _ => break,
                         }
                     }
-                    r = read_frame(
+                    r = crate::ws::read_frame_pong_channel(
                         &mut rd,
-                        Option::<&mut W>::None,
+                        &pong_tx,
+                        false,
                         &mut frame_buf,
+                        None,
                     ) => r,
                 }
             } else {
                 match timeout(
                     drain_wait,
-                    read_frame(
+                    crate::ws::read_frame_pong_channel(
                         &mut rd,
-                        Option::<&mut W>::None,
+                        &pong_tx,
+                        false,
                         &mut frame_buf,
+                        None,
                     ),
                 )
                 .await
@@ -10764,13 +10969,23 @@ where
     let udp_send = udp.clone();
     let known_send = known_targets.clone();
     let cipher_send = cipher.clone();
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let mut send_task = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
         let mut packet = Vec::with_capacity(2048);
         loop {
-            let count = match batch.recv().await {
-                Ok(n) => n,
-                Err(_) => break,
+            let count = tokio::select! {
+                biased;
+                Some(pong) = pong_rx.recv() => {
+                    if wr.write_all(&pong).await.is_err() || wr.flush().await.is_err() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    continue;
+                }
+                res = batch.recv() => match res {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
             };
             for i in 0..count {
                 let (pkt, source) = batch.packet(i);
@@ -10802,9 +11017,10 @@ where
         _ = &mut send_task => Ok::<(), anyhow::Error>(()),
         res = async {
             loop {
-                let Some((opcode, packet)) = read_frame_with_cipher(
+                let Some((opcode, packet)) = crate::ws::read_frame_pong_channel(
                     &mut rd,
-                    Option::<&mut W>::None,
+                    &pong_tx,
+                    false,
                     &mut frame_buf,
                     Some(&cipher),
                 )
@@ -14030,7 +14246,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    read_frame_inner(r, reply, None, buf, cipher).await
+    read_frame_inner(r, reply, None, None, buf, cipher).await
 }
 
 pub(crate) async fn read_frame_mux<R>(
@@ -14047,6 +14263,28 @@ where
         r,
         Option::<&mut tokio::io::Sink>::None,
         Some((writer, masked_pong)),
+        None,
+        buf,
+        cipher,
+    )
+    .await
+}
+
+pub(crate) async fn read_frame_pong_channel<R>(
+    r: &mut R,
+    pong_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    masked_pong: bool,
+    buf: &mut Vec<u8>,
+    cipher: Option<&crate::crypto::XorCipher>,
+) -> Result<Option<(u8, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+{
+    read_frame_inner(
+        r,
+        Option::<&mut tokio::io::Sink>::None,
+        None,
+        Some((pong_tx, masked_pong)),
         buf,
         cipher,
     )
@@ -14058,6 +14296,7 @@ async fn read_frame_inner<R, W>(
     r: &mut R,
     mut reply: Option<&mut W>,
     pong_writer: Option<(&std::sync::Arc<crate::mux_writer::MuxFrameWriter>, bool)>,
+    pong_tx: Option<(&tokio::sync::mpsc::Sender<Vec<u8>>, bool)>,
     buf: &mut Vec<u8>,
     cipher: Option<&crate::crypto::XorCipher>,
 ) -> Result<Option<(u8, Vec<u8>)>>
@@ -14201,6 +14440,10 @@ where
                 } else if let Some((writer, masked_pong)) = pong_writer {
                     if let Ok(pong) = encode_ws_frame(buf, 0xA, masked_pong) {
                         writer.try_send_system(pong);
+                    }
+                } else if let Some((tx, masked_pong)) = pong_tx {
+                    if let Ok(pong) = encode_ws_frame(buf, 0xA, masked_pong) {
+                        let _ = tx.try_send(pong);
                     }
                 }
             }
@@ -14432,6 +14675,32 @@ mod tests {
         assert_eq!(opcode, 2);
         assert_eq!(owned, vec![23u8; 70000]);
         assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pong_channel_replies_to_ping() {
+        let (mut a, mut b) = duplex(4096);
+        let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let writer = tokio::spawn(async move {
+            write_frame(&mut a, b"keepalive", 9, false).await.unwrap();
+            write_frame(&mut a, b"payload", 2, false).await.unwrap();
+        });
+        let mut buf = Vec::new();
+        let (opcode, payload) = read_frame_pong_channel(&mut b, &pong_tx, true, &mut buf, None)
+            .await
+            .unwrap()
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(opcode, 2);
+        assert_eq!(payload, b"payload");
+        let pong_wire = pong_rx.try_recv().expect("expected queued Pong frame");
+        // Client Pong frame: FIN|Pong (0x8A), MASK|len(9) (0x89), 4-byte mask key, 9-byte masked body
+        assert_eq!(pong_wire[0], 0x8A);
+        assert_eq!(pong_wire[1], 0x80 | 9);
+        let key: [u8; 4] = pong_wire[2..6].try_into().unwrap();
+        let mut body = pong_wire[6..].to_vec();
+        apply_ws_mask(&mut body, key);
+        assert_eq!(body, b"keepalive");
     }
 
     #[tokio::test]
@@ -15196,7 +15465,7 @@ impl WssSessionPool {
             if let Some(session) = chosen {
                 if let Ok(opened) = session.open_stream(target, &initial_data).await {
                     recycle_encode_buf(initial_data);
-                    if need_new {
+                    if need_new && self.session_creation.try_lock().is_ok() {
                         let pool = self.clone();
                         tokio::spawn(async move {
                             pool.replenish().await;
