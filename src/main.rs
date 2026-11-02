@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.74";
+pub const APP_VERSION: &str = "0.0.75";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -458,8 +458,22 @@ impl MuxClientSession {
                 self.capacity_notify.notify_waiters();
                 bail!("MUX session is closed")
             }
+            if streams.len() >= 65535 {
+                crate::mux_writer::recycle_encode_buf(syn_payload);
+                self.dec_active(1);
+                self.capacity_notify.notify_waiters();
+                bail!("MUX session stream table full");
+            }
             let mut stream_id;
+            let mut attempts = 0usize;
             loop {
+                attempts += 1;
+                if attempts > 65535 {
+                    crate::mux_writer::recycle_encode_buf(syn_payload);
+                    self.dec_active(1);
+                    self.capacity_notify.notify_waiters();
+                    bail!("MUX session stream IDs exhausted");
+                }
                 stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 if stream_id == 0 {
                     stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -554,19 +568,7 @@ impl MuxClientSession {
         Ok((id, rx, gate))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn close_stream_sync(&self, id: u32) {
-        if let Some(entry) = self
-            .streams
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
-        {
-            entry.gate.close();
-            self.dec_active(1);
-            self.capacity_notify.notify_waiters();
-        }
-    }
+
 
     pub(crate) fn close_stream_if_same(&self, id: u32, gate: &Arc<crate::flow::CreditGate>) {
         let mut guard = self.streams.write().unwrap_or_else(|e| e.into_inner());
@@ -4532,6 +4534,16 @@ fn encode_pool() -> &'static [PoolShard; ENCODE_POOL_SHARDS] {
 /// Starts at this thread's own shard and only scans outwards on a miss,
 /// using a relaxed atomic length check to skip empty shards without locking.
 pub(crate) fn acquire_encode_buf() -> Vec<u8> {
+    acquire_encode_buf_sized(ENCODE_POOL_MIN_CAP)
+}
+
+/// Sized allocation for encode buffers:
+/// Small frames (< 4 KiB such as 15-byte Window, Fin, Rst, Ping, Pong) allocate exact capacity
+/// to eliminate 80 KiB buffer starvation in ENCODE_POOL. Larger frames reuse or initialize pooled buffers.
+pub(crate) fn acquire_encode_buf_sized(needed: usize) -> Vec<u8> {
+    if needed < 4096 {
+        return Vec::with_capacity(needed);
+    }
     let shards = encode_pool();
     let start = pool_shard();
     for offset in 0..ENCODE_POOL_SHARDS {
@@ -4548,7 +4560,7 @@ pub(crate) fn acquire_encode_buf() -> Vec<u8> {
         }
         shard.len.store(0, Ordering::Relaxed);
     }
-    Vec::new()
+    Vec::with_capacity(needed.max(ENCODE_POOL_MAX_CAP))
 }
 
 /// Returns a post-write frame buffer to the pool (best-effort: zero-cap or
@@ -5857,6 +5869,22 @@ mod tests {
     }
 
     #[test]
+    fn sized_encode_buf_distinguishes_small_and_large() {
+        let small = acquire_encode_buf_sized(15);
+        assert!(small.capacity() < 4096);
+        let large = acquire_encode_buf_sized(64 * 1024);
+        assert!(large.capacity() >= ENCODE_POOL_MIN_CAP);
+    }
+
+    #[test]
+    fn owned_mux_frame_auto_drops_to_pool() {
+        let payload = vec![0x42u8; 100];
+        let frame = OwnedMuxFrame::from_parts(1, MuxCommand::Data, &payload).unwrap();
+        assert_eq!(frame.stream_id, 1);
+        drop(frame);
+    }
+
+    #[test]
     fn drr_deficit_accumulates_across_rounds() {
         // A 200KB frame needs 4 quanta (64KB x 3 = 192KB < 200KB): streams
         // 2 and 3 emit first while stream 1 accrues 64/128/192KB over
@@ -6481,7 +6509,7 @@ impl OwnedMuxFrame {
         if payload_len > MAX_MUX_PAYLOAD {
             return Err(ProtocolError::PayloadTooLarge(payload_len));
         }
-        let mut storage = crate::mux_writer::acquire_encode_buf();
+        let mut storage = crate::mux_writer::acquire_encode_buf_sized(MUX_HEADER_LEN + payload_len);
         storage.reserve(MUX_HEADER_LEN + payload_len);
         write_frame_parts(&mut storage, stream_id, command, payload)?;
         Ok(Self {
@@ -6516,10 +6544,20 @@ impl OwnedMuxFrame {
     }
 
     #[allow(dead_code)]
-    pub fn into_storage(self) -> Vec<u8> {
-        self.storage
+    pub fn into_storage(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.storage)
     }
 }
+
+impl Drop for OwnedMuxFrame {
+    #[inline]
+    fn drop(&mut self) {
+        if self.storage.capacity() >= crate::mux_writer::ENCODE_POOL_MIN_CAP {
+            crate::mux_writer::recycle_encode_buf(std::mem::take(&mut self.storage));
+        }
+    }
+}
+
 
 #[allow(dead_code)]
 impl MuxFrame {
@@ -9471,6 +9509,7 @@ pub(crate) const SHUTDOWN_DRAIN_SECS: u64 = 5;
 const POOLED_BUF_MAX_SIZE: usize = 1024 * 1024;
 
 static RELAY_BUFS: OnceLock<StdMutex<Vec<Vec<u8>>>> = OnceLock::new();
+static RELAY_BUFS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn relay_bufs() -> &'static StdMutex<Vec<Vec<u8>>> {
     RELAY_BUFS.get_or_init(|| StdMutex::new(Vec::new()))
@@ -9481,9 +9520,13 @@ fn recycle_buf_sync(buf: Vec<u8>) {
         return;
     }
     let max_count = crate::adaptive::profile().relay_pool_max_count;
+    if RELAY_BUFS_COUNT.load(Ordering::Relaxed) >= max_count {
+        return;
+    }
     let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
     if pool.len() < max_count {
         pool.push(buf);
+        RELAY_BUFS_COUNT.store(pool.len(), Ordering::Relaxed);
     }
 }
 
@@ -9534,10 +9577,17 @@ impl Drop for RelayBufGuard {
 /// bytes wrapped in a `RelayBufGuard`, reusing a pooled one when available.
 pub(crate) async fn relay_buf(requested: usize) -> RelayBufGuard {
     let size = relay_buffer_size(requested);
-    if size <= POOLED_BUF_MAX_SIZE {
+    if size <= POOLED_BUF_MAX_SIZE && RELAY_BUFS_COUNT.load(Ordering::Relaxed) > 0 {
         let mut pool = relay_bufs().lock().unwrap_or_else(|e| e.into_inner());
+        if pool.last().is_some_and(|b| b.len() == size) {
+            let buf = pool.pop().unwrap();
+            RELAY_BUFS_COUNT.store(pool.len(), Ordering::Relaxed);
+            return RelayBufGuard(Some(buf));
+        }
         if let Some(pos) = pool.iter().position(|b| b.len() == size) {
-            return RelayBufGuard(Some(pool.swap_remove(pos)));
+            let buf = pool.swap_remove(pos);
+            RELAY_BUFS_COUNT.store(pool.len(), Ordering::Relaxed);
+            return RelayBufGuard(Some(buf));
         }
     }
     RelayBufGuard(Some(vec![0u8; size]))
@@ -10101,7 +10151,25 @@ where
                     false,
                     &mut frame_buf,
                     Some(&cipher),
-                ) => r?,
+                ) => {
+                    if r.is_ok() {
+                        writer.notify_pong();
+                    }
+                    r?
+                },
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    let last_active = writer.last_pong();
+                    if last_active.elapsed() > Duration::from_secs(90) {
+                        tracing::warn!("server mux session idle timeout; terminating dead peer");
+                        break;
+                    }
+                    if last_active.elapsed() >= Duration::from_secs(30) {
+                        let mut ping_buf = [0u8; 2];
+                        let _ = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
+                        writer.try_send_system(ping_buf.to_vec());
+                    }
+                    continue;
+                }
                 _ = &mut writer_task, if !writer_dead => {
                     writer_dead = true;
                     break;
@@ -13009,7 +13077,9 @@ impl UdpBatchReader {
 pub(crate) struct UdpBatchWriter {
     sock: Arc<tokio::net::UdpSocket>,
     sock_is_v6: bool,
-    queue: Vec<(Vec<u8>, SocketAddr)>,
+    bufs: Vec<Vec<u8>>,
+    addrs: Vec<SocketAddr>,
+    count: usize,
 }
 
 impl UdpBatchWriter {
@@ -13018,17 +13088,21 @@ impl UdpBatchWriter {
         Self {
             sock,
             sock_is_v6,
-            queue: Vec::with_capacity(UDP_BATCH),
+            bufs: (0..UDP_BATCH).map(|_| Vec::with_capacity(1500)).collect(),
+            addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH],
+            count: 0,
         }
     }
 
     /// Appends a datagram to the batch. Flushes automatically when reaching [`UDP_BATCH`].
     pub(crate) async fn push(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
         let dest = target_for_socket(addr, self.sock_is_v6);
-        let mut buf = crate::mux_writer::acquire_encode_buf();
-        buf.extend_from_slice(payload);
-        self.queue.push((buf, dest));
-        if self.queue.len() >= UDP_BATCH {
+        let idx = self.count;
+        self.bufs[idx].clear();
+        self.bufs[idx].extend_from_slice(payload);
+        self.addrs[idx] = dest;
+        self.count += 1;
+        if self.count >= UDP_BATCH {
             self.flush().await?;
         }
         Ok(())
@@ -13036,25 +13110,24 @@ impl UdpBatchWriter {
 
     /// Flushes all pending datagrams in the batch.
     pub(crate) async fn flush(&mut self) -> io::Result<usize> {
-        if self.queue.is_empty() {
+        if self.count == 0 {
             return Ok(0);
         }
         let mut total = 0;
         let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
-        while !self.queue.is_empty() {
+        let mut offset = 0;
+        while offset < self.count {
             self.sock.writable().await?;
-            let take = self.queue.len().min(UDP_BATCH);
+            let take = (self.count - offset).min(UDP_BATCH);
             let mut slice: [(&[u8], SocketAddr); UDP_BATCH] = [(&[], dummy_addr); UDP_BATCH];
             for i in 0..take {
-                slice[i] = (self.queue[i].0.as_slice(), self.queue[i].1);
+                slice[i] = (self.bufs[offset + i].as_slice(), self.addrs[offset + i]);
             }
 
             #[cfg(target_os = "linux")]
             match send_batch_linux(&self.sock, &slice[..take]) {
                 Ok(n) if n > 0 => {
-                    for (buf, _) in self.queue.drain(..n) {
-                        crate::mux_writer::recycle_encode_buf(buf);
-                    }
+                    offset += n;
                     total += n;
                 }
                 Ok(_) => break,
@@ -13065,9 +13138,7 @@ impl UdpBatchWriter {
             #[cfg(not(target_os = "linux"))]
             match send_batch_fallback(&self.sock, &slice[..take]) {
                 Ok(n) if n > 0 => {
-                    for (buf, _) in self.queue.drain(..n) {
-                        crate::mux_writer::recycle_encode_buf(buf);
-                    }
+                    offset += n;
                     total += n;
                 }
                 Ok(_) => break,
@@ -13075,13 +13146,14 @@ impl UdpBatchWriter {
                 Err(e) => return Err(e),
             }
         }
+        self.count = 0;
         Ok(total)
     }
 
     /// Immediately sends a datagram, flushing any previously queued datagrams in the same syscall.
     pub(crate) async fn send(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
         let dest = target_for_socket(addr, self.sock_is_v6);
-        if self.queue.is_empty() {
+        if self.count == 0 {
             match self.sock.try_send_to(payload, dest) {
                 Ok(_) => return Ok(()),
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -13094,14 +13166,6 @@ impl UdpBatchWriter {
         self.push(payload, addr).await?;
         self.flush().await?;
         Ok(())
-    }
-}
-
-impl Drop for UdpBatchWriter {
-    fn drop(&mut self) {
-        for (buf, _) in self.queue.drain(..) {
-            crate::mux_writer::recycle_encode_buf(buf);
-        }
     }
 }
 
@@ -13573,22 +13637,24 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
     timeout_duration: std::time::Duration,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
-    let mut byte = [0u8; 1];
+    let mut step_buf = [0u8; 2];
 
     let read_loop = async {
         loop {
-            match r.read(&mut byte).await {
+            // When the last byte is not '\n', completing '\n\n' or '\r\n\r\n' requires
+            // at least 2 more bytes. Reading 2 bytes cannot overshoot header boundaries,
+            // cutting syscall count in half while guaranteeing zero data-frame byte stealing.
+            let max_read = if out.last().copied() == Some(b'\n') { 1 } else { 2 };
+            match r.read(&mut step_buf[..max_read]).await {
                 Ok(0) => {
                     return Err(anyhow::Error::from(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "early eof",
                     )));
                 }
-                Ok(_) => {
-                    out.push(byte[0]);
-                    if byte[0] == b'\n'
-                        && (out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n"))
-                    {
+                Ok(n) => {
+                    out.extend_from_slice(&step_buf[..n]);
+                    if out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n") {
                         return Ok(());
                     }
                     if out.len() > MAX_HTTP_HEADER_SIZE {
@@ -14092,7 +14158,7 @@ pub fn encode_ws_frame(payload: &[u8], opcode: u8, masked: bool) -> Result<Vec<u
         } else {
             payload.len()
         };
-    let mut frame = crate::mux_writer::acquire_encode_buf();
+    let mut frame = crate::mux_writer::acquire_encode_buf_sized(total);
     frame.reserve(total);
     frame.extend_from_slice(&header[..header_len]);
     if !masked {

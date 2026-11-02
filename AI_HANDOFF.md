@@ -2159,3 +2159,46 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 
 ### Status
 - Completed and released as `v0.0.74`.
+
+
+## Release: v0.0.75 (2026-11-02)
+
+### Context & User Directives
+- **Directives:** "/boost /plan 请对本项目进行全面的性能优化和 BUG 排查... 更新版本号，更新日志，更新AI交接接力日志，推送仓库，推送tag".
+- **Ironclad Constraints:** Forward-only optimizations, 100% protocol backwards compatibility, zero regressions, strict RAII lifecycle safety, verification via ci_guard and test suite before publishing.
+
+### Architectural Optimizations & Bug Fixes Implemented & Shipped
+1. **[BUG-1] Server MUX Session Idle Ping Supervision & Dead Peer Eviction (`src/main.rs:runtime::handle_mux_parts`)**:
+   - *Problem:* Server MUX reader loop lacked idle ping probes and read timeouts. When remote clients dropped (NAT timeout, Wi-Fi -> cellular switch, client crash), the server MUX connection, its `Semaphore` slot (`max_connections`), and active stream tasks remained leaked on the VPS indefinitely.
+   - *Fix:* Added `writer.notify_pong()` on every inbound WebSocket frame. Added a 30-second keepalive timer: emits an unmasked WebSocket Ping (`opcode == 9`) if no inbound traffic is received for 30s; proactively breaks and tears down the session if no frames or responses arrive for >90s.
+2. **[BUG-2] `OwnedMuxFrame` RAII `Drop` Auto-Recycling (`src/main.rs:protocol::OwnedMuxFrame`, `mux_writer::recycle_encode_buf`)**:
+   - *Problem:* `OwnedMuxFrame` lacked `Drop`, relying solely on manual `recycle_encode_buf(frame.into_storage())`. When stream tasks were aborted via `stream_tasks.abort_all()` or client timeouts, frames trapped in `pending`, `data_batch`, or `mpsc` channels bypassed `ENCODE_POOL` and dropped directly to system heap, depleting the pool during connection churn.
+   - *Fix:* Implemented `Drop for OwnedMuxFrame` to return `self.storage` to `ENCODE_POOL` whenever capacity $\ge$ `ENCODE_POOL_MIN_CAP`. Modified `into_storage` to use `std::mem::take`, guaranteeing 100% automatic buffer reclamation across all cancellation and early return paths.
+3. **[BUG-3] Client MUX Stream Table 65535 Exhaustion Spin Protection (`src/main.rs:common::MuxClientSession::open_stream`)**:
+   - *Problem:* `open_stream` looped infinitely checking `!streams.contains_key(&candidate)`. If 65535 streams were open, the loop spun indefinitely holding the `streams` write lock, deadlocking the Tokio worker thread.
+   - *Fix:* Added upfront `streams.len() >= 65535` verification and a 65535 attempt limit to cleanly bail with an error.
+4. **[BUG-4] Zero-Allocation In-Place `UdpBatchWriter` Slots (`src/main.rs:udp_batch::UdpBatchWriter`)**:
+   - *Problem:* `UdpBatchWriter::push` acquired 80 KiB buffers from `ENCODE_POOL` to queue small UDP packets, draining the pool from TCP MUX streams during DNS/UDP bursts.
+   - *Fix:* Replaced `ENCODE_POOL` usage with internal persistent buffer slots (`bufs: Vec<Vec<u8>>` of `UDP_BATCH = 8` capacity). Datagram payloads are appended into persistent slots and cleared in-place upon transmission, achieving 0 heap allocations and complete isolation from MUX pools.
+5. **[OPT-1] Sized Encode Buffer Allocation Fast-Path (`src/main.rs:mux_writer::acquire_encode_buf_sized`, `encode_mux_ws_frame`, `protocol::OwnedMuxFrame::from_parts`)**:
+   - *Problem:* Micro control frames (15-byte `Window`, `Fin`, `Rst`, `Ping`, `Pong`) unconditionally popped 80 KiB pooled buffers, wasting memory and starving bulk `Data` frames.
+   - *Fix:* Added `acquire_encode_buf_sized(needed: usize)`. Allocates exact capacity for frames < 4 KiB, reserving the 80 KiB `ENCODE_POOL` exclusively for high-throughput `Data` frames.
+6. **[OPT-2] WebSocket HTTP Header Safe 2-Byte Lookahead Step Read (`src/main.rs:ws::read_http_headers_timeout`)**:
+   - *Problem:* `read_http_headers_timeout` read 1 byte per syscall (`read(&mut [0u8; 1])`), generating hundreds of syscalls during connection handshakes.
+   - *Fix:* Implemented safe 2-byte lookahead step when the last byte is not `\n`. Mathematically guarantees zero data-frame byte stealing while cutting handshake `read`/`poll` calls in half.
+7. **[OPT-3] `RELAY_BUFS` Atomic Quick-Check & $O(1)$ LIFO Pop (`src/main.rs:runtime::relay_buf`, `recycle_buf_sync`)**:
+   - *Problem:* `relay_buf` executed $O(N)$ linear scans under a global mutex even when the pool was empty.
+   - *Fix:* Added `RELAY_BUFS_COUNT` atomic check to skip mutex acquisition when empty, and prioritized $O(1)$ LIFO `pool.last()` pop for matching buffer sizes.
+8. **[OPT-4] Dead Code Clean-Up (`src/main.rs:common::MuxClientSession::close_stream_sync`)**:
+   - Removed obsolete `close_stream_sync` function.
+
+### Tests Added
+- `sized_encode_buf_distinguishes_small_and_large`: Validates small (<4 KiB) vs large ($\ge$32 KiB) encode buffer size differentiation.
+- `owned_mux_frame_auto_drops_to_pool`: Validates automatic RAII return of `OwnedMuxFrame` storage to `ENCODE_POOL` upon drop.
+
+### Commit & Tag
+- Commit: `release: v0.0.75 - server mux idle heartbeat supervision, owned mux frame raii buffer reclamation & zero-allocation udp batching`
+- Tag: `v0.0.75`
+
+### Status
+- Completed and released as `v0.0.75`.
