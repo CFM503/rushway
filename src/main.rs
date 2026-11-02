@@ -4475,7 +4475,7 @@ const WRITE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// the first A/B — 32 × ~80 KiB ≈ 2.5 MiB retained ceiling.
 /// Minimum capacity worth pooling in the 80 KiB encode pool; smaller frames
 /// allocate exact capacity so queued small frames never pin 80 KiB each on low-RAM VPS.
-const ENCODE_POOL_MIN_CAP: usize = 32 * 1024;
+pub(crate) const ENCODE_POOL_MIN_CAP: usize = 32 * 1024;
 /// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
 /// ~80 KiB so a rare huge frame cannot pin memory.
 const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
@@ -10142,6 +10142,7 @@ where
     let mut stream_tasks = tokio::task::JoinSet::new();
     let mut frame_buf = Vec::new();
 
+    let mut unacked_intervals = 0u32;
     let session_res: Result<()> = async {
         loop {
             let next_ws = tokio::select! {
@@ -10153,21 +10154,20 @@ where
                     Some(&cipher),
                 ) => {
                     if r.is_ok() {
+                        unacked_intervals = 0;
                         writer.notify_pong();
                     }
                     r?
                 },
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    let last_active = writer.last_pong();
-                    if last_active.elapsed() > Duration::from_secs(90) {
+                    unacked_intervals += 1;
+                    if unacked_intervals >= 3 {
                         tracing::warn!("server mux session idle timeout; terminating dead peer");
                         break;
                     }
-                    if last_active.elapsed() >= Duration::from_secs(30) {
-                        let mut ping_buf = [0u8; 2];
-                        let _ = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
-                        writer.try_send_system(ping_buf.to_vec());
-                    }
+                    let mut ping_buf = [0u8; 2];
+                    let _ = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
+                    writer.try_send_system(ping_buf.to_vec());
                     continue;
                 }
                 _ = &mut writer_task, if !writer_dead => {
@@ -13119,13 +13119,13 @@ impl UdpBatchWriter {
         while offset < self.count {
             self.sock.writable().await?;
             let take = (self.count - offset).min(UDP_BATCH);
-            let mut slice: [(&[u8], SocketAddr); UDP_BATCH] = [(&[], dummy_addr); UDP_BATCH];
+            let mut slice: Vec<(&[u8], SocketAddr)> = Vec::with_capacity(take);
             for i in 0..take {
-                slice[i] = (self.bufs[offset + i].as_slice(), self.addrs[offset + i]);
+                slice.push((self.bufs[offset + i].as_slice(), self.addrs[offset + i]));
             }
 
             #[cfg(target_os = "linux")]
-            match send_batch_linux(&self.sock, &slice[..take]) {
+            match send_batch_linux(&self.sock, &slice) {
                 Ok(n) if n > 0 => {
                     offset += n;
                     total += n;
@@ -13136,7 +13136,7 @@ impl UdpBatchWriter {
             }
 
             #[cfg(not(target_os = "linux"))]
-            match send_batch_fallback(&self.sock, &slice[..take]) {
+            match send_batch_fallback(&self.sock, &slice) {
                 Ok(n) if n > 0 => {
                     offset += n;
                     total += n;
