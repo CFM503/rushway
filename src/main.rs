@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.76";
+pub const APP_VERSION: &str = "0.0.77";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -16,7 +16,7 @@ pub mod adaptive {
     pub struct MemProfile {
         pub detected_mib: usize,
         pub tier_name: &'static str,
-        pub mux_initial_window_kib: u16,
+        pub mux_initial_window_kib: u32,
         pub mux_window_refresh: usize,
         pub mux_stream_queue_cap: usize,
         pub encode_pool_shard_cap: usize,
@@ -35,8 +35,9 @@ pub mod adaptive {
             let mib = detect_memory_mib();
             let custom_window = std::env::var("RUSHWAY_WINDOW_KIB")
                 .ok()
-                .and_then(|v| v.trim().parse::<u16>().ok())
-                .filter(|&w| w > 0);
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&w| w > 0)
+                .map(|w| w.min(1024 * 1024));
             let mut p = if mib <= 640 {
                 MemProfile {
                     detected_mib: mib,
@@ -44,7 +45,7 @@ pub mod adaptive {
                     mux_initial_window_kib: 4096,
                     mux_window_refresh: 512 * 1024,
                     mux_stream_queue_cap: 768,
-                    encode_pool_shard_cap: 8, // 8 * 8 = 64 bufs (~5 MiB)
+                    encode_pool_shard_cap: 8, // 8 * 8 = 64 bufs
                     relay_pool_max_count: 32, // ~4 MiB
                     max_session_pending_bytes: 32 * 1024 * 1024,
                     max_stream_pending_bytes: 4 * 1024 * 1024,
@@ -58,7 +59,7 @@ pub mod adaptive {
                     mux_initial_window_kib: 16384,
                     mux_window_refresh: 2 * 1024 * 1024,
                     mux_stream_queue_cap: 1536,
-                    encode_pool_shard_cap: 16, // 8 * 16 = 128 bufs (~10 MiB)
+                    encode_pool_shard_cap: 16, // 8 * 16 = 128 bufs
                     relay_pool_max_count: 64,  // ~8 MiB
                     max_session_pending_bytes: 96 * 1024 * 1024,
                     max_stream_pending_bytes: 16 * 1024 * 1024,
@@ -69,20 +70,21 @@ pub mod adaptive {
                 MemProfile {
                     detected_mib: mib,
                     tier_name: "High-BDP",
-                    mux_initial_window_kib: 32768,
-                    mux_window_refresh: 4 * 1024 * 1024,
+                    mux_initial_window_kib: 65535,
+                    mux_window_refresh: 8 * 1024 * 1024,
                     mux_stream_queue_cap: 3072,
-                    encode_pool_shard_cap: 32, // 8 * 32 = 256 bufs (~20.5 MiB)
+                    encode_pool_shard_cap: 32, // 8 * 32 = 256 bufs
                     relay_pool_max_count: 128, // ~16 MiB
                     max_session_pending_bytes: 256 * 1024 * 1024,
-                    max_stream_pending_bytes: 32 * 1024 * 1024,
+                    max_stream_pending_bytes: 64 * 1024 * 1024,
                     max_stream_pending_frames: 512,
                     non_mux_pool_size: 32,
                 }
             };
             if let Some(win) = custom_window {
                 p.mux_initial_window_kib = win;
-                p.mux_window_refresh = ((win as usize * 1024) / 8).max(512 * 1024);
+                p.mux_window_refresh = (((win as usize).saturating_mul(1024)) / 8)
+                    .clamp(512 * 1024, 32 * 1024 * 1024);
             }
             p
         })
@@ -274,6 +276,7 @@ pub(crate) struct MuxClientSession {
     pub(crate) obfs: bool,
     pub(crate) streams: Arc<std::sync::RwLock<crate::protocol::U32HashMap<ClientStreamEntry>>>,
     pub(crate) peer_window_kib: std::sync::atomic::AtomicU32,
+    pub(crate) peer_version: std::sync::atomic::AtomicU8,
     next_id: std::sync::atomic::AtomicU32,
     pub(crate) active: std::sync::atomic::AtomicUsize,
     pub(crate) closed: std::sync::atomic::AtomicBool,
@@ -282,7 +285,7 @@ pub(crate) struct MuxClientSession {
 
 impl MuxClientSession {
     pub(crate) async fn spawn_from_parts<R>(
-        mut rd: R,
+        rd: R,
         writer: Arc<MuxFrameWriter>,
         mut writer_task: tokio::task::JoinHandle<()>,
         cipher: XorCipher,
@@ -293,10 +296,16 @@ impl MuxClientSession {
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
-        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+        let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
         let version_payload =
             crate::protocol::encode_version_payload(crate::protocol::mux_initial_window_kib());
         send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload, obfs).await?;
+        let full_win_kib = crate::protocol::mux_initial_window_kib_u32();
+        if full_win_kib > u16::MAX as u32 {
+            let ext_win = crate::protocol::encode_window_payload(full_win_kib);
+            send_mux_parts(&writer, &cipher, 0, MuxCommand::Window, &ext_win, obfs).await?;
+        }
         let state = Arc::new(Self {
             writer: writer.clone(),
             cipher,
@@ -305,6 +314,7 @@ impl MuxClientSession {
                 crate::protocol::U32HashMap::default(),
             )),
             peer_window_kib: AtomicU32::new(0),
+            peer_version: AtomicU8::new(1),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -602,6 +612,7 @@ where
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
     let mut frame_buf = Vec::new();
+    let mut coalesced = Vec::with_capacity(8);
     let res = async {
         loop {
             let Some((opcode, payload)) = crate::ws::read_frame_mux(
@@ -620,17 +631,18 @@ where
                 crate::mux_writer::recycle_encode_buf(payload);
                 continue;
             }
-            let frame = match crate::protocol::MuxFrame::decode_owned(payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            if crate::protocol::MuxFrame::decode_v2_coalesced(payload, state.obfs, &mut coalesced).is_err() {
+                continue;
+            }
+            for frame in coalesced.drain(..) {
             match frame.command {
                 MuxCommand::Version => {
                     let decoded = crate::protocol::decode_version_payload(frame.payload());
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some((version, kib)) = decoded {
                         if version >= 1 {
-                            let prev = state.peer_window_kib.swap(kib as u32, Ordering::AcqRel);
+                            state.peer_version.store(version, Ordering::Release);
+                            let prev = state.peer_window_kib.fetch_max(kib as u32, Ordering::AcqRel);
                             if prev == 0 {
                                 let streams =
                                     state.streams.read().unwrap_or_else(|e| e.into_inner());
@@ -639,7 +651,7 @@ where
                                     entry.gate.enable(window);
                                 }
                                 drop(streams);
-                                tracing::debug!(kib, "peer VERSION received; send window enabled");
+                                tracing::debug!(version, kib, "peer VERSION received; send window enabled");
                             }
                         }
                     }
@@ -647,6 +659,19 @@ where
                 }
                 MuxCommand::Window => {
                     let stream_id = frame.stream_id;
+                    if stream_id == 0 {
+                        let decoded_kib = crate::protocol::decode_session_window_kib(frame.payload());
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                        if let Some(kib32) = decoded_kib {
+                            state.peer_window_kib.store(kib32, Ordering::Release);
+                            let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
+                            let window = i64::from(kib32) * 1024;
+                            for entry in streams.values() {
+                                entry.gate.enable(window);
+                            }
+                        }
+                        continue;
+                    }
                     let decoded = crate::protocol::decode_window_payload(frame.payload());
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some(credit) = decoded {
@@ -766,6 +791,7 @@ where
                     crate::mux_writer::recycle_encode_buf(f.into_storage());
                     state.close_stream_if_same(id, &gate);
                 }
+            }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -1264,6 +1290,7 @@ pub(crate) async fn relay_client_mux_stream(
     let (mut local_rd, mut local_wr) = local.into_split();
     let writer_up = writer.clone();
     let cipher_up = cipher.clone();
+    let session_up = session.clone();
     let fin_sent = Arc::new(AtomicBool::new(false));
     let fin_sent_up = fin_sent.clone();
     let mut upload = AbortOnDrop(tokio::spawn(async move {
@@ -1271,7 +1298,24 @@ pub(crate) async fn relay_client_mux_stream(
         let mut frame_scratch = Vec::new();
         let res = async {
             loop {
-                let n = match local_rd.read(&mut buf).await {
+                let is_v2 = session_up.peer_version.load(Ordering::Relaxed) >= 2;
+                let max_chunk = if is_v2 {
+                    crate::protocol::MAX_MUX_V2_CHUNK
+                } else {
+                    u16::MAX as usize
+                };
+                let read_cap = if is_v2 {
+                    if buf.len() <= 128 * 1024 {
+                        buf.len().min(crate::protocol::MAX_MUX_V2_CHUNK)
+                    } else {
+                        buf.len()
+                    }
+                } else if buf.len() == 128 * 1024 {
+                    (u16::MAX as usize) * 2
+                } else {
+                    buf.len()
+                };
+                let n = match local_rd.read(&mut buf[..read_cap]).await {
                     Ok(n) => n,
                     Err(e) => {
                         let _ = send_mux_parts_reuse(
@@ -1305,7 +1349,7 @@ pub(crate) async fn relay_client_mux_stream(
                 crate::stats::add_bytes(n as i64, 0);
                 let mut off = 0;
                 while off < n {
-                    let end = (off + u16::MAX as usize).min(n);
+                    let end = (off + max_chunk).min(n);
                     gate_up.acquire(end - off).await;
                     send_mux_parts_reuse(
                         &writer_up,
@@ -1950,6 +1994,7 @@ mod tests {
             obfs: false,
             streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
+            peer_version: std::sync::atomic::AtomicU8::new(1),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -2016,6 +2061,7 @@ mod tests {
             obfs: false,
             streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
+            peer_version: std::sync::atomic::AtomicU8::new(1),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -4500,7 +4546,7 @@ const WRITE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const ENCODE_POOL_MIN_CAP: usize = 32 * 1024;
 /// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
 /// ~80 KiB so a rare huge frame cannot pin memory.
-const ENCODE_POOL_MAX_CAP: usize = 80 * 1024;
+const ENCODE_POOL_MAX_CAP: usize = 144 * 1024;
 const ENCODE_POOL_SHARDS: usize = 8;
 
 #[inline(always)]
@@ -6420,13 +6466,24 @@ pub const MUX_RST: u8 = 0x04;
 pub const MUX_VERSION: u8 = 0x05;
 pub const MUX_WINDOW: u8 = 0x06;
 pub const MAX_MUX_PAYLOAD: usize = u16::MAX as usize;
+/// Maximum payload of a MUX v2 23-bit Jumbo DATA frame (`0x80 | len_hi` in byte 4).
+pub const MAX_MUX_V2_PAYLOAD: usize = 512 * 1024;
+/// Optimal single-read v2 Jumbo chunk size (~126.5 KiB) so `chunk + OBFS_PAD_MAX + headers <= DRR_QUANTUM (128 KiB)`.
+pub const MAX_MUX_V2_CHUNK: usize = 129_600;
+/// Maximum 32-bit session window advertised on `stream_id = 0` in KiB (1 GiB).
+pub const MAX_MUX_V2_WINDOW_KIB: u32 = 1024 * 1024;
 
-/// Wire version advertised in the VERSION frame payload.
+/// Wire version advertised in the VERSION frame payload (v2: Jumbo frames + 32-bit window + coalesced packets).
 #[allow(dead_code)]
-pub const MUX_PROTO_VERSION: u8 = 1;
-/// Initial per-stream receive window advertised in VERSION (KiB), adaptive to RAM.
+pub const MUX_PROTO_VERSION: u8 = 2;
+/// Initial per-stream receive window advertised in 3-byte VERSION (clamped to u16 KiB for v1 compatibility).
 #[inline(always)]
 pub fn mux_initial_window_kib() -> u16 {
+    crate::adaptive::profile().mux_initial_window_kib.min(u16::MAX as u32) as u16
+}
+/// Full 32-bit initial per-stream receive window in KiB for MUX v2 peers.
+#[inline(always)]
+pub fn mux_initial_window_kib_u32() -> u32 {
     crate::adaptive::profile().mux_initial_window_kib
 }
 /// Send a WINDOW refund once this many consumed bytes have accumulated, adaptive to RAM.
@@ -6524,6 +6581,20 @@ pub fn decode_window_payload(payload: &[u8]) -> Option<u32> {
     Some(credit)
 }
 
+/// Decodes a MUX v2 session-level (`stream_id = 0`) WINDOW payload advertising
+/// a 32-bit receive window in KiB (up to `MAX_MUX_V2_WINDOW_KIB` = 1 GiB).
+#[allow(dead_code)]
+pub fn decode_session_window_kib(payload: &[u8]) -> Option<u32> {
+    if payload.len() != 4 {
+        return None;
+    }
+    let kib = u32::from_be_bytes(payload[..4].try_into().unwrap());
+    if kib == 0 || kib > MAX_MUX_V2_WINDOW_KIB {
+        return None;
+    }
+    Some(kib.max(MUX_WINDOW_MIN_KIB as u32))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxHeader {
     pub stream_id: u32,
@@ -6537,8 +6608,20 @@ impl MuxHeader {
             return Err(ProtocolError::TruncatedHeader(buf.len()));
         }
         let stream_id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-        let command = MuxCommand::try_from(buf[4])?;
-        let payload_len = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
+        let raw_cmd = buf[4];
+        let (command, payload_len) = if raw_cmd & 0x80 != 0 {
+            let hi = (raw_cmd & 0x7F) as usize;
+            let lo = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
+            let len = (hi << 16) | lo;
+            if len <= MAX_MUX_PAYLOAD || len > MAX_MUX_V2_PAYLOAD {
+                return Err(ProtocolError::UnknownCommand(raw_cmd));
+            }
+            (MuxCommand::Data, len)
+        } else {
+            let cmd = MuxCommand::try_from(raw_cmd)?;
+            let len = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
+            (cmd, len)
+        };
         // Trailing bytes past the declared payload are obfuscation padding
         // (GoWay `-obfs`): slice by the declared length and ignore the tail.
         // Only a short buffer is an error.
@@ -6568,7 +6651,14 @@ pub fn encode_header(
     payload_len: usize,
 ) -> Result<(), ProtocolError> {
     if payload_len > MAX_MUX_PAYLOAD {
-        return Err(ProtocolError::PayloadTooLarge(payload_len));
+        if command != MuxCommand::Data || payload_len > MAX_MUX_V2_PAYLOAD {
+            return Err(ProtocolError::PayloadTooLarge(payload_len));
+        }
+        out.reserve(MUX_HEADER_LEN);
+        out.extend_from_slice(&stream_id.to_be_bytes());
+        out.push(0x80 | ((payload_len >> 16) as u8));
+        out.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        return Ok(());
     }
     out.reserve(MUX_HEADER_LEN);
     out.extend_from_slice(&stream_id.to_be_bytes());
@@ -6613,7 +6703,12 @@ impl OwnedMuxFrame {
         payload: &[u8],
     ) -> Result<Self, ProtocolError> {
         let payload_len = payload.len();
-        if payload_len > MAX_MUX_PAYLOAD {
+        let max_len = if command == MuxCommand::Data {
+            MAX_MUX_V2_PAYLOAD
+        } else {
+            MAX_MUX_PAYLOAD
+        };
+        if payload_len > max_len {
             return Err(ProtocolError::PayloadTooLarge(payload_len));
         }
         let mut storage = crate::mux_writer::acquire_encode_buf_sized(MUX_HEADER_LEN + payload_len);
@@ -6673,7 +6768,12 @@ impl MuxFrame {
         command: MuxCommand,
         payload: Vec<u8>,
     ) -> Result<Self, ProtocolError> {
-        if payload.len() > MAX_MUX_PAYLOAD {
+        let max_len = if command == MuxCommand::Data {
+            MAX_MUX_V2_PAYLOAD
+        } else {
+            MAX_MUX_PAYLOAD
+        };
+        if payload.len() > max_len {
             return Err(ProtocolError::PayloadTooLarge(payload.len()));
         }
         Ok(Self {
@@ -6711,6 +6811,72 @@ impl MuxFrame {
             payload_len: header.payload_len,
             storage: buf,
         })
+    }
+
+    /// Decodes one or more concatenated MUX frames from a single WebSocket binary payload.
+    /// Fast-paths the single-frame case with zero allocations or copies, and reuses `buf`
+    /// in-place for the final frame when unpacking a multi-frame MUX v2 super-packet.
+    pub fn decode_v2_coalesced(
+        mut buf: Vec<u8>,
+        obfs: bool,
+        out: &mut Vec<OwnedMuxFrame>,
+    ) -> Result<(), ProtocolError> {
+        let header = match MuxHeader::parse(&buf) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::mux_writer::recycle_encode_buf(buf);
+                return Err(e);
+            }
+        };
+        let first_end = MUX_HEADER_LEN + header.payload_len;
+        if obfs || buf.len() < first_end + MUX_HEADER_LEN {
+            out.push(OwnedMuxFrame {
+                stream_id: header.stream_id,
+                command: header.command,
+                payload_len: header.payload_len,
+                storage: buf,
+            });
+            return Ok(());
+        }
+        let mut off = first_end;
+        while off < buf.len() {
+            match MuxHeader::parse(&buf[off..]) {
+                Ok(h) => {
+                    off += MUX_HEADER_LEN + h.payload_len;
+                }
+                Err(e) => {
+                    crate::mux_writer::recycle_encode_buf(buf);
+                    return Err(e);
+                }
+            }
+        }
+        let mut cursor = 0usize;
+        while cursor < buf.len() {
+            let h = MuxHeader::parse(&buf[cursor..]).unwrap();
+            let frame_len = MUX_HEADER_LEN + h.payload_len;
+            if cursor + frame_len == buf.len() {
+                buf.copy_within(cursor..cursor + frame_len, 0);
+                buf.truncate(frame_len);
+                out.push(OwnedMuxFrame {
+                    stream_id: h.stream_id,
+                    command: h.command,
+                    payload_len: h.payload_len,
+                    storage: buf,
+                });
+                break;
+            }
+            let mut slice_buf = crate::mux_writer::acquire_encode_buf_sized(frame_len);
+            slice_buf.reserve(frame_len);
+            slice_buf.extend_from_slice(&buf[cursor..cursor + frame_len]);
+            out.push(OwnedMuxFrame {
+                stream_id: h.stream_id,
+                command: h.command,
+                payload_len: h.payload_len,
+                storage: slice_buf,
+            });
+            cursor += frame_len;
+        }
+        Ok(())
     }
 }
 
@@ -6897,7 +7063,7 @@ mod tests {
     fn version_payload_round_trip_and_validation() {
         let payload = encode_version_payload(1024);
         assert_eq!(payload, [MUX_PROTO_VERSION, 0x04, 0x00]);
-        assert_eq!(decode_version_payload(&payload), Some((1, 1024)));
+        assert_eq!(decode_version_payload(&payload), Some((MUX_PROTO_VERSION, 1024)));
         // Truncation / overlong payloads rejected.
         assert_eq!(decode_version_payload(&payload[..2]), None);
         assert_eq!(decode_version_payload(&[0, 0, 0, 0]), None);
@@ -7028,6 +7194,54 @@ mod tests {
         assert_eq!(data_frame.stream_id, 7);
         assert_eq!(data_frame.command, MuxCommand::Data);
         assert_eq!(data_frame.payload(), b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    #[test]
+    fn mux_v2_jumbo_frame_round_trip() {
+        let jumbo_len = MAX_MUX_V2_CHUNK; // 129,600 bytes (> 64 KiB)
+        let data = vec![0xA5u8; jumbo_len];
+        let mut encoded = Vec::new();
+        write_frame_parts(&mut encoded, 19, MuxCommand::Data, &data).unwrap();
+        assert_eq!(encoded.len(), MUX_HEADER_LEN + jumbo_len);
+        assert_ne!(encoded[4] & 0x80, 0, "v2 Jumbo header must set bit 7");
+
+        // Also test with -obfs random trailing padding
+        encoded.extend_from_slice(&[0x3Cu8; 512]);
+        let owned = MuxFrame::decode_owned(encoded).unwrap();
+        assert_eq!(owned.stream_id, 19);
+        assert_eq!(owned.command, MuxCommand::Data);
+        assert_eq!(owned.payload().len(), jumbo_len);
+        assert_eq!(owned.payload()[0], 0xA5);
+        assert_eq!(owned.payload()[jumbo_len - 1], 0xA5);
+    }
+
+    #[test]
+    fn mux_v2_coalesced_super_packet_unpacking() {
+        let mut super_pkt = Vec::new();
+        write_frame_parts(&mut super_pkt, 1, MuxCommand::Data, b"frame-one").unwrap();
+        write_frame_parts(&mut super_pkt, 2, MuxCommand::Window, &encode_window_payload(131072)).unwrap();
+        write_frame_parts(&mut super_pkt, 1, MuxCommand::Fin, &[]).unwrap();
+
+        let mut out = Vec::new();
+        MuxFrame::decode_v2_coalesced(super_pkt, false, &mut out).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].stream_id, 1);
+        assert_eq!(out[0].command, MuxCommand::Data);
+        assert_eq!(out[0].payload(), b"frame-one");
+        assert_eq!(out[1].stream_id, 2);
+        assert_eq!(out[1].command, MuxCommand::Window);
+        assert_eq!(decode_window_payload(out[1].payload()), Some(131072));
+        assert_eq!(out[2].stream_id, 1);
+        assert_eq!(out[2].command, MuxCommand::Fin);
+    }
+
+    #[test]
+    fn mux_v2_session_window_32bit_kib() {
+        let win_256_mib_kib: u32 = 256 * 1024;
+        let payload = encode_window_payload(win_256_mib_kib);
+        assert_eq!(decode_session_window_kib(&payload), Some(win_256_mib_kib));
+        assert_eq!(decode_session_window_kib(&encode_window_payload(0)), None);
+        assert_eq!(decode_session_window_kib(&encode_window_payload(MAX_MUX_V2_WINDOW_KIB + 1)), None);
     }
 }
 } // mod protocol
@@ -10104,11 +10318,29 @@ async fn target_to_mux(
     cipher: XorCipher,
     obfs: bool,
     gate: Arc<CreditGate>,
+    peer_version: Arc<std::sync::atomic::AtomicU8>,
 ) -> bool {
     let mut buf = relay_buf(buffer_size).await;
     let mut frame_scratch = Vec::new();
     let clean_eof = loop {
-        match target.read(&mut buf).await {
+        let is_v2 = peer_version.load(Ordering::Relaxed) >= 2;
+        let max_chunk = if is_v2 {
+            crate::protocol::MAX_MUX_V2_CHUNK
+        } else {
+            u16::MAX as usize
+        };
+        let read_cap = if is_v2 {
+            if buf.len() <= 128 * 1024 {
+                buf.len().min(crate::protocol::MAX_MUX_V2_CHUNK)
+            } else {
+                buf.len()
+            }
+        } else if buf.len() == 128 * 1024 {
+            (u16::MAX as usize) * 2
+        } else {
+            buf.len()
+        };
+        match target.read(&mut buf[..read_cap]).await {
             Ok(0) => {
                 let _ = send_mux_parts_encrypted_reuse(
                     &writer,
@@ -10126,7 +10358,7 @@ async fn target_to_mux(
                 crate::stats::add_bytes(0, n as i64);
                 let mut off = 0;
                 while off < n {
-                    let end = (off + u16::MAX as usize).min(n);
+                    let end = (off + max_chunk).min(n);
                     gate.acquire(end - off).await;
                     if send_mux_parts_encrypted_reuse(
                         &writer,
@@ -10263,7 +10495,7 @@ impl Drop for PendingBytes {
 }
 
 async fn handle_mux_parts<R, W>(
-    mut rd: R,
+    rd: R,
     wr: W,
     cfg: RuntimeConfig,
     cipher: XorCipher,
@@ -10272,6 +10504,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
     // Hand the write half to the dedicated writer task; all MUX frames on
     // this session go through its serialized, coalescing queue.
     let (writer, mut writer_task) = MuxFrameWriter::spawn(wr);
@@ -10280,6 +10513,8 @@ where
     cipher.apply(&mut ok);
     let mut flight = encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?;
     let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let peer_version: Arc<std::sync::atomic::AtomicU8> =
+        Arc::new(std::sync::atomic::AtomicU8::new(1));
     let version_payload = encode_version_payload(mux_initial_window_kib());
     let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Version, version_payload.len(), false, cfg.obfs);
     let mut ver_buf = crate::mux_writer::acquire_encode_buf_sized(needed);
@@ -10294,6 +10529,21 @@ where
     )
     .map_err(|e| anyhow!(e.to_string()))?;
     flight.extend_from_slice(&ver_buf);
+    let full_win_kib = crate::protocol::mux_initial_window_kib_u32();
+    if full_win_kib > u16::MAX as u32 {
+        let ext_win = encode_window_payload(full_win_kib);
+        crate::mux_writer::encode_mux_ws_frame(
+            &mut ver_buf,
+            0,
+            MuxCommand::Window,
+            &ext_win,
+            &cipher,
+            false,
+            cfg.obfs,
+        )
+        .map_err(|e| anyhow!(e.to_string()))?;
+        flight.extend_from_slice(&ver_buf);
+    }
     crate::mux_writer::recycle_encode_buf(ver_buf);
     writer.send(flight).await?;
 
@@ -10307,6 +10557,7 @@ where
     // handle per stream it ever opened and only released them at session end.
     let mut stream_tasks = tokio::task::JoinSet::new();
     let mut frame_buf = Vec::new();
+    let mut coalesced = Vec::with_capacity(8);
 
     let writer_for_hb = writer.clone();
     let mut heartbeat_handle = tokio::spawn(async move {
@@ -10358,11 +10609,11 @@ where
                 continue;
             }
 
-            let frame = match MuxFrame::decode_owned(payload) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+            if MuxFrame::decode_v2_coalesced(payload, cfg.obfs, &mut coalesced).is_err() {
+                continue;
+            }
 
+            for frame in coalesced.drain(..) {
             match frame.command {
                 MuxCommand::Syn => {
                     let stream_id = frame.stream_id;
@@ -10460,6 +10711,7 @@ where
                     let cfg_task = cfg.clone();
                     let gate_task = gate;
                     let peer_window_task = peer_window.clone();
+                    let peer_version_task = peer_version.clone();
                     let pending_total_task = pending_bytes_total.clone();
 
                     let max_pending_frames: usize =
@@ -10636,6 +10888,7 @@ where
                             cipher_task.clone(),
                             cfg_task.obfs,
                             gate_task.clone(),
+                            peer_version_task.clone(),
                         )));
 
                         let mut write_failed = false;
@@ -10980,14 +11233,15 @@ where
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some((version, kib)) = decoded {
                         if version >= 1 {
-                            let prev = peer_window.swap(kib as u32, Ordering::AcqRel);
+                            peer_version.store(version, Ordering::Release);
+                            let prev = peer_window.fetch_max(kib as u32, Ordering::AcqRel);
                             if prev == 0 {
                                 let window = i64::from(kib) * 1024;
                                 for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values()
                                 {
                                     entry.gate.enable(window);
                                 }
-                                tracing::debug!(kib, "peer VERSION received; send window enabled");
+                                tracing::debug!(version, kib, "peer VERSION received; send window enabled");
                             }
                         }
                     }
@@ -10995,6 +11249,19 @@ where
 
                 MuxCommand::Window => {
                     let stream_id = frame.stream_id;
+                    if stream_id == 0 {
+                        let decoded_kib = crate::protocol::decode_session_window_kib(frame.payload());
+                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                        if let Some(kib32) = decoded_kib {
+                            peer_window.store(kib32, Ordering::Release);
+                            let window = i64::from(kib32) * 1024;
+                            for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values()
+                            {
+                                entry.gate.enable(window);
+                            }
+                        }
+                        continue;
+                    }
                     let decoded = decode_window_payload(frame.payload());
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some(credit) = decoded {
@@ -11007,6 +11274,7 @@ where
                         }
                     }
                 }
+            }
             }
         }
         Ok(())
@@ -14651,7 +14919,7 @@ where
         // (65535 + 7 = 65542 bytes, or up to 66942 bytes with obfs) is read
         // in a single `read_exact` call and never triggers `grow_amortized`
         // to 128 KiB (which would exceed the pool cap and force reallocs).
-        const READ_SEGMENT: usize = 80 * 1024;
+        const READ_SEGMENT: usize = 144 * 1024;
         buf.clear();
 
         let mut key = [0u8; 4];

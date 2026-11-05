@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.77] - 2026-11-05
+
+### RushWay MUX v2 Unlimited Throughput Protocol: 23-Bit Jumbo Frames, Multi-Frame Super-Packet Unpacking, 32-Bit Window Extension & 16 KiB Buffered WS Reader
+
+- **Automatic MUX v2 Protocol Negotiation (`src/main.rs:protocol::MUX_PROTO_VERSION = 2`, `common::MuxClientSession`, `runtime::handle_mux_parts`)** — Upgraded the advertised `MUX_VERSION` protocol byte from `1` to `2` while maintaining 100% wire compatibility with GoWay v1.8.4/v1.8.5 (which accepts any 3-byte `VERSION` frame with `version >= 1`). When both peers advertise `version >= 2`, the session automatically activates MUX v2 Turbo features; when paired with a legacy v1 peer, it seamlessly falls back to v1 framing.
+- **23-Bit Jumbo MUX `Data` Frame Header & Elimination of 128 KiB 3-Frame Splitting (`src/main.rs:protocol::MuxHeader::parse`, `encode_header`, `MAX_MUX_V2_PAYLOAD = 512 KiB`, `MAX_MUX_V2_CHUNK = 129_600`)** — Extended the 7-byte MUX header to support 23-bit payload lengths (`0x80 | (len >> 16)` in byte 4, low 16 bits in bytes 5..7) for `Data` frames exceeding 64 KiB, preserving the exact 7-byte header size and full `-obfs` padding compatibility. Eliminated the `128 KiB -> 65535 + 65535 + 2 byte` 3-frame split in `relay_client_mux_stream` and `target_to_mux`, dispatching an entire 128 KiB socket read as a single MUX v2 Jumbo frame in 1 DRR round and cutting frame count, channel ops, and WS headers by 66.7%.
+- **Multi-MUX Coalesced Super-Packet Unpacking (`src/main.rs:protocol::MuxFrame::decode_v2_coalesced`)** — Enabled receivers on both client and server to unpack multiple back-to-back concatenated MUX frames from a single WebSocket binary payload when `!obfs`, fast-pathing single frames with 0 allocations and reusing the outer buffer in-place for the final frame of a multi-frame batch.
+- **32-Bit Unlimited Session Flow-Control Window Extension (`src/main.rs:protocol::decode_session_window_kib`, `mux_initial_window_kib_u32`, `adaptive::MemProfile`)** — Scaled `High-BDP` default window from 32 MiB to 64 MiB (refresh 8 MiB) and upgraded `RUSHWAY_WINDOW_KIB` to `u32` (up to `1_048_576 KiB = 1 GiB` per stream). When `window_kib > 65535`, a `stream_id = 0` `MuxCommand::Window` frame advertises the full 32-bit KiB window to v2 peers while being safely ignored by legacy v1 peers.
+- **16 KiB Buffered WebSocket Frame Reader (`src/main.rs:common::MuxClientSession::spawn_from_parts`, `runtime::handle_mux_parts`, `ENCODE_POOL_MAX_CAP = 144 KiB`)** — Wrapped post-handshake MUX read streams in `tokio::io::BufReader::with_capacity(16 * 1024, rd)` and expanded `ENCODE_POOL_MAX_CAP` / `READ_SEGMENT` to 144 KiB. Eliminates the per-frame 2-byte header read + 6-byte extended-header read syscall overhead and coalesces bursts of incoming control frames (`WINDOW`, `SYN`, `FIN`, `RST`) into a single read syscall.
+
 ## [v0.0.76] - 2026-11-05
 
 ### Gigabit (1000Mbps) Line-Rate Saturation, Dual-Channel MUX Priority, Kernel TCP Scaling Guard & Full-Duplex Half-Close

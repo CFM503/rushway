@@ -2293,3 +2293,33 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
   - `cargo check --all-targets --all-features` produced ZERO warnings.
 - Status: Fixed and validated.
 - Next action: Present completion report to user with operational guidelines and VPS benchmarking commands.
+
+
+## Release: v0.0.77 (2026-11-05)
+
+### Context & User Directives
+- **Directives:** "rushway 协议需要优化吗，让他吞吐量不受 goway协议的限制，吞吐无上限，成功了再把rushway的协议复刻到goway上去... 立即开始，优化完成后推送仓库，推送tag".
+- **Ironclad Constraints:** Automatic backward compatibility with GoWay v1.8.4/v1.8.5 via `MUX_VERSION` negotiation, unlimited throughput between v2 peers, clean wire format easily portable to GoWay.
+
+### Architectural Optimizations Implemented
+1. **Automatic MUX v2 Protocol Negotiation (`src/main.rs:protocol::MUX_PROTO_VERSION = 2`)**:
+   - Advertises version `2` in the 3-byte `MUX_VERSION` handshake frame (`[2, win_hi, win_lo]`). Legacy v1 peers check `len == 3 && version >= 1` and continue in v1 mode; v2 peers detect `peer_version >= 2` and activate v2 Jumbo framing.
+2. **23-Bit Jumbo MUX `Data` Frame Header (`0x80 | len_hi` in Byte 4 of 7-Byte Header)**:
+   - Encodes `Data` payloads `> 65,535` bytes (up to `MAX_MUX_V2_PAYLOAD = 512 KiB`) using `0x80 | ((len >> 16) as u8)` in byte 4 and `(len as u16).to_be_bytes()` in bytes 5..7. Preserves the exact 7-byte header length (`MUX_HEADER_LEN = 7`) and `-obfs` padding compatibility.
+   - Eliminated the `128 KiB -> 65535 + 65535 + 2 byte` 3-frame split in `relay_client_mux_stream` and `target_to_mux` using `MAX_MUX_V2_CHUNK = 129_600` (which fits inside a single `DRR_QUANTUM = 128 KiB` and `ENCODE_POOL_MAX_CAP = 144 KiB`), reducing frame count by 66.7%.
+3. **Multi-MUX Coalesced Super-Packet Unpacking (`MuxFrame::decode_v2_coalesced`)**:
+   - Unpacks multiple back-to-back MUX frames inside a single WebSocket binary payload when `!obfs`, fast-pathing single frames with 0 allocations and reusing `buf` in-place for the final frame.
+4. **32-Bit Session Window Extension (`decode_session_window_kib`, `stream_id = 0` `MuxCommand::Window`)**:
+   - Scaled `High-BDP` default window to 64 MiB (`65,535 KiB`) and `RUSHWAY_WINDOW_KIB` to `u32` (up to `1 GiB` per stream), advertising windows `> 64 MiB` via a `stream_id = 0` `Window` frame.
+5. **16 KiB Buffered WebSocket Frame Reader (`BufReader::with_capacity(16 * 1024, rd)`)**:
+   - Wrapped post-handshake MUX read halves in a 16 KiB `BufReader`, eliminating separate 2-byte and 6-byte header read syscalls and coalescing control frame bursts into single reads.
+
+### Tests Added
+- `protocol::tests::mux_v2_jumbo_frame_round_trip`
+- `protocol::tests::mux_v2_coalesced_super_packet_unpacking`
+- `protocol::tests::mux_v2_session_window_32bit_kib`
+
+### Validation
+- All 154 unit tests passed (`154 passed; 0 failed`).
+- `python scripts/ci_guard.py` passed with 0 warnings.
+- Status: Released and tagged as `v0.0.77`.
