@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.75";
+pub const APP_VERSION: &str = "0.0.76";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -33,7 +33,11 @@ pub mod adaptive {
     pub fn profile() -> &'static MemProfile {
         PROFILE.get_or_init(|| {
             let mib = detect_memory_mib();
-            if mib <= 640 {
+            let custom_window = std::env::var("RUSHWAY_WINDOW_KIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u16>().ok())
+                .filter(|&w| w > 0);
+            let mut p = if mib <= 640 {
                 MemProfile {
                     detected_mib: mib,
                     tier_name: "Low-RAM",
@@ -51,13 +55,13 @@ pub mod adaptive {
                 MemProfile {
                     detected_mib: mib,
                     tier_name: "Balanced",
-                    mux_initial_window_kib: 8192,
-                    mux_window_refresh: 1024 * 1024,
+                    mux_initial_window_kib: 16384,
+                    mux_window_refresh: 2 * 1024 * 1024,
                     mux_stream_queue_cap: 1536,
                     encode_pool_shard_cap: 16, // 8 * 16 = 128 bufs (~10 MiB)
                     relay_pool_max_count: 64,  // ~8 MiB
                     max_session_pending_bytes: 96 * 1024 * 1024,
-                    max_stream_pending_bytes: 8 * 1024 * 1024,
+                    max_stream_pending_bytes: 16 * 1024 * 1024,
                     max_stream_pending_frames: 256,
                     non_mux_pool_size: 16,
                 }
@@ -65,17 +69,22 @@ pub mod adaptive {
                 MemProfile {
                     detected_mib: mib,
                     tier_name: "High-BDP",
-                    mux_initial_window_kib: 16384,
-                    mux_window_refresh: 2 * 1024 * 1024,
+                    mux_initial_window_kib: 32768,
+                    mux_window_refresh: 4 * 1024 * 1024,
                     mux_stream_queue_cap: 3072,
                     encode_pool_shard_cap: 32, // 8 * 32 = 256 bufs (~20.5 MiB)
                     relay_pool_max_count: 128, // ~16 MiB
                     max_session_pending_bytes: 256 * 1024 * 1024,
-                    max_stream_pending_bytes: 16 * 1024 * 1024,
+                    max_stream_pending_bytes: 32 * 1024 * 1024,
                     max_stream_pending_frames: 512,
                     non_mux_pool_size: 32,
                 }
+            };
+            if let Some(win) = custom_window {
+                p.mux_initial_window_kib = win;
+                p.mux_window_refresh = ((win as usize * 1024) / 8).max(512 * 1024);
             }
+            p
         })
     }
 
@@ -1055,7 +1064,7 @@ where
     let control_peer_ip = control.peer_addr().ok().map(|a| a.ip());
     let hint = bind_hint.clone();
     let c = configured_cipher(key);
-    let mut hello = b"UDP\n".to_vec();
+    let mut hello = *b"UDP\n";
     c.apply(&mut hello);
     write_frame(&mut wr, &hello, 2, true).await?;
     let mut frame_buf = Vec::new();
@@ -1107,6 +1116,7 @@ where
                     Err(_) => break,
                 },
             };
+            packet.clear();
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
                 if !udp_client_allowed(peer, control_peer_ip, &hint, local_established) {
@@ -1127,7 +1137,6 @@ where
                 let mut ws_hdr = [0u8; 14];
                 let hdr_len = crate::ws::ws_header_into(&mut ws_hdr, pkt.len(), 2, true);
                 let mask_key = crate::ws::next_mask();
-                packet.clear();
                 packet.reserve(hdr_len + 4 + pkt.len());
                 packet.extend_from_slice(&ws_hdr[..hdr_len]);
                 packet.extend_from_slice(&mask_key);
@@ -1141,6 +1150,8 @@ where
                     crate::crypto::apply_fused_xor(body, ks, mask_key);
                 }
                 crate::stats::add_bytes(pkt.len() as i64, 0);
+            }
+            if !packet.is_empty() {
                 if wr.write_all(&packet).await.is_err() || wr.flush().await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
@@ -1321,7 +1332,8 @@ pub(crate) async fn relay_client_mux_stream(
     let mut remote_fin = false;
     let mut remote_rst = false;
     let mut refund_pending: u32 = 0;
-    let mut data_batch: Vec<crate::protocol::OwnedMuxFrame> = Vec::with_capacity(16);
+    let mut data_batch: Vec<crate::protocol::OwnedMuxFrame> =
+        Vec::with_capacity(crate::mux_writer::BATCH_MAX_FRAMES);
     let mut deferred_ctrl: Option<crate::protocol::OwnedMuxFrame> = None;
     loop {
         let frame = if let Some(ctrl) = deferred_ctrl.take() {
@@ -1359,7 +1371,7 @@ pub(crate) async fn relay_client_mux_stream(
         match frame.command {
             MuxCommand::Data => {
                 data_batch.push(frame);
-                while data_batch.len() < 16 {
+                while data_batch.len() < crate::mux_writer::BATCH_MAX_FRAMES {
                     match rx.try_recv() {
                         Ok(next) if next.command == MuxCommand::Data => data_batch.push(next),
                         Ok(other) => {
@@ -1463,14 +1475,17 @@ pub(crate) fn peek_initial_payload(
         crate::stats::add_bytes(initial_data.len() as i64, 0);
         return initial_data;
     }
-    let mut first_pkt = Vec::with_capacity(16384);
-    if let Ok(n) = local.try_read_buf(&mut first_pkt) {
-        if n > 0 {
+    let mut first_pkt = crate::mux_writer::acquire_encode_buf();
+    match local.try_read_buf(&mut first_pkt) {
+        Ok(n) if n > 0 => {
             crate::stats::add_bytes(n as i64, 0);
-            return first_pkt;
+            first_pkt
+        }
+        _ => {
+            crate::mux_writer::recycle_encode_buf(first_pkt);
+            Vec::new()
         }
     }
-    Vec::new()
 }
 
 /// Encodes one MUX frame into a pooled scratch buffer and queues it on the
@@ -1487,9 +1502,10 @@ pub(crate) async fn send_mux_parts_reuse(
 ) -> Result<()> {
     // Prefer the caller's local scratch only while it still owns capacity
     // (first frame); after `mem::take` the pool supplies the next buffer
-    // so the encoder's exact `reserve` hits existing capacity.
+    // sized to the exact frame requirement.
     if scratch.capacity() == 0 {
-        *scratch = crate::mux_writer::acquire_encode_buf();
+        let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), true, obfs);
+        *scratch = crate::mux_writer::acquire_encode_buf_sized(needed);
     }
     crate::mux_writer::encode_mux_ws_frame(
         scratch, stream_id, command, payload, cipher, true, obfs,
@@ -1498,8 +1514,7 @@ pub(crate) async fn send_mux_parts_reuse(
     writer.send_mux(stream_id, command, std::mem::take(scratch)).await
 }
 
-/// One-shot variant of [`send_mux_parts_reuse`] that starts from the encode
-/// pool so the encoder's single exact `reserve` is a no-op on a warm pool.
+/// One-shot variant of [`send_mux_parts_reuse`] with sized buffer acquisition.
 pub(crate) async fn send_mux_parts(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
@@ -1508,14 +1523,15 @@ pub(crate) async fn send_mux_parts(
     payload: &[u8],
     obfs: bool,
 ) -> Result<()> {
-    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), true, obfs);
+    let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     send_mux_parts_reuse(
         writer, cipher, stream_id, command, payload, &mut bytes, obfs,
     )
     .await
 }
 
-/// Non-blocking MUX control frame sender for read loops.
+/// Non-blocking MUX control frame sender for read loops with sized buffer acquisition.
 pub(crate) fn try_send_mux_parts(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
@@ -1524,7 +1540,8 @@ pub(crate) fn try_send_mux_parts(
     payload: &[u8],
     obfs: bool,
 ) {
-    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), true, obfs);
+    let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     if crate::mux_writer::encode_mux_ws_frame(
         &mut bytes, stream_id, command, payload, cipher, true, obfs,
     )
@@ -1829,6 +1846,7 @@ where
         write_frame(&mut wr, &initial, 2, true).await?;
     }
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let (up_err_tx, mut up_err_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         let res: Result<()> = async {
@@ -1853,7 +1871,9 @@ where
         }
         .await;
         recycle_buf(buf).await;
-        res
+        if let Err(e) = res {
+            let _ = up_err_tx.send(e);
+        }
     }));
     let mut upload_done = false;
     let mut remote_eof = false;
@@ -1862,13 +1882,12 @@ where
             let next_frame = if !upload_done {
                 tokio::select! {
                     r = crate::ws::read_frame_pong_channel(&mut rd, &pong_tx, true, &mut frame_buf, None) => r?,
-                    up_res = &mut upload => {
+                    err_res = &mut up_err_rx => {
                         upload_done = true;
-                        match up_res {
-                            Ok(Ok(())) => continue,
-                            Ok(Err(e)) => return Err(e),
-                            Err(e) => return Err(anyhow!("non-MUX upload task panicked: {e}")),
+                        if let Ok(e) = err_res {
+                            return Err(e);
                         }
+                        crate::ws::read_frame_pong_channel(&mut rd, &pong_tx, true, &mut frame_buf, None).await?
                     }
                 }
             } else {
@@ -2343,6 +2362,7 @@ pub(crate) unsafe fn apply_chunk_neon(chunk: &mut [u8], key: &[u8]) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn apply_chunk_fallback(chunk: &mut [u8], key: &[u8]) {
     let clen = chunk.len();
     let key = &key[..clen];
@@ -2606,6 +2626,7 @@ pub(crate) unsafe fn apply_fused_xor_neon(region: &mut [u8], ks: &[u8], key: [u8
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn apply_fused_xor_fallback(region: &mut [u8], ks: &[u8], key: [u8; 4]) {
     let len = region.len().min(ks.len());
     let mask64 = u64::from_ne_bytes([
@@ -2934,6 +2955,7 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
                 return Ok(ip);
             }
             if now.duration_since(expires) < STALE_TTL {
+                drop(guard);
                 let already_inflight = in_flight()
                     .lock()
                     .map(|m| m.contains_key(key.as_ref()))
@@ -4078,7 +4100,7 @@ async fn connect_plain_mux_session(
     let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
     let (writer, writer_task) = MuxFrameWriter::spawn(wr);
     let cipher = configured_cipher(&cfg.key);
-    let mut hello = b"MUX\n".to_vec();
+    let mut hello = *b"MUX\n";
     cipher.apply(&mut hello);
     writer
         .send(encode_ws_frame(&hello, 2, true).map_err(|e| anyhow!(e.to_string()))?)
@@ -4457,7 +4479,7 @@ use tokio::time::timeout;
 
 const WRITER_QUEUE: usize = 512;
 const FEED_CAP: usize = 512;
-const BATCH_MAX_FRAMES: usize = 32;
+pub(crate) const BATCH_MAX_FRAMES: usize = 32;
 const BATCH_MAX_BYTES: usize = 1024 * 1024;
 /// Wall-clock bound for one batch write. A peer that silently stops reading
 /// (dead NAT/CDN path, black-holed connection) would otherwise park the
@@ -4535,6 +4557,22 @@ fn encode_pool() -> &'static [PoolShard; ENCODE_POOL_SHARDS] {
 /// using a relaxed atomic length check to skip empty shards without locking.
 pub(crate) fn acquire_encode_buf() -> Vec<u8> {
     acquire_encode_buf_sized(ENCODE_POOL_MIN_CAP)
+}
+
+#[inline]
+pub(crate) fn mux_frame_needed_cap(
+    command: MuxCommand,
+    payload_len: usize,
+    masked: bool,
+    obfs: bool,
+) -> usize {
+    let pad_max = if obfs && command == MuxCommand::Data {
+        OBFS_PAD_MAX
+    } else {
+        0
+    };
+    let mask_len = if masked { 4 } else { 0 };
+    17 + mask_len + payload_len + pad_max
 }
 
 /// Sized allocation for encode buffers:
@@ -4648,7 +4686,8 @@ pub(crate) struct OutboundFrame {
 }
 
 pub(crate) struct MuxFrameWriter {
-    tx: mpsc::Sender<OutboundFrame>,
+    ctrl_tx: mpsc::Sender<OutboundFrame>,
+    data_tx: mpsc::Sender<OutboundFrame>,
     closed: Arc<AtomicBool>,
     unacked_pings: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -4664,16 +4703,18 @@ impl MuxFrameWriter {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel(FEED_CAP);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(FEED_CAP);
+        let (data_tx, data_rx) = mpsc::channel(FEED_CAP);
         let closed = Arc::new(AtomicBool::new(false));
         let unacked_pings = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let this = Arc::new(Self {
-            tx,
+            ctrl_tx,
+            data_tx,
             closed: closed.clone(),
             unacked_pings: unacked_pings.clone(),
         });
         let handle = tokio::spawn(async move {
-            writer_loop(w, rx).await;
+            writer_loop(w, ctrl_rx, data_rx).await;
             closed.store(true, Ordering::Release);
         });
         (this, handle)
@@ -4717,13 +4758,10 @@ impl MuxFrameWriter {
             is_rst: false,
             bytes: frame,
         };
-        match self.tx.try_send(out) {
+        match self.ctrl_tx.try_send(out) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(out)) => {
-                let writer = self.clone();
-                tokio::spawn(async move {
-                    let _ = writer.send_frame(out).await;
-                });
+                recycle_encode_buf(out.bytes);
             }
             Err(mpsc::error::TrySendError::Closed(out)) => {
                 self.closed.store(true, Ordering::Release);
@@ -4775,13 +4813,15 @@ impl MuxFrameWriter {
             is_rst: command == MuxCommand::Rst,
             bytes: frame,
         };
-        match self.tx.try_send(out) {
+        let target_tx = if out.priority {
+            &self.ctrl_tx
+        } else {
+            &self.data_tx
+        };
+        match target_tx.try_send(out) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(out)) => {
-                let writer = self.clone();
-                tokio::spawn(async move {
-                    let _ = writer.send_frame(out).await;
-                });
+                recycle_encode_buf(out.bytes);
             }
             Err(mpsc::error::TrySendError::Closed(out)) => {
                 self.closed.store(true, Ordering::Release);
@@ -4795,7 +4835,12 @@ impl MuxFrameWriter {
             recycle_encode_buf(frame.bytes);
             return Err(anyhow!("mux writer closed"));
         }
-        self.tx.send(frame).await.map_err(|err| {
+        let target_tx = if frame.priority {
+            &self.ctrl_tx
+        } else {
+            &self.data_tx
+        };
+        target_tx.send(frame).await.map_err(|err| {
             self.closed.store(true, Ordering::Release);
             recycle_encode_buf(err.0.bytes);
             anyhow!("mux writer closed")
@@ -5160,40 +5205,64 @@ pub(crate) fn encode_mux_ws_frame(
     Ok(())
 }
 
-async fn writer_loop<W>(mut w: W, mut rx: mpsc::Receiver<OutboundFrame>)
-where
+async fn writer_loop<W>(
+    mut w: W,
+    mut ctrl_rx: mpsc::Receiver<OutboundFrame>,
+    mut data_rx: mpsc::Receiver<OutboundFrame>,
+) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut sched = Scheduler::new();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_MAX_FRAMES);
+    let mut ctrl_closed = false;
+    let mut data_closed = false;
     loop {
-        // Admit: block for the first frame when the scheduler is empty
-        // (channel close here means all owners gone); otherwise drain the
-        // feed opportunistically while under the total queue cap. A full
-        // scheduler/feed makes senders block, preserving backpressure.
-        if sched.is_empty() {
-            match rx.recv().await {
-                Some(frame) => sched.push(frame),
-                None => break,
-            }
-        }
+        // High-priority control lane drains first unconditionally
         while sched.len() < WRITER_QUEUE {
-            match rx.try_recv() {
+            match ctrl_rx.try_recv() {
                 Ok(frame) => sched.push(frame),
-                Err(_) => break,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    ctrl_closed = true;
+                    break;
+                }
             }
         }
-        // Emit one DRR-ordered batch (priority lane first, then one frame
-        // per affordable stream); vectored write preserved.
-        //
-        // A `None` here only means "nothing affordable THIS round" — each
-        // next() call adds a quantum to every stream, so retrying while the
-        // scheduler is non-empty always reaches an emission within a few
-        // rounds (frames are far below the deficit cap). Breaking at the
-        // first None instead would strand the tail whenever no further
-        // arrivals come to wake us (caught live: 4MiB tail stall).
-        // `batch` is drained (not cleared) after each write so frame buffers
-        // return to the encode pool instead of being freed.
+        // Then bulk DATA frames
+        while sched.len() < WRITER_QUEUE {
+            match data_rx.try_recv() {
+                Ok(frame) => sched.push(frame),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    data_closed = true;
+                    break;
+                }
+            }
+        }
+
+        if sched.is_empty() {
+            if ctrl_closed && data_closed {
+                break;
+            }
+            tokio::select! {
+                biased;
+                maybe_frame = ctrl_rx.recv(), if !ctrl_closed => match maybe_frame {
+                    Some(frame) => sched.push(frame),
+                    None => ctrl_closed = true,
+                },
+                maybe_frame = data_rx.recv(), if !data_closed => match maybe_frame {
+                    Some(frame) => sched.push(frame),
+                    None => data_closed = true,
+                },
+            }
+            if sched.is_empty() {
+                if ctrl_closed && data_closed {
+                    break;
+                }
+                continue;
+            }
+        }
+
         debug_assert!(batch.is_empty());
         let mut bytes = 0usize;
         let mut empty_rounds = 0usize;
@@ -5207,9 +5276,6 @@ where
                 None if sched.is_empty() => break,
                 None => {
                     empty_rounds += 1;
-                    // Only break early if we already have at least one frame to flush;
-                    // if batch is empty, keep spinning (up to 64 rounds) so large frames
-                    // can accumulate enough DRR quantum instead of parking on rx.recv().
                     let limit = if batch.is_empty() { 64 } else { 8 };
                     if empty_rounds > limit {
                         break;
@@ -5219,43 +5285,47 @@ where
             }
         }
         if batch.is_empty() {
-            // Scheduler non-empty but nothing affordable (DRR credit still
-            // accumulating) and feed drained: park until a new frame
-            // arrives or the channel closes. recv() also returns frames
-            // already sitting in the feed, so this cannot deadlock.
-            // Deficits persist across rounds — no stream starves.
-            match rx.recv().await {
-                Some(frame) => {
-                    sched.push(frame);
-                    continue;
-                }
-                // Feed closed: drain everything still scheduled before
-                // exiting — abandoning queued frames here would silently
-                // drop tails (caught live: 56 stranded frames at close).
-                // Terminates: every next() either emits (total--) or
-                // accrues deficit, and frames are far below the deficit
-                // cap, so emission is always reached within a few calls.
-                // The iteration bound is pure paranoia against a hang at
-                // teardown (a hang there is worse than a drop).
-                None => {
-                    let mut spins = 0usize;
-                    let max_spins = sched.len() * 8 + 32;
-                    while !sched.is_empty() && spins < max_spins {
-                        spins += 1;
-                        if let Some(frame) = sched.next() {
-                            batch.push(frame);
-                            if batch.len() >= BATCH_MAX_FRAMES {
-                                let _ = write_batch(&mut w, &batch).await;
-                                recycle_encode_bufs(batch.drain(..));
-                            }
+            if ctrl_closed && data_closed {
+                let mut spins = 0usize;
+                let max_spins = sched.len() * 8 + 32;
+                while !sched.is_empty() && spins < max_spins {
+                    spins += 1;
+                    if let Some(frame) = sched.next() {
+                        batch.push(frame);
+                        if batch.len() >= BATCH_MAX_FRAMES {
+                            let _ = write_batch(&mut w, &batch).await;
+                            recycle_encode_bufs(batch.drain(..));
                         }
                     }
-                    if !batch.is_empty() {
-                        let _ = write_batch(&mut w, &batch).await;
-                        recycle_encode_bufs(batch.drain(..));
-                    }
-                    break;
                 }
+                if !batch.is_empty() {
+                    let _ = write_batch(&mut w, &batch).await;
+                    recycle_encode_bufs(batch.drain(..));
+                }
+                break;
+            }
+            tokio::select! {
+                biased;
+                maybe_frame = ctrl_rx.recv(), if !ctrl_closed => match maybe_frame {
+                    Some(frame) => {
+                        sched.push(frame);
+                        continue;
+                    }
+                    None => {
+                        ctrl_closed = true;
+                        continue;
+                    }
+                },
+                maybe_frame = data_rx.recv(), if !data_closed => match maybe_frame {
+                    Some(frame) => {
+                        sched.push(frame);
+                        continue;
+                    }
+                    None => {
+                        data_closed = true;
+                        continue;
+                    }
+                },
             }
         }
         if write_batch(&mut w, &batch).await.is_err() {
@@ -5264,8 +5334,6 @@ where
         }
         recycle_encode_bufs(batch.drain(..));
     }
-    // Shutdown drain path already wrote leftovers above; recycle anything
-    // still sitting in `batch` or `sched` from a partial fill / write error.
     recycle_encode_bufs(batch.drain(..));
     recycle_encode_bufs(sched.priority.drain(..).map(|(_, _, b)| b));
     for (_, q) in sched.streams.drain() {
@@ -5877,6 +5945,16 @@ mod tests {
     }
 
     #[test]
+    fn test_mux_frame_needed_cap_control_frames() {
+        let rst_cap = mux_frame_needed_cap(MuxCommand::Rst, 0, false, false);
+        assert!(rst_cap < 64);
+        let win_cap = mux_frame_needed_cap(MuxCommand::Window, 4, true, false);
+        assert!(win_cap < 64);
+        let data_obfs = mux_frame_needed_cap(MuxCommand::Data, 1000, true, true);
+        assert!(data_obfs >= 1000 + OBFS_PAD_MAX);
+    }
+
+    #[test]
     fn owned_mux_frame_auto_drops_to_pool() {
         let payload = vec![0x42u8; 100];
         let frame = OwnedMuxFrame::from_parts(1, MuxCommand::Data, &payload).unwrap();
@@ -5913,6 +5991,35 @@ mod tests {
             assert_eq!(sched.live_stream_count(), 0);
             assert_eq!(sched.free_queues.len(), 16);
         }
+    }
+
+    #[tokio::test]
+    async fn dual_channel_control_priority() {
+        use crate::crypto::XorCipher;
+        use crate::ws::read_frame;
+        use tokio::io::duplex;
+        let (a, mut b) = duplex(1024 * 1024);
+        let (writer, handle) = MuxFrameWriter::spawn(a);
+        let cipher = XorCipher::new("priotest");
+
+        let mut enc_data = Vec::new();
+        encode_mux_ws_frame(&mut enc_data, 1, MuxCommand::Data, &[1u8; 100], &cipher, true, false).unwrap();
+        let mut enc_win = Vec::new();
+        encode_mux_ws_frame(&mut enc_win, 1, MuxCommand::Window, &[2u8; 4], &cipher, true, false).unwrap();
+
+        writer.send_mux(1, MuxCommand::Data, enc_data).await.unwrap();
+        writer.send_mux(1, MuxCommand::Window, enc_win).await.unwrap();
+        drop(writer);
+
+        let mut buf = Vec::new();
+        let mut received = Vec::new();
+        while let Ok(Some((_, mut payload))) = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await {
+            cipher.apply(&mut payload);
+            let frame = MuxFrame::decode(&payload).unwrap();
+            received.push(frame.command);
+        }
+        assert_eq!(received.len(), 2);
+        handle.await.unwrap();
     }
 }
 } // mod mux_writer
@@ -6638,8 +6745,12 @@ impl SynPayload {
         use std::io::Write as _;
         // Max port string is 5 digits + 1 colon = 6 bytes.
         let est_target_len = host.len() + 6;
-        let mut out = crate::mux_writer::acquire_encode_buf();
-        out.reserve(2 + est_target_len + 2 + initial_data.len());
+        if est_target_len > u16::MAX as usize {
+            return Err(ProtocolError::TargetTooLarge(est_target_len));
+        }
+        let needed = 2 + est_target_len + initial_data.len();
+        let mut out = crate::mux_writer::acquire_encode_buf_sized(needed);
+        out.reserve(needed);
         out.extend_from_slice(&[0, 0]);
         if host.contains(':') && !host.starts_with('[') {
             let _ = write!(&mut out, "[{host}]:{port}");
@@ -6648,6 +6759,7 @@ impl SynPayload {
         }
         let target_len = out.len() - 2;
         if target_len > u16::MAX as usize {
+            crate::mux_writer::recycle_encode_buf(out);
             return Err(ProtocolError::TargetTooLarge(target_len));
         }
         let len_bytes = (target_len as u16).to_be_bytes();
@@ -7830,9 +7942,14 @@ fn transport_config() -> Arc<TransportConfig> {
     cfg.keep_alive_interval(Some(Duration::from_secs(15)));
     cfg.max_concurrent_bidi_streams(VarInt::from_u32(512));
     cfg.datagram_receive_buffer_size(None);
-    cfg.stream_receive_window(VarInt::from_u64(8 * 1024 * 1024).expect("8MiB fits QUIC VarInt"));
-    cfg.receive_window(VarInt::from_u64(16 * 1024 * 1024).expect("16MiB fits QUIC VarInt"));
-    cfg.send_window(16 * 1024 * 1024);
+    let (stream_win, conn_win) = if crate::adaptive::profile().detected_mib <= 640 {
+        (8 * 1024 * 1024, 16 * 1024 * 1024)
+    } else {
+        (16 * 1024 * 1024, 32 * 1024 * 1024)
+    };
+    cfg.stream_receive_window(VarInt::from_u64(stream_win).expect("fits QUIC VarInt"));
+    cfg.receive_window(VarInt::from_u64(conn_win).expect("fits QUIC VarInt"));
+    cfg.send_window(conn_win as u64);
     cfg.max_concurrent_uni_streams(0u32.into());
     // Without path MTU discovery every datagram stays near 1200 bytes;
     // discovering larger MTUs cuts per-packet crypto/scheduling overhead.
@@ -8022,11 +8139,29 @@ fn key_digest_hex(key: &str) -> String {
 fn line_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+static KEY_DIGEST_CACHE: std::sync::RwLock<Option<(String, [u8; 64])>> =
+    std::sync::RwLock::new(None);
+
+fn get_cached_key_digest(configured: &str) -> [u8; 64] {
+    if let Ok(guard) = KEY_DIGEST_CACHE.read() {
+        if let Some((k, digest)) = guard.as_ref() {
+            if k == configured {
+                return *digest;
+            }
+        }
+    }
+    let digest = key_digest_hex_bytes(configured);
+    if let Ok(mut guard) = KEY_DIGEST_CACHE.write() {
+        *guard = Some((configured.to_string(), digest));
+    }
+    digest
+}
+
 /// First-line QUIC auth: the SHA-256 hex digest of the configured key is the
 /// primary form; the legacy inline plaintext key stays accepted for
 /// plaintext-only peers (GoWay interop).
 fn quic_auth_matches_str(presented: &str, configured: &str) -> bool {
-    let digest_bytes = key_digest_hex_bytes(configured);
+    let digest_bytes = get_cached_key_digest(configured);
     let digest_str = std::str::from_utf8(&digest_bytes).unwrap_or("");
     if line_eq(presented, digest_str) {
         return true;
@@ -8113,6 +8248,7 @@ async fn read_len_prefixed_udp(
     let mut empty: &[u8] = &[];
     read_len_prefixed_udp_buffered(recv, &mut empty, buf).await
 }
+#[allow(dead_code)]
 async fn write_len_prefixed_udp(send: &mut SendStream, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_QUIC_UDP_PACKET {
         bail!("QUIC UDP payload too large")
@@ -8807,19 +8943,21 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
                 let Some(incoming) = incoming else {
                     break;
                 };
-                let cfg2 = cfg.clone();
-                let sem = semaphore.clone();
                 while set.try_join_next().is_some() {}
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!("maximum QUIC connections reached");
+                        continue;
+                    }
+                };
+                let cfg2 = cfg.clone();
                 set.spawn(async move {
-                    let permit = match sem.clone().try_acquire_owned() {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
+                    let _permit = permit;
                     let _conn = crate::stats::ConnGuard::new();
                     let hs_timeout = Duration::from_secs(cfg2.connection_timeout.max(1));
                     match timeout(hs_timeout, incoming).await {
                         Ok(Ok(connection)) => {
-                            let _permit = permit;
                             let mut stream_tasks = tokio::task::JoinSet::new();
                             loop {
                                 tokio::select! {
@@ -9329,6 +9467,19 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(&buf[..n], &b"ok"[..]);
     }
+
+    #[test]
+    fn test_cached_key_digest_matches() {
+        let k = "test-cached-key";
+        let expected = key_digest_hex_bytes(k);
+        let cached = get_cached_key_digest(k);
+        assert_eq!(expected, cached);
+        // Verify second call hits the cache
+        let cached2 = get_cached_key_digest(k);
+        assert_eq!(expected, cached2);
+        let digest_str = std::str::from_utf8(&cached).unwrap();
+        assert!(quic_auth_matches_str(digest_str, k));
+    }
 }
 } // mod quic
 
@@ -9767,8 +9918,18 @@ pub(crate) fn apply_socket_options_raw(
     let _ = sock.set_nodelay(nodelay);
     if socket_buffer > 0 {
         let bytes = socket_buffer.saturating_mul(1024);
-        let _ = sock.set_send_buffer_size(bytes);
-        let _ = sock.set_recv_buffer_size(bytes);
+        #[cfg(target_os = "linux")]
+        {
+            if bytes >= 2 * 1024 * 1024 {
+                let _ = sock.set_send_buffer_size(bytes);
+                let _ = sock.set_recv_buffer_size(bytes);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = sock.set_send_buffer_size(bytes);
+            let _ = sock.set_recv_buffer_size(bytes);
+        }
     }
     if keepalive {
         let ka = socket2::TcpKeepalive::new()
@@ -9901,7 +10062,8 @@ async fn send_mux_parts_encrypted_reuse(
     obfs: bool,
 ) -> Result<()> {
     if scratch.capacity() == 0 {
-        *scratch = crate::mux_writer::acquire_encode_buf();
+        let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), false, obfs);
+        *scratch = crate::mux_writer::acquire_encode_buf_sized(needed);
     }
     crate::mux_writer::encode_mux_ws_frame(
         scratch, stream_id, command, payload, cipher, false, obfs,
@@ -9916,7 +10078,8 @@ fn send_reset_encrypted(
     id: u32,
     obfs: bool,
 ) {
-    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Rst, 0, false, obfs);
+    let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     if crate::mux_writer::encode_mux_ws_frame(
         &mut bytes,
         id,
@@ -10016,12 +10179,14 @@ fn maybe_send_window(
         return;
     }
     let credit = std::mem::take(refund_pending);
-    let mut bytes = crate::mux_writer::acquire_encode_buf();
+    let payload = encode_window_payload(credit);
+    let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Window, payload.len(), false, obfs);
+    let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     if crate::mux_writer::encode_mux_ws_frame(
         &mut bytes,
         stream_id,
         MuxCommand::Window,
-        &encode_window_payload(credit),
+        &payload,
         cipher,
         false,
         obfs,
@@ -10111,12 +10276,13 @@ where
     // this session go through its serialized, coalescing queue.
     let (writer, mut writer_task) = MuxFrameWriter::spawn(wr);
     let mut writer_dead = false;
-    let mut ok = b"OK\n".to_vec();
+    let mut ok = *b"OK\n";
     cipher.apply(&mut ok);
     let mut flight = encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?;
     let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let version_payload = encode_version_payload(mux_initial_window_kib());
-    let mut ver_buf = crate::mux_writer::acquire_encode_buf();
+    let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Version, version_payload.len(), false, cfg.obfs);
+    let mut ver_buf = crate::mux_writer::acquire_encode_buf_sized(needed);
     crate::mux_writer::encode_mux_ws_frame(
         &mut ver_buf,
         0,
@@ -10142,9 +10308,26 @@ where
     let mut stream_tasks = tokio::task::JoinSet::new();
     let mut frame_buf = Vec::new();
 
-    let mut unacked_intervals = 0u32;
+    let writer_for_hb = writer.clone();
+    let mut heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if writer_for_hb.inc_unacked_pings() >= 3 {
+                tracing::warn!("server mux session idle timeout; terminating dead peer");
+                break;
+            }
+            let mut ping_buf = [0u8; 14];
+            let hlen = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
+            writer_for_hb.try_send_system(ping_buf[..hlen].to_vec());
+        }
+    });
+
     let session_res: Result<()> = async {
         loop {
+            while stream_tasks.try_join_next().is_some() {}
             let next_ws = tokio::select! {
                 r = crate::ws::read_frame_mux(
                     &mut rd,
@@ -10154,28 +10337,16 @@ where
                     Some(&cipher),
                 ) => {
                     if r.is_ok() {
-                        unacked_intervals = 0;
                         writer.notify_pong();
                     }
                     r?
                 },
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    unacked_intervals += 1;
-                    if unacked_intervals >= 3 {
-                        tracing::warn!("server mux session idle timeout; terminating dead peer");
-                        break;
-                    }
-                    let mut ping_buf = [0u8; 14];
-                    let hlen = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
-                    writer.try_send_system(ping_buf[..hlen].to_vec());
-                    continue;
+                _ = &mut heartbeat_handle => {
+                    break;
                 }
                 _ = &mut writer_task, if !writer_dead => {
                     writer_dead = true;
                     break;
-                }
-                Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
-                    continue;
                 }
             };
             let Some((opcode, payload)) = next_ws else {
@@ -10524,11 +10695,11 @@ where
                                         match rx.try_recv() {
                                             Ok(StreamCommand::Data(second)) => {
                                                 if data_batch.capacity() == 0 {
-                                                    data_batch.reserve(16);
+                                                    data_batch.reserve(crate::mux_writer::BATCH_MAX_FRAMES);
                                                 }
                                                 data_batch.push(frame);
                                                 data_batch.push(second);
-                                                while data_batch.len() < 16 {
+                                                while data_batch.len() < crate::mux_writer::BATCH_MAX_FRAMES {
                                                     match rx.try_recv() {
                                                         Ok(StreamCommand::Data(next)) => {
                                                             data_batch.push(next);
@@ -10851,6 +11022,7 @@ where
     }
 
     stream_tasks.abort_all();
+    heartbeat_handle.abort();
     if !writer_dead {
         writer_task.abort();
     }
@@ -10881,7 +11053,7 @@ where
     let target = match target_res.and_then(|t| enforce_target_policy(&cfg, &t).map(|()| t)) {
         Ok(t) => t,
         Err(e) => {
-            let mut err_frame = b"ERR\n".to_vec();
+            let mut err_frame = *b"ERR\n";
             cipher.apply(&mut err_frame);
             let _ = write_frame(&mut wr, &err_frame, 2, false).await;
             return Err(e);
@@ -10890,39 +11062,46 @@ where
     let target_stream = match dial_target(&target, cfg.connection_timeout, &cfg).await {
         Ok(s) => s,
         Err(e) => {
-            let mut err_frame = b"ERR\n".to_vec();
+            let mut err_frame = *b"ERR\n";
             cipher.apply(&mut err_frame);
             let _ = write_frame(&mut wr, &err_frame, 2, false).await;
             return Err(e);
         }
     };
-    let mut ok = b"OK\n".to_vec();
+    let mut ok = *b"OK\n";
     cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
     let (mut target_rd, mut target_wr) = target_stream.into_split();
     let buffer_size = cfg.buffer_size;
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let (dl_err_tx, mut dl_err_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
     let mut download = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
-        loop {
-            let n = tokio::select! {
-                biased;
-                Some(pong) = pong_rx.recv() => {
-                    wr.write_all(&pong).await?;
-                    wr.flush().await?;
-                    continue;
+        let res: Result<()> = async {
+            loop {
+                let n = tokio::select! {
+                    biased;
+                    Some(pong) = pong_rx.recv() => {
+                        wr.write_all(&pong).await?;
+                        wr.flush().await?;
+                        continue;
+                    }
+                    r = target_rd.read(&mut buf) => r?,
+                };
+                if n == 0 {
+                    let _ = write_frame(&mut wr, &[], 8, false).await;
+                    break;
                 }
-                r = target_rd.read(&mut buf) => r?,
-            };
-            if n == 0 {
-                let _ = write_frame(&mut wr, &[], 8, false).await;
-                break;
+                crate::stats::add_bytes(0, n as i64);
+                write_frame_borrowed(&mut wr, &mut buf[..n], 2, false).await?;
             }
-            crate::stats::add_bytes(0, n as i64);
-            write_frame_borrowed(&mut wr, &mut buf[..n], 2, false).await?;
+            Ok(())
         }
+        .await;
         recycle_buf(buf).await;
-        Result::<()>::Ok(())
+        if let Err(e) = res {
+            let _ = dl_err_tx.send(e);
+        }
     }));
     let mut frame_buf = Vec::new();
     let mut download_done = false;
@@ -10931,12 +11110,19 @@ where
         loop {
             let res = if !download_done {
                 tokio::select! {
-                    dl_res = &mut download => {
+                    err_res = &mut dl_err_rx => {
                         download_done = true;
-                        match dl_res {
-                            Ok(Ok(())) => continue,
-                            _ => break,
+                        if let Ok(e) = err_res {
+                            return Err(e);
                         }
+                        crate::ws::read_frame_pong_channel(
+                            &mut rd,
+                            &pong_tx,
+                            false,
+                            &mut frame_buf,
+                            None,
+                        )
+                        .await
                     }
                     r = crate::ws::read_frame_pong_channel(
                         &mut rd,
@@ -11028,7 +11214,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let mut ok = b"OK\n".to_vec();
+    let mut ok = *b"OK\n";
     cipher.apply(&mut ok);
     write_frame(&mut wr, &ok, 2, false).await?;
     let udp = Arc::new(crate::udp_batch::bind_dual_stack_udp_unspecified()?);
@@ -11040,7 +11226,9 @@ where
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let mut send_task = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
-        let mut packet = Vec::with_capacity(2048);
+        let mut packet = Vec::with_capacity(4096);
+        let mut single_env = Vec::with_capacity(2048);
+        let mut last_allowed_src: Option<SocketAddr> = None;
         loop {
             let count = tokio::select! {
                 biased;
@@ -11055,23 +11243,36 @@ where
                     Err(_) => break,
                 },
             };
+            packet.clear();
             for i in 0..count {
                 let (pkt, source) = batch.packet(i);
-                if !known_send
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&source)
-                {
+                let allowed = match last_allowed_src {
+                    Some(s) if s == source => true,
+                    _ => {
+                        let ok = known_send
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains(&source);
+                        if ok {
+                            last_allowed_src = Some(source);
+                        }
+                        ok
+                    }
+                };
+                if !allowed {
                     tracing::debug!(%source, "UDP relay dropped a datagram from an undialed source");
                     continue;
                 }
                 crate::stats::add_bytes(0, pkt.len() as i64);
-                udp_envelope_into(&mut packet, source, pkt);
-                cipher_send.apply(&mut packet);
-                if write_frame_borrowed(&mut wr, &mut packet, 2, false)
-                    .await
-                    .is_err()
-                {
+                udp_envelope_into(&mut single_env, source, pkt);
+                cipher_send.apply(&mut single_env);
+                let mut ws_hdr = [0u8; 14];
+                let hlen = crate::ws::ws_header_into(&mut ws_hdr, single_env.len(), 2, false);
+                packet.extend_from_slice(&ws_hdr[..hlen]);
+                packet.extend_from_slice(&single_env);
+            }
+            if !packet.is_empty() {
+                if wr.write_all(&packet).await.is_err() || wr.flush().await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -13052,14 +13253,29 @@ impl UdpBatchReader {
 
     #[cfg(not(target_os = "linux"))]
     fn try_recv_batch(&mut self) -> io::Result<usize> {
-        match self.sock.try_recv_from(&mut self.bufs[0]) {
-            Ok((n, addr)) => {
-                self.lens[0] = n;
-                self.addrs[0] = normalize_peer_addr(addr);
-                Ok(1)
+        let mut count = 0;
+        while count < UDP_BATCH {
+            match self.sock.try_recv_from(&mut self.bufs[count]) {
+                Ok((n, addr)) => {
+                    self.lens[count] = n;
+                    self.addrs[count] = normalize_peer_addr(addr);
+                    count += 1;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if count > 0 {
+                        return Ok(count);
+                    }
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Err(e) => {
+                    if count > 0 {
+                        return Ok(count);
+                    }
+                    return Err(e);
+                }
             }
-            Err(e) => Err(e),
         }
+        Ok(count)
     }
 
     /// Payload + source of datagram `i` (valid for `i` below the last
@@ -13088,8 +13304,8 @@ impl UdpBatchWriter {
         Self {
             sock,
             sock_is_v6,
-            bufs: (0..UDP_BATCH).map(|_| Vec::with_capacity(1500)).collect(),
-            addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH],
+            bufs: Vec::new(),
+            addrs: Vec::new(),
             count: 0,
         }
     }
@@ -13098,6 +13314,10 @@ impl UdpBatchWriter {
     pub(crate) async fn push(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
         let dest = target_for_socket(addr, self.sock_is_v6);
         let idx = self.count;
+        if self.bufs.is_empty() {
+            self.bufs = (0..UDP_BATCH).map(|_| Vec::with_capacity(1500)).collect();
+            self.addrs = vec![SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH];
+        }
         self.bufs[idx].clear();
         self.bufs[idx].extend_from_slice(payload);
         self.addrs[idx] = dest;
@@ -13118,13 +13338,15 @@ impl UdpBatchWriter {
         while offset < self.count {
             self.sock.writable().await?;
             let take = (self.count - offset).min(UDP_BATCH);
-            let mut slice: Vec<(&[u8], SocketAddr)> = Vec::with_capacity(take);
+            let mut slice: [(&[u8], SocketAddr); UDP_BATCH] =
+                [(&[], SocketAddr::from(([0, 0, 0, 0], 0))); UDP_BATCH];
             for i in 0..take {
-                slice.push((self.bufs[offset + i].as_slice(), self.addrs[offset + i]));
+                slice[i] = (self.bufs[offset + i].as_slice(), self.addrs[offset + i]);
             }
+            let slice_ref = &slice[..take];
 
             #[cfg(target_os = "linux")]
-            match send_batch_linux(&self.sock, &slice) {
+            match send_batch_linux(&self.sock, slice_ref) {
                 Ok(n) if n > 0 => {
                     offset += n;
                     total += n;
@@ -13135,7 +13357,7 @@ impl UdpBatchWriter {
             }
 
             #[cfg(not(target_os = "linux"))]
-            match send_batch_fallback(&self.sock, &slice) {
+            match send_batch_fallback(&self.sock, slice_ref) {
                 Ok(n) if n > 0 => {
                     offset += n;
                     total += n;
@@ -13347,8 +13569,25 @@ pub(crate) fn send_batch_fallback(
     if pkts.is_empty() {
         return Ok(0);
     }
-    let (payload, dest) = pkts[0];
-    sock.try_send_to(payload, dest).map(|_| 1)
+    let mut sent = 0;
+    for &(payload, dest) in pkts {
+        match sock.try_send_to(payload, dest) {
+            Ok(_) => sent += 1,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if sent > 0 {
+                    return Ok(sent);
+                }
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            Err(e) => {
+                if sent > 0 {
+                    return Ok(sent);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(sent)
 }
 
 #[cfg(test)]
@@ -13409,6 +13648,13 @@ mod tests {
             assert_eq!(buf[2], 0xEF);
             assert_eq!(buf[3], 0x12);
         }
+    }
+
+    #[tokio::test]
+    async fn batch_writer_lazy_allocation() {
+        let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let writer = UdpBatchWriter::new(tx);
+        assert_eq!(writer.bufs.len(), 0, "UdpBatchWriter must allocate lazily");
     }
 }
 } // mod udp_batch
@@ -14116,6 +14362,7 @@ unsafe fn apply_ws_mask_neon(buf: &mut [u8], key: [u8; 4]) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn apply_ws_mask_fallback(buf: &mut [u8], key: [u8; 4]) {
     let mut mask32 = [0u8; 32];
     for i in 0..8 {
@@ -14460,6 +14707,16 @@ where
                     buf.reserve_exact(total.min(READ_SEGMENT));
                 }
             }
+            struct TruncateOnDrop<'a> {
+                buf: &'a mut Vec<u8>,
+                target_len: usize,
+            }
+            impl<'a> Drop for TruncateOnDrop<'a> {
+                fn drop(&mut self) {
+                    self.buf.truncate(self.target_len);
+                }
+            }
+
             let mut read: usize = 0;
             while read < total {
                 let chunk = (total - read).min(READ_SEGMENT);
@@ -14467,14 +14724,19 @@ where
                 if buf.capacity() - start < chunk {
                     buf.reserve(chunk);
                 }
+                let mut guard = TruncateOnDrop {
+                    buf: &mut *buf,
+                    target_len: start,
+                };
                 // SAFETY: `set_len` exposes `[start, start+chunk)`, which the
                 // `read_exact` below fully initializes before any of it is
-                // observed; on error we `truncate` back to `start` first.
-                unsafe { buf.set_len(start + chunk) };
-                if r.read_exact(&mut buf[start..start + chunk]).await.is_err() {
-                    buf.truncate(start);
+                // observed; on error or cancellation the RAII guard truncates
+                // back to `start`.
+                unsafe { guard.buf.set_len(start + chunk) };
+                if r.read_exact(&mut guard.buf[start..start + chunk]).await.is_err() {
                     return Err(anyhow!("websocket payload truncated"));
                 }
+                guard.target_len = start + chunk;
                 read += chunk;
             }
         }
@@ -15325,7 +15587,7 @@ async fn connect_wss_mux_session(
 ) -> Result<Arc<WssSessionState>> {
     let (mut rd, mut wr) = open_upstream(cfg).await?;
     let c = configured_cipher(&cfg.key);
-    let mut hello = b"MUX\n".to_vec();
+    let mut hello = *b"MUX\n";
     c.apply(&mut hello);
 
     tracing::debug!("[WSS] Sending MUX handshake");
