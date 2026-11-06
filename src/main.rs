@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.77";
+pub const APP_VERSION: &str = "0.0.78";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -4825,14 +4825,17 @@ impl MuxFrameWriter {
         command: MuxCommand,
         frame: Vec<u8>,
     ) -> Result<()> {
-        // Only stream-CLOSING controls yield to their own queued DATA.
-        // SYN must lead (it creates the peer-side stream); DATA never
-        // takes the priority lane at all.
-        let yield_to_data = command == MuxCommand::Fin;
+        // Control frames (SYN, RST, WINDOW, VERSION) take the priority lane.
+        // Stream DATA and half-close FIN share the stream's ordered DATA lane
+        // so FIN can never race ahead of unwritten stream DATA across channels.
+        let is_ctrl = match command {
+            MuxCommand::Syn | MuxCommand::Rst | MuxCommand::Window | MuxCommand::Version => true,
+            MuxCommand::Data | MuxCommand::Fin => false,
+        };
         self.send_frame(OutboundFrame {
             stream_id: Some(stream_id),
-            priority: command != MuxCommand::Data,
-            yield_to_data,
+            priority: is_ctrl,
+            yield_to_data: false,
             is_rst: command == MuxCommand::Rst,
             bytes: frame,
         })
@@ -4851,11 +4854,14 @@ impl MuxFrameWriter {
             recycle_encode_buf(frame);
             return;
         }
-        let yield_to_data = command == MuxCommand::Fin;
+        let is_ctrl = match command {
+            MuxCommand::Syn | MuxCommand::Rst | MuxCommand::Window | MuxCommand::Version => true,
+            MuxCommand::Data | MuxCommand::Fin => false,
+        };
         let out = OutboundFrame {
             stream_id: Some(stream_id),
-            priority: command != MuxCommand::Data,
-            yield_to_data,
+            priority: is_ctrl,
+            yield_to_data: false,
             is_rst: command == MuxCommand::Rst,
             bytes: frame,
         };
@@ -5301,12 +5307,10 @@ async fn writer_loop<W>(
                     None => data_closed = true,
                 },
             }
-            if sched.is_empty() {
-                if ctrl_closed && data_closed {
-                    break;
-                }
-                continue;
+            if ctrl_closed && data_closed && sched.is_empty() {
+                break;
             }
+            continue;
         }
 
         debug_assert!(batch.is_empty());
@@ -6066,6 +6070,42 @@ mod tests {
         }
         assert_eq!(received.len(), 2);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mux_writer_fin_never_overtakes_data() {
+        use crate::crypto::XorCipher;
+        use crate::ws::read_frame;
+        use tokio::io::duplex;
+
+        for iteration in 0..10 {
+            let (a, mut b) = duplex(1024 * 1024);
+            let (writer, handle) = MuxFrameWriter::spawn(a);
+            let cipher = XorCipher::new("fin_fifo_test");
+
+            let mut enc_data = Vec::new();
+            encode_mux_ws_frame(&mut enc_data, 1, MuxCommand::Data, &[42u8; 512], &cipher, true, false).unwrap();
+            let mut enc_fin = Vec::new();
+            encode_mux_ws_frame(&mut enc_fin, 1, MuxCommand::Fin, &[], &cipher, true, false).unwrap();
+
+            writer.send_mux(1, MuxCommand::Data, enc_data).await.unwrap();
+            writer.send_mux(1, MuxCommand::Fin, enc_fin).await.unwrap();
+            drop(writer);
+
+            let mut buf = Vec::new();
+            let mut received = Vec::new();
+            while let Ok(Some((_, mut payload))) = read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await {
+                cipher.apply(&mut payload);
+                let frame = MuxFrame::decode(&payload).unwrap();
+                received.push(frame.command);
+            }
+            assert_eq!(
+                received,
+                vec![MuxCommand::Data, MuxCommand::Fin],
+                "Iteration {iteration}: FIN must NEVER overtake DATA on the wire"
+            );
+            handle.await.unwrap();
+        }
     }
 }
 } // mod mux_writer

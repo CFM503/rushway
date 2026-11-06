@@ -2323,3 +2323,30 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 - All 154 unit tests passed (`154 passed; 0 failed`).
 - `python scripts/ci_guard.py` passed with 0 warnings.
 - Status: Released and tagged as `v0.0.77`.
+
+
+## Release: v0.0.78 (2026-11-06)
+
+### Context & User Directives
+- **Directives:** "更新版本号，推送仓库，推送tag"
+- **Problem Statement:** Client testing `https://speed.cloudflare.com/` through `rushway` server hung at "正在测量 延迟 · 2个数据包" (measuring latency · 2 packets). `goway` server did not have this issue.
+- **Root Cause Confirmed:** Live wire capture on `172.64.229.85:2052` proved `cmd=FIN` was emitted BEFORE `cmd=DATA` on stream 1. `MuxFrameWriter` (introduced in v0.0.76) had routed `Fin` to `ctrl_tx` and `Data` to `data_tx`. In `writer_loop`, `ctrl_rx` drained first, overtaking unpolled `DATA` in `data_rx`. The client received `FIN`, closed local socket, and dropped the subsequent `DATA` frame.
+- **Ironclad Constraints:** Do not remove MUX v1; preserve full backwards compatibility with GoWay; guarantee strict per-stream FIFO delivery without head-of-line blocking for true control frames (`Syn`, `Rst`, `Window`, `Version`).
+
+### Architectural Changes & Fixes
+1. **Stream-Ordered MUX `Fin` Frame Scheduling (`src/main.rs:mux_writer::MuxFrameWriter::send_mux`, `try_send_mux`)**:
+   - Reclassified `MuxCommand::Fin` as `is_ctrl = false`, routing it into `data_tx` with `priority = false`.
+   - Control frames (`Syn`, `Rst`, `Window`, `Version`) continue taking `ctrl_tx` for microsecond-level dispatch.
+   - Per-stream FIFO order is preserved: `DATA_1`, `DATA_2`, ..., `FIN` arrive in exact sequence.
+2. **Writer Loop Drain-Before-Batch Optimization (`src/main.rs:mux_writer::writer_loop`)**:
+   - Replaced immediate batching on single-frame wake-up with loop `continue;`, ensuring both `ctrl_rx` and `data_rx` are drained before frame rotation.
+3. **Regression Test (`src/main.rs:mux_writer::tests::mux_writer_fin_never_overtakes_data`)**:
+   - Added automated test executing 10 iterations of `Data` immediately followed by `Fin` through `MuxFrameWriter`, verifying wire output is strictly `[Data, Fin]`.
+
+### Validation
+- `python scripts/ci_guard.py` completely passed:
+  - Version synchronized across all files (v0.0.78).
+  - Lexical delimiter balance verified (17,431 lines).
+  - Static module/import/mutex/type analysis passed across 20 modules.
+  - `git diff --check` clean with 0 warnings.
+- Status: Released and tagged as `v0.0.78`.

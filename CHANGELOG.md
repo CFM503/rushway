@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.78] - 2026-11-06
+
+### MUX Dual-Channel Frame FIFO Delivery & Speedtest Latency Stall Resolution
+
+- **Stream-Ordered MUX `Fin` Frame Scheduling (`src/main.rs:mux_writer::MuxFrameWriter::send_mux`, `try_send_mux`) [BUG]** — Resolved an issue where speed test tools (e.g. `speed.cloudflare.com`) stalled during latency probing (`正在测量 延迟 · 2个数据包`). The dual-channel writer previously classified `MuxCommand::Fin` as a priority control frame (`priority: command != MuxCommand::Data`), sending it to `ctrl_tx` while trailing `Data` was enqueued in `data_tx`. When upstream servers closed the connection after sending response bytes, `writer_loop` drained `FIN` from `ctrl_rx` ahead of unpolled `DATA` in `data_rx`, causing the peer client (`goway.exe`) to close the socket and drop the HTTP response payload. Reclassified `Fin` into the per-stream ordered `data_tx` channel (`is_ctrl = matches!(command, Syn | Rst | Window | Version)`), mathematically guaranteeing that `FIN` never precedes prior `DATA` frames.
+- **Biased Priority Writer Queue Non-Blocking Drain Optimization (`src/main.rs:mux_writer::writer_loop`) [OPT]** — When waking from idle upon frame arrival in `tokio::select!`, the writer loop now immediately loops back to perform non-blocking drains on both `ctrl_rx` and `data_rx` before assembling batches, maximizing batch packing efficiency and eliminating channel interleaving jitter.
+- **Automated Anti-Regression Unit Test (`src/main.rs:mux_writer::tests::mux_writer_fin_never_overtakes_data`) [TEST]** — Added an end-to-end regression test asserting strict `[Data, Fin]` arrival order across 10 iterations under concurrent writer tasks.
+
 ## [v0.0.77] - 2026-11-05
 
 ### RushWay MUX v2 Unlimited Throughput Protocol: 23-Bit Jumbo Frames, Multi-Frame Super-Packet Unpacking, 32-Bit Window Extension & 16 KiB Buffered WS Reader
