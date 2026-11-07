@@ -2350,3 +2350,21 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
   - Static module/import/mutex/type analysis passed across 20 modules.
   - `git diff --check` clean with 0 warnings.
 - Status: Released and tagged as `v0.0.78`.
+
+
+## Release: v0.0.79 (2026-11-07)
+
+### Context & User Directives
+- **Directives:** "/boost 执行以上你的计划，我再加一条同时去掉goway.go的mux v1" -> "执行推送"
+- **Goal:** Remove legacy MUX v1 fallback branches in both `rushway` and `goway.go` so 0-RTT streams immediately use MUX v2 Jumbo frames (`129,600 B`) without waiting for `VERSION` negotiation, eliminate per-read atomic `peer_version` checks and per-stream `Arc` clones, and add the post-batch `ctrl_rx` sweep in `writer_loop`.
+
+### Architectural Changes & Optimizations
+1. **Pure MUX v2 Execution & 0-RTT Jumbo Framing (`src/main.rs:common::MuxClientSession`, `relay_client_mux_stream`, `runtime::target_to_mux`, `handle_mux_parts`)**:
+   - Removed `peer_version: AtomicU8` from `MuxClientSession` and `handle_mux_parts`, eliminating `session_up` and `peer_version_task` `Arc` clones on every stream creation.
+   - Hoisted `max_chunk = MAX_MUX_V2_CHUNK` (`129,600 B`) and `read_cap` outside the `loop` in `relay_client_mux_stream` and `target_to_mux`.
+2. **Post-Batch Control Frame Sweep (`src/main.rs:mux_writer::writer_loop`)**:
+   - Added non-blocking `ctrl_rx.try_recv()` sweep right after `sched` batch extraction when batch capacity remains, piggybacking newly arrived control frames onto the current vectored write.
+
+### Validation
+- `python scripts/ci_guard.py` passed all static, lexical, and version checks.
+- Status: Released and tagged as `v0.0.79`.

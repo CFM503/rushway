@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.78";
+pub const APP_VERSION: &str = "0.0.79";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -276,7 +276,6 @@ pub(crate) struct MuxClientSession {
     pub(crate) obfs: bool,
     pub(crate) streams: Arc<std::sync::RwLock<crate::protocol::U32HashMap<ClientStreamEntry>>>,
     pub(crate) peer_window_kib: std::sync::atomic::AtomicU32,
-    pub(crate) peer_version: std::sync::atomic::AtomicU8,
     next_id: std::sync::atomic::AtomicU32,
     pub(crate) active: std::sync::atomic::AtomicUsize,
     pub(crate) closed: std::sync::atomic::AtomicBool,
@@ -296,7 +295,7 @@ impl MuxClientSession {
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
         let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
         let version_payload =
             crate::protocol::encode_version_payload(crate::protocol::mux_initial_window_kib());
@@ -314,7 +313,6 @@ impl MuxClientSession {
                 crate::protocol::U32HashMap::default(),
             )),
             peer_window_kib: AtomicU32::new(0),
-            peer_version: AtomicU8::new(1),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -641,7 +639,6 @@ where
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some((version, kib)) = decoded {
                         if version >= 1 {
-                            state.peer_version.store(version, Ordering::Release);
                             let prev = state.peer_window_kib.fetch_max(kib as u32, Ordering::AcqRel);
                             if prev == 0 {
                                 let streams =
@@ -1290,31 +1287,19 @@ pub(crate) async fn relay_client_mux_stream(
     let (mut local_rd, mut local_wr) = local.into_split();
     let writer_up = writer.clone();
     let cipher_up = cipher.clone();
-    let session_up = session.clone();
     let fin_sent = Arc::new(AtomicBool::new(false));
     let fin_sent_up = fin_sent.clone();
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         let mut frame_scratch = Vec::new();
+        let max_chunk = crate::protocol::MAX_MUX_V2_CHUNK;
+        let read_cap = if buf.len() <= 128 * 1024 {
+            buf.len().min(max_chunk)
+        } else {
+            buf.len()
+        };
         let res = async {
             loop {
-                let is_v2 = session_up.peer_version.load(Ordering::Relaxed) >= 2;
-                let max_chunk = if is_v2 {
-                    crate::protocol::MAX_MUX_V2_CHUNK
-                } else {
-                    u16::MAX as usize
-                };
-                let read_cap = if is_v2 {
-                    if buf.len() <= 128 * 1024 {
-                        buf.len().min(crate::protocol::MAX_MUX_V2_CHUNK)
-                    } else {
-                        buf.len()
-                    }
-                } else if buf.len() == 128 * 1024 {
-                    (u16::MAX as usize) * 2
-                } else {
-                    buf.len()
-                };
                 let n = match local_rd.read(&mut buf[..read_cap]).await {
                     Ok(n) => n,
                     Err(e) => {
@@ -1994,7 +1979,6 @@ mod tests {
             obfs: false,
             streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
-            peer_version: std::sync::atomic::AtomicU8::new(1),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -2061,7 +2045,6 @@ mod tests {
             obfs: false,
             streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
-            peer_version: std::sync::atomic::AtomicU8::new(1),
             next_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -5331,6 +5314,22 @@ async fn writer_loop<W>(
                         break;
                     }
                     continue;
+                }
+            }
+        }
+        while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES && !ctrl_closed {
+            match ctrl_rx.try_recv() {
+                Ok(frame) => {
+                    sched.push(frame);
+                    if let Some(f) = sched.next() {
+                        bytes += f.len();
+                        batch.push(f);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    ctrl_closed = true;
+                    break;
                 }
             }
         }
@@ -10358,28 +10357,16 @@ async fn target_to_mux(
     cipher: XorCipher,
     obfs: bool,
     gate: Arc<CreditGate>,
-    peer_version: Arc<std::sync::atomic::AtomicU8>,
 ) -> bool {
     let mut buf = relay_buf(buffer_size).await;
     let mut frame_scratch = Vec::new();
+    let max_chunk = crate::protocol::MAX_MUX_V2_CHUNK;
+    let read_cap = if buf.len() <= 128 * 1024 {
+        buf.len().min(max_chunk)
+    } else {
+        buf.len()
+    };
     let clean_eof = loop {
-        let is_v2 = peer_version.load(Ordering::Relaxed) >= 2;
-        let max_chunk = if is_v2 {
-            crate::protocol::MAX_MUX_V2_CHUNK
-        } else {
-            u16::MAX as usize
-        };
-        let read_cap = if is_v2 {
-            if buf.len() <= 128 * 1024 {
-                buf.len().min(crate::protocol::MAX_MUX_V2_CHUNK)
-            } else {
-                buf.len()
-            }
-        } else if buf.len() == 128 * 1024 {
-            (u16::MAX as usize) * 2
-        } else {
-            buf.len()
-        };
         match target.read(&mut buf[..read_cap]).await {
             Ok(0) => {
                 let _ = send_mux_parts_encrypted_reuse(
@@ -10553,8 +10540,6 @@ where
     cipher.apply(&mut ok);
     let mut flight = encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?;
     let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-    let peer_version: Arc<std::sync::atomic::AtomicU8> =
-        Arc::new(std::sync::atomic::AtomicU8::new(1));
     let version_payload = encode_version_payload(mux_initial_window_kib());
     let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Version, version_payload.len(), false, cfg.obfs);
     let mut ver_buf = crate::mux_writer::acquire_encode_buf_sized(needed);
@@ -10751,7 +10736,6 @@ where
                     let cfg_task = cfg.clone();
                     let gate_task = gate;
                     let peer_window_task = peer_window.clone();
-                    let peer_version_task = peer_version.clone();
                     let pending_total_task = pending_bytes_total.clone();
 
                     let max_pending_frames: usize =
@@ -10928,7 +10912,6 @@ where
                             cipher_task.clone(),
                             cfg_task.obfs,
                             gate_task.clone(),
-                            peer_version_task.clone(),
                         )));
 
                         let mut write_failed = false;
@@ -11273,7 +11256,6 @@ where
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some((version, kib)) = decoded {
                         if version >= 1 {
-                            peer_version.store(version, Ordering::Release);
                             let prev = peer_window.fetch_max(kib as u32, Ordering::AcqRel);
                             if prev == 0 {
                                 let window = i64::from(kib) * 1024;

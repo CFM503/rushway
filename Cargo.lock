@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "rushway"
-version = "0.0.78"
+version = "0.0.79"
 dependencies = [
  "anyhow",
  "base64",

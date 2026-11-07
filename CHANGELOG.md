@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.79] - 2026-11-07
+
+### Pure MUX v2 Execution Path, 0-RTT Jumbo Framing & Post-Drain Control Sweep
+
+- **Pure MUX v2 Execution & Removal of Legacy v1 Fallback (`src/main.rs:common::MuxClientSession`, `relay_client_mux_stream`, `runtime::target_to_mux`, `handle_mux_parts`) [OPT]** — Removed legacy MUX v1 `peer_version` atomic tracking, per-stream `Arc<AtomicU8>` clones (`session_up` / `peer_version_task`), and the `64 KiB` `(u16::MAX) * 2` 3-frame splitting fallback branches. Both client and server now unconditionally use MUX v2 `MAX_MUX_V2_CHUNK` (`129,600 B`) from byte 0 (including 0-RTT packets sent before the peer's `VERSION` frame arrives) and hoist `max_chunk` / `read_cap` out of the inner socket `read()` hot loops.
+- **Writer Loop Post-Drain Control Frame Sweep (`src/main.rs:mux_writer::writer_loop`) [OPT]** — Added a non-blocking `ctrl_rx.try_recv()` sweep immediately after `sched.next()` batch assembly so control frames (`Syn`, `Rst`, `Window`) arriving during scheduler rotation are piggybacked onto the outgoing `write_vectored` syscall without waiting for the next loop cycle.
+
 ## [v0.0.78] - 2026-11-06
 
 ### MUX Dual-Channel Frame FIFO Delivery & Speedtest Latency Stall Resolution
