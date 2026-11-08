@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.79";
+pub const APP_VERSION: &str = "0.0.80";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -609,8 +609,15 @@ where
 {
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
+    type CachedClientStream = (
+        u32,
+        mpsc::Sender<crate::protocol::OwnedMuxFrame>,
+        Arc<crate::flow::CreditGate>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
     let mut frame_buf = Vec::new();
     let mut coalesced = Vec::with_capacity(8);
+    let mut last_stream: Option<CachedClientStream> = None;
     let res = async {
         loop {
             let Some((opcode, payload)) = crate::ws::read_frame_mux(
@@ -660,11 +667,11 @@ where
                         let decoded_kib = crate::protocol::decode_session_window_kib(frame.payload());
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         if let Some(kib32) = decoded_kib {
-                            state.peer_window_kib.store(kib32, Ordering::Release);
+                            state.peer_window_kib.fetch_max(kib32, Ordering::AcqRel);
                             let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
                             let window = i64::from(kib32) * 1024;
                             for entry in streams.values() {
-                                entry.gate.enable(window);
+                                entry.gate.upgrade_window(window);
                             }
                         }
                         continue;
@@ -672,13 +679,24 @@ where
                     let decoded = crate::protocol::decode_window_payload(frame.payload());
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some(credit) = decoded {
-                        if let Some(entry) = state
-                            .streams
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&stream_id)
-                        {
-                            entry.gate.release(i64::from(credit));
+                        match &last_stream {
+                            Some((cached_id, tx, gate, _))
+                                if *cached_id == stream_id && !tx.is_closed() =>
+                            {
+                                gate.release(i64::from(credit));
+                            }
+                            _ => {
+                                let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
+                                if let Some(entry) = streams.get(&stream_id) {
+                                    entry.gate.release(i64::from(credit));
+                                    last_stream = Some((
+                                        stream_id,
+                                        entry.tx.clone(),
+                                        entry.gate.clone(),
+                                        entry.pending_ctrl.clone(),
+                                    ));
+                                }
+                            }
                         }
                     }
                     continue;
@@ -686,35 +704,75 @@ where
                 _ => {}
             }
             let id = frame.stream_id;
-            let send_res = {
-                let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
-                match streams.get(&id) {
-                    Some(entry) => {
-                        if entry.pending_ctrl.load(Ordering::Acquire) {
-                            // A prior control frame is already queued in the background for this stream.
-                            // To preserve strict per-stream FIFO order and prevent unbounded task accumulation,
-                            // subsequent frames must not bypass the queued control frame or spawn new tasks.
-                            if frame.command == MuxCommand::Rst {
-                                let gate = entry.gate.clone();
-                                drop(streams);
-                                crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                                state.close_stream_if_same(id, &gate);
-                            } else {
-                                crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                            }
-                            None
-                        } else {
-                            Some(match entry.tx.try_send(frame) {
-                                Ok(()) => Ok(()),
-                                Err(err) => Err((entry.tx.clone(), entry.gate.clone(), entry.pending_ctrl.clone(), err)),
-                            })
-                        }
-                    }
-                    None => {
-                        // Unknown/stale stream IDs are normal during teardown; return
-                        // their pooled storage instead of dropping it to the allocator.
+            let is_data = frame.command == MuxCommand::Data;
+            let send_res = match &last_stream {
+                Some((cached_id, tx, gate, pending_ctrl))
+                    if is_data && *cached_id == id && !tx.is_closed() =>
+                {
+                    if pending_ctrl.load(Ordering::Acquire) {
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         None
+                    } else {
+                        Some(match tx.try_send(frame) {
+                            Ok(()) => Ok(()),
+                            Err(err) => Err((tx.clone(), gate.clone(), pending_ctrl.clone(), err)),
+                        })
+                    }
+                }
+                _ => {
+                    let streams = state.streams.read().unwrap_or_else(|e| e.into_inner());
+                    match streams.get(&id) {
+                        Some(entry) => {
+                            if entry.pending_ctrl.load(Ordering::Acquire) {
+                                // A prior control frame is already queued in the background for this stream.
+                                // To preserve strict per-stream FIFO order and prevent unbounded task accumulation,
+                                // subsequent frames must not bypass the queued control frame or spawn new tasks.
+                                if frame.command == MuxCommand::Rst {
+                                    let gate = entry.gate.clone();
+                                    drop(streams);
+                                    if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                        last_stream = None;
+                                    }
+                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                    state.close_stream_if_same(id, &gate);
+                                } else {
+                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                }
+                                None
+                            } else {
+                                let res = match entry.tx.try_send(frame) {
+                                    Ok(()) => {
+                                        if is_data {
+                                            last_stream = Some((
+                                                id,
+                                                entry.tx.clone(),
+                                                entry.gate.clone(),
+                                                entry.pending_ctrl.clone(),
+                                            ));
+                                        } else if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                            last_stream = None;
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(err) => {
+                                        if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                            last_stream = None;
+                                        }
+                                        Err((entry.tx.clone(), entry.gate.clone(), entry.pending_ctrl.clone(), err))
+                                    }
+                                };
+                                Some(res)
+                            }
+                        }
+                        None => {
+                            if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                last_stream = None;
+                            }
+                            // Unknown/stale stream IDs are normal during teardown; return
+                            // their pooled storage instead of dropping it to the allocator.
+                            crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                            None
+                        }
                     }
                 }
             };
@@ -1292,6 +1350,7 @@ pub(crate) async fn relay_client_mux_stream(
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         let mut frame_scratch = Vec::new();
+        let mut stats_batch = crate::stats::StatsBatcher::new();
         let max_chunk = crate::protocol::MAX_MUX_V2_CHUNK;
         let read_cap = if buf.len() <= 128 * 1024 {
             buf.len().min(max_chunk)
@@ -1331,7 +1390,7 @@ pub(crate) async fn relay_client_mux_stream(
                     }
                     break;
                 }
-                crate::stats::add_bytes(n as i64, 0);
+                stats_batch.add_up(n);
                 let mut off = 0;
                 while off < n {
                     let end = (off + max_chunk).min(n);
@@ -1361,6 +1420,7 @@ pub(crate) async fn relay_client_mux_stream(
     let mut remote_fin = false;
     let mut remote_rst = false;
     let mut refund_pending: u32 = 0;
+    let mut stats_batch = crate::stats::StatsBatcher::new();
     let mut data_batch: Vec<crate::protocol::OwnedMuxFrame> =
         Vec::with_capacity(crate::mux_writer::BATCH_MAX_FRAMES);
     let mut deferred_ctrl: Option<crate::protocol::OwnedMuxFrame> = None;
@@ -1429,7 +1489,7 @@ pub(crate) async fn relay_client_mux_stream(
                     }
                 };
                 if written > 0 {
-                    crate::stats::add_bytes(0, written as i64);
+                    stats_batch.add_down(written);
                     let negotiated = peer_window_kib.load(Ordering::Relaxed) > 0;
                     if negotiated {
                         refund_pending = refund_pending.saturating_add(written as u32);
@@ -3870,6 +3930,42 @@ impl CreditGate {
         }
     }
 
+    /// Upgrades the send window to `window` bytes for MUX v2 32-bit session
+    /// `WINDOW` frames (`stream_id == 0`). If the gate is still unbounded,
+    /// enables it with `window`; if already bounded with a smaller window,
+    /// atomically adds `window - old_window` to both `window` and `available`.
+    pub(crate) fn upgrade_window(&self, window: i64) {
+        let w = window.clamp(1, MAX_WINDOW) as u32;
+        let mut cur = self.state.load(Ordering::Acquire);
+        loop {
+            let (win, avail) = unpack_state(cur);
+            if win == CLOSED_TAG {
+                return;
+            }
+            let next = if win == UNBOUNDED_TAG {
+                pack_state(w, w)
+            } else if w > win {
+                let delta = w - win;
+                let new_avail = avail.saturating_add(delta).min(w);
+                pack_state(w, new_avail)
+            } else {
+                return;
+            };
+            match self.state.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.notify.notify_waiters();
+                    return;
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// Credits `n` consumed bytes back to the window (capped at the
     /// advertised maximum so a buggy peer cannot inflate it).
     #[inline]
@@ -4066,6 +4162,34 @@ mod tests {
         let pending =
             tokio::time::timeout(std::time::Duration::from_millis(50), gate.acquire(1)).await;
         assert!(pending.is_err(), "re-enable refilled a live window");
+        gate.close();
+    }
+
+    #[tokio::test]
+    async fn upgrade_window_grows_live_window_and_wakes_waiters() {
+        let gate = CreditGate::new();
+        gate.enable(100);
+        gate.acquire(100).await;
+
+        let waiting = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                gate.acquire(150).await;
+                150usize
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Same or smaller window is a no-op.
+        gate.upgrade_window(100);
+        gate.upgrade_window(50);
+
+        // Upgrading from 100 -> 250 adds +150 available credit, waking the waiter.
+        gate.upgrade_window(250);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("upgrade_window did not wake waiter")
+            .unwrap();
+        assert_eq!(got, 150);
         gate.close();
     }
 }
@@ -6123,7 +6247,7 @@ use crate::runtime::{
 use crate::udp_relay::handle_local_udp_proxy;
 use crate::ws::{
     build_server_handshake_response, read_frame_with_cipher,
-    read_http_headers_timeout, validate_server_handshake,
+    read_http_headers_timeout_buf, validate_server_handshake,
 };
 use anyhow::{anyhow, bail, Result};
 use std::future::Future;
@@ -6304,9 +6428,10 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
     Ok(())
 }
 async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
-    let (mut rd, mut wr) = stream.into_split();
+    let (rd, mut wr) = stream.into_split();
+    let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
     let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let request = read_http_headers_timeout(&mut rd, hs_timeout).await?;
+    let request = read_http_headers_timeout_buf(&mut rd, hs_timeout).await?;
     let key = validate_server_handshake(&request)?;
     wr.write_all(&build_server_handshake_response(&key)).await?;
     wr.flush().await?;
@@ -8193,7 +8318,7 @@ fn transport_config() -> Arc<TransportConfig> {
     // than GoWay's 128); windows stay 8/16 MiB (bulk-tuned, GoWay parity).
     cfg.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("30s fits")));
     cfg.keep_alive_interval(Some(Duration::from_secs(15)));
-    cfg.max_concurrent_bidi_streams(VarInt::from_u32(512));
+    cfg.max_concurrent_bidi_streams(VarInt::from_u32(4096));
     cfg.datagram_receive_buffer_size(None);
     let (stream_win, conn_win) = if crate::adaptive::profile().detected_mib <= 640 {
         (8 * 1024 * 1024, 16 * 1024 * 1024)
@@ -9298,11 +9423,12 @@ async fn handle_server_stream(
     let buffer_size = cfg.buffer_size;
     let mut send_task = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
+        let mut stats_batch = crate::stats::StatsBatcher::new();
         loop {
             match target_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    crate::stats::add_bytes(0, n as i64);
+                    stats_batch.add_down(n);
                     if send.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
@@ -9314,6 +9440,7 @@ async fn handle_server_stream(
         Result::<()>::Ok(())
     }));
     let mut buf = relay_buf(buffer_size).await;
+    let mut stats_batch = crate::stats::StatsBatcher::new();
     let mut recv_eof = false;
     let mut send_done = false;
     let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
@@ -9335,7 +9462,7 @@ async fn handle_server_stream(
                                 if target_wr.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                                crate::stats::add_bytes(n as i64, 0);
+                                stats_batch.add_up(n);
                             }
                         }
                     }
@@ -9350,7 +9477,7 @@ async fn handle_server_stream(
                         if target_wr.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                        crate::stats::add_bytes(n as i64, 0);
+                        stats_batch.add_up(n);
                     }
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => break,
@@ -9390,6 +9517,7 @@ async fn handle_server_udp_stream(
     let mut sender = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
         let mut packet = Vec::with_capacity(2048);
+        let mut last_allowed_src: Option<std::net::SocketAddr> = None;
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
@@ -9397,11 +9525,20 @@ async fn handle_server_udp_stream(
             };
             for i in 0..count {
                 let (pkt, src) = batch.packet(i);
-                if !known_send
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&src)
-                {
+                let allowed = match last_allowed_src {
+                    Some(s) if s == src => true,
+                    _ => {
+                        let ok = known_send
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains(&src);
+                        if ok {
+                            last_allowed_src = Some(src);
+                        }
+                        ok
+                    }
+                };
+                if !allowed {
                     tracing::debug!(%src, "QUIC UDP relay dropped a datagram from an undialed source");
                     continue;
                 }
@@ -10360,6 +10497,7 @@ async fn target_to_mux(
 ) -> bool {
     let mut buf = relay_buf(buffer_size).await;
     let mut frame_scratch = Vec::new();
+    let mut stats_batch = crate::stats::StatsBatcher::new();
     let max_chunk = crate::protocol::MAX_MUX_V2_CHUNK;
     let read_cap = if buf.len() <= 128 * 1024 {
         buf.len().min(max_chunk)
@@ -10382,7 +10520,7 @@ async fn target_to_mux(
                 break true;
             }
             Ok(n) => {
-                crate::stats::add_bytes(0, n as i64);
+                stats_batch.add_down(n);
                 let mut off = 0;
                 while off < n {
                     let end = (off + max_chunk).min(n);
@@ -10522,7 +10660,7 @@ impl Drop for PendingBytes {
 }
 
 async fn handle_mux_parts<R, W>(
-    rd: R,
+    mut rd: R,
     wr: W,
     cfg: RuntimeConfig,
     cipher: XorCipher,
@@ -10531,7 +10669,6 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
     // Hand the write half to the dedicated writer task; all MUX frames on
     // this session go through its serialized, coalescing queue.
     let (writer, mut writer_task) = MuxFrameWriter::spawn(wr);
@@ -10580,9 +10717,16 @@ where
     let pending_bytes_total = Arc::new(AtomicUsize::new(0));
     // JoinSet, not Vec<JoinHandle>: a long-lived session used to push one
     // handle per stream it ever opened and only released them at session end.
+    type CachedServerStream = (
+        u32,
+        mpsc::Sender<StreamCommand>,
+        Arc<CreditGate>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
     let mut stream_tasks = tokio::task::JoinSet::new();
     let mut frame_buf = Vec::new();
     let mut coalesced = Vec::with_capacity(8);
+    let mut last_stream: Option<CachedServerStream> = None;
 
     let writer_for_hb = writer.clone();
     let mut heartbeat_handle = tokio::spawn(async move {
@@ -10691,6 +10835,9 @@ where
 
                     // Atomically admit and register the logical stream. This removes
                     // the check-then-insert race during large concurrent SYN bursts.
+                    let pending_ctrl = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let tx_for_cache = tx.clone();
+                    let pending_ctrl_for_cache = pending_ctrl.clone();
                     let (admitted, old_entry) = {
                         let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                         if guard.len() >= 2048 {
@@ -10704,13 +10851,16 @@ where
                                     tx,
                                     cancel,
                                     gate: gate.clone(),
-                                    pending_ctrl: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                    pending_ctrl,
                                 },
                             );
                             (true, None)
                         }
                     };
                     if let Some(old) = old_entry {
+                        if last_stream.as_ref().is_some_and(|c| c.0 == stream_id) {
+                            last_stream = None;
+                        }
                         old.gate.close();
                         let _ = old.cancel.send(true);
                     }
@@ -10720,6 +10870,12 @@ where
                         send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs);
                         continue;
                     }
+                    last_stream = Some((
+                        stream_id,
+                        tx_for_cache,
+                        gate.clone(),
+                        pending_ctrl_for_cache,
+                    ));
 
                     let syn_prefix_len = 2 + target_bytes.len();
                     let has_initial_data = !initial_data.is_empty();
@@ -10871,6 +11027,7 @@ where
                         }
                         let (rd_target, mut wr_target) = target_stream.into_split();
                         let mut refund_pending: u32 = 0;
+                        let mut stats_batch = crate::stats::StatsBatcher::new();
 
                         if !pending.is_empty() {
                             let write_res =
@@ -10884,7 +11041,7 @@ where
                             match write_res {
                                 Ok(written) => {
                                     if written > 0 {
-                                        crate::stats::add_bytes(written as i64, 0);
+                                        stats_batch.add_up(written);
                                         maybe_send_window(
                                             &writer_task,
                                             &cipher_task,
@@ -11001,7 +11158,7 @@ where
                                                 match write_res {
                                                     Ok(written) => {
                                                         if written > 0 {
-                                                            crate::stats::add_bytes(written as i64, 0);
+                                                            stats_batch.add_up(written);
                                                             maybe_send_window(
                                                                 &writer_task,
                                                                 &cipher_task,
@@ -11033,7 +11190,7 @@ where
                                                     write_failed = true;
                                                     break;
                                                 }
-                                                crate::stats::add_bytes(len as i64, 0);
+                                                stats_batch.add_up(len);
                                                 maybe_send_window(
                                                     &writer_task,
                                                     &cipher_task,
@@ -11102,26 +11259,58 @@ where
 
                 MuxCommand::Data => {
                     let id = frame.stream_id;
-                    let send_res = {
-                        let guard = streams.read().unwrap_or_else(|e| e.into_inner());
-                        match guard.get(&id) {
-                            Some(s) => {
-                                if s.pending_ctrl.load(Ordering::Acquire) {
-                                    // A prior control frame is already queued in the background for this stream.
-                                    // To preserve strict per-stream FIFO order and prevent unbounded task accumulation,
-                                    // subsequent frames must not bypass the queued control frame.
-                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                                    None
-                                } else {
-                                    Some(match s.tx.try_send(StreamCommand::Data(frame)) {
-                                        Ok(()) => Ok(()),
-                                        Err(err) => Err((s.tx.clone(), s.gate.clone(), err)),
-                                    })
-                                }
-                            }
-                            None => {
+                    let send_res = match &last_stream {
+                        Some((cached_id, tx, gate, pending_ctrl))
+                            if *cached_id == id && !tx.is_closed() =>
+                        {
+                            if pending_ctrl.load(Ordering::Acquire) {
                                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                 None
+                            } else {
+                                Some(match tx.try_send(StreamCommand::Data(frame)) {
+                                    Ok(()) => Ok(()),
+                                    Err(err) => Err((tx.clone(), gate.clone(), err)),
+                                })
+                            }
+                        }
+                        _ => {
+                            let guard = streams.read().unwrap_or_else(|e| e.into_inner());
+                            match guard.get(&id) {
+                                Some(s) => {
+                                    if s.pending_ctrl.load(Ordering::Acquire) {
+                                        // A prior control frame is already queued in the background for this stream.
+                                        // To preserve strict per-stream FIFO order and prevent unbounded task accumulation,
+                                        // subsequent frames must not bypass the queued control frame.
+                                        crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                        None
+                                    } else {
+                                        let res = match s.tx.try_send(StreamCommand::Data(frame)) {
+                                            Ok(()) => {
+                                                last_stream = Some((
+                                                    id,
+                                                    s.tx.clone(),
+                                                    s.gate.clone(),
+                                                    s.pending_ctrl.clone(),
+                                                ));
+                                                Ok(())
+                                            }
+                                            Err(err) => {
+                                                if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                                    last_stream = None;
+                                                }
+                                                Err((s.tx.clone(), s.gate.clone(), err))
+                                            }
+                                        };
+                                        Some(res)
+                                    }
+                                }
+                                None => {
+                                    if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                        last_stream = None;
+                                    }
+                                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                                    None
+                                }
                             }
                         }
                     };
@@ -11172,6 +11361,9 @@ where
                             }
                         }
                         Some(Err((_, gate, mpsc::error::TrySendError::Closed(StreamCommand::Data(f))))) => {
+                            if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                last_stream = None;
+                            }
                             crate::mux_writer::recycle_encode_buf(f.into_storage());
                             let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                             if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
@@ -11240,6 +11432,9 @@ where
                 MuxCommand::Rst => {
                     let stream_id = frame.stream_id;
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    if last_stream.as_ref().is_some_and(|c| c.0 == stream_id) {
+                        last_stream = None;
+                    }
                     let removed = streams
                         .write()
                         .unwrap_or_else(|e| e.into_inner())
@@ -11275,11 +11470,11 @@ where
                         let decoded_kib = crate::protocol::decode_session_window_kib(frame.payload());
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         if let Some(kib32) = decoded_kib {
-                            peer_window.store(kib32, Ordering::Release);
+                            peer_window.fetch_max(kib32, Ordering::AcqRel);
                             let window = i64::from(kib32) * 1024;
                             for entry in streams.read().unwrap_or_else(|e| e.into_inner()).values()
                             {
-                                entry.gate.enable(window);
+                                entry.gate.upgrade_window(window);
                             }
                         }
                         continue;
@@ -11287,12 +11482,24 @@ where
                     let decoded = decode_window_payload(frame.payload());
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                     if let Some(credit) = decoded {
-                        if let Some(entry) = streams
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&stream_id)
-                        {
-                            entry.gate.release(i64::from(credit));
+                        match &last_stream {
+                            Some((cached_id, tx, gate, _))
+                                if *cached_id == stream_id && !tx.is_closed() =>
+                            {
+                                gate.release(i64::from(credit));
+                            }
+                            _ => {
+                                let guard = streams.read().unwrap_or_else(|e| e.into_inner());
+                                if let Some(entry) = guard.get(&stream_id) {
+                                    entry.gate.release(i64::from(credit));
+                                    last_stream = Some((
+                                        stream_id,
+                                        entry.tx.clone(),
+                                        entry.gate.clone(),
+                                        entry.pending_ctrl.clone(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -11624,7 +11831,7 @@ where
 /// connection directly into the MUX, UDP, or non-MUX TCP handler without
 /// any intermediate loopback hop.
 pub(crate) async fn dispatch_server_ws_parts<R, W>(
-    mut rd: R,
+    rd: R,
     mut wr: W,
     cfg: RuntimeConfig,
 ) -> Result<()>
@@ -11632,8 +11839,9 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
     let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let request = crate::ws::read_http_headers_timeout(&mut rd, hs_timeout).await?;
+    let request = crate::ws::read_http_headers_timeout_buf(&mut rd, hs_timeout).await?;
     let key = validate_server_handshake(&request)?;
     wr.write_all(&build_server_handshake_response(&key)).await?;
     wr.flush().await?;
@@ -12026,6 +12234,66 @@ pub fn add_bytes(up: i64, down: i64) {
     }
     if down > 0 {
         HOT.bytes_down.fetch_add(down, Ordering::Relaxed);
+    }
+}
+
+/// Per-task byte accumulator that flushes to the global atomic counters in
+/// `STATS_BATCH_THRESHOLD` (64 KiB) chunks and unconditionally on `Drop`,
+/// preventing cross-core L1/L3 cache-line bouncing under multi-stream load.
+pub const STATS_BATCH_THRESHOLD: i64 = 64 * 1024;
+
+pub struct StatsBatcher {
+    up: i64,
+    down: i64,
+}
+
+impl StatsBatcher {
+    #[inline]
+    pub const fn new() -> Self {
+        Self { up: 0, down: 0 }
+    }
+
+    #[inline]
+    pub fn add_up(&mut self, n: usize) {
+        self.up += n as i64;
+        if self.up >= STATS_BATCH_THRESHOLD {
+            HOT.bytes_up
+                .fetch_add(std::mem::take(&mut self.up), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn add_down(&mut self, n: usize) {
+        self.down += n as i64;
+        if self.down >= STATS_BATCH_THRESHOLD {
+            HOT.bytes_down
+                .fetch_add(std::mem::take(&mut self.down), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn flush(&mut self) {
+        if self.up > 0 {
+            HOT.bytes_up
+                .fetch_add(std::mem::take(&mut self.up), Ordering::Relaxed);
+        }
+        if self.down > 0 {
+            HOT.bytes_down
+                .fetch_add(std::mem::take(&mut self.down), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Default for StatsBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for StatsBatcher {
+    #[inline]
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -13417,6 +13685,27 @@ mod tests {
         assert_eq!(u1 - u0, 100);
         assert_eq!(d1 - d0, 200);
     }
+
+    #[test]
+    fn stats_batcher_flushes_at_threshold_and_on_drop() {
+        let (u0, d0) = crate::stats::totals();
+        {
+            let mut b = crate::stats::StatsBatcher::new();
+            b.add_up(1024);
+            b.add_down(2048);
+            // Threshold reached -> flushes immediately.
+            b.add_up(crate::stats::STATS_BATCH_THRESHOLD as usize);
+            let (u_mid, _) = crate::stats::totals();
+            assert!(u_mid - u0 >= crate::stats::STATS_BATCH_THRESHOLD + 1024);
+            b.add_up(500);
+        }
+        let (u1, d1) = crate::stats::totals();
+        assert_eq!(
+            u1 - u0,
+            crate::stats::STATS_BATCH_THRESHOLD + 1024 + 500
+        );
+        assert_eq!(d1 - d0, 2048);
+    }
 }
 } // mod tui
 
@@ -14167,43 +14456,11 @@ pub async fn read_http_headers<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8
     read_http_headers_timeout(r, std::time::Duration::from_secs(60)).await
 }
 
-pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
-    r: &mut R,
-    timeout_duration: std::time::Duration,
+fn finish_http_headers_read(
+    out: Vec<u8>,
+    res: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(1024);
-    let mut step_buf = [0u8; 2];
-
-    let read_loop = async {
-        loop {
-            // When the last byte is not '\n', completing '\n\n' or '\r\n\r\n' requires
-            // at least 2 more bytes. Reading 2 bytes cannot overshoot header boundaries,
-            // cutting syscall count in half while guaranteeing zero data-frame byte stealing.
-            let max_read = if out.last().copied() == Some(b'\n') { 1 } else { 2 };
-            match r.read(&mut step_buf[..max_read]).await {
-                Ok(0) => {
-                    return Err(anyhow::Error::from(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "early eof",
-                    )));
-                }
-                Ok(n) => {
-                    out.extend_from_slice(&step_buf[..n]);
-                    if out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n") {
-                        return Ok(());
-                    }
-                    if out.len() > MAX_HTTP_HEADER_SIZE {
-                        bail!("header too large");
-                    }
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::from(e));
-                }
-            }
-        }
-    };
-
-    match tokio::time::timeout(timeout_duration, read_loop).await {
+    match res {
         Ok(Ok(())) => Ok(out),
         Ok(Err(e)) => {
             if out.is_empty() {
@@ -14243,6 +14500,91 @@ pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
             }
         }
     }
+}
+
+pub async fn read_http_headers_timeout<R: AsyncRead + Unpin>(
+    r: &mut R,
+    timeout_duration: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(1024);
+    let mut step_buf = [0u8; 2];
+
+    let read_loop = async {
+        loop {
+            // When the last byte is not '\n', completing '\n\n' or '\r\n\r\n' requires
+            // at least 2 more bytes. Reading 2 bytes cannot overshoot header boundaries,
+            // cutting syscall count in half while guaranteeing zero data-frame byte stealing.
+            let max_read = if out.last().copied() == Some(b'\n') { 1 } else { 2 };
+            match r.read(&mut step_buf[..max_read]).await {
+                Ok(0) => {
+                    return Err(anyhow::Error::from(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "early eof",
+                    )));
+                }
+                Ok(n) => {
+                    out.extend_from_slice(&step_buf[..n]);
+                    if out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n") {
+                        return Ok(());
+                    }
+                    if out.len() > MAX_HTTP_HEADER_SIZE {
+                        bail!("header too large");
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e));
+                }
+            }
+        }
+    };
+
+    let res = tokio::time::timeout(timeout_duration, read_loop).await;
+    finish_http_headers_read(out, res)
+}
+
+/// Buffered HTTP header reader for server-side WebSocket handshakes: reads the
+/// entire HTTP upgrade header (plus any pipelined 0-RTT WebSocket frames) in a
+/// single `fill_buf()` syscall and consumes only up to the `\r\n\r\n` / `\n\n`
+/// header terminator, leaving subsequent bytes intact in the `BufReader`.
+pub async fn read_http_headers_timeout_buf<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    timeout_duration: std::time::Duration,
+) -> Result<Vec<u8>> {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut out = Vec::with_capacity(1024);
+
+    let read_loop = async {
+        loop {
+            let buf = r.fill_buf().await?;
+            if buf.is_empty() {
+                return Err(anyhow::Error::from(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early eof",
+                )));
+            }
+            let mut consumed = 0usize;
+            let mut done = false;
+            for &b in buf {
+                out.push(b);
+                consumed += 1;
+                if b == b'\n' && (out.ends_with(b"\r\n\r\n") || out.ends_with(b"\n\n")) {
+                    done = true;
+                    break;
+                }
+                if out.len() > MAX_HTTP_HEADER_SIZE {
+                    r.consume(consumed);
+                    bail!("header too large");
+                }
+            }
+            r.consume(consumed);
+            if done {
+                return Ok(());
+            }
+        }
+    };
+
+    let res = tokio::time::timeout(timeout_duration, read_loop).await;
+    finish_http_headers_read(out, res)
 }
 
 pub fn validate_server_handshake(request: &[u8]) -> Result<String> {
@@ -15196,6 +15538,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("received 0 response bytes"));
+    }
+
+    #[tokio::test]
+    async fn read_http_headers_timeout_buf_preserves_pipelined_ws_frame() {
+        use tokio::io::AsyncWriteExt;
+        let (mut a, b) = duplex(4096);
+        let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, b);
+        let (req, key) = build_client_handshake_request("example.com", "/", None, None);
+        let mut wire = req.clone();
+        let ws_hello = encode_ws_frame(b"MUX\n", 2, true).unwrap();
+        wire.extend_from_slice(&ws_hello);
+        a.write_all(&wire).await.unwrap();
+
+        let got_hdr = read_http_headers_timeout_buf(&mut rd, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(got_hdr, req);
+        assert_eq!(validate_server_handshake(&got_hdr).unwrap(), key);
+
+        let mut buf = Vec::new();
+        let (opcode, payload) = read_frame(
+            &mut rd,
+            Option::<&mut tokio::io::DuplexStream>::None,
+            &mut buf,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(opcode, 2);
+        assert_eq!(payload, b"MUX\n");
     }
 
     #[test]

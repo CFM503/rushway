@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.80] - 2026-11-08
+
+### Server Hot-Path Acceleration: Single-Syscall WS Handshake, Zero-Lock Stream Cache, Batched Stats & 32-Bit Window Upgrade
+
+- **Unified 16 KiB `BufReader` & Single-Syscall HTTP Upgrade Parsing (`src/main.rs:ws::read_http_headers_timeout_buf`, `runtime::dispatch_server_ws_parts`, `nonmux::handle_server`) [OPT]** — Wrapped incoming server connections in `tokio::io::BufReader::with_capacity(16 * 1024, rd)` at entry in `dispatch_server_ws_parts` and `nonmux::handle_server` and introduced `read_http_headers_timeout_buf` using `AsyncBufRead` (`fill_buf`/`consume`) to scan for `\r\n\r\n` / `\n\n` in memory. Collapses ~220 two-byte `read()` syscalls per incoming HTTP upgrade handshake into 1 syscall while preserving pipelined 0-RTT WebSocket frames (`"MUX\n"`, `VERSION`, `SYN`) in the user-space buffer and providing buffered WebSocket frame reads to non-MUX TCP and UDP server relays.
+- **Hot-Stream `last_stream` Single-Slot Cache (`src/main.rs:runtime::handle_mux_parts`, `common::mux_client_reader_loop`) [OPT]** — Added a thread-local single-entry stream cache (`last_stream`) on both server and client MUX read loops so consecutive `MuxCommand::Data` and `MuxCommand::Window` (`stream_id != 0`) frames for the same `stream_id` bypass `streams.read()` `RwLock` acquisition and `U32HashMap` lookup. Automatically invalidated on `Rst`, duplicate `Syn`, or channel teardown.
+- **Batched Multi-Core Byte Accounting (`src/main.rs:stats::StatsBatcher`, `runtime::target_to_mux`, `handle_mux_parts`, `common::relay_client_mux_stream`, `quic::handle_server_stream`) [OPT]** — Added a stack-allocated `StatsBatcher` that accumulates relayed bytes locally up to `STATS_BATCH_THRESHOLD` (`64 KiB`) before updating global atomics (`HOT.bytes_up` / `HOT.bytes_down`) and flushes unconditionally on `Drop`, eliminating cross-core L1/L3 cache-line bouncing under multi-stream Gigabit load with zero lost accounting on stream exit.
+- **32-Bit Session Window Upgrade for Live 0-RTT Streams (`src/main.rs:flow::CreditGate::upgrade_window`, `runtime::handle_mux_parts`, `common::mux_client_reader_loop`) [BUG]** — Fixed an issue where `CreditGate::enable` only transitioned from `UNBOUNDED_TAG`, causing `stream_id == 0` 32-bit `MuxCommand::Window` frames arriving after `MuxCommand::Version` to silently no-op on already-opened 0-RTT streams when the peer window exceeded 64 MiB. `upgrade_window` now atomically adds `window - old_window` to both `window` and `available` and wakes parked senders.
+- **QUIC Server Bidi Stream Scaling (`4096`) & UDP Source Fast-Path Cache (`src/main.rs:quic::transport_config`, `handle_server_udp_stream`) [OPT]** — Raised `max_concurrent_bidi_streams` from `512` to `4096` (GoWay parity) and added a `last_allowed_src: Option<SocketAddr>` fast-path cache to `quic::handle_server_udp_stream`, avoiding per-datagram `known_send.read()` lock acquisition on UDP reply bursts.
+
 ## [v0.0.79] - 2026-11-07
 
 ### Pure MUX v2 Execution Path, 0-RTT Jumbo Framing & Post-Drain Control Sweep

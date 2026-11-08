@@ -2368,3 +2368,22 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 ### Validation
 - `python scripts/ci_guard.py` passed all static, lexical, and version checks.
 - Status: Released and tagged as `v0.0.79`.
+
+
+## Release: v0.0.80 (2026-11-08)
+
+### Context & User Directives
+- **Directives:** "/plan 检查一下rushway 做为服务器端还有提升的空间吗" -> Approved plan -> "推送仓库，发布tag"
+- **Bug:** On sessions advertising a >64 MiB receive window (`window_kib > 65535`), `CreditGate::enable` only transitioned from `UNBOUNDED_TAG (0)`. When a 0-RTT stream was opened before the peer's `VERSION` + `WINDOW(stream_id=0)` pair arrived, `VERSION` enabled the gate at `65535 KiB` and the immediately following 32-bit `WINDOW(stream_id=0)` call to `enable()` silently no-oped, clamping 0-RTT streams at 64 MiB.
+- **Root cause:** `CreditGate::enable` used a single `compare_exchange` from `UNBOUNDED_TAG` without a monotonic upgrade path for already-bounded gates. Additionally, server HTTP upgrade handshakes read 2 bytes per syscall on unbuffered `OwnedReadHalf`, MUX `DATA`/`WINDOW` frames acquired `streams.read()` on every frame in same-stream bursts, and per-frame `stats::add_bytes` caused cross-core atomic cache-line bouncing.
+- **Astra review:** Verified Rust 2021 edition compatibility, zero byte-stealing across HTTP upgrade and pipelined 0-RTT WS frames via `AsyncBufRead::fill_buf`/`consume`, strict `last_stream` cache invalidation on `Rst`/duplicate `Syn`/channel close, and lossless `Drop` flushing in `StatsBatcher`.
+- **Change:**
+  - `src/main.rs:flow::CreditGate::upgrade_window`: Added CAS loop to upgrade live bounded windows by `delta = w - win` and wake waiters; wired into `stream_id == 0` `MuxCommand::Window` on both server and client.
+  - `src/main.rs:ws::read_http_headers_timeout_buf`, `runtime::dispatch_server_ws_parts`, `nonmux::handle_server`: Unified 16 KiB `BufReader` at server connection entry and added buffered header scanning.
+  - `src/main.rs:runtime::handle_mux_parts`, `common::mux_client_reader_loop`: Added `last_stream` single-entry hot cache for `Data` and `Window` frames.
+  - `src/main.rs:stats::StatsBatcher`: Added 64 KiB batched byte counter with `Drop` flush across MUX and QUIC relay loops.
+  - `src/main.rs:quic::transport_config`, `handle_server_udp_stream`: Raised `max_concurrent_bidi_streams` to `4096` and added `last_allowed_src` cache.
+- **Validation:** `python scripts/ci_guard.py` passed (`v0.0.80` synchronized, lexical/static analysis clean, `git diff --check` clean) + GitHub Actions CI verification.
+- **Status:** Fixed and released as `v0.0.80`.
+- **Remaining risk:** None identified.
+- **Next action:** Monitor production server throughput and CPU utilization under multi-stream load.
