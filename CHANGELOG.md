@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.82] - 2026-11-09
+
+### MUX v2 Scheduler Hot-Path Cleanup & Removal of Legacy Dead Branches
+
+- **Simplified Priority Lane in `mux_writer::Scheduler` (`src/main.rs:mux_writer::OutboundFrame`, `Scheduler`)** — Removed the obsolete `yield_to_data: bool` field from `OutboundFrame`, simplified `Scheduler::priority` from `VecDeque<(Option<u32>, bool, Vec<u8>)>` to `VecDeque<Vec<u8>>`, and collapsed ~55 lines of dead `yield_to_data` scan branches in `Scheduler::next` and `Scheduler::push` into a direct `self.priority.pop_front()` fast path.
+- **Removal of No-Op `runtime::recycle_buf` & Dead-Code Attribute Cleanup (`src/main.rs:runtime`, `common`, `quic`, `protocol`)** — Removed the empty `pub(crate) async fn recycle_buf(_buf: RelayBufGuard)` function and redundant `.await` call sites in favor of `RelayBufGuard`'s synchronous `Drop` recycling, stripped unnecessary `#[allow(dead_code)]` attributes from active `protocol` primitives, and gated test-only helpers behind `#[cfg(test)]`.
+
 ## [v0.0.81] - 2026-11-09
 
 ### Complete Removal of `-obfs` / `--obfs` Obfuscation Padding & Unconditional Coalesced MUX Frame Unpacking

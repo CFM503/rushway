@@ -2397,3 +2397,15 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
   - `src/main.rs`: Removed `--obfs` CLI flag, legacy `-obfs` normalization, JSON config `"obfs"` parsing, `RuntimeConfig::obfs`, `WssClientConfig::obfs`, `MuxClientSession::obfs`, `OBFS_PAD_MAX`, random padding in `mux_writer::encode_mux_ws_frame`, `obfs` parameter from `MuxFrame::decode_v2_coalesced` and server relay helpers, and `Obfs` display fields in startup banner and `TuiConfig`.
 - **Validation:** `python scripts/ci_guard.py` passed (`v0.0.81` synchronized, lexical/static analysis clean, `git diff --check` clean) + `cargo test` passed (156 tests, 0 warnings).
 - **Status:** Released and tagged as `v0.0.81`.
+
+
+## Release: v0.0.82 (2026-11-09)
+
+### Context & User Directives
+- **Directives:** Audit and clean up obsolete parameters/fields left over after upgrading to MUX v2, then update version to `0.0.82`, push repository and tag.
+- **Change:**
+  - `src/main.rs:mux_writer`: Removed `yield_to_data: bool` from `OutboundFrame`, simplified `Scheduler::priority` to `VecDeque<Vec<u8>>`, and collapsed `Scheduler::next` priority extraction to `self.priority.pop_front()`.
+  - `src/main.rs:runtime`, `common`, `quic`: Removed no-op `async fn recycle_buf(_buf: RelayBufGuard)` and redundant `.await` call sites, relying directly on `RelayBufGuard::drop`.
+  - `src/main.rs:protocol`, `quic`: Removed redundant `#[allow(dead_code)]` annotations on production functions and gated test-only helpers with `#[cfg(test)]`.
+- **Validation:** `python scripts/ci_guard.py` passed (`v0.0.82` synchronized, lexical/static analysis clean, `git diff --check` clean) + `cargo test` passed (155 tests, 0 warnings).
+- **Status:** Released and tagged as `v0.0.82`.

@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.81";
+pub const APP_VERSION: &str = "0.0.82";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
