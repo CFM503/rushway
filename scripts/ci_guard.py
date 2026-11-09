@@ -129,6 +129,20 @@ def strip_rust_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
+def check_src_tree_hygiene():
+    src_dir = os.path.join(REPO_ROOT, "src")
+    bad_files = []
+    for root, _dirs, files in os.walk(src_dir):
+        for fname in files:
+            if not fname.endswith(".rs"):
+                bad_files.append(os.path.relpath(os.path.join(root, fname), REPO_ROOT))
+    if bad_files:
+        raise RuntimeError(
+            f"Non-Rust artifacts found in `src/` (must contain only `.rs` files): {', '.join(bad_files)}"
+        )
+    print("[OK] `src/` directory hygiene verified (only `.rs` files present)")
+
+
 def check_versions_and_encoding() -> str:
     main_rs = os.path.join(REPO_ROOT, "src", "main.rs")
     cargo_toml = os.path.join(REPO_ROOT, "Cargo.toml")
@@ -276,9 +290,10 @@ def check_rust_static_semantics(path: str):
                 "IsTerminal": r"\.is_terminal\s*\(",
                 "SliceRandom": r"\.(?:choose|shuffle)\s*\(",
                 "Digest": r"\.(?:update|finalize)\s*\(",
+                "AsRawFd": r"\.as_raw_fd\s*\(",
             }
             for ident in extract_use_items(stmt):
-                if re.search(rf"\b{re.escape(ident)}\b", remainder):
+                if re.search(rf"(?<!::)\b{re.escape(ident)}\b", remainder):
                     continue
                 hint = trait_method_hints.get(ident)
                 if hint and re.search(hint, remainder):
@@ -308,6 +323,21 @@ def check_rust_static_semantics(path: str):
                         f"Unqualified `{net_ty}::` used in `mod {mod_name}` (src/main.rs:{err_line}) "
                         f"without `use std::net::{net_ty}` in scope; use `std::net::{net_ty}::` instead"
                     )
+
+    # 3. Cross-module `crate::<mod>::<sym>` resolution check
+    mod_dict = {m_name: m_body for m_name, _, m_body in modules}
+    for m_ref in re.finditer(r"crate::([a-z_]+)::([A-Za-z0-9_]+)", clean_src):
+        target_mod, target_sym = m_ref.group(1), m_ref.group(2)
+        if target_mod in mod_dict:
+            t_body = mod_dict[target_mod]
+            if not re.search(
+                rf"\b(fn|struct|enum|const|type|static|mod|use)\s+[^;{{]*\b{re.escape(target_sym)}\b",
+                t_body,
+            ):
+                err_line = clean_src.count("\n", 0, m_ref.start()) + 1
+                raise RuntimeError(
+                    f"Unresolved cross-module symbol `crate::{target_mod}::{target_sym}` at src/main.rs:{err_line}"
+                )
 
     print(f"[OK] Static module/import/mutex/type analysis passed across {len(modules)} modules")
 
@@ -440,6 +470,7 @@ def main():
     )
     args = parser.parse_args()
 
+    check_src_tree_hygiene()
     version = check_versions_and_encoding()
     check_rust_static_semantics(os.path.join(REPO_ROOT, "src", "main.rs"))
     run_git_diff_check()

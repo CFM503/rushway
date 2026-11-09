@@ -5,11 +5,12 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.82";
+pub const APP_VERSION: &str = "0.0.83";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
     //! Startup system memory detector (host + cgroup v1/v2) and adaptive resource profile.
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::OnceLock;
 
     #[derive(Debug, Clone, Copy)]
@@ -28,16 +29,44 @@ pub mod adaptive {
     }
 
     static PROFILE: OnceLock<MemProfile> = OnceLock::new();
+    static CLI_WINDOW_KIB: AtomicU32 = AtomicU32::new(0);
+
+    pub const MUX_WINDOW_MIN_KIB: u32 = 64;
+    pub const MUX_WINDOW_MAX_KIB: u32 = 1024 * 1024;
+
+    /// Sets an explicit CLI `-mux-window <KiB>` override before [`profile()`] is initialized.
+    #[inline]
+    pub fn set_window_override(raw_kib: u32) {
+        CLI_WINDOW_KIB.store(raw_kib, Ordering::Release);
+    }
+
+    /// Computes `(mux_initial_window_kib, mux_window_refresh)` given an optional
+    /// user `-mux-window` / `RUSHWAY_WINDOW_KIB` override, ensuring `mux_window_refresh`
+    /// never exceeds 50% of the initial window (preventing stream credit deadlock on small windows).
+    #[inline]
+    pub fn compute_window_override(raw_kib: u32) -> (u32, usize) {
+        let win = raw_kib.clamp(MUX_WINDOW_MIN_KIB, MUX_WINDOW_MAX_KIB);
+        let win_bytes = (win as usize).saturating_mul(1024);
+        let refresh = (win_bytes / 8)
+            .clamp(32 * 1024, 32 * 1024 * 1024)
+            .min((win_bytes / 2).max(1024));
+        (win, refresh)
+    }
 
     #[inline(always)]
     pub fn profile() -> &'static MemProfile {
         PROFILE.get_or_init(|| {
             let mib = detect_memory_mib();
-            let custom_window = std::env::var("RUSHWAY_WINDOW_KIB")
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .filter(|&w| w > 0)
-                .map(|w| w.min(1024 * 1024));
+            let cli_win = CLI_WINDOW_KIB.load(Ordering::Acquire);
+            let custom_window = if cli_win > 0 {
+                Some(cli_win)
+            } else {
+                std::env::var("RUSHWAY_WINDOW_KIB")
+                    .or_else(|_| std::env::var("GOWAY_WINDOW_KIB"))
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .filter(|&w| w > 0)
+            };
             let mut p = if mib <= 640 {
                 MemProfile {
                     detected_mib: mib,
@@ -81,20 +110,22 @@ pub mod adaptive {
                     non_mux_pool_size: 32,
                 }
             };
-            if let Some(win) = custom_window {
+            if let Some(raw_win) = custom_window {
+                let (win, refresh) = compute_window_override(raw_win);
                 p.mux_initial_window_kib = win;
-                p.mux_window_refresh = (((win as usize).saturating_mul(1024)) / 8)
-                    .clamp(512 * 1024, 32 * 1024 * 1024);
+                p.mux_window_refresh = refresh;
             }
             p
         })
     }
 
     fn detect_memory_mib() -> usize {
-        if let Ok(val) = std::env::var("RUSHWAY_MEM_MIB") {
-            if let Ok(parsed) = val.trim().parse::<usize>() {
-                if parsed > 0 {
-                    return parsed;
+        for env_name in ["RUSHWAY_MEM_MIB", "GOWAY_MEM_MIB"] {
+            if let Ok(val) = std::env::var(env_name) {
+                if let Ok(parsed) = val.trim().parse::<usize>() {
+                    if parsed > 0 {
+                        return parsed;
+                    }
                 }
             }
         }
@@ -176,6 +207,28 @@ pub mod adaptive {
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn window_override_clamps_refresh_below_half_window() {
+            for raw_kib in [1u32, 32, 64, 128, 256, 512, 1024, 2048, 2_000_000] {
+                let (win_kib, refresh_bytes) = compute_window_override(raw_kib);
+                assert!(
+                    (MUX_WINDOW_MIN_KIB..=MUX_WINDOW_MAX_KIB).contains(&win_kib),
+                    "win_kib={win_kib} out of bounds for raw_kib={raw_kib}"
+                );
+                let win_bytes = (win_kib as usize) * 1024;
+                assert!(
+                    refresh_bytes <= win_bytes / 2,
+                    "refresh_bytes={refresh_bytes} must be <= win_bytes/2 ({}) for raw_kib={raw_kib}",
+                    win_bytes / 2
+                );
+            }
+        }
     }
 }
 
@@ -283,7 +336,7 @@ pub(crate) struct MuxClientSession {
 
 impl MuxClientSession {
     pub(crate) async fn spawn_from_parts<R>(
-        rd: R,
+        mut rd: R,
         writer: Arc<MuxFrameWriter>,
         mut writer_task: tokio::task::JoinHandle<()>,
         cipher: XorCipher,
@@ -294,15 +347,32 @@ impl MuxClientSession {
         R: AsyncRead + Unpin + Send + 'static,
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-        let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
         let version_payload =
             crate::protocol::encode_version_payload(crate::protocol::mux_initial_window_kib());
-        send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload).await?;
         let full_win_kib = crate::protocol::mux_initial_window_kib_u32();
+        let mut flight = Vec::with_capacity(64);
+        crate::mux_writer::encode_mux_ws_frame(
+            &mut flight,
+            0,
+            MuxCommand::Version,
+            &version_payload,
+            &cipher,
+            true,
+        )?;
         if full_win_kib > u16::MAX as u32 {
             let ext_win = crate::protocol::encode_window_payload(full_win_kib);
-            send_mux_parts(&writer, &cipher, 0, MuxCommand::Window, &ext_win).await?;
+            let mut win_buf = Vec::with_capacity(32);
+            crate::mux_writer::encode_mux_ws_frame(
+                &mut win_buf,
+                0,
+                MuxCommand::Window,
+                &ext_win,
+                &cipher,
+                true,
+            )?;
+            flight.extend_from_slice(&win_buf);
         }
+        writer.send(flight).await?;
         let state = Arc::new(Self {
             writer: writer.clone(),
             cipher,
@@ -318,6 +388,7 @@ impl MuxClientSession {
         let heartbeat_state = state.clone();
         let mut heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(25));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -561,18 +632,21 @@ impl MuxClientSession {
         open_guard.syn_sent = true;
 
         if !remaining_initial.is_empty() {
-            gate.acquire(remaining_initial.len()).await;
-            if let Err(e) = send_mux_parts(
-                &self.writer,
-                &self.cipher,
-                id,
-                MuxCommand::Data,
-                remaining_initial,
-            )
-            .await
-            {
-                self.closed.store(true, Ordering::Release);
-                return Err(e);
+            let max_chunk = self.max_data_chunk();
+            for chunk in remaining_initial.chunks(max_chunk) {
+                gate.acquire(chunk.len()).await;
+                if let Err(e) = send_mux_parts(
+                    &self.writer,
+                    &self.cipher,
+                    id,
+                    MuxCommand::Data,
+                    chunk,
+                )
+                .await
+                {
+                    self.closed.store(true, Ordering::Release);
+                    return Err(e);
+                }
             }
         }
         open_guard.armed = false;
@@ -635,6 +709,11 @@ where
             }
             for frame in coalesced.drain(..) {
             match frame.command {
+                MuxCommand::Syn => {
+                    // Server-to-client SYN frames are not part of the protocol; ignore and recycle.
+                    crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    continue;
+                }
                 MuxCommand::Version => {
                     let decoded = crate::protocol::decode_version_payload(frame.payload());
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
@@ -727,6 +806,7 @@ where
                                     if last_stream.as_ref().is_some_and(|c| c.0 == id) {
                                         last_stream = None;
                                     }
+                                    state.writer.drop_stream(id);
                                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                     state.close_stream_if_same(id, &gate);
                                 } else {
@@ -734,6 +814,14 @@ where
                                 }
                                 None
                             } else {
+                                if frame.command == MuxCommand::Rst {
+                                    // Close the CreditGate immediately so any upload task or
+                                    // open_stream caller blocked on gate.acquire() wakes up
+                                    // without waiting for rx to drain up to 3,072 queued frames,
+                                    // and purge any queued outbound DATA frames for this stream.
+                                    entry.gate.close();
+                                    state.writer.drop_stream(id);
+                                }
                                 let res = match entry.tx.try_send(frame) {
                                     Ok(()) => {
                                         if is_data {
@@ -780,15 +868,14 @@ where
                             crate::mux_writer::recycle_encode_buf(f.into_storage());
                             state.close_stream_if_same(id, &gate);
                         } else {
-                            // Exactly one pending control frame is permitted per stream.
+                            // Exactly one pending control frame (FIN) is permitted per stream;
+                            // keep pending_ctrl latched true so no trailing frames can race in.
                             pending_ctrl.store(true, Ordering::Release);
                             let state_for_cleanup = state.clone();
-                            let pending_ctrl_for_task = pending_ctrl.clone();
                             tokio::spawn(async move {
                                 match timeout(Duration::from_secs(10), tx.reserve()).await {
                                     Ok(Ok(permit)) => {
                                         permit.send(f);
-                                        pending_ctrl_for_task.store(false, Ordering::Release);
                                     }
                                     _ => {
                                         crate::mux_writer::recycle_encode_buf(f.into_storage());
@@ -1010,7 +1097,7 @@ pub(crate) async fn open_ws_upstream(
     cfg: &crate::runtime::RuntimeConfig,
     scheme_error: &str,
 ) -> Result<(
-    tokio::net::tcp::OwnedReadHalf,
+    tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
     tokio::net::tcp::OwnedWriteHalf,
 )> {
     let upstream = cfg
@@ -1039,7 +1126,8 @@ pub(crate) async fn open_ws_upstream(
         .unwrap_or(&target.host);
     let socket = connect_ws_with_fallback(cfg, &target.host, target.port).await?;
     crate::runtime::apply_socket_options(&socket, cfg);
-    let (mut rd, mut wr) = socket.into_split();
+    let (rd, mut wr) = socket.into_split();
+    let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
     let header_base = extract_host_only(header_host);
     let origin = format!("http://{}", format_origin_host(sni_base));
     let sec_fetch_site = if sni_base.eq_ignore_ascii_case(header_base) {
@@ -1056,7 +1144,7 @@ pub(crate) async fn open_ws_upstream(
     wr.write_all(&request).await?;
     wr.flush().await?;
     let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let response = crate::ws::read_http_headers_timeout(&mut rd, hs_timeout).await?;
+    let response = crate::ws::read_http_headers_timeout_buf(&mut rd, hs_timeout).await?;
     crate::ws::validate_client_handshake_response(&response, &key)?;
     Ok((rd, wr))
 }
@@ -1117,14 +1205,16 @@ pub(crate) fn udp_client_allowed(
 }
 
 /// Shared WebSocket (`ws://` and `wss://`) client UDP relay loop: sends the
-/// XOR-encrypted `"UDP\n"` handshake, verifies `"OK\n"`, and relays SOCKS5 UDP
-/// datagrams bidirectionally while enforcing target policy and source address locking.
+/// XOR-encrypted `"UDP\n"` handshake, verifies `"OK\n"`, replies to the local
+/// SOCKS5 `UDP ASSOCIATE` client, and relays SOCKS5 UDP datagrams bidirectionally
+/// while enforcing target policy and source address locking.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn relay_udp_ws<R, W>(
     mut control: TcpStream,
     udp: Arc<tokio::net::UdpSocket>,
+    bound: SocketAddr,
     bind_hint: &TargetAddr,
-    mut rd: R,
+    mut rd: tokio::io::BufReader<R>,
     mut wr: W,
     key: &Option<String>,
     conn_timeout: Duration,
@@ -1140,24 +1230,40 @@ where
     let c = configured_cipher(key);
     let mut hello = *b"UDP\n";
     c.apply(&mut hello);
-    write_frame(&mut wr, &hello, 2, true).await?;
+    if let Err(e) = write_frame(&mut wr, &hello, 2, true).await {
+        let _ = control.write_all(&crate::proxy::socks5_failure_response()).await;
+        return Err(e);
+    }
     let mut frame_buf = Vec::new();
-    let ok_res = timeout(
+    let ok_res = match timeout(
         conn_timeout,
         read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
     )
     .await
-    .map_err(|_| anyhow!("{err_prefix} UDP handshake OK timed out"))?;
-    let Some((opcode, mut ok)) = ok_res.inspect_err(|_| {
-        crate::mux_writer::recycle_encode_buf(std::mem::take(&mut frame_buf));
-    })?
-    else {
+    {
+        Ok(res) => res,
+        Err(_) => {
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            let _ = control.write_all(&crate::proxy::socks5_failure_response()).await;
+            bail!("{err_prefix} UDP handshake OK timed out");
+        }
+    };
+    let Some((opcode, mut ok)) = (match ok_res {
+        Ok(v) => v,
+        Err(e) => {
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            let _ = control.write_all(&crate::proxy::socks5_failure_response()).await;
+            return Err(e);
+        }
+    }) else {
         crate::mux_writer::recycle_encode_buf(frame_buf);
+        let _ = control.write_all(&crate::proxy::socks5_failure_response()).await;
         bail!("{err_prefix} closed during UDP handshake")
     };
     if opcode != 2 {
         crate::mux_writer::recycle_encode_buf(ok);
         crate::mux_writer::recycle_encode_buf(frame_buf);
+        let _ = control.write_all(&crate::proxy::socks5_failure_response()).await;
         bail!("invalid {err_prefix} UDP handshake response opcode")
     }
     c.apply(&mut ok);
@@ -1165,8 +1271,11 @@ where
     crate::mux_writer::recycle_encode_buf(ok);
     if !is_ok {
         crate::mux_writer::recycle_encode_buf(frame_buf);
+        let _ = control.write_all(&crate::proxy::socks5_failure_response()).await;
         bail!("{err_prefix} rejected UDP handshake")
     }
+    let resp = socks5_udp_associate_reply(bound);
+    control.write_all(&resp).await?;
     let latest = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
     let udp_send = udp.clone();
     let c_send = c.clone();
@@ -1274,7 +1383,10 @@ where
                 };
                 if let Some(peer) = peer_opt {
                     let n = packet.len();
-                    let _ = batch_writer.send(&packet, peer).await;
+                    let _ = batch_writer.push(&packet, peer).await;
+                    if rd.buffer().len() < 2 {
+                        let _ = batch_writer.flush().await;
+                    }
                     crate::stats::add_bytes(0, n as i64);
                 }
                 crate::mux_writer::recycle_encode_buf(packet);
@@ -1859,6 +1971,7 @@ where
             Ok(pair) => break pair,
             Err(e) if attempt_pooled => {
                 attempt_pooled = false;
+                frame_buf.clear();
                 tracing::debug!(error=%e, "{} pre-warmed connection closed before OK; dialing fresh upstream", pool.log_tag);
                 let fresh = match pool.dial_fresh().await {
                     Ok(v) => v,
@@ -1921,6 +2034,7 @@ where
     let (up_err_tx, mut up_err_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
     let mut upload = AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
+        let mut stats_batch = crate::stats::StatsBatcher::new();
         let res: Result<()> = async {
             loop {
                 let n = tokio::select! {
@@ -1936,7 +2050,7 @@ where
                     let _ = write_frame(&mut wr, &[], 8, true).await;
                     break;
                 }
-                crate::stats::add_bytes(n as i64, 0);
+                stats_batch.add_up(n);
                 write_frame_borrowed(&mut wr, &mut buf[..n], 2, true).await?;
             }
             Ok(())
@@ -1948,6 +2062,7 @@ where
     }));
     let mut upload_done = false;
     let mut remote_eof = false;
+    let mut down_stats = crate::stats::StatsBatcher::new();
     let down_res: Result<()> = async {
         loop {
             let next_frame = if !upload_done {
@@ -1977,7 +2092,7 @@ where
                     if write_res.is_err() {
                         break;
                     }
-                    crate::stats::add_bytes(0, len as i64);
+                    down_stats.add_down(len);
                 }
                 8 => {
                     crate::mux_writer::recycle_encode_buf(payload);
@@ -4514,9 +4629,9 @@ pub async fn run_client(cfg: RuntimeConfig, session_count: usize) -> Result<()> 
     let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     apply_listener_options(&listener);
     let pool_maintainer = pool.clone();
-    tokio::spawn(async move {
+    let _maintainer = crate::common::AbortOnDrop(tokio::spawn(async move {
         pool_maintainer.maintain().await;
-    });
+    }));
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
     tracing::info!("RushWay pooled client proxy listening on {}:{} ({} physical MUX sessions, up to {} streams/session)",cfg.proxy_host,cfg.proxy_port,pool.session_count,MAX_STREAMS_PER_SESSION);
     let mut set = tokio::task::JoinSet::new();
@@ -4639,10 +4754,10 @@ const ENCODE_POOL_SHARDS: usize = 8;
 fn encode_pool_shard_max_count() -> usize {
     crate::adaptive::profile().encode_pool_shard_cap
 }
-/// Per-stream byte credit added each deficit round (GoWay parity).
-/// Set to 128KB so that even maximum-size MUX frames (~67KB) can be
+/// Per-stream byte credit added each deficit round (aligned with GoWay v1.8.35 `muxDRRQuantum = 144 KiB`).
+/// Set to 144KB so that even maximum-size MUX v2 Jumbo frames (`129,600 B` + WS/MUX headers) can be
 /// dispatched in a single round without deficit underflow stall.
-const DRR_QUANTUM: usize = 128 * 1024;
+const DRR_QUANTUM: usize = 144 * 1024;
 /// Cap accumulated credit so a long-idle stream cannot hog the link.
 const DRR_MAX_DEFICIT: usize = 512 * 1024;
 
@@ -4970,6 +5085,21 @@ impl MuxFrameWriter {
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+
+    /// Purges any queued outbound `DATA` frames for `stream_id` in the DRR
+    /// scheduler without emitting a wire frame (mirrors GoWay v1.8.35
+    /// `writer.dropStream(streamID)` on incoming `RST` or abrupt stream close).
+    pub fn drop_stream(&self, stream_id: u32) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.ctrl_tx.try_send(OutboundFrame {
+            stream_id: Some(stream_id),
+            priority: true,
+            is_rst: true,
+            bytes: Vec::new(),
+        });
+    }
 }
 
 const FREE_STREAM_QUEUES_CAP: usize = 256;
@@ -5041,6 +5171,9 @@ impl Scheduler {
             if frame.is_rst {
                 if let Some(sid) = frame.stream_id {
                     self.remove_stream(&sid);
+                }
+                if frame.bytes.is_empty() {
+                    return;
                 }
             }
             self.priority.push_back(frame.bytes);
@@ -5223,13 +5356,21 @@ async fn writer_loop<W>(
 {
     let mut sched = Scheduler::new();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_MAX_FRAMES);
+    let mut rst_streams: Vec<u32> = Vec::new();
     let mut ctrl_closed = false;
     let mut data_closed = false;
     loop {
-        // High-priority control lane drains first unconditionally
-        while sched.len() < WRITER_QUEUE {
+        // High-priority control lane drains first unconditionally (never gated by bulk DATA queue cap).
+        while !ctrl_closed {
             match ctrl_rx.try_recv() {
-                Ok(frame) => sched.push(frame),
+                Ok(frame) => {
+                    if frame.is_rst {
+                        if let Some(sid) = frame.stream_id {
+                            rst_streams.push(sid);
+                        }
+                    }
+                    sched.push(frame);
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     ctrl_closed = true;
@@ -5237,13 +5378,32 @@ async fn writer_loop<W>(
                 }
             }
         }
-        // Then bulk DATA frames
+        // Then bulk DATA frames up to WRITER_QUEUE.
         while sched.len() < WRITER_QUEUE {
             match data_rx.try_recv() {
                 Ok(frame) => sched.push(frame),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     data_closed = true;
+                    break;
+                }
+            }
+        }
+        // Purge any in-flight DATA frames that were sitting in data_rx when RST / drop_stream
+        // was drained from ctrl_rx above, preventing DATA from being emitted after RST.
+        for sid in rst_streams.drain(..) {
+            sched.remove_stream(&sid);
+        }
+        // Re-drain ctrl_rx immediately after data_rx before popping from sched:
+        // if a task enqueued SYN (on ctrl_tx) followed by DATA (on data_tx) while
+        // writer_loop was between the two loops above, this guarantees SYN is in
+        // sched.priority before sched.next() pops any frame.
+        while !ctrl_closed {
+            match ctrl_rx.try_recv() {
+                Ok(frame) => sched.push(frame),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    ctrl_closed = true;
                     break;
                 }
             }
@@ -5962,6 +6122,85 @@ mod tests {
             handle.await.unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn mux_writer_syn_precedes_data_under_concurrent_enqueue() {
+        use crate::crypto::XorCipher;
+        use crate::ws::read_frame;
+        use tokio::io::duplex;
+
+        for iteration in 0..10 {
+            let (a, mut b) = duplex(1024 * 1024);
+            let (writer, handle) = MuxFrameWriter::spawn(a);
+            let cipher = XorCipher::new("syn_fifo_test");
+
+            let mut enc_syn = Vec::new();
+            encode_mux_ws_frame(&mut enc_syn, 7, MuxCommand::Syn, b"\x00\x0eexample.com:80", &cipher, true).unwrap();
+            let mut enc_data = Vec::new();
+            encode_mux_ws_frame(&mut enc_data, 7, MuxCommand::Data, &[99u8; 256], &cipher, true).unwrap();
+
+            writer.send_mux(7, MuxCommand::Syn, enc_syn).await.unwrap();
+            writer.send_mux(7, MuxCommand::Data, enc_data).await.unwrap();
+            drop(writer);
+
+            let mut buf = Vec::new();
+            let mut received = Vec::new();
+            while let Ok(Some((_, mut payload))) =
+                read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await
+            {
+                cipher.apply(&mut payload);
+                let frame = MuxFrame::decode(&payload).unwrap();
+                received.push(frame.command);
+            }
+            assert_eq!(
+                received,
+                vec![MuxCommand::Syn, MuxCommand::Data],
+                "Iteration {iteration}: SYN must ALWAYS precede DATA on the wire"
+            );
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_writer_rst_purges_queued_and_inflight_data() {
+        use crate::crypto::XorCipher;
+        use crate::ws::read_frame;
+        use tokio::io::duplex;
+
+        let (a, mut b) = duplex(1024 * 1024);
+        let (writer, handle) = MuxFrameWriter::spawn(a);
+        let cipher = XorCipher::new("rst_purge_test");
+
+        let mut enc_data1 = Vec::new();
+        encode_mux_ws_frame(&mut enc_data1, 42, MuxCommand::Data, &[1u8; 512], &cipher, true).unwrap();
+        let mut enc_rst = Vec::new();
+        encode_mux_ws_frame(&mut enc_rst, 42, MuxCommand::Rst, &[], &cipher, true).unwrap();
+        let mut enc_data2 = Vec::new();
+        encode_mux_ws_frame(&mut enc_data2, 99, MuxCommand::Data, &[2u8; 128], &cipher, true).unwrap();
+
+        // Stream 42 enqueues DATA then immediately aborts with RST; stream 99 enqueues DATA then drops via drop_stream.
+        writer.send_mux(42, MuxCommand::Data, enc_data1).await.unwrap();
+        writer.send_mux(42, MuxCommand::Rst, enc_rst).await.unwrap();
+        writer.send_mux(99, MuxCommand::Data, enc_data2).await.unwrap();
+        writer.drop_stream(99);
+        drop(writer);
+
+        let mut buf = Vec::new();
+        let mut received = Vec::new();
+        while let Ok(Some((_, mut payload))) =
+            read_frame(&mut b, Option::<&mut tokio::io::DuplexStream>::None, &mut buf).await
+        {
+            cipher.apply(&mut payload);
+            let frame = MuxFrame::decode(&payload).unwrap();
+            received.push((frame.stream_id, frame.command));
+        }
+        assert_eq!(
+            received,
+            vec![(42, MuxCommand::Rst)],
+            "Reset stream 42 must never emit DATA after RST, and drop_stream(99) must purge stream 99 DATA without emitting a wire frame"
+        );
+        handle.await.unwrap();
+    }
 }
 } // mod mux_writer
 
@@ -5993,16 +6232,21 @@ use tokio::net::{
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 
-async fn open_upstream(cfg: &RuntimeConfig) -> Result<(OwnedReadHalf, OwnedWriteHalf)> {
+async fn open_upstream(
+    cfg: &RuntimeConfig,
+) -> Result<(tokio::io::BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
     crate::common::open_ws_upstream(cfg, "non-MUX plain client requires ws:// upstream").await
 }
 
-type PlainNonMuxPool = NonMuxPool<RuntimeConfig, OwnedReadHalf, OwnedWriteHalf>;
+type PlainNonMuxPool =
+    NonMuxPool<RuntimeConfig, tokio::io::BufReader<OwnedReadHalf>, OwnedWriteHalf>;
 
 /// Boxed adapter so the shared [`NonMuxPool`] can dial the plain-WS opener.
 fn dial_pooled_plain(
     cfg: &RuntimeConfig,
-) -> Pin<Box<dyn Future<Output = Result<(OwnedReadHalf, OwnedWriteHalf)>> + Send + '_>> {
+) -> Pin<
+    Box<dyn Future<Output = Result<(tokio::io::BufReader<OwnedReadHalf>, OwnedWriteHalf)>> + Send + '_>,
+> {
     Box::pin(open_upstream(cfg))
 }
 
@@ -6057,9 +6301,9 @@ async fn handle_client_connection(
 pub async fn run_client(cfg: RuntimeConfig) -> Result<()> {
     let pool = NonMuxPool::new(cfg.clone(), Box::new(dial_pooled_plain), "[non-MUX]");
     let maintainer = pool.clone();
-    tokio::spawn(async move {
+    let _maintainer = crate::common::AbortOnDrop(tokio::spawn(async move {
         maintainer.maintain().await;
-    });
+    }));
     let listener = TcpListener::bind(crate::runtime::format_listen_addr(&cfg.proxy_host, cfg.proxy_port)).await?;
     crate::runtime::apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
@@ -6170,12 +6414,18 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     let c = configured_cipher(&cfg.key);
     let mut frame_buf = Vec::new();
     let first_frame_timeout = Duration::from_secs(cfg.connection_timeout.max(45));
-    let target_res = timeout(
+    let target_res = match timeout(
         first_frame_timeout,
         read_frame_with_cipher(&mut rd, Some(&mut wr), &mut frame_buf, Some(&c)),
     )
     .await
-    .map_err(|_| anyhow!("non-MUX target frame timed out"))?;
+    {
+        Ok(res) => res,
+        Err(_) => {
+            crate::mux_writer::recycle_encode_buf(frame_buf);
+            bail!("non-MUX target frame timed out");
+        }
+    };
     let Some((opcode, target_frame)) = target_res.inspect_err(|_| {
         crate::mux_writer::recycle_encode_buf(std::mem::take(&mut frame_buf));
     })?
@@ -6192,6 +6442,13 @@ async fn handle_server(stream: TcpStream, cfg: RuntimeConfig) -> Result<()> {
     if target_frame == b"UDP\n" {
         crate::mux_writer::recycle_encode_buf(target_frame);
         return crate::runtime::handle_server_udp_parts(rd, wr, cfg, c).await;
+    }
+    if target_frame == b"MUX\n" {
+        crate::mux_writer::recycle_encode_buf(target_frame);
+        let mut err_frame = *b"ERR\n";
+        c.apply(&mut err_frame);
+        let _ = crate::ws::write_frame(&mut wr, &err_frame, 2, false).await;
+        bail!("MUX handshake rejected: server is running in --no-mux mode");
     }
     crate::runtime::handle_server_tcp_parts(rd, wr, cfg, c, target_frame).await
 }
@@ -6233,6 +6490,7 @@ mod imp {
     pub(crate) fn start(path: PathBuf, duration_secs: Option<u64>) -> Result<()> {
         let guard = pprof::ProfilerGuardBuilder::default()
             .frequency(99)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
             .build()
             .map_err(|e| anyhow!("failed to start CPU profiler: {e}"))?;
         {
@@ -7206,6 +7464,14 @@ pub fn parse_socks5_greeting(buf: &[u8]) -> Result<(), ProxyParseError> {
     }
 }
 
+#[inline]
+fn is_valid_target_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'/')
+}
+
 pub fn parse_socks5_request(buf: &[u8]) -> Result<SocksRequest, ProxyParseError> {
     if buf.len() < 4 {
         return Err(ProxyParseError::Truncated);
@@ -7243,7 +7509,7 @@ pub fn parse_socks5_request(buf: &[u8]) -> Result<SocksRequest, ProxyParseError>
             let h = std::str::from_utf8(&buf[5..5 + n])
                 .map_err(|_| ProxyParseError::InvalidUtf8)?
                 .to_owned();
-            if h.trim().is_empty() {
+            if !is_valid_target_host(&h) {
                 return Err(ProxyParseError::InvalidHttpRequest);
             }
             (h, 5 + n)
@@ -7325,7 +7591,7 @@ pub fn parse_socks5_udp_datagram_borrowed(
             }
             let h = std::str::from_utf8(&buf[5..5 + n])
                 .map_err(|_| ProxyParseError::InvalidUtf8)?;
-            if h.trim().is_empty() {
+            if !is_valid_target_host(h) {
                 return Err(ProxyParseError::InvalidHttpRequest);
             }
             (BorrowedUdpHost::Domain(h), 5 + n)
@@ -7374,7 +7640,7 @@ pub fn parse_target_authority(authority: &str) -> Result<TargetAddr, ProxyParseE
             .find(']')
             .ok_or(ProxyParseError::InvalidHttpRequest)?;
         let host = &authority[1..close];
-        if host.is_empty() {
+        if !is_valid_target_host(host) {
             return Err(ProxyParseError::InvalidHttpRequest);
         }
         let port_text = authority
@@ -7396,7 +7662,7 @@ pub fn parse_target_authority(authority: &str) -> Result<TargetAddr, ProxyParseE
     let (host, port_text) = authority
         .rsplit_once(':')
         .ok_or(ProxyParseError::InvalidHttpRequest)?;
-    if host.is_empty() {
+    if !is_valid_target_host(host) {
         return Err(ProxyParseError::InvalidHttpRequest);
     }
     let port = port_text
@@ -7427,7 +7693,7 @@ pub fn parse_authority_with_default(
             .find(']')
             .ok_or(ProxyParseError::InvalidHttpRequest)?;
         let host = &authority[1..close];
-        if host.is_empty() {
+        if !is_valid_target_host(host) {
             return Err(ProxyParseError::InvalidHttpRequest);
         }
         let port = match authority.get(close + 1..).and_then(|t| t.strip_prefix(':')) {
@@ -7446,7 +7712,7 @@ pub fn parse_authority_with_default(
         });
     }
     if let Some((host, port_text)) = authority.rsplit_once(':') {
-        if host.is_empty() {
+        if !is_valid_target_host(host) {
             return Err(ProxyParseError::InvalidHttpRequest);
         }
         let port = port_text
@@ -7460,6 +7726,9 @@ pub fn parse_authority_with_default(
             port,
         })
     } else {
+        if !is_valid_target_host(authority) {
+            return Err(ProxyParseError::InvalidHttpRequest);
+        }
         Ok(TargetAddr {
             host: authority.to_owned(),
             port: default_port,
@@ -7546,6 +7815,7 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
 
     let mut target_host = String::new();
     let mut target_port = 80u16;
+    let mut rewritten_path: Option<String> = None;
 
     let scheme_rest = if uri.len() >= 7 && uri[..7].eq_ignore_ascii_case("http://") {
         Some((&uri[7..], 80u16))
@@ -7555,24 +7825,29 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
         None
     };
     if let Some((rest, default_port)) = scheme_rest {
-        target_port = default_port;
-        let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-        if let Ok(target) = parse_authority_with_default(authority, default_port) {
-            target_host = target.host;
-            target_port = target.port;
-        }
+        let path_start = rest.find('/');
+        let query_start = rest.find('?');
+        let (authority, origin_path) = match (path_start, query_start) {
+            (Some(p), Some(q)) if q < p => (&rest[..q], format!("/{}", &rest[q..])),
+            (Some(p), _) => (&rest[..p], rest[p..].to_string()),
+            (None, Some(q)) => (&rest[..q], format!("/{}", &rest[q..])),
+            (None, None) => (rest, "/".to_string()),
+        };
+        let target = parse_authority_with_default(authority, default_port)?;
+        target_host = target.host;
+        target_port = target.port;
+        rewritten_path = Some(origin_path);
     }
 
+    let headers_str = std::str::from_utf8(&buf[first_line_end + 1..end])
+        .map_err(|_| ProxyParseError::InvalidHttpRequest)?;
     if target_host.is_empty() {
-        let headers_str = std::str::from_utf8(&buf[first_line_end + 1..end])
-            .map_err(|_| ProxyParseError::InvalidHttpRequest)?;
-        for line in headers_str.lines() {
-            if let Some((k, val)) = line.split_once(':') {
+        for hdr_line in headers_str.lines() {
+            if let Some((k, val)) = hdr_line.split_once(':') {
                 if k.trim().eq_ignore_ascii_case("host") {
-                    if let Ok(target) = parse_authority_with_default(val.trim(), target_port) {
-                        target_host = target.host;
-                        target_port = target.port;
-                    }
+                    let target = parse_authority_with_default(val.trim(), target_port)?;
+                    target_host = target.host;
+                    target_port = target.port;
                     break;
                 }
             }
@@ -7583,13 +7858,42 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
         return Err(ProxyParseError::InvalidHttpRequest);
     }
 
+    let req_target = rewritten_path.as_deref().unwrap_or(uri);
+    let mut rewritten = Vec::with_capacity(buf.len());
+    rewritten.extend_from_slice(method.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(req_target.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(proto.as_bytes());
+    rewritten.extend_from_slice(b"\r\n");
+    for hdr_line in headers_str.lines() {
+        let trimmed = hdr_line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, _)) = trimmed.split_once(':') {
+            let name = k.trim();
+            if name.eq_ignore_ascii_case("proxy-connection")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+            {
+                continue;
+            }
+        }
+        rewritten.extend_from_slice(trimmed.as_bytes());
+        rewritten.extend_from_slice(b"\r\n");
+    }
+    rewritten.extend_from_slice(b"\r\n");
+    if buf.len() > end {
+        rewritten.extend_from_slice(&buf[end..]);
+    }
+
     Ok(HttpProxyRequest {
         target: TargetAddr {
             host: target_host,
             port: target_port,
         },
         is_connect: false,
-        initial_payload: Some(buf.to_vec()),
+        initial_payload: Some(rewritten),
     })
 }
 
@@ -7922,6 +8226,51 @@ mod tests {
 
         assert!(parse_socks5_udp_datagram_borrowed(&[0, 0, 1, 1, 8, 8, 8, 8, 0, 53]).is_err());
     }
+
+    #[test]
+    fn http_proxy_rewrites_origin_form_and_strips_proxy_headers() {
+        let req = concat!(
+            "GET http://example.com:8080/hello?x=1 HTTP/1.1\r\n",
+            "Host: example.com:8080\r\n",
+            "Proxy-Connection: keep-alive\r\n",
+            "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n",
+            "User-Agent: RushWayTest/1.0\r\n",
+            "\r\n",
+            "body-bytes"
+        );
+        let parsed = parse_http_proxy_request(req.as_bytes()).unwrap();
+        assert!(!parsed.is_connect);
+        assert_eq!(parsed.target.host, "example.com");
+        assert_eq!(parsed.target.port, 8080);
+        let rewritten = String::from_utf8(parsed.initial_payload.unwrap()).unwrap();
+        assert!(rewritten.starts_with("GET /hello?x=1 HTTP/1.1\r\n"));
+        assert!(rewritten.contains("Host: example.com:8080\r\n"));
+        assert!(rewritten.contains("User-Agent: RushWayTest/1.0\r\n"));
+        assert!(!rewritten.contains("Proxy-Connection"));
+        assert!(!rewritten.contains("Proxy-Authorization"));
+        assert!(rewritten.ends_with("\r\n\r\nbody-bytes"));
+    }
+
+    #[test]
+    fn http_proxy_rejects_invalid_port_and_malformed_hosts() {
+        let bad_uri_port =
+            b"GET http://example.com:99999/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(
+            parse_http_proxy_request(bad_uri_port).unwrap_err(),
+            ProxyError::InvalidPort
+        );
+
+        let bad_host_port =
+            b"GET / HTTP/1.1\r\nHost: example.com:99999\r\n\r\n";
+        assert_eq!(
+            parse_http_proxy_request(bad_host_port).unwrap_err(),
+            ProxyError::InvalidPort
+        );
+
+        assert!(parse_target_authority("evil.com/path:80").is_err());
+        assert!(parse_target_authority("evil\r\n.com:80").is_err());
+        assert!(parse_authority_with_default("evil.com/path", 80).is_err());
+    }
 }
 } // mod proxy
 
@@ -7957,7 +8306,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
@@ -8336,21 +8685,6 @@ async fn write_len_prefixed_udp(send: &mut SendStream, payload: &[u8]) -> Result
     send.write_all(payload).await?;
     Ok(())
 }
-async fn write_len_prefixed_udp_reuse(
-    send: &mut SendStream,
-    payload: &[u8],
-    scratch: &mut Vec<u8>,
-) -> Result<()> {
-    if payload.len() > MAX_QUIC_UDP_PACKET {
-        bail!("QUIC UDP payload too large")
-    }
-    scratch.clear();
-    scratch.reserve(2 + payload.len());
-    scratch.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    scratch.extend_from_slice(payload);
-    send.write_all(scratch).await?;
-    Ok(())
-}
 #[derive(Clone)]
 struct QuicClientPool {
     endpoint: Endpoint,
@@ -8358,7 +8692,9 @@ struct QuicClientPool {
     upstream_port: u16,
     server_addr: Arc<StdMutex<std::net::SocketAddr>>,
     server_name: String,
-    connection: Arc<StdMutex<Option<Connection>>>,
+    connections: Arc<StdMutex<Vec<Connection>>>,
+    max_conns: usize,
+    next_idx: Arc<std::sync::atomic::AtomicUsize>,
     dial_lock: Arc<Mutex<()>>,
     timeout_secs: u64,
     key_digest: Option<[u8; 64]>,
@@ -8376,14 +8712,18 @@ impl QuicClientPool {
         server_name: String,
         timeout_secs: u64,
         key: Option<&str>,
+        max_conns: usize,
     ) -> Arc<Self> {
+        let max_conns = max_conns.clamp(1, 64);
         Arc::new(Self {
             endpoint,
             upstream_host,
             upstream_port,
             server_addr: Arc::new(StdMutex::new(server_addr)),
             server_name,
-            connection: Arc::new(StdMutex::new(None)),
+            connections: Arc::new(StdMutex::new(Vec::with_capacity(max_conns))),
+            max_conns,
+            next_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dial_lock: Arc::new(Mutex::new(())),
             timeout_secs,
             key_digest: key.map(key_digest_hex_bytes),
@@ -8404,26 +8744,68 @@ impl QuicClientPool {
         }
     }
     async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
+        use std::sync::atomic::Ordering;
         let wait_timeout = Duration::from_secs(self.timeout_secs.max(1));
         for _ in 0..2 {
-            let existing = self
-                .connection
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .filter(|c| c.close_reason().is_none())
-                .cloned();
+            let (existing, need_more) = {
+                let mut guard = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+                guard.retain(|c| c.close_reason().is_none());
+                let len = guard.len();
+                let picked = if len > 0 {
+                    let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % len;
+                    Some(guard[idx].clone())
+                } else {
+                    None
+                };
+                (picked, len < self.max_conns)
+            };
             let connection = match existing {
-                Some(c) => c,
+                Some(c) => {
+                    if need_more && self.dial_lock.try_lock().is_ok() {
+                        let pool = self.clone();
+                        tokio::spawn(async move {
+                            let Ok(_guard) = pool.dial_lock.try_lock() else {
+                                return;
+                            };
+                            let cur_len = {
+                                let mut g = pool.connections.lock().unwrap_or_else(|e| e.into_inner());
+                                g.retain(|c| c.close_reason().is_none());
+                                g.len()
+                            };
+                            if cur_len < pool.max_conns {
+                                let addr = pool.current_or_resolve_addr().await;
+                                if let Ok(connecting) = pool.endpoint.connect(addr, &pool.server_name) {
+                                    if let Ok(Ok(conn)) = timeout(
+                                        Duration::from_secs(pool.timeout_secs.max(1)),
+                                        connecting,
+                                    )
+                                    .await
+                                    {
+                                        let mut g =
+                                            pool.connections.lock().unwrap_or_else(|e| e.into_inner());
+                                        g.retain(|c| c.close_reason().is_none());
+                                        if g.len() < pool.max_conns {
+                                            g.push(conn);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    c
+                }
                 None => {
                     let _dial_guard = self.dial_lock.lock().await;
-                    let rechecked = self
-                        .connection
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .filter(|c| c.close_reason().is_none())
-                        .cloned();
+                    let rechecked = {
+                        let mut guard = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.retain(|c| c.close_reason().is_none());
+                        if !guard.is_empty() {
+                            let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % guard.len();
+                            Some(guard[idx].clone())
+                        } else {
+                            None
+                        }
+                    };
                     if let Some(c) = rechecked {
                         c
                     } else {
@@ -8440,34 +8822,21 @@ impl QuicClientPool {
                                 bail!("QUIC connection handshake timed out to {addr}");
                             }
                         };
-                        *self.connection.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(conn.clone());
+                        let mut guard = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.push(conn.clone());
                         conn
                     }
                 }
             };
             match timeout(wait_timeout, connection.open_bi()).await {
                 Ok(Ok(pair)) => return Ok(pair),
-                Ok(Err(_)) => {
-                    dns::invalidate_host(&self.upstream_host);
-                    let mut guard = self.connection.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard
-                        .as_ref()
-                        .is_some_and(|c| c.stable_id() == connection.stable_id())
-                    {
-                        guard.take();
-                    }
-                }
-                Err(_) => {
+                Ok(Err(_)) | Err(_) => {
                     if connection.close_reason().is_some() {
                         dns::invalidate_host(&self.upstream_host);
-                    }
-                    let mut guard = self.connection.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard
-                        .as_ref()
-                        .is_some_and(|c| c.stable_id() == connection.stable_id())
-                    {
-                        guard.take();
+                        let mut guard = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.retain(|c| {
+                            c.close_reason().is_none() && c.stable_id() != connection.stable_id()
+                        });
                     }
                 }
             }
@@ -8605,6 +8974,7 @@ async fn relay_quic(
     let mut upload = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut r = lr;
         let mut buf = relay_buf(buffer_size).await;
+        let mut stats_batch = crate::stats::StatsBatcher::new();
         let res: Result<()> = async {
             loop {
                 match r.read(&mut buf).await {
@@ -8613,7 +8983,7 @@ async fn relay_quic(
                         break;
                     }
                     Ok(n) => {
-                        crate::stats::add_bytes(n as i64, 0);
+                        stats_batch.add_up(n);
                         send.write_all(&buf[..n]).await?;
                     }
                     Err(e) => {
@@ -8629,6 +8999,7 @@ async fn relay_quic(
     }));
     let mut lw2 = lw;
     let mut buf = relay_buf(buffer_size).await;
+    let mut stats_batch = crate::stats::StatsBatcher::new();
     let mut remote_eof = false;
     let mut upload_done = false;
     let down_res: Result<()> = async {
@@ -8642,7 +9013,7 @@ async fn relay_quic(
                                 break;
                             }
                             Some(n) => {
-                                crate::stats::add_bytes(0, n as i64);
+                                stats_batch.add_down(n);
                                 lw2.write_all(&buf[..n]).await?;
                             }
                         }
@@ -8663,7 +9034,7 @@ async fn relay_quic(
                         break;
                     }
                     Some(n) => {
-                        crate::stats::add_bytes(0, n as i64);
+                        stats_batch.add_down(n);
                         lw2.write_all(&buf[..n]).await?;
                     }
                 }
@@ -8694,11 +9065,17 @@ async fn relay_quic_udp(
 ) -> Result<()> {
     let control_peer_ip = control.peer_addr().ok().map(|a| a.ip());
     let local_ip = crate::common::local_udp_bind_ip(&control);
-    let udp = Arc::new(UdpSocket::bind(std::net::SocketAddr::new(local_ip, 0)).await?);
+    let udp = Arc::new(crate::udp_batch::bind_local_udp_socket(
+        std::net::SocketAddr::new(local_ip, 0),
+    )?);
     let bound = udp.local_addr()?;
-    let resp = socks5_udp_associate_reply(bound);
-    control.write_all(&resp).await?;
-    let (mut send, mut recv) = pool.open_bi().await?;
+    let (mut send, mut recv) = match pool.open_bi().await {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = quic_reject_local(&mut control, true).await;
+            return Err(error);
+        }
+    };
     // Same digest-first handshake as the TCP relay: the plaintext key only
     // goes on the wire when a plaintext-only upstream rejects the digest —
     // and only on an auth-shaped rejection or a stream closed before any
@@ -8726,7 +9103,10 @@ async fn relay_quic_udp(
             }
             None => header_buf.extend_from_slice(b"UDP\n"),
         }
-        send.write_all(&header_buf).await?;
+        if let Err(error) = send.write_all(&header_buf).await {
+            let _ = quic_reject_local(&mut control, true).await;
+            return Err(error.into());
+        }
         let mut no_response = false;
         let hs_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
         match timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192)).await {
@@ -8736,11 +9116,15 @@ async fn relay_quic_udp(
             }
             Ok(Err(error)) => {
                 if key.is_none() || retried {
+                    let _ = quic_reject_local(&mut control, true).await;
                     return Err(error);
                 }
                 no_response = true;
             }
-            Err(_) => bail!("QUIC UDP upstream handshake timed out"),
+            Err(_) => {
+                let _ = quic_reject_local(&mut control, true).await;
+                bail!("QUIC UDP upstream handshake timed out");
+            }
         }
         if ok == "OK" || key.is_none() || retried {
             break;
@@ -8755,11 +9139,20 @@ async fn relay_quic_udp(
             // rejection marks the upstream plaintext-only.
             pool.mark_plaintext_needed();
         }
-        (send, recv) = pool.open_bi().await?;
+        (send, recv) = match pool.open_bi().await {
+            Ok(v) => v,
+            Err(error) => {
+                let _ = quic_reject_local(&mut control, true).await;
+                return Err(error);
+            }
+        };
     }
     if ok != "OK" {
+        let _ = quic_reject_local(&mut control, true).await;
         bail!("QUIC UDP upstream rejected: {}", ok)
     }
+    let resp = socks5_udp_associate_reply(bound);
+    control.write_all(&resp).await?;
     let latest = Arc::new(StdMutex::new(None::<std::net::SocketAddr>));
     let block_local = cfg.block_local;
     let udp_send = udp.clone();
@@ -8767,15 +9160,20 @@ async fn relay_quic_udp(
     let mut send_task = send;
     let mut upload = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
-        let mut scratch = Vec::with_capacity(2048);
+        let mut scratch = Vec::with_capacity(4096);
         let mut local_established: Option<std::net::SocketAddr> = None;
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
                 Err(_) => break,
             };
+            scratch.clear();
+            let mut batch_bytes = 0i64;
             for i in 0..count {
                 let (pkt, peer) = batch.packet(i);
+                if pkt.len() > MAX_QUIC_UDP_PACKET {
+                    continue;
+                }
                 if !crate::common::udp_client_allowed(peer, control_peer_ip, &bind_hint, local_established) {
                     tracing::debug!(%peer, "QUIC UDP associate dropped datagram from unauthorized local peer");
                     continue;
@@ -8791,11 +9189,13 @@ async fn relay_quic_udp(
                     local_established = Some(peer);
                     *latest_send.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
                 }
-                crate::stats::add_bytes(pkt.len() as i64, 0);
-                if write_len_prefixed_udp_reuse(&mut send_task, pkt, &mut scratch)
-                    .await
-                    .is_err()
-                {
+                batch_bytes += pkt.len() as i64;
+                scratch.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+                scratch.extend_from_slice(pkt);
+            }
+            if !scratch.is_empty() {
+                crate::stats::add_bytes(batch_bytes, 0);
+                if send_task.write_all(&scratch).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
             }
@@ -8833,7 +9233,10 @@ async fn relay_quic_udp(
                     }
                 };
                 if let Some(peer) = peer_opt {
-                    let _ = batch_writer.send(packet, peer).await;
+                    let _ = batch_writer.push(packet, peer).await;
+                    if stash.len() < 2 {
+                        let _ = batch_writer.flush().await;
+                    }
                     crate::stats::add_bytes(0, packet_len as i64);
                 }
             }
@@ -8846,7 +9249,7 @@ async fn relay_quic_udp(
     Ok(())
 }
 
-pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
+pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool, session_count: usize) -> Result<()> {
     let upstream = cfg
         .upstream
         .clone()
@@ -8879,6 +9282,7 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         bytes = socket_buf,
         "QUIC client UDP socket buffers requested"
     );
+    let max_conns = if cfg.mux { session_count.max(1) } else { 1 };
     let pool = QuicClientPool::new(
         endpoint,
         upstream_host,
@@ -8887,16 +9291,19 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
         server_name,
         cfg.connection_timeout,
         cfg.key.as_deref(),
+        max_conns,
     );
     let warm_pool = pool.clone();
     tokio::spawn(async move {
         let _dial_guard = warm_pool.dial_lock.lock().await;
-        let alive = warm_pool
-            .connection
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|c| c.close_reason().is_none());
+        let alive = {
+            let mut g = warm_pool
+                .connections
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            g.retain(|c| c.close_reason().is_none());
+            !g.is_empty()
+        };
         if !alive {
             let addr = warm_pool.current_or_resolve_addr().await;
             if let Ok(connecting) = warm_pool.endpoint.connect(addr, &warm_pool.server_name) {
@@ -8906,10 +9313,14 @@ pub async fn run_client(cfg: RuntimeConfig, verify_ssl: bool) -> Result<()> {
                 )
                 .await
                 {
-                    *warm_pool
-                        .connection
+                    let mut g = warm_pool
+                        .connections
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(conn);
+                        .unwrap_or_else(|e| e.into_inner());
+                    g.retain(|c| c.close_reason().is_none());
+                    if g.len() < warm_pool.max_conns {
+                        g.push(conn);
+                    }
                 }
             }
         }
@@ -9062,8 +9473,8 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
             }
         }
     }
-    endpoint.close(0u32.into(), b"shutdown");
     drain_join_set(&mut set).await;
+    endpoint.close(0u32.into(), b"shutdown");
     Ok(())
 }
 
@@ -9214,13 +9625,15 @@ async fn handle_server_udp_stream(
     let known_send = known_targets.clone();
     let mut sender = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut batch = UdpBatchReader::new(udp_send);
-        let mut packet = Vec::with_capacity(2048);
+        let mut packet = Vec::with_capacity(4096);
         let mut last_allowed_src: Option<std::net::SocketAddr> = None;
         loop {
             let count = match batch.recv().await {
                 Ok(n) => n,
                 Err(_) => break,
             };
+            packet.clear();
+            let mut batch_bytes = 0i64;
             for i in 0..count {
                 let (pkt, src) = batch.packet(i);
                 let allowed = match last_allowed_src {
@@ -9247,8 +9660,7 @@ async fn handle_server_udp_stream(
                 if body_len > MAX_QUIC_UDP_PACKET {
                     continue;
                 }
-                crate::stats::add_bytes(0, pkt.len() as i64);
-                packet.clear();
+                batch_bytes += pkt.len() as i64;
                 packet.reserve(2 + body_len);
                 packet.extend_from_slice(&(body_len as u16).to_be_bytes());
                 packet.extend_from_slice(&[0, 0, 0]);
@@ -9264,6 +9676,9 @@ async fn handle_server_udp_stream(
                 }
                 packet.extend_from_slice(&src.port().to_be_bytes());
                 packet.extend_from_slice(pkt);
+            }
+            if !packet.is_empty() {
+                crate::stats::add_bytes(0, batch_bytes);
                 if send.write_all(&packet).await.is_err() {
                     return Ok::<(), anyhow::Error>(());
                 }
@@ -9296,7 +9711,10 @@ async fn handle_server_udp_stream(
                 // never arrive ahead of its target joining the known set.
                 record_known_udp_target(&known_targets, &mut last_addr, addr);
                 crate::stats::add_bytes(payload.len() as i64, 0);
-                let _ = batch_writer.send(payload, addr).await;
+                let _ = batch_writer.push(payload, addr).await;
+                if stash.len() < 2 {
+                    let _ = batch_writer.flush().await;
+                }
             }
             let _ = batch_writer.flush().await;
             Ok::<(), anyhow::Error>(())
@@ -9590,7 +10008,7 @@ use crate::ws::{
     build_server_handshake_response, encode_ws_frame, read_frame_with_cipher,
     validate_server_handshake, write_frame, write_frame_borrowed,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use socket2::SockRef;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -9704,6 +10122,8 @@ pub(crate) fn is_blocked_local_ip(ip: IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
+                || (v4.octets()[0] & 0xf0) == 240
                 || v4.octets()[0] == 0
         }
         IpAddr::V6(v6) => {
@@ -9712,11 +10132,42 @@ pub(crate) fn is_blocked_local_ip(ip: IpAddr) -> bool {
                     return true;
                 }
             }
+            let segs = v6.segments();
+            // NAT64 Well-Known Prefix (64:ff9b::/96, RFC 6052)
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    segs[6] as u8,
+                    (segs[7] >> 8) as u8,
+                    segs[7] as u8,
+                );
+                if is_blocked_local_ip(IpAddr::V4(v4)) {
+                    return true;
+                }
+            }
+            // 6to4 Prefix (2002::/16, RFC 3056)
+            if segs[0] == 0x2002 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segs[1] >> 8) as u8,
+                    segs[1] as u8,
+                    (segs[2] >> 8) as u8,
+                    segs[2] as u8,
+                );
+                if is_blocked_local_ip(IpAddr::V4(v4)) {
+                    return true;
+                }
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
-                || ((v6.segments()[0] & 0xff00) == 0xff00 && (v6.segments()[0] & 0x000f) <= 2)
+                || v6.is_multicast()
         }
     }
 }
@@ -9936,6 +10387,7 @@ pub(crate) fn record_known_udp_target(
     last_addr: &mut Option<SocketAddr>,
     addr: SocketAddr,
 ) {
+    let addr = crate::udp_batch::normalize_peer_addr(addr);
     if *last_addr == Some(addr) {
         return;
     }
@@ -11054,34 +11506,50 @@ where
                 MuxCommand::Fin => {
                     let id = frame.stream_id;
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
-                    let full_tx = {
-                        let guard = streams.read().unwrap_or_else(|e| e.into_inner());
-                        match guard.get(&id) {
-                            Some(s) => {
-                                if s.pending_ctrl.load(Ordering::Acquire) {
-                                    // A control frame is already queued in the background;
-                                    // drop redundant FIN to bound tasks and memory.
-                                    None
-                                } else {
-                                    match s.tx.try_send(StreamCommand::Fin) {
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            s.pending_ctrl.store(true, Ordering::Release);
-                                            Some((s.tx.clone(), s.gate.clone(), s.pending_ctrl.clone()))
-                                        }
-                                        _ => None,
+                    let full_tx = match &last_stream {
+                        Some((cached_id, tx, gate, pending_ctrl))
+                            if *cached_id == id && !tx.is_closed() =>
+                        {
+                            if pending_ctrl.load(Ordering::Acquire) {
+                                None
+                            } else {
+                                match tx.try_send(StreamCommand::Fin) {
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        pending_ctrl.store(true, Ordering::Release);
+                                        Some((tx.clone(), gate.clone()))
                                     }
+                                    _ => None,
                                 }
                             }
-                            None => None,
+                        }
+                        _ => {
+                            let guard = streams.read().unwrap_or_else(|e| e.into_inner());
+                            match guard.get(&id) {
+                                Some(s) => {
+                                    if s.pending_ctrl.load(Ordering::Acquire) {
+                                        // A control frame is already queued in the background;
+                                        // drop redundant FIN to bound tasks and memory.
+                                        None
+                                    } else {
+                                        match s.tx.try_send(StreamCommand::Fin) {
+                                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                                s.pending_ctrl.store(true, Ordering::Release);
+                                                Some((s.tx.clone(), s.gate.clone()))
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                }
+                                None => None,
+                            }
                         }
                     };
-                    if let Some((tx, gate, pending_ctrl)) = full_tx {
+                    if let Some((tx, gate)) = full_tx {
                         let streams_for_cleanup = streams.clone();
                         tokio::spawn(async move {
                             match timeout(Duration::from_secs(10), tx.reserve()).await {
                                 Ok(Ok(permit)) => {
                                     permit.send(StreamCommand::Fin);
-                                    pending_ctrl.store(false, Ordering::Release);
                                 }
                                 _ => {
                                     // A FIN that silently disappears can strand a server stream.
@@ -11106,6 +11574,7 @@ where
                 MuxCommand::Rst => {
                     let stream_id = frame.stream_id;
                     crate::mux_writer::recycle_encode_buf(frame.into_storage());
+                    writer.drop_stream(stream_id);
                     if last_stream.as_ref().is_some_and(|c| c.0 == stream_id) {
                         last_stream = None;
                     }
@@ -11248,6 +11717,7 @@ where
     let (dl_err_tx, mut dl_err_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
     let mut download = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
+        let mut stats_batch = crate::stats::StatsBatcher::new();
         let res: Result<()> = async {
             loop {
                 let n = tokio::select! {
@@ -11263,7 +11733,7 @@ where
                     let _ = write_frame(&mut wr, &[], 8, false).await;
                     break;
                 }
-                crate::stats::add_bytes(0, n as i64);
+                stats_batch.add_down(n);
                 write_frame_borrowed(&mut wr, &mut buf[..n], 2, false).await?;
             }
             Ok(())
@@ -11274,6 +11744,7 @@ where
         }
     }));
     let mut frame_buf = Vec::new();
+    let mut stats_batch = crate::stats::StatsBatcher::new();
     let mut download_done = false;
     let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
     let result = async {
@@ -11344,12 +11815,13 @@ where
                 crate::mux_writer::recycle_encode_buf(payload);
                 break;
             }
-            crate::stats::add_bytes(payload.len() as i64, 0);
+            stats_batch.add_up(payload.len());
             crate::mux_writer::recycle_encode_buf(payload);
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    drop(stats_batch);
     crate::mux_writer::recycle_encode_buf(frame_buf);
     let _ = target_wr.shutdown().await;
     if !download_done {
@@ -11381,7 +11853,7 @@ pub(crate) async fn handle_server_udp_parts<R, W>(
     cipher: XorCipher,
 ) -> Result<()>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut ok = *b"OK\n";
@@ -11488,7 +11960,10 @@ where
                 };
                 record_known_udp_target(&known_targets, &mut last_addr, addr);
                 crate::stats::add_bytes(payload.len() as i64, 0);
-                let _ = batch_writer.send(payload, addr).await;
+                let _ = batch_writer.push(payload, addr).await;
+                if rd.buffer().len() < 2 {
+                    let _ = batch_writer.flush().await;
+                }
                 crate::mux_writer::recycle_encode_buf(packet);
             }
             Ok::<(), anyhow::Error>(())
@@ -11521,12 +11996,18 @@ where
     let cipher = configured_cipher(&cfg.key);
     let mut buf = Vec::new();
     let first_frame_timeout = Duration::from_secs(cfg.connection_timeout.max(45));
-    let first_res = timeout(
+    let first_res = match timeout(
         first_frame_timeout,
         read_frame_with_cipher(&mut rd, Some(&mut wr), &mut buf, Some(&cipher)),
     )
     .await
-    .context("transport handshake frame timeout")?;
+    {
+        Ok(res) => res,
+        Err(_) => {
+            crate::mux_writer::recycle_encode_buf(buf);
+            bail!("transport handshake frame timeout");
+        }
+    };
     crate::mux_writer::recycle_encode_buf(buf);
     let Some((opcode, first)) = first_res? else {
         bail!("missing transport handshake")
@@ -11748,6 +12229,34 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn blocked_local_ip_covers_multicast_class_e_nat64_and_6to4() {
+        for blocked in [
+            "224.0.0.1",
+            "239.255.255.250",
+            "240.0.0.1",
+            "254.254.254.254",
+            "ff02::1",
+            "ff0e::1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:7f00:1::",
+            "2002:c0a8:101::",
+        ] {
+            assert!(
+                is_blocked_local_host(blocked),
+                "{blocked} should be blocked by SSRF target policy"
+            );
+        }
+        for allowed in ["64:ff9b::808:808", "2002:808:808::"] {
+            assert!(
+                !is_blocked_local_host(allowed),
+                "{allowed} (public 8.8.8.8) should be allowed"
+            );
+        }
+    }
+
+    #[test]
     fn localhost_root_and_subdomains_are_blocked() {
         // The old check was an exact `eq_ignore_ascii_case("localhost")`.
         // `getaddrinfo` accepts `localhost.` (trailing root) and RFC 6761
@@ -11843,10 +12352,12 @@ pub mod stats {
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 #[repr(align(64))]
+struct AlignedAtomicI64(AtomicI64);
+
 struct HotCounters {
-    active_conns: AtomicI64,
-    bytes_up: AtomicI64,
-    bytes_down: AtomicI64,
+    active_conns: AlignedAtomicI64,
+    bytes_up: AlignedAtomicI64,
+    bytes_down: AlignedAtomicI64,
 }
 
 #[repr(align(64))]
@@ -11856,9 +12367,9 @@ struct SpeedWords {
 }
 
 static HOT: HotCounters = HotCounters {
-    active_conns: AtomicI64::new(0),
-    bytes_up: AtomicI64::new(0),
-    bytes_down: AtomicI64::new(0),
+    active_conns: AlignedAtomicI64(AtomicI64::new(0)),
+    bytes_up: AlignedAtomicI64(AtomicI64::new(0)),
+    bytes_down: AlignedAtomicI64(AtomicI64::new(0)),
 };
 
 static SPEEDS: SpeedWords = SpeedWords {
@@ -11874,7 +12385,7 @@ pub struct ConnGuard;
 impl ConnGuard {
     #[must_use]
     pub fn new() -> Self {
-        HOT.active_conns.fetch_add(1, Ordering::Relaxed);
+        HOT.active_conns.0.fetch_add(1, Ordering::Relaxed);
         Self
     }
 }
@@ -11887,15 +12398,7 @@ impl Default for ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        let _ = HOT
-            .active_conns
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v > 0 {
-                    Some(v - 1)
-                } else {
-                    Some(0)
-                }
-            });
+        HOT.active_conns.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -11903,10 +12406,10 @@ impl Drop for ConnGuard {
 #[inline]
 pub fn add_bytes(up: i64, down: i64) {
     if up > 0 {
-        HOT.bytes_up.fetch_add(up, Ordering::Relaxed);
+        HOT.bytes_up.0.fetch_add(up, Ordering::Relaxed);
     }
     if down > 0 {
-        HOT.bytes_down.fetch_add(down, Ordering::Relaxed);
+        HOT.bytes_down.0.fetch_add(down, Ordering::Relaxed);
     }
 }
 
@@ -11931,6 +12434,7 @@ impl StatsBatcher {
         self.up += n as i64;
         if self.up >= STATS_BATCH_THRESHOLD {
             HOT.bytes_up
+                .0
                 .fetch_add(std::mem::take(&mut self.up), Ordering::Relaxed);
         }
     }
@@ -11940,6 +12444,7 @@ impl StatsBatcher {
         self.down += n as i64;
         if self.down >= STATS_BATCH_THRESHOLD {
             HOT.bytes_down
+                .0
                 .fetch_add(std::mem::take(&mut self.down), Ordering::Relaxed);
         }
     }
@@ -11948,10 +12453,12 @@ impl StatsBatcher {
     pub fn flush(&mut self) {
         if self.up > 0 {
             HOT.bytes_up
+                .0
                 .fetch_add(std::mem::take(&mut self.up), Ordering::Relaxed);
         }
         if self.down > 0 {
             HOT.bytes_down
+                .0
                 .fetch_add(std::mem::take(&mut self.down), Ordering::Relaxed);
         }
     }
@@ -11972,14 +12479,14 @@ impl Drop for StatsBatcher {
 
 #[inline]
 pub fn active_conns() -> i64 {
-    HOT.active_conns.load(Ordering::Relaxed)
+    HOT.active_conns.0.load(Ordering::Relaxed).max(0)
 }
 
 #[inline]
 pub fn totals() -> (i64, i64) {
     (
-        HOT.bytes_up.load(Ordering::Relaxed),
-        HOT.bytes_down.load(Ordering::Relaxed),
+        HOT.bytes_up.0.load(Ordering::Relaxed),
+        HOT.bytes_down.0.load(Ordering::Relaxed),
     )
 }
 
@@ -12007,13 +12514,16 @@ pub fn spawn_monitor(tui_enabled: bool, print_stats_line: bool) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first tick so the initial window is a full interval.
         ticker.tick().await;
+        let mut last_tick = std::time::Instant::now();
         let mut last_up = 0i64;
         let mut last_down = 0i64;
         loop {
             ticker.tick().await;
+            let now = std::time::Instant::now();
+            let secs = now.duration_since(last_tick).as_secs_f64().max(0.001);
+            last_tick = now;
             let (curr_up, curr_down) = totals();
             let active = active_conns();
-            let secs = interval_secs as f64;
             let up_speed = (curr_up.saturating_sub(last_up)) as f64 / secs / 1024.0 / 1024.0;
             let down_speed = (curr_down.saturating_sub(last_down)) as f64 / secs / 1024.0 / 1024.0;
             last_up = curr_up;
@@ -12187,7 +12697,8 @@ pub async fn connect_with_profile(
     profile_index: usize,
 ) -> Result<RushTlsStream> {
     let config = profile_config(profile_index, verify_ssl);
-    let server_name = ServerName::try_from(host.to_owned())
+    let clean_host = host.trim().trim_matches(|c| c == '[' || c == ']');
+    let server_name = ServerName::try_from(clean_host.to_owned())
         .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
     let connector = TlsConnector::from(config);
     connector
@@ -12269,7 +12780,8 @@ fn pem_blocks(pem: &str) -> Result<Vec<(String, Vec<u8>)>> {
             }
         } else if line.starts_with("-----END ") {
             if let Some(name) = label.take() {
-                let mut encoded = body.replace(' ', "");
+                let mut encoded: String =
+                    body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
                 while encoded.len() % 4 != 0 {
                     encoded.push('=');
                 }
@@ -12646,6 +13158,8 @@ fn tui_log_slice(n: usize) -> Vec<String> {
 struct LogFileState {
     path: Mutex<Option<PathBuf>>,
     ring: Mutex<VecDeque<String>>,
+    write_lock: Mutex<()>,
+    flush_pending: AtomicBool,
 }
 
 fn log_file_state() -> &'static LogFileState {
@@ -12653,6 +13167,8 @@ fn log_file_state() -> &'static LogFileState {
     STATE.get_or_init(|| LogFileState {
         path: Mutex::new(None),
         ring: Mutex::new(VecDeque::with_capacity(LOG_FILE_RING_CAP)),
+        write_lock: Mutex::new(()),
+        flush_pending: AtomicBool::new(false),
     })
 }
 
@@ -12662,19 +13178,42 @@ pub fn configure_log_file(path: PathBuf) {
     *state.path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
 }
 
-fn log_file_add(entry: &str) {
+fn flush_log_file_sync() {
     let state = log_file_state();
+    let _guard = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    state.flush_pending.store(false, Ordering::Release);
     let path = state.path.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(path) = path else { return };
-    let stamp = stamp_ymd_hms();
-    let mut ring = state.ring.lock().unwrap_or_else(|e| e.into_inner());
-    if ring.len() == LOG_FILE_RING_CAP {
-        ring.pop_front();
-    }
-    ring.push_back(format!("{stamp} {entry}"));
-    let content = render_log_file(&ring);
-    drop(ring);
+    let content = {
+        let ring = state.ring.lock().unwrap_or_else(|e| e.into_inner());
+        if ring.is_empty() {
+            return;
+        }
+        render_log_file(&ring)
+    };
     let _ = std::fs::write(&path, content);
+}
+
+fn log_file_add(entry: &str) {
+    let state = log_file_state();
+    if state.path.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return;
+    }
+    let stamp = stamp_ymd_hms();
+    {
+        let mut ring = state.ring.lock().unwrap_or_else(|e| e.into_inner());
+        if ring.len() == LOG_FILE_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(format!("{stamp} {entry}"));
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if !state.flush_pending.swap(true, Ordering::AcqRel) {
+            handle.spawn_blocking(flush_log_file_sync);
+        }
+    } else {
+        flush_log_file_sync();
+    }
 }
 
 fn render_log_file(ring: &VecDeque<String>) -> String {
@@ -12688,6 +13227,8 @@ fn render_log_file(ring: &VecDeque<String>) -> String {
 /// Final flush on shutdown (GoWay `saveLogFile` parity).
 pub fn save_log_file() {
     let state = log_file_state();
+    let _guard = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    state.flush_pending.store(false, Ordering::Release);
     let path = state.path.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(path) = path else { return };
     let ring = state.ring.lock().unwrap_or_else(|e| e.into_inner());
@@ -13438,6 +13979,25 @@ fn target_for_socket(addr: SocketAddr, sock_is_v6: bool) -> SocketAddr {
     addr
 }
 
+/// Default kernel UDP socket buffer target (2 MiB) to absorb packet bursts.
+const UDP_SOCKET_BUF_BYTES: usize = 2 * 1024 * 1024;
+
+/// Binds a local UDP socket at `addr` with 2 MiB `SO_RCVBUF` / `SO_SNDBUF`.
+pub(crate) fn bind_local_udp_socket(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUF_BYTES);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUF_BYTES);
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    tokio::net::UdpSocket::from_std(std_sock)
+}
+
 /// Binds a dual-stack unspecified UDP socket (`[::]:0` with `only_v6 = false`),
 /// falling back to `0.0.0.0:0` on hosts where IPv6 is disabled.
 pub(crate) fn bind_dual_stack_udp_unspecified() -> io::Result<tokio::net::UdpSocket> {
@@ -13448,6 +14008,8 @@ pub(crate) fn bind_dual_stack_udp_unspecified() -> io::Result<tokio::net::UdpSoc
         Some(socket2::Protocol::UDP),
     ) {
         let _ = sock.set_only_v6(false);
+        let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUF_BYTES);
+        let _ = sock.set_send_buffer_size(UDP_SOCKET_BUF_BYTES);
         if sock.set_nonblocking(true).is_ok() && sock.bind(&v6_any.into()).is_ok() {
             let std_sock: std::net::UdpSocket = sock.into();
             if let Ok(tokio_sock) = tokio::net::UdpSocket::from_std(std_sock) {
@@ -13461,6 +14023,8 @@ pub(crate) fn bind_dual_stack_udp_unspecified() -> io::Result<tokio::net::UdpSoc
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?;
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUF_BYTES);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUF_BYTES);
     sock.set_nonblocking(true)?;
     sock.bind(&v4_any.into())?;
     let std_sock: std::net::UdpSocket = sock.into();
@@ -13603,7 +14167,10 @@ impl UdpBatchWriter {
                 }
                 Ok(_) => break,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.count = 0;
+                    return Err(e);
+                }
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -13614,7 +14181,10 @@ impl UdpBatchWriter {
                 }
                 Ok(_) => break,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.count = 0;
+                    return Err(e);
+                }
             }
         }
         self.count = 0;
@@ -13910,14 +14480,13 @@ mod tests {
 } // mod udp_batch
 
 pub mod udp_relay {
-use crate::common::socks5_udp_associate_reply;
 use crate::proxy::TargetAddr;
 use crate::runtime::RuntimeConfig;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::time::Duration;
 
 pub async fn handle_local_udp_proxy(
@@ -13926,16 +14495,24 @@ pub async fn handle_local_udp_proxy(
     bind_hint: TargetAddr,
 ) -> Result<()> {
     let local_ip = crate::common::local_udp_bind_ip(&control);
-    let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
+    let udp = Arc::new(crate::udp_batch::bind_local_udp_socket(SocketAddr::new(
+        local_ip, 0,
+    ))?);
     let bound = udp.local_addr()?;
-    let resp = socks5_udp_associate_reply(bound);
-    control.write_all(&resp).await?;
     let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let (rd, wr) =
-        crate::common::open_ws_upstream(&cfg, "UDP relay requires ws:// upstream").await?;
+    let (rd, wr) = match crate::common::open_ws_upstream(&cfg, "UDP relay requires ws:// upstream").await {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = control
+                .write_all(&crate::proxy::socks5_failure_response())
+                .await;
+            return Err(e);
+        }
+    };
     crate::common::relay_udp_ws(
         control,
         udp,
+        bound,
         &bind_hint,
         rd,
         wr,
@@ -15470,7 +16047,7 @@ pub mod wss_client {
 //! WSS client paths for GoWay-compatible upstreams.
 
 use crate::common::{
-    configured_cipher, non_mux_pool_size, relay_non_mux_ws, socks5_udp_associate_reply,
+    configured_cipher, non_mux_pool_size, relay_non_mux_ws,
     MuxClientSession, NonMuxOkRejection, NonMuxPool, NonMuxRelaySpec,
     HTTP_200_CONNECTION_ESTABLISHED,
 };
@@ -15488,7 +16065,7 @@ use crate::runtime::{
 };
 use crate::tls;
 use crate::ws::{
-    read_frame, read_http_headers_timeout, redact_handshake_request,
+    read_frame, read_http_headers_timeout_buf, redact_handshake_request,
     validate_client_handshake_response, write_frame,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -15500,11 +16077,11 @@ use std::sync::{
     Arc,
 };
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 
-pub(crate) type TlsReader = ReadHalf<tls::RushTlsStream>;
+pub(crate) type TlsReader = tokio::io::BufReader<ReadHalf<tls::RushTlsStream>>;
 pub(crate) type TlsWriter = WriteHalf<tls::RushTlsStream>;
 
 const MAX_SESSION_COUNT: usize = 64;
@@ -15718,7 +16295,8 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
         }
     };
 
-    let (mut rd, mut wr) = tokio::io::split(tls_stream);
+    let (rd, mut wr) = tokio::io::split(tls_stream);
+    let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
     let origin = format!("https://{}", crate::common::format_origin_host(tls_name));
     let header_host_name = crate::common::extract_host_only(header_host);
     let sec_fetch_site = if tls_name.eq_ignore_ascii_case(header_host_name) {
@@ -15746,7 +16324,7 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
     wr.flush().await.context("WebSocket request flush failed")?;
 
     let handshake_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let response = read_http_headers_timeout(&mut rd, handshake_timeout).await?;
+    let response = read_http_headers_timeout_buf(&mut rd, handshake_timeout).await?;
     validate_client_handshake_response(&response, &key)?;
     tracing::debug!("[WSS] WebSocket handshake completed");
 
@@ -15772,15 +16350,24 @@ async fn handle_udp_proxy(
     bind_hint: TargetAddr,
 ) -> Result<()> {
     let local_ip = crate::common::local_udp_bind_ip(&control);
-    let udp = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
+    let udp = Arc::new(crate::udp_batch::bind_local_udp_socket(SocketAddr::new(
+        local_ip, 0,
+    ))?);
     let bound = udp.local_addr()?;
-    let resp = socks5_udp_associate_reply(bound);
-    control.write_all(&resp).await?;
-    let (rd, wr) = open_upstream(&cfg).await?;
+    let (rd, wr) = match open_upstream(&cfg).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = control
+                .write_all(&crate::proxy::socks5_failure_response())
+                .await;
+            return Err(e);
+        }
+    };
     let conn_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
     crate::common::relay_udp_ws(
         control,
         udp,
+        bound,
         &bind_hint,
         rd,
         wr,
@@ -15850,9 +16437,9 @@ pub async fn run_non_mux_from_config(cfg: RuntimeConfig, verify_ssl: bool) -> Re
     let wc = WssConfig::from_runtime_config(&cfg, verify_ssl)?;
     let pool = NonMuxPool::new(wc.clone(), Box::new(dial_pooled_wss), "[WSS non-MUX]");
     let maintainer = pool.clone();
-    tokio::spawn(async move {
+    let _maintainer = crate::common::AbortOnDrop(tokio::spawn(async move {
         maintainer.maintain().await;
-    });
+    }));
     let listener = TcpListener::bind(crate::runtime::format_listen_addr(&wc.proxy_host, wc.proxy_port)).await?;
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
@@ -15926,14 +16513,20 @@ async fn connect_wss_mux_session(
         .context("MUX handshake request write failed")?;
     let mut frame_buf = Vec::new();
     let mux_timeout = Duration::from_secs(cfg.connection_timeout.max(1));
-    let read_result = timeout(
+    let read_result = match timeout(
         mux_timeout,
         read_frame(&mut rd, Some(&mut wr), &mut frame_buf),
     )
     .await
-    .context("MUX OK timeout");
+    {
+        Ok(res) => res,
+        Err(_) => {
+            recycle_encode_buf(frame_buf);
+            bail!("MUX OK timeout");
+        }
+    };
     recycle_encode_buf(frame_buf);
-    let read_result = read_result??;
+    let read_result = read_result?;
 
     let Some((opcode, mut ok)) = read_result else {
         bail!("WSS upstream closed during MUX handshake")
@@ -16255,9 +16848,9 @@ pub async fn run_client_from_config(
     apply_listener_options(&listener);
     let semaphore = Arc::new(Semaphore::new(wc.max_connections.max(1)));
     let pool_maintainer = pool.clone();
-    tokio::spawn(async move {
+    let _maintainer = crate::common::AbortOnDrop(tokio::spawn(async move {
         pool_maintainer.maintain().await;
-    });
+    }));
     tracing::info!(
         "RushWay WSS client proxy listening on {}:{}",
         wc.proxy_host,
@@ -16586,8 +17179,22 @@ struct Args {
     no_mux: bool,
     #[arg(long = "mux-sessions", default_value_t = 8, value_parser = clap::value_parser!(usize))]
     mux_sessions: usize,
+    #[arg(
+        long = "mux-window",
+        value_parser = clap::value_parser!(u32),
+        help = "MUX per-stream receive window in KiB (64..1048576, default 0 = auto adaptive)"
+    )]
+    mux_window: Option<u32>,
+    #[arg(
+        long = "quic-conns",
+        value_parser = clap::value_parser!(usize),
+        help = "Number of parallel QUIC connections (1..16)"
+    )]
+    quic_conns: Option<usize>,
     #[arg(long = "allow-open", default_value_t = false)]
     allow_open: bool,
+    #[arg(long = "no-allow-open", default_value_t = false, hide = true)]
+    no_allow_open: bool,
     #[arg(
         long = "verify-ssl",
         default_value_t = true,
@@ -16616,8 +17223,12 @@ struct Args {
     buffer_kib: Option<usize>,
     #[arg(long = "socket-buffer")]
     socket_buffer_kib: Option<usize>,
+    #[arg(long = "tcp-nodelay", default_value_t = false, hide = true)]
+    tcp_nodelay: bool,
     #[arg(long = "no-tcp-nodelay", default_value_t = false)]
     no_tcp_nodelay: bool,
+    #[arg(long = "tcp-keepalive", default_value_t = false, hide = true)]
+    tcp_keepalive: bool,
     #[arg(long = "no-tcp-keepalive", default_value_t = false)]
     no_tcp_keepalive: bool,
     #[arg(long = "dns")]
@@ -16626,6 +17237,10 @@ struct Args {
     block_local: bool,
     #[arg(long = "no-block-local", default_value_t = false)]
     no_block_local: bool,
+    #[arg(long = "server-block-local", default_value_t = false, hide = true)]
+    server_block_local: bool,
+    #[arg(long = "no-server-block-local", default_value_t = false, hide = true)]
+    no_server_block_local: bool,
     #[arg(
         long = "max-conn",
         value_parser = clap::value_parser!(usize),
@@ -16663,6 +17278,8 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "mux",
     "no-mux",
     "mux-sessions",
+    "mux-window",
+    "quic-conns",
     "allow-open",
     "verify-ssl",
     "no-verify-ssl",
@@ -16674,6 +17291,8 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "dns",
     "block-local",
     "no-block-local",
+    "server-block-local",
+    "no-server-block-local",
     "max-conn",
     "connection-timeout",
     "log",
@@ -16712,7 +17331,7 @@ where
                     };
                     if let Some(value) = bool_value {
                         match *name {
-                            "mux" | "block-local" | "verify-ssl" => {
+                            "mux" | "block-local" | "server-block-local" | "verify-ssl" => {
                                 return if value {
                                     format!("--{name}")
                                 } else {
@@ -16728,6 +17347,7 @@ where
                             }
                             "no-mux"
                             | "no-block-local"
+                            | "no-server-block-local"
                             | "no-tcp-nodelay"
                             | "no-tcp-keepalive"
                             | "no-verify-ssl" => {
@@ -16737,6 +17357,7 @@ where
                                 return match *name {
                                     "no-mux" => "--mux".to_string(),
                                     "no-block-local" => "--block-local".to_string(),
+                                    "no-server-block-local" => "--server-block-local".to_string(),
                                     "no-verify-ssl" => "--verify-ssl".to_string(),
                                     _ => String::new(),
                                 };
@@ -17034,10 +17655,30 @@ fn mux_summary(enabled: bool, sessions: usize) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let raw_args = normalize_legacy_args(std::env::args());
+    let orig_args: Vec<String> = std::env::args().collect();
+    let raw_args = normalize_legacy_args(orig_args.iter().cloned());
     let args = Args::parse_from(&raw_args);
     if !(1..=64).contains(&args.mux_sessions) {
         return Err(anyhow!("mux-sessions must be between 1 and 64"));
+    }
+    if let Some(w) = args.mux_window {
+        if w != 0
+            && !(adaptive::MUX_WINDOW_MIN_KIB..=adaptive::MUX_WINDOW_MAX_KIB).contains(&w)
+        {
+            return Err(anyhow!(
+                "mux-window must be 0 (auto) or between {} and {} KiB",
+                adaptive::MUX_WINDOW_MIN_KIB,
+                adaptive::MUX_WINDOW_MAX_KIB
+            ));
+        }
+        if w > 0 {
+            adaptive::set_window_override(w);
+        }
+    }
+    if let Some(qc) = args.quic_conns {
+        if !(1..=16).contains(&qc) {
+            return Err(anyhow!("quic-conns must be between 1 and 16"));
+        }
     }
     if let Some(v) = args.max_conn {
         if !(1..=1_000_000).contains(&v) {
@@ -17103,9 +17744,23 @@ async fn main() -> Result<()> {
     }
     if args.no_tcp_nodelay {
         cfg.tcp_nodelay = false;
+    } else if args.tcp_nodelay
+        || orig_args.iter().any(|a| {
+            a.eq_ignore_ascii_case("-no-tcp-nodelay=false")
+                || a.eq_ignore_ascii_case("--no-tcp-nodelay=false")
+        })
+    {
+        cfg.tcp_nodelay = true;
     }
     if args.no_tcp_keepalive {
         cfg.tcp_keepalive = false;
+    } else if args.tcp_keepalive
+        || orig_args.iter().any(|a| {
+            a.eq_ignore_ascii_case("-no-tcp-keepalive=false")
+                || a.eq_ignore_ascii_case("--no-tcp-keepalive=false")
+        })
+    {
+        cfg.tcp_keepalive = true;
     }
     if args.no_mux {
         cfg.mux = false;
@@ -17114,13 +17769,24 @@ async fn main() -> Result<()> {
     }
     if args.allow_open {
         cfg.allow_open = true;
+    } else if args.no_allow_open
+        || orig_args.iter().any(|a| {
+            a.eq_ignore_ascii_case("-allow-open=false")
+                || a.eq_ignore_ascii_case("--allow-open=false")
+        })
+    {
+        cfg.allow_open = false;
     }
     if let Some(v) = args.max_conn {
         cfg.max_connections = v;
     }
-    if args.no_block_local {
+    if args.no_block_local || args.no_server_block_local {
         cfg.block_local = false;
-    } else if raw_args.iter().any(|a| a == "--block-local") {
+    } else if args.server_block_local
+        || raw_args
+            .iter()
+            .any(|a| a == "--block-local" || a == "--server-block-local")
+    {
         cfg.block_local = true;
     }
     if let Some(v) = args.connection_timeout {
@@ -17194,7 +17860,8 @@ async fn run_forwarding(cfg: RuntimeConfig, args: &Args, mux_sessions: usize) ->
             return wss_client::run_non_mux_from_config(cfg, verify_ssl).await;
         }
         if upstream.starts_with("quic://") || upstream.starts_with("quic+tls://") {
-            return quic::run_client(cfg, verify_ssl).await;
+            let quic_sessions = args.quic_conns.unwrap_or_else(|| mux_sessions.min(16));
+            return quic::run_client(cfg, verify_ssl, quic_sessions).await;
         }
         if cfg.mux {
             return mux_pool::run_client(cfg, mux_sessions).await;
