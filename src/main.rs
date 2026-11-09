@@ -468,11 +468,15 @@ impl MuxClientSession {
         if n == 0 {
             return;
         }
-        let _ = self
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(n))
-            });
+        let mut cur = self.active.load(Ordering::Relaxed);
+        while let Err(actual) = self.active.compare_exchange_weak(
+            cur,
+            cur.saturating_sub(n),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            cur = actual;
+        }
     }
 
     pub(crate) fn try_reserve(&self) -> bool {
@@ -480,11 +484,21 @@ impl MuxClientSession {
         if self.is_dead() {
             return false;
         }
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < MAX_MUX_STREAMS_PER_SESSION).then_some(current + 1)
-            })
-            .is_ok()
+        let mut cur = self.active.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_MUX_STREAMS_PER_SESSION {
+                return false;
+            }
+            match self.active.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     pub(crate) async fn open_stream(
@@ -632,7 +646,7 @@ impl MuxClientSession {
         open_guard.syn_sent = true;
 
         if !remaining_initial.is_empty() {
-            let max_chunk = self.max_data_chunk();
+            let max_chunk = crate::protocol::MAX_MUX_V2_CHUNK;
             for chunk in remaining_initial.chunks(max_chunk) {
                 gate.acquire(chunk.len()).await;
                 if let Err(e) = send_mux_parts(
@@ -4754,10 +4768,10 @@ const ENCODE_POOL_SHARDS: usize = 8;
 fn encode_pool_shard_max_count() -> usize {
     crate::adaptive::profile().encode_pool_shard_cap
 }
-/// Per-stream byte credit added each deficit round (aligned with GoWay v1.8.35 `muxDRRQuantum = 144 KiB`).
-/// Set to 144KB so that even maximum-size MUX v2 Jumbo frames (`129,600 B` + WS/MUX headers) can be
-/// dispatched in a single round without deficit underflow stall.
-const DRR_QUANTUM: usize = 144 * 1024;
+/// Per-stream byte credit added each deficit round (aligned with GoWay v1.8.36 `muxDRRQuantum = 128 KiB`).
+/// Set to 128KB (`131,072 B`) to exactly match `MAX_MUX_V2_CHUNK` (`129,600 B` + 7B MUX + 14B WS = `129,621 B`),
+/// dispatching one full MUX v2 Jumbo frame per round with minimal (`1.1%`) leftover deficit.
+const DRR_QUANTUM: usize = 128 * 1024;
 /// Cap accumulated credit so a long-idle stream cannot hog the link.
 const DRR_MAX_DEFICIT: usize = 512 * 1024;
 
@@ -8257,14 +8271,14 @@ mod tests {
             b"GET http://example.com:99999/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(
             parse_http_proxy_request(bad_uri_port).unwrap_err(),
-            ProxyError::InvalidPort
+            ProxyParseError::InvalidPort
         );
 
         let bad_host_port =
             b"GET / HTTP/1.1\r\nHost: example.com:99999\r\n\r\n";
         assert_eq!(
             parse_http_proxy_request(bad_host_port).unwrap_err(),
-            ProxyError::InvalidPort
+            ProxyParseError::InvalidPort
         );
 
         assert!(parse_target_authority("evil.com/path:80").is_err());
@@ -11847,13 +11861,13 @@ fn udp_envelope_into(out: &mut Vec<u8>, source: SocketAddr, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 pub(crate) async fn handle_server_udp_parts<R, W>(
-    mut rd: R,
+    mut rd: tokio::io::BufReader<R>,
     mut wr: W,
     cfg: RuntimeConfig,
     cipher: XorCipher,
 ) -> Result<()>
 where
-    R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut ok = *b"OK\n";
