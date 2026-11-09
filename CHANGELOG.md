@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.81] - 2026-11-09
+
+### Complete Removal of `-obfs` / `--obfs` Obfuscation Padding & Unconditional Coalesced MUX Frame Unpacking
+
+- **Complete `-obfs` / `--obfs` Removal (`src/main.rs`)** — Removed `--obfs` CLI flag, `-obfs` legacy flag normalization, JSON config `"obfs"` key, `RuntimeConfig::obfs`, `WssClientConfig::obfs`, `MuxClientSession::obfs`, `OBFS_PAD_MAX`, random xorshift padding in `mux_writer::encode_mux_ws_frame`, and `Obfs` status fields from the startup banner and TUI dashboard.
+- **Unconditional MUX v2 Coalesced Frame Unpacking (`src/main.rs:protocol::MuxFrame::decode_v2_coalesced`)** — Simplified `decode_v2_coalesced` by removing the `obfs` parameter and unconditionally fast-pathing single frames (`buf.len() < first_end + MUX_HEADER_LEN`) while unpacking multi-frame coalesced WebSocket batches.
+
 ## [v0.0.80] - 2026-11-08
 
 ### Server Hot-Path Acceleration: Single-Syscall WS Handshake, Zero-Lock Stream Cache, Batched Stats & 32-Bit Window Upgrade

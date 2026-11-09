@@ -2387,3 +2387,13 @@ Landed in the working tree, uncommitted; all thirteen items above are present in
 - **Status:** Fixed and released as `v0.0.80`.
 - **Remaining risk:** None identified.
 - **Next action:** Monitor production server throughput and CPU utilization under multi-stream load.
+
+
+## Release: v0.0.81 (2026-11-09)
+
+### Context & User Directives
+- **Directives:** Completely remove `-obfs` / `--obfs` feature and all related code, update version to `0.0.81`, push repository and tag.
+- **Change:**
+  - `src/main.rs`: Removed `--obfs` CLI flag, legacy `-obfs` normalization, JSON config `"obfs"` parsing, `RuntimeConfig::obfs`, `WssClientConfig::obfs`, `MuxClientSession::obfs`, `OBFS_PAD_MAX`, random padding in `mux_writer::encode_mux_ws_frame`, `obfs` parameter from `MuxFrame::decode_v2_coalesced` and server relay helpers, and `Obfs` display fields in startup banner and `TuiConfig`.
+- **Validation:** `python scripts/ci_guard.py` passed (`v0.0.81` synchronized, lexical/static analysis clean, `git diff --check` clean) + `cargo test` passed (156 tests, 0 warnings).
+- **Status:** Released and tagged as `v0.0.81`.

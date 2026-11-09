@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.80";
+pub const APP_VERSION: &str = "0.0.81";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -273,7 +273,6 @@ pub(crate) struct ClientStreamEntry {
 pub(crate) struct MuxClientSession {
     pub(crate) writer: Arc<MuxFrameWriter>,
     pub(crate) cipher: XorCipher,
-    pub(crate) obfs: bool,
     pub(crate) streams: Arc<std::sync::RwLock<crate::protocol::U32HashMap<ClientStreamEntry>>>,
     pub(crate) peer_window_kib: std::sync::atomic::AtomicU32,
     next_id: std::sync::atomic::AtomicU32,
@@ -288,7 +287,6 @@ impl MuxClientSession {
         writer: Arc<MuxFrameWriter>,
         mut writer_task: tokio::task::JoinHandle<()>,
         cipher: XorCipher,
-        obfs: bool,
         capacity_notify: Arc<tokio::sync::Notify>,
         log_tag: &'static str,
     ) -> Result<Arc<Self>>
@@ -299,16 +297,15 @@ impl MuxClientSession {
         let mut rd = tokio::io::BufReader::with_capacity(16 * 1024, rd);
         let version_payload =
             crate::protocol::encode_version_payload(crate::protocol::mux_initial_window_kib());
-        send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload, obfs).await?;
+        send_mux_parts(&writer, &cipher, 0, MuxCommand::Version, &version_payload).await?;
         let full_win_kib = crate::protocol::mux_initial_window_kib_u32();
         if full_win_kib > u16::MAX as u32 {
             let ext_win = crate::protocol::encode_window_payload(full_win_kib);
-            send_mux_parts(&writer, &cipher, 0, MuxCommand::Window, &ext_win, obfs).await?;
+            send_mux_parts(&writer, &cipher, 0, MuxCommand::Window, &ext_win).await?;
         }
         let state = Arc::new(Self {
             writer: writer.clone(),
             cipher,
-            obfs,
             streams: Arc::new(std::sync::RwLock::new(
                 crate::protocol::U32HashMap::default(),
             )),
@@ -531,7 +528,6 @@ impl MuxClientSession {
                             self.id,
                             MuxCommand::Rst,
                             &[],
-                            self.session.obfs,
                         );
                     }
                     self.session.close_stream_if_same(self.id, &self.gate);
@@ -555,7 +551,6 @@ impl MuxClientSession {
             id,
             MuxCommand::Syn,
             &syn_payload,
-            self.obfs,
         )
         .await;
         crate::mux_writer::recycle_encode_buf(syn_payload);
@@ -573,7 +568,6 @@ impl MuxClientSession {
                 id,
                 MuxCommand::Data,
                 remaining_initial,
-                self.obfs,
             )
             .await
             {
@@ -636,7 +630,7 @@ where
                 crate::mux_writer::recycle_encode_buf(payload);
                 continue;
             }
-            if crate::protocol::MuxFrame::decode_v2_coalesced(payload, state.obfs, &mut coalesced).is_err() {
+            if crate::protocol::MuxFrame::decode_v2_coalesced(payload, &mut coalesced).is_err() {
                 continue;
             }
             for frame in coalesced.drain(..) {
@@ -829,7 +823,6 @@ where
                                             id,
                                             MuxCommand::Rst,
                                             &[],
-                                            state.obfs,
                                         );
                                         state.close_stream_if_same(id, &gate);
                                     }
@@ -1324,7 +1317,6 @@ pub(crate) async fn relay_client_mux_stream(
                         self.id,
                         MuxCommand::Rst,
                         &[],
-                        self.session.obfs,
                     );
                 }
                 self.session.close_stream_if_same(self.id, &self.gate);
@@ -1339,7 +1331,6 @@ pub(crate) async fn relay_client_mux_stream(
     };
     let writer = session.writer.clone();
     let cipher = session.cipher.clone();
-    let obfs = session.obfs;
     let peer_window_kib = &session.peer_window_kib;
     let gate_up = gate.clone();
     let (mut local_rd, mut local_wr) = local.into_split();
@@ -1369,7 +1360,6 @@ pub(crate) async fn relay_client_mux_stream(
                             MuxCommand::Rst,
                             &[],
                             &mut frame_scratch,
-                            obfs,
                         )
                         .await;
                         return Err(e.into());
@@ -1384,7 +1374,6 @@ pub(crate) async fn relay_client_mux_stream(
                             MuxCommand::Fin,
                             &[],
                             &mut frame_scratch,
-                            obfs,
                         )
                         .await;
                     }
@@ -1402,7 +1391,6 @@ pub(crate) async fn relay_client_mux_stream(
                         MuxCommand::Data,
                         &buf[off..end],
                         &mut frame_scratch,
-                        obfs,
                     )
                     .await?;
                     off = end
@@ -1501,7 +1489,6 @@ pub(crate) async fn relay_client_mux_stream(
                                 id,
                                 MuxCommand::Window,
                                 &crate::protocol::encode_window_payload(credit),
-                                obfs,
                             );
                         }
                     } else {
@@ -1534,14 +1521,14 @@ pub(crate) async fn relay_client_mux_stream(
             }
         }
         if !fin_sent.swap(true, Ordering::AcqRel) {
-            let _ = send_mux_parts(&writer, &cipher, id, MuxCommand::Fin, &[], obfs).await;
+            let _ = send_mux_parts(&writer, &cipher, id, MuxCommand::Fin, &[]).await;
         }
     } else {
         if !upload_done {
             upload.abort();
         }
         if result.is_err() && !remote_rst {
-            try_send_mux_parts(&writer, &cipher, id, MuxCommand::Rst, &[], obfs);
+            try_send_mux_parts(&writer, &cipher, id, MuxCommand::Rst, &[]);
         }
     }
 
@@ -1587,17 +1574,16 @@ pub(crate) async fn send_mux_parts_reuse(
     command: MuxCommand,
     payload: &[u8],
     scratch: &mut Vec<u8>,
-    obfs: bool,
 ) -> Result<()> {
     // Prefer the caller's local scratch only while it still owns capacity
     // (first frame); after `mem::take` the pool supplies the next buffer
     // sized to the exact frame requirement.
     if scratch.capacity() == 0 {
-        let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), true, obfs);
+        let needed = crate::mux_writer::mux_frame_needed_cap(payload.len(), true);
         *scratch = crate::mux_writer::acquire_encode_buf_sized(needed);
     }
     crate::mux_writer::encode_mux_ws_frame(
-        scratch, stream_id, command, payload, cipher, true, obfs,
+        scratch, stream_id, command, payload, cipher, true,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
     writer.send_mux(stream_id, command, std::mem::take(scratch)).await
@@ -1610,12 +1596,11 @@ pub(crate) async fn send_mux_parts(
     stream_id: u32,
     command: MuxCommand,
     payload: &[u8],
-    obfs: bool,
 ) -> Result<()> {
-    let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), true, obfs);
+    let needed = crate::mux_writer::mux_frame_needed_cap(payload.len(), true);
     let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     send_mux_parts_reuse(
-        writer, cipher, stream_id, command, payload, &mut bytes, obfs,
+        writer, cipher, stream_id, command, payload, &mut bytes,
     )
     .await
 }
@@ -1627,12 +1612,11 @@ pub(crate) fn try_send_mux_parts(
     stream_id: u32,
     command: MuxCommand,
     payload: &[u8],
-    obfs: bool,
 ) {
-    let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), true, obfs);
+    let needed = crate::mux_writer::mux_frame_needed_cap(payload.len(), true);
     let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     if crate::mux_writer::encode_mux_ws_frame(
-        &mut bytes, stream_id, command, payload, cipher, true, obfs,
+        &mut bytes, stream_id, command, payload, cipher, true,
     )
     .is_ok()
     {
@@ -2036,7 +2020,6 @@ mod tests {
         let state = Arc::new(MuxClientSession {
             writer,
             cipher: XorCipher::new(""),
-            obfs: false,
             streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
@@ -2070,7 +2053,7 @@ mod tests {
         let c = XorCipher::new("");
         // 1. Send FIN (control frame)
         let mut frame_fin = Vec::new();
-        crate::mux_writer::encode_mux_ws_frame(&mut frame_fin, stream_id, MuxCommand::Fin, &[], &c, false, false).unwrap();
+        crate::mux_writer::encode_mux_ws_frame(&mut frame_fin, stream_id, MuxCommand::Fin, &[], &c, false).unwrap();
         upstream_wr.write_all(&frame_fin).await.unwrap();
 
         // Give reader loop a slice to process FIN, discover full queue, and set pending_ctrl=true
@@ -2078,7 +2061,7 @@ mod tests {
 
         // 2. Send DATA frame - this must NOT overtake the pending FIN
         let mut frame_data = Vec::new();
-        crate::mux_writer::encode_mux_ws_frame(&mut frame_data, stream_id, MuxCommand::Data, b"LATE_DATA", &c, false, false).unwrap();
+        crate::mux_writer::encode_mux_ws_frame(&mut frame_data, stream_id, MuxCommand::Data, b"LATE_DATA", &c, false).unwrap();
         upstream_wr.write_all(&frame_data).await.unwrap();
 
         // 3. Consumer consumes the dummy frame to free a slot
@@ -2102,7 +2085,6 @@ mod tests {
         let state = Arc::new(MuxClientSession {
             writer,
             cipher: XorCipher::new(""),
-            obfs: false,
             streams: Arc::new(std::sync::RwLock::new(crate::protocol::U32HashMap::default())),
             peer_window_kib: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
@@ -2135,7 +2117,7 @@ mod tests {
 
         let c = XorCipher::new("");
         let mut frame_fin = Vec::new();
-        crate::mux_writer::encode_mux_ws_frame(&mut frame_fin, stream_id, MuxCommand::Fin, &[], &c, false, false).unwrap();
+        crate::mux_writer::encode_mux_ws_frame(&mut frame_fin, stream_id, MuxCommand::Fin, &[], &c, false).unwrap();
 
         // Blast 200 FIN control frames into saturated stream
         for _ in 0..200 {
@@ -4284,7 +4266,6 @@ async fn connect_plain_mux_session(
         writer,
         writer_task,
         cipher,
-        cfg.obfs,
         capacity_notify,
         "pooled MUX",
     )
@@ -4651,8 +4632,8 @@ const WRITE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Minimum capacity worth pooling in the 80 KiB encode pool; smaller frames
 /// allocate exact capacity so queued small frames never pin 80 KiB each on low-RAM VPS.
 pub(crate) const ENCODE_POOL_MIN_CAP: usize = 32 * 1024;
-/// Frames top out near 67 KiB + WS header + obfs pad; pool only up to
-/// ~80 KiB so a rare huge frame cannot pin memory.
+/// Frames top out near 126.5 KiB + WS header; pool only up to
+/// 144 KiB so a rare huge frame cannot pin memory.
 const ENCODE_POOL_MAX_CAP: usize = 144 * 1024;
 const ENCODE_POOL_SHARDS: usize = 8;
 
@@ -4714,18 +4695,11 @@ pub(crate) fn acquire_encode_buf() -> Vec<u8> {
 
 #[inline]
 pub(crate) fn mux_frame_needed_cap(
-    command: MuxCommand,
     payload_len: usize,
     masked: bool,
-    obfs: bool,
 ) -> usize {
-    let pad_max = if obfs && command == MuxCommand::Data {
-        OBFS_PAD_MAX
-    } else {
-        0
-    };
     let mask_len = if masked { 4 } else { 0 };
-    17 + mask_len + payload_len + pad_max
+    17 + mask_len + payload_len
 }
 
 /// Sized allocation for encode buffers:
@@ -5255,23 +5229,14 @@ impl Scheduler {
     }
 }
 
-/// Max random padding appended to MUX DATA frames when obfuscation is on
-/// (GoWay `-obfs` parity: same 1400-byte cap).
-pub(crate) const OBFS_PAD_MAX: usize = 1400;
-
 /// Encodes one MUX frame already wrapped in its WebSocket frame, in a
 /// single buffer with a single allocation: `[WS header][mask?][MUX header |
-/// payload][pad?]`.
+/// payload]`.
 ///
 /// Previously this took two allocations and a full extra copy (MUX `Vec`
 /// then WS `Vec`). Layout: the WS header describes the MUX frame length
-/// (`7 + payload.len()`, plus obfs pad when enabled), and the
-/// cipher + WS mask (client side) cover the whole region including pad.
-///
-/// When `obfs` is set, DATA frames carry `[0, OBFS_PAD_MAX]` random pad
-/// bytes inside the WS payload past the declared MUX length. Receivers
-/// (old and new, Go and Rust) slice by the declared length, so padding is
-/// transparently ignored — unilateral deployment is safe.
+/// (`7 + payload.len()`), and the cipher + WS mask (client side) cover the
+/// whole region.
 pub(crate) fn encode_mux_ws_frame(
     out: &mut Vec<u8>,
     stream_id: u32,
@@ -5279,25 +5244,13 @@ pub(crate) fn encode_mux_ws_frame(
     payload: &[u8],
     cipher: &XorCipher,
     masked: bool,
-    obfs: bool,
 ) -> Result<()> {
     let mux_len = 7 + payload.len();
-    // Unilateral obfuscation: random pad past the declared MUX length.
-    // Computed up-front so the WS header covers it — otherwise the peer
-    // would leave pad bytes in the stream and desync the next frame.
-    // Receivers slice by the declared MUX length, so the tail is ignored
-    // by old and new peers alike. DATA only — control frames stay exact.
-    let pad_len = if obfs && command == MuxCommand::Data {
-        (u32::from_ne_bytes(next_mask()) as usize) % (OBFS_PAD_MAX + 1)
-    } else {
-        0
-    };
-    let total = mux_len + pad_len;
     let mut ws_header = [0u8; 14];
-    let ws_header_len = ws_header_into(&mut ws_header, total, 0x2, masked);
+    let ws_header_len = ws_header_into(&mut ws_header, mux_len, 0x2, masked);
     let mask_len = if masked { 4 } else { 0 };
     out.clear();
-    let needed = ws_header_len + mask_len + total;
+    let needed = ws_header_len + mask_len + mux_len;
     if needed > out.capacity() {
         if needed > 4096 && needed <= ENCODE_POOL_MAX_CAP {
             out.reserve_exact(ENCODE_POOL_MAX_CAP);
@@ -5321,29 +5274,6 @@ pub(crate) fn encode_mux_ws_frame(
         anyhow!(e.to_string())
     })?;
     debug_assert_eq!(out.len() - mux_start, mux_len);
-    // Pad lands inside the WS payload and gets masked/ciphered with the
-    // rest; the receiver slices by the declared MUX length and ignores it.
-    if pad_len > 0 {
-        let mut seed = u64::from_ne_bytes({
-            let a = next_mask();
-            let b = next_mask();
-            [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
-        });
-        let full_words = pad_len / 8;
-        for _ in 0..full_words {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            out.extend_from_slice(&seed.to_ne_bytes());
-        }
-        let rem = pad_len & 7;
-        if rem > 0 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            out.extend_from_slice(&seed.to_ne_bytes()[..rem]);
-        }
-    }
     // Single pass over the payload: cipher keystream XOR WS mask.
     // Offsets are region-relative (key byte `i` maps to
     // `keystream[i % XOR_KEY_SIZE]`), exactly matching two sequential
@@ -5658,10 +5588,10 @@ mod tests {
         ] {
             let payload = vec![0xABu8; payload_len];
             for masked in [false, true] {
-                // Fused single-buffer path (obfs off: exact lengths).
+                // Fused single-buffer path.
                 let mut fused = Vec::new();
                 encode_mux_ws_frame(
-                    &mut fused, 0x01020304, command, &payload, &cipher, masked, false,
+                    &mut fused, 0x01020304, command, &payload, &cipher, masked,
                 )
                 .unwrap();
                 // Lengths must match the legacy path exactly (mask keys
@@ -5696,71 +5626,6 @@ mod tests {
                 assert_eq!(frame.payload, payload);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn obfs_pads_data_only_within_cap() {
-        let cipher = XorCipher::new("obfs-key");
-        let payload = vec![0xCDu8; 100];
-        // Control frames are never padded.
-        for command in [MuxCommand::Syn, MuxCommand::Fin, MuxCommand::Rst] {
-            let mut out = Vec::new();
-            encode_mux_ws_frame(&mut out, 1, command, &payload, &cipher, true, true).unwrap();
-            assert_eq!(out.len(), mux_ws_len(100, true), "control must stay exact");
-        }
-        // DATA frames gain [0, OBFS_PAD_MAX] random tail past the declared
-        // length; the declared prefix always decodes.
-        let mut seen_pad = false;
-        for _ in 0..16 {
-            let mut out = Vec::new();
-            encode_mux_ws_frame(&mut out, 9, MuxCommand::Data, &payload, &cipher, true, true)
-                .unwrap();
-            let min_len = mux_ws_len(100, true);
-            let max_len = mux_ws_len(100 + OBFS_PAD_MAX, true);
-            assert!((min_len..=max_len).contains(&out.len()));
-            if out.len() > min_len {
-                seen_pad = true;
-            }
-            // Strip the WS layer using the header's own length field
-            // (pad is inside the WS payload now): unmask, decrypt, then
-            // verify the MUX header still declares exactly 100 bytes.
-            assert_eq!(out[0] & 0x0F, 0x2);
-            let (ws_len, header_len) = match out[1] & 0x7F {
-                126 => (
-                    u16::from_be_bytes(out[2..4].try_into().unwrap()) as usize,
-                    4,
-                ),
-                127 => (
-                    u64::from_be_bytes(out[2..10].try_into().unwrap()) as usize,
-                    10,
-                ),
-                n => (n as usize, 2),
-            };
-            assert!((107..=107 + OBFS_PAD_MAX).contains(&ws_len));
-            let mask: [u8; 4] = out[header_len..header_len + 4].try_into().unwrap();
-            let mut mux_frame = out[header_len + 4..header_len + 4 + ws_len].to_vec();
-            for (i, byte) in mux_frame.iter_mut().enumerate() {
-                *byte ^= mask[i & 3];
-            }
-            cipher.apply(&mut mux_frame);
-            let frame = MuxFrame::decode(&mux_frame).unwrap();
-            assert_eq!(frame.stream_id, 9);
-            assert_eq!(frame.payload, payload);
-        }
-        assert!(seen_pad, "16 padded frames all came out unpadded (p ~= 0)");
-    }
-
-    /// Wire length of an unpadded MUX+WS frame (mirrors the encoder).
-    fn mux_ws_len(payload_len: usize, masked: bool) -> usize {
-        let mux_len = 7 + payload_len;
-        let ws_header_len = if mux_len <= 125 {
-            2
-        } else if mux_len <= u16::MAX as usize {
-            4
-        } else {
-            10
-        };
-        ws_header_len + if masked { 4 } else { 0 } + mux_len
     }
 
     #[test]
@@ -6025,13 +5890,12 @@ mod tests {
                         &[sid as u8; 65535],
                         &c,
                         true,
-                        false,
                     )
                     .unwrap();
                     w.send_mux(sid, MuxCommand::Data, enc).await.unwrap();
                 }
                 let mut enc = Vec::new();
-                encode_mux_ws_frame(&mut enc, sid, MuxCommand::Fin, &[], &c, true, false).unwrap();
+                encode_mux_ws_frame(&mut enc, sid, MuxCommand::Fin, &[], &c, true).unwrap();
                 w.send_mux(sid, MuxCommand::Fin, enc).await.unwrap();
             }));
         }
@@ -6084,7 +5948,6 @@ mod tests {
             &[7u8; 100],
             &cipher,
             true,
-            false,
         )
         .unwrap();
         writer.send_mux(5, MuxCommand::Data, enc).await.unwrap();
@@ -6119,12 +5982,10 @@ mod tests {
 
     #[test]
     fn test_mux_frame_needed_cap_control_frames() {
-        let rst_cap = mux_frame_needed_cap(MuxCommand::Rst, 0, false, false);
+        let rst_cap = mux_frame_needed_cap(0, false);
         assert!(rst_cap < 64);
-        let win_cap = mux_frame_needed_cap(MuxCommand::Window, 4, true, false);
+        let win_cap = mux_frame_needed_cap(4, true);
         assert!(win_cap < 64);
-        let data_obfs = mux_frame_needed_cap(MuxCommand::Data, 1000, true, true);
-        assert!(data_obfs >= 1000 + OBFS_PAD_MAX);
     }
 
     #[test]
@@ -6176,9 +6037,9 @@ mod tests {
         let cipher = XorCipher::new("priotest");
 
         let mut enc_data = Vec::new();
-        encode_mux_ws_frame(&mut enc_data, 1, MuxCommand::Data, &[1u8; 100], &cipher, true, false).unwrap();
+        encode_mux_ws_frame(&mut enc_data, 1, MuxCommand::Data, &[1u8; 100], &cipher, true).unwrap();
         let mut enc_win = Vec::new();
-        encode_mux_ws_frame(&mut enc_win, 1, MuxCommand::Window, &[2u8; 4], &cipher, true, false).unwrap();
+        encode_mux_ws_frame(&mut enc_win, 1, MuxCommand::Window, &[2u8; 4], &cipher, true).unwrap();
 
         writer.send_mux(1, MuxCommand::Data, enc_data).await.unwrap();
         writer.send_mux(1, MuxCommand::Window, enc_win).await.unwrap();
@@ -6207,9 +6068,9 @@ mod tests {
             let cipher = XorCipher::new("fin_fifo_test");
 
             let mut enc_data = Vec::new();
-            encode_mux_ws_frame(&mut enc_data, 1, MuxCommand::Data, &[42u8; 512], &cipher, true, false).unwrap();
+            encode_mux_ws_frame(&mut enc_data, 1, MuxCommand::Data, &[42u8; 512], &cipher, true).unwrap();
             let mut enc_fin = Vec::new();
-            encode_mux_ws_frame(&mut enc_fin, 1, MuxCommand::Fin, &[], &cipher, true, false).unwrap();
+            encode_mux_ws_frame(&mut enc_fin, 1, MuxCommand::Fin, &[], &cipher, true).unwrap();
 
             writer.send_mux(1, MuxCommand::Data, enc_data).await.unwrap();
             writer.send_mux(1, MuxCommand::Fin, enc_fin).await.unwrap();
@@ -6632,7 +6493,7 @@ pub const MUX_WINDOW: u8 = 0x06;
 pub const MAX_MUX_PAYLOAD: usize = u16::MAX as usize;
 /// Maximum payload of a MUX v2 23-bit Jumbo DATA frame (`0x80 | len_hi` in byte 4).
 pub const MAX_MUX_V2_PAYLOAD: usize = 512 * 1024;
-/// Optimal single-read v2 Jumbo chunk size (~126.5 KiB) so `chunk + OBFS_PAD_MAX + headers <= DRR_QUANTUM (128 KiB)`.
+/// Optimal single-read v2 Jumbo chunk size (~126.5 KiB) so `chunk + headers <= DRR_QUANTUM (128 KiB)`.
 pub const MAX_MUX_V2_CHUNK: usize = 129_600;
 /// Maximum 32-bit session window advertised on `stream_id = 0` in KiB (1 GiB).
 pub const MAX_MUX_V2_WINDOW_KIB: u32 = 1024 * 1024;
@@ -6786,9 +6647,7 @@ impl MuxHeader {
             let len = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
             (cmd, len)
         };
-        // Trailing bytes past the declared payload are obfuscation padding
-        // (GoWay `-obfs`): slice by the declared length and ignore the tail.
-        // Only a short buffer is an error.
+        // Slice by the declared payload length; only a short buffer is an error.
         if buf.len() < MUX_HEADER_LEN + payload_len {
             return Err(ProtocolError::LengthMismatch {
                 declared: payload_len,
@@ -6886,9 +6745,7 @@ impl OwnedMuxFrame {
         })
     }
 
-    /// Payload bounded by the declared MUX length. Storage may hold extra
-    /// trailing bytes (GoWay `-obfs` padding); those must never leak into
-    /// the relayed stream.
+    /// Payload bounded by the declared MUX length.
     pub fn payload(&self) -> &[u8] {
         &self.storage[MUX_HEADER_LEN..MUX_HEADER_LEN + self.payload_len]
     }
@@ -6982,7 +6839,6 @@ impl MuxFrame {
     /// in-place for the final frame when unpacking a multi-frame MUX v2 super-packet.
     pub fn decode_v2_coalesced(
         mut buf: Vec<u8>,
-        obfs: bool,
         out: &mut Vec<OwnedMuxFrame>,
     ) -> Result<(), ProtocolError> {
         let header = match MuxHeader::parse(&buf) {
@@ -6993,7 +6849,7 @@ impl MuxFrame {
             }
         };
         let first_end = MUX_HEADER_LEN + header.payload_len;
-        if obfs || buf.len() < first_end + MUX_HEADER_LEN {
+        if buf.len() < first_end + MUX_HEADER_LEN {
             out.push(OwnedMuxFrame {
                 stream_id: header.stream_id,
                 command: header.command,
@@ -7320,22 +7176,6 @@ mod tests {
     }
 
     #[test]
-    fn trailing_obfs_padding_is_ignored() {
-        // Declared payload is 2 bytes ("hi"); 1400 random pad bytes follow
-        // (GoWay `-obfs` unilateral padding must not break decoding).
-        let mut encoded = vec![0, 0, 0, 1, MUX_DATA, 0, 2, b'h', b'i'];
-        encoded.extend_from_slice(&[0x5Au8; 1400]);
-        let frame = MuxFrame::decode(&encoded).unwrap();
-        assert_eq!(frame.stream_id, 1);
-        assert_eq!(frame.command, MuxCommand::Data);
-        assert_eq!(frame.payload, b"hi");
-        // The zero-copy owned path must bound by the declared length too —
-        // this was the live data-leak (pad bytes forwarded into streams).
-        let owned = MuxFrame::decode_owned(encoded).unwrap();
-        assert_eq!(owned.payload(), b"hi");
-    }
-
-    #[test]
     fn owned_mux_frame_from_parts() {
         let frame = OwnedMuxFrame::from_parts(42, MuxCommand::Data, b"hello world").unwrap();
         assert_eq!(frame.stream_id, 42);
@@ -7369,8 +7209,6 @@ mod tests {
         assert_eq!(encoded.len(), MUX_HEADER_LEN + jumbo_len);
         assert_ne!(encoded[4] & 0x80, 0, "v2 Jumbo header must set bit 7");
 
-        // Also test with -obfs random trailing padding
-        encoded.extend_from_slice(&[0x3Cu8; 512]);
         let owned = MuxFrame::decode_owned(encoded).unwrap();
         assert_eq!(owned.stream_id, 19);
         assert_eq!(owned.command, MuxCommand::Data);
@@ -7387,7 +7225,7 @@ mod tests {
         write_frame_parts(&mut super_pkt, 1, MuxCommand::Fin, &[]).unwrap();
 
         let mut out = Vec::new();
-        MuxFrame::decode_v2_coalesced(super_pkt, false, &mut out).unwrap();
+        MuxFrame::decode_v2_coalesced(super_pkt, &mut out).unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].stream_id, 1);
         assert_eq!(out[0].command, MuxCommand::Data);
@@ -9920,8 +9758,6 @@ pub struct RuntimeConfig {
     pub tcp_nodelay: bool,
     pub tcp_keepalive: bool,
     pub socket_buffer: usize,
-    /// Pad MUX DATA frames with random lengths (GoWay `-obfs` parity).
-    pub obfs: bool,
 }
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -9940,7 +9776,6 @@ impl Default for RuntimeConfig {
             tcp_nodelay: true,
             tcp_keepalive: true,
             socket_buffer: 0,
-            obfs: false,
         }
     }
 }
@@ -10449,14 +10284,13 @@ async fn send_mux_parts_encrypted_reuse(
     command: MuxCommand,
     payload: &[u8],
     scratch: &mut Vec<u8>,
-    obfs: bool,
 ) -> Result<()> {
     if scratch.capacity() == 0 {
-        let needed = crate::mux_writer::mux_frame_needed_cap(command, payload.len(), false, obfs);
+        let needed = crate::mux_writer::mux_frame_needed_cap(payload.len(), false);
         *scratch = crate::mux_writer::acquire_encode_buf_sized(needed);
     }
     crate::mux_writer::encode_mux_ws_frame(
-        scratch, stream_id, command, payload, cipher, false, obfs,
+        scratch, stream_id, command, payload, cipher, false,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
     writer.send_mux(stream_id, command, std::mem::take(scratch)).await
@@ -10466,9 +10300,8 @@ fn send_reset_encrypted(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     id: u32,
-    obfs: bool,
 ) {
-    let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Rst, 0, false, obfs);
+    let needed = crate::mux_writer::mux_frame_needed_cap(0, false);
     let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     if crate::mux_writer::encode_mux_ws_frame(
         &mut bytes,
@@ -10477,7 +10310,6 @@ fn send_reset_encrypted(
         &[],
         cipher,
         false,
-        obfs,
     )
     .is_ok()
     {
@@ -10492,7 +10324,6 @@ async fn target_to_mux(
     writer: Arc<MuxFrameWriter>,
     buffer_size: usize,
     cipher: XorCipher,
-    obfs: bool,
     gate: Arc<CreditGate>,
 ) -> bool {
     let mut buf = relay_buf(buffer_size).await;
@@ -10514,7 +10345,6 @@ async fn target_to_mux(
                     MuxCommand::Fin,
                     &[],
                     &mut frame_scratch,
-                    obfs,
                 )
                 .await;
                 break true;
@@ -10532,7 +10362,6 @@ async fn target_to_mux(
                         MuxCommand::Data,
                         &buf[off..end],
                         &mut frame_scratch,
-                        obfs,
                     )
                     .await
                     .is_err()
@@ -10545,7 +10374,7 @@ async fn target_to_mux(
                 }
             }
             Err(_) => {
-                send_reset_encrypted(&writer, &cipher, id, obfs);
+                send_reset_encrypted(&writer, &cipher, id);
                 break false;
             }
         }
@@ -10561,7 +10390,6 @@ fn maybe_send_window(
     writer: &Arc<MuxFrameWriter>,
     cipher: &XorCipher,
     stream_id: u32,
-    obfs: bool,
     peer_window: &AtomicU32,
     refund_pending: &mut u32,
     consumed: usize,
@@ -10577,7 +10405,7 @@ fn maybe_send_window(
     }
     let credit = std::mem::take(refund_pending);
     let payload = encode_window_payload(credit);
-    let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Window, payload.len(), false, obfs);
+    let needed = crate::mux_writer::mux_frame_needed_cap(payload.len(), false);
     let mut bytes = crate::mux_writer::acquire_encode_buf_sized(needed);
     if crate::mux_writer::encode_mux_ws_frame(
         &mut bytes,
@@ -10586,7 +10414,6 @@ fn maybe_send_window(
         &payload,
         cipher,
         false,
-        obfs,
     )
     .is_ok()
     {
@@ -10678,7 +10505,7 @@ where
     let mut flight = encode_ws_frame(&ok, 2, false).map_err(|e| anyhow!(e.to_string()))?;
     let peer_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let version_payload = encode_version_payload(mux_initial_window_kib());
-    let needed = crate::mux_writer::mux_frame_needed_cap(MuxCommand::Version, version_payload.len(), false, cfg.obfs);
+    let needed = crate::mux_writer::mux_frame_needed_cap(version_payload.len(), false);
     let mut ver_buf = crate::mux_writer::acquire_encode_buf_sized(needed);
     crate::mux_writer::encode_mux_ws_frame(
         &mut ver_buf,
@@ -10687,7 +10514,6 @@ where
         &version_payload,
         &cipher,
         false,
-        cfg.obfs,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
     flight.extend_from_slice(&ver_buf);
@@ -10701,7 +10527,6 @@ where
             &ext_win,
             &cipher,
             false,
-            cfg.obfs,
         )
         .map_err(|e| anyhow!(e.to_string()))?;
         flight.extend_from_slice(&ver_buf);
@@ -10778,7 +10603,7 @@ where
                 continue;
             }
 
-            if MuxFrame::decode_v2_coalesced(payload, cfg.obfs, &mut coalesced).is_err() {
+            if MuxFrame::decode_v2_coalesced(payload, &mut coalesced).is_err() {
                 continue;
             }
 
@@ -10793,7 +10618,7 @@ where
                             Err(_) => {
                                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                 tracing::warn!(stream_id, "mux RST: bad syn payload");
-                                send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs);
+                                send_reset_encrypted(&writer, &cipher, stream_id);
                                 continue;
                             }
                         };
@@ -10803,7 +10628,7 @@ where
                         Err(_) => {
                             crate::mux_writer::recycle_encode_buf(frame.into_storage());
                             tracing::warn!(stream_id, "mux RST: target not utf-8");
-                            send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs);
+                            send_reset_encrypted(&writer, &cipher, stream_id);
                             continue;
                         }
                     };
@@ -10813,7 +10638,7 @@ where
                         Err(_) => {
                             crate::mux_writer::recycle_encode_buf(frame.into_storage());
                             tracing::warn!(stream_id, "mux RST: bad target authority");
-                            send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs);
+                            send_reset_encrypted(&writer, &cipher, stream_id);
                             continue;
                         }
                     };
@@ -10821,7 +10646,7 @@ where
                     if let Err(e) = enforce_target_policy(&cfg, &target) {
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         tracing::warn!(stream_id, error=%e, "mux RST: target policy");
-                        send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs);
+                        send_reset_encrypted(&writer, &cipher, stream_id);
                         continue;
                     }
 
@@ -10867,7 +10692,7 @@ where
                     if !admitted {
                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                         tracing::warn!(stream_id, "mux RST: stream admission rejected (table full or duplicate id)");
-                        send_reset_encrypted(&writer, &cipher, stream_id, cfg.obfs);
+                        send_reset_encrypted(&writer, &cipher, stream_id);
                         continue;
                     }
                     last_stream = Some((
@@ -10931,7 +10756,7 @@ where
                             if !pending_budget.try_reserve(len, max_session_pending_bytes) {
                                 crate::mux_writer::recycle_encode_buf(first_frame.into_storage());
                                 tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
-                                send_reset_encrypted(&writer_task, &cipher_task, stream_id, cfg_task.obfs);
+                                send_reset_encrypted(&writer_task, &cipher_task, stream_id);
                                 cleanup_stream_entry(&streams_task, stream_id, &gate_task, &mut pending, &mut rx);
                                 return;
                             }
@@ -10951,7 +10776,7 @@ where
                                         Ok(stream) => break stream,
                                         Err(error) => {
                                             tracing::warn!(stream_id, error=%error, "mux RST: target dial failed");
-                                            send_reset_encrypted(&writer_task, &cipher_task, stream_id, cfg_task.obfs);
+                                            send_reset_encrypted(&writer_task, &cipher_task, stream_id);
                                             cleanup_stream_entry(&streams_task, stream_id, &gate_task, &mut pending, &mut rx);
                                             return;
                                         }
@@ -10977,7 +10802,7 @@ where
                                             {
                                                 crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                                 tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
-                                                send_reset_encrypted(&writer_task, &cipher_task, stream_id, cfg_task.obfs);
+                                                send_reset_encrypted(&writer_task, &cipher_task, stream_id);
                                                 cleanup_stream_entry(&streams_task, stream_id, &gate_task, &mut pending, &mut rx);
                                                 return;
                                             }
@@ -11012,7 +10837,7 @@ where
                                     {
                                         crate::mux_writer::recycle_encode_buf(frame.into_storage());
                                         tracing::warn!(stream_id, "mux RST: pre-dial pending overflow");
-                                        send_reset_encrypted(&writer_task, &cipher_task, stream_id, cfg_task.obfs);
+                                        send_reset_encrypted(&writer_task, &cipher_task, stream_id);
                                         cleanup_stream_entry(&streams_task, stream_id, &gate_task, &mut pending, &mut rx);
                                         return;
                                     }
@@ -11046,7 +10871,6 @@ where
                                             &writer_task,
                                             &cipher_task,
                                             stream_id,
-                                            cfg_task.obfs,
                                             &peer_window_task,
                                             &mut refund_pending,
                                             written,
@@ -11054,7 +10878,7 @@ where
                                     }
                                 }
                                 Err(_) => {
-                                    send_reset_encrypted(&writer_task, &cipher_task, stream_id, cfg_task.obfs);
+                                    send_reset_encrypted(&writer_task, &cipher_task, stream_id);
                                     cleanup_stream_entry(&streams_task, stream_id, &gate_task, &mut pending, &mut rx);
                                     return;
                                 }
@@ -11067,7 +10891,6 @@ where
                             writer_task.clone(),
                             cfg_task.buffer_size,
                             cipher_task.clone(),
-                            cfg_task.obfs,
                             gate_task.clone(),
                         )));
 
@@ -11163,7 +10986,6 @@ where
                                                                 &writer_task,
                                                                 &cipher_task,
                                                                 stream_id,
-                                                                cfg_task.obfs,
                                                                 &peer_window_task,
                                                                 &mut refund_pending,
                                                                 written,
@@ -11195,7 +11017,6 @@ where
                                                     &writer_task,
                                                     &cipher_task,
                                                     stream_id,
-                                                    cfg_task.obfs,
                                                     &peer_window_task,
                                                     &mut refund_pending,
                                                     len,
@@ -11244,7 +11065,6 @@ where
                                     &writer_task,
                                     &cipher_task,
                                     stream_id,
-                                    cfg_task.obfs,
                                 );
                             }
                         }
@@ -11336,7 +11156,7 @@ where
                                         Err(_) => {
                                             crate::mux_writer::recycle_encode_buf(f.into_storage());
                                             tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
-                                            send_reset_encrypted(&writer, &cipher, id, cfg.obfs);
+                                            send_reset_encrypted(&writer, &cipher, id);
                                             let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                                             if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
                                                 if let Some(old) = guard.remove(&id) {
@@ -13189,7 +13009,6 @@ pub struct TuiConfig {
     pub listen: String,
     pub upstream: String,
     pub mux: String,
-    pub obfs: String,
     pub dns: String,
     pub auth: String,
     pub buffer: String,
@@ -13235,7 +13054,6 @@ impl TuiConfig {
             listen: format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
             upstream: cfg.upstream.clone().unwrap_or_else(|| "N/A".to_string()),
             mux,
-            obfs: if cfg.obfs { "Enabled" } else { "Disabled" }.to_string(),
             dns: dns_display.to_string(),
             auth,
             buffer: {
@@ -13404,7 +13222,7 @@ fn draw_tui(cfg: &TuiConfig) {
     }
     row(
         &mut buf,
-        &two_col("Mux:       ", &cfg.mux, "Obfs:        ", &cfg.obfs, col),
+        &two_col("Mux:       ", &cfg.mux, "", "", col),
         box_w,
     );
     config_lines += 1;
@@ -15279,10 +15097,9 @@ where
             return Err(anyhow!("unsupported or fragmented websocket frame"));
         }
 
-        // Match ENCODE_POOL_MAX_CAP (80 KiB) so a full 64 KiB MUX frame
-        // (65535 + 7 = 65542 bytes, or up to 66942 bytes with obfs) is read
-        // in a single `read_exact` call and never triggers `grow_amortized`
-        // to 128 KiB (which would exceed the pool cap and force reallocs).
+        // Match ENCODE_POOL_MAX_CAP (144 KiB) so a full MUX v2 Jumbo frame
+        // is read in a single `read_exact` call and never triggers `grow_amortized`
+        // beyond the pool cap.
         const READ_SEGMENT: usize = 144 * 1024;
         buf.clear();
 
@@ -15412,7 +15229,7 @@ where
                 }
             }
             // Reserved opcodes (0x3-0x7, 0xB-0xF): a buggy or hostile peer
-            // must cause an error, never a panic (cf. obfs desync probe).
+            // must cause an error, never a panic.
             _ => return Err(anyhow!("reserved websocket opcode {}", opcode)),
         }
     }
@@ -15852,7 +15669,6 @@ pub(crate) struct WssConfig {
     pub(crate) tcp_nodelay: bool,
     pub(crate) tcp_keepalive: bool,
     pub(crate) socket_buffer: usize,
-    pub(crate) obfs: bool,
     pub(crate) max_connections: usize,
     /// Mirrors `RuntimeConfig::block_local`. The WSS client paths had no
     /// target policy at all, so `-block-local` was silently ignored whenever
@@ -15878,7 +15694,6 @@ impl WssConfig {
             tcp_nodelay: cfg.tcp_nodelay,
             tcp_keepalive: cfg.tcp_keepalive,
             socket_buffer: cfg.socket_buffer,
-            obfs: cfg.obfs,
             max_connections: cfg.max_connections,
             block_local: cfg.block_local,
         })
@@ -16288,7 +16103,6 @@ async fn connect_wss_mux_session(
         writer,
         writer_task,
         c,
-        cfg.obfs,
         capacity_notify,
         "WSS physical session",
     )
@@ -16812,7 +16626,6 @@ mod tests {
             tcp_nodelay: true,
             tcp_keepalive: true,
             socket_buffer: 0,
-            obfs: false,
             max_connections: 16,
             block_local: false,
         };
@@ -16861,7 +16674,6 @@ mod tests {
             tcp_nodelay: true,
             tcp_keepalive: true,
             socket_buffer: 0,
-            obfs: false,
             max_connections: 16,
             block_local: false,
         };
@@ -16921,12 +16733,6 @@ struct Args {
     no_mux: bool,
     #[arg(long = "mux-sessions", default_value_t = 8, value_parser = clap::value_parser!(usize))]
     mux_sessions: usize,
-    #[arg(
-        long = "obfs",
-        default_value_t = false,
-        help = "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting (GoWay parity)"
-    )]
-    obfs: bool,
     #[arg(long = "allow-open", default_value_t = false)]
     allow_open: bool,
     #[arg(
@@ -17004,7 +16810,6 @@ const LEGACY_LONG_FLAGS: &[&str] = &[
     "mux",
     "no-mux",
     "mux-sessions",
-    "obfs",
     "allow-open",
     "verify-ssl",
     "no-verify-ssl",
@@ -17061,7 +16866,7 @@ where
                                     format!("--no-{name}")
                                 };
                             }
-                            "allow-open" | "tui" | "obfs" | "wss-server" => {
+                            "allow-open" | "tui" | "wss-server" => {
                                 return if value {
                                     format!("--{name}")
                                 } else {
@@ -17192,9 +16997,6 @@ async fn load_json(path: PathBuf) -> Result<RuntimeConfig> {
         .and_then(|x| x.as_bool())
     {
         cfg.allow_open = x
-    }
-    if let Some(x) = v.get("obfs").and_then(|x| x.as_bool()) {
-        cfg.obfs = x
     }
     if let Some(x) = v
         .get("max_connections")
@@ -17338,10 +17140,6 @@ fn print_banner(cfg: &RuntimeConfig, mux_sessions: usize, dns_display: &str, ver
     println!(" [+] Listen:      {}:{}", cfg.proxy_host, cfg.proxy_port);
     println!(" [+] Upstream:    {upstream}");
     println!(" [+] Mux:         {mux}");
-    println!(
-        " [+] Obfs:        {}",
-        if cfg.obfs { "Enabled" } else { "Disabled" }
-    );
     println!(" [+] DNS:         {dns_display}");
     println!(" [+] Auth:        {auth}");
     let mem_prof = adaptive::profile();
@@ -17463,9 +17261,6 @@ async fn main() -> Result<()> {
     }
     if args.allow_open {
         cfg.allow_open = true;
-    }
-    if args.obfs {
-        cfg.obfs = true;
     }
     if let Some(v) = args.max_conn {
         cfg.max_connections = v;
