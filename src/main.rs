@@ -192,7 +192,7 @@ use crate::dns::resolve_all_ipv4;
 use crate::mux_writer::MuxFrameWriter;
 use crate::protocol::MuxCommand;
 use crate::proxy::{socks5_success_response, TargetAddr};
-use crate::runtime::{recycle_buf, relay_buf};
+use crate::runtime::relay_buf;
 use crate::ws::{read_frame, write_frame, write_frame_borrowed};
 use anyhow::{anyhow, bail, Result};
 use std::future::Future;
@@ -1400,7 +1400,6 @@ pub(crate) async fn relay_client_mux_stream(
         }
         .await;
         crate::mux_writer::recycle_encode_buf(frame_scratch);
-        recycle_buf(buf).await;
         res
     }));
     let mut upload_done = false;
@@ -1943,7 +1942,6 @@ where
             Ok(())
         }
         .await;
-        recycle_buf(buf).await;
         if let Err(e) = res {
             let _ = up_err_tx.send(e);
         }
@@ -4794,20 +4792,13 @@ where
 /// One pre-encoded outbound frame with scheduling identity.
 ///
 /// `priority` frames (WS handshake hellos/pings via [`MuxFrameWriter::send`]
-/// and non-DATA MUX commands via [`MuxFrameWriter::send_mux`]) drain from a
-/// dedicated lane ahead of bulk DATA; DATA frames are deficit-round-robin
-/// scheduled per `stream_id` (GoWay `muxOutboundWriter` parity).
-///
-/// `stream_id` is `Some` for MUX control frames (SYN/FIN/RST) so the
-/// scheduler can keep a stream-closing control behind its own queued DATA.
-/// `yield_to_data` is set ONLY for FIN/RST: a SYN must always lead (it
-/// creates the server-side stream — yielding it behind its own DATA makes
-/// the peer drop that DATA as unknown-stream, a live-caught burst bug).
-/// System frames (hello/ping) carry `None` and always jump the queue.
+/// and control MUX commands `SYN`/`RST`/`WINDOW`/`VERSION` via
+/// [`MuxFrameWriter::send_mux`]) drain from a dedicated lane ahead of bulk
+/// `DATA`; `DATA` and `FIN` frames share each stream's ordered queue and are
+/// deficit-round-robin scheduled per `stream_id`.
 pub(crate) struct OutboundFrame {
     stream_id: Option<u32>,
     priority: bool,
-    yield_to_data: bool,
     is_rst: bool,
     bytes: Vec<u8>,
 }
@@ -4855,7 +4846,6 @@ impl MuxFrameWriter {
         self.send_frame(OutboundFrame {
             stream_id: None,
             priority: true,
-            yield_to_data: false,
             is_rst: false,
             bytes: frame,
         })
@@ -4881,7 +4871,6 @@ impl MuxFrameWriter {
         let out = OutboundFrame {
             stream_id: None,
             priority: true,
-            yield_to_data: false,
             is_rst: false,
             bytes: frame,
         };
@@ -4916,7 +4905,6 @@ impl MuxFrameWriter {
         self.send_frame(OutboundFrame {
             stream_id: Some(stream_id),
             priority: is_ctrl,
-            yield_to_data: false,
             is_rst: command == MuxCommand::Rst,
             bytes: frame,
         })
@@ -4942,7 +4930,6 @@ impl MuxFrameWriter {
         let out = OutboundFrame {
             stream_id: Some(stream_id),
             priority: is_ctrl,
-            yield_to_data: false,
             is_rst: command == MuxCommand::Rst,
             bytes: frame,
         };
@@ -5000,7 +4987,7 @@ struct StreamQueue {
 /// queue depth is bounded at [`WRITER_QUEUE`] frames total (priority + all
 /// streams), preserving the old backpressure contract.
 struct Scheduler {
-    priority: VecDeque<(Option<u32>, bool, Vec<u8>)>,
+    priority: VecDeque<Vec<u8>>,
     streams: U32HashMap<StreamQueue>,
     rotation: Vec<u32>,
     free_queues: Vec<VecDeque<Vec<u8>>>,
@@ -5013,7 +5000,7 @@ impl Drop for Scheduler {
         if self.total == 0 && self.priority.is_empty() && self.streams.is_empty() {
             return;
         }
-        recycle_encode_bufs(self.priority.drain(..).map(|(_, _, b)| b));
+        recycle_encode_bufs(self.priority.drain(..));
         for (_, q) in self.streams.drain() {
             recycle_encode_bufs(q.frames);
         }
@@ -5048,37 +5035,22 @@ impl Scheduler {
     fn push(&mut self, frame: OutboundFrame) {
         // Termination guard: the deficit caps at DRR_MAX_DEFICIT, so an
         // oversized frame could never afford emission and would wedge the
-        // stream. MUX frames top out near 67KB — far below the cap.
+        // stream. MUX frames top out near 126.5KB — far below the cap.
         debug_assert!(frame.bytes.len() <= DRR_MAX_DEFICIT);
         if frame.priority {
             if frame.is_rst {
                 if let Some(sid) = frame.stream_id {
                     self.remove_stream(&sid);
-                    // Purge any pending FIN (yield_to_data) for `sid` in `priority`
-                    // so a reset stream never emits a clean FIN ahead of RST after its
-                    // queued DATA was dropped.
-                    let mut i = 0;
-                    while i < self.priority.len() {
-                        if self.priority[i].0 == Some(sid) && self.priority[i].1 {
-                            if let Some((_, _, buf)) = self.priority.remove(i) {
-                                self.total = self.total.saturating_sub(1);
-                                recycle_encode_buf(buf);
-                            }
-                        } else {
-                            i += 1;
-                        }
-                    }
                 }
             }
-            self.priority
-                .push_back((frame.stream_id, frame.yield_to_data, frame.bytes));
+            self.priority.push_back(frame.bytes);
             self.total += 1;
             return;
         }
         let Some(stream_id) = frame.stream_id else {
             // Unreachable: only send_mux (always Some) reaches here with
             // priority == false. Guard anyway to never strand a frame.
-            self.priority.push_back((None, false, frame.bytes));
+            self.priority.push_back(frame.bytes);
             self.total += 1;
             return;
         };
@@ -5100,66 +5072,14 @@ impl Scheduler {
 
     /// Pops the next frame to emit: priority lane first, then one DRR step.
     ///
-    /// Intra-stream order wins over cross-stream priority, but ONLY for
-    /// stream-closing controls (FIN/RST): those yield while their own
-    /// stream still has queued DATA (it stays queued), otherwise the peer
-    /// would close early and drop the tail. SYN never yields — it creates
-    /// the peer-side stream, so yielding it makes the peer drop its own
-    /// DATA as unknown-stream. System frames (`None`) and controls for
-    /// streams with empty queues jump immediately.
+    /// Control frames (`SYN`, `RST`, `WINDOW`, `VERSION`) and system frames
+    /// (`Ping`/`Pong`) drain from `priority` ahead of bulk `DATA`. Stream `FIN`
+    /// shares its stream's ordered `StreamQueue` with `DATA` so `FIN` never
+    /// overtakes prior `DATA` of the same stream.
     fn next(&mut self) -> Option<Vec<u8>> {
-        if let Some(&(sid, yield_to_data, _)) = self.priority.front() {
-            let front_blocked = yield_to_data
-                && sid.is_some_and(|id| {
-                    self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
-                });
-            if !front_blocked {
-                let (sid_opt, yield_flag, frame) = self.priority.pop_front().unwrap();
-                self.total -= 1;
-                if yield_flag {
-                    if let Some(id) = sid_opt {
-                        self.remove_stream(&id);
-                    }
-                }
-                return Some(frame);
-            }
-            let ready_idx =
-                self.priority
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, &(sid, yield_to_data, _))| {
-                        let blocked_by_data = yield_to_data
-                            && sid.is_some_and(|id| {
-                                self.streams.get(&id).is_some_and(|q| !q.frames.is_empty())
-                            });
-                        if blocked_by_data {
-                            return None;
-                        }
-                        if let Some(id) = sid {
-                            let blocked_by_earlier_ctrl = self
-                                .priority
-                                .iter()
-                                .take(idx)
-                                .any(|&(earlier_sid, _, _)| earlier_sid == Some(id));
-                            if blocked_by_earlier_ctrl {
-                                return None;
-                            }
-                        }
-                        Some(idx)
-                    });
-            if let Some(idx) = ready_idx {
-                let (sid_opt, yield_flag, frame) = self.priority.remove(idx).unwrap();
-                self.total -= 1;
-                if yield_flag {
-                    if let Some(id) = sid_opt {
-                        let empty = self.streams.get(&id).is_none_or(|q| q.frames.is_empty());
-                        if empty {
-                            self.remove_stream(&id);
-                        }
-                    }
-                }
-                return Some(frame);
-            }
+        if let Some(frame) = self.priority.pop_front() {
+            self.total -= 1;
+            return Some(frame);
         }
         if self.total == 0 {
             if !self.streams.is_empty() {
@@ -5438,7 +5358,7 @@ async fn writer_loop<W>(
         recycle_encode_bufs(batch.drain(..));
     }
     recycle_encode_bufs(batch.drain(..));
-    recycle_encode_bufs(sched.priority.drain(..).map(|(_, _, b)| b));
+    recycle_encode_bufs(sched.priority.drain(..));
     for (_, q) in sched.streams.drain() {
         recycle_encode_bufs(q.frames);
     }
@@ -5713,18 +5633,6 @@ mod tests {
     }
 
     fn drr_frame(stream_id: u32, priority: bool, len: usize, tag: u8) -> OutboundFrame {
-        drr_frame_yield(stream_id, priority, priority, len, tag)
-    }
-
-    /// priority + yield_to_data set independently (mirrors send_mux: only
-    /// FIN/RST yield; SYN never does even though it is priority).
-    fn drr_frame_yield(
-        stream_id: u32,
-        priority: bool,
-        yield_to_data: bool,
-        len: usize,
-        tag: u8,
-    ) -> OutboundFrame {
         let mut bytes = vec![tag; len];
         if !bytes.is_empty() {
             bytes[0] = tag;
@@ -5732,19 +5640,8 @@ mod tests {
         OutboundFrame {
             stream_id: Some(stream_id),
             priority,
-            yield_to_data,
             is_rst: false,
             bytes,
-        }
-    }
-
-    fn drr_system(len: usize, tag: u8) -> OutboundFrame {
-        OutboundFrame {
-            stream_id: None,
-            priority: true,
-            yield_to_data: false,
-            is_rst: false,
-            bytes: vec![tag; len],
         }
     }
 
@@ -5789,30 +5686,6 @@ mod tests {
     }
 
     #[test]
-    fn drr_control_never_overtakes_own_data() {
-        // Regression: a FIN must not jump ahead of its own stream's queued
-        // DATA (peer would close early and drop the tail), but it still
-        // jumps ahead of OTHER streams' bulk. System frames always go first
-        // among ready controls.
-        let mut sched = Scheduler::new();
-        sched.push(drr_system(2, 3)); // ping, queued first
-        sched.push(drr_frame(5, false, 65536, 5)); // other stream's bulk
-        sched.push(drr_frame(1, false, 100, 1)); // own DATA
-        sched.push(drr_frame(1, true, 7, 2)); // own FIN
-        let mut order = Vec::new();
-        while !sched.is_empty() {
-            if let Some(frame) = sched.next() {
-                order.push(frame[0]);
-            }
-        }
-        // Ping first; the FIN yields to DRR while its own DATA is queued
-        // (stream 5's bulk wins that round), but it still precedes nothing
-        // of its own stream: D1 always comes before FIN. Intra-stream order
-        // is what correctness needs; cross-stream order stays fair.
-        assert_eq!(order, vec![3, 5, 1, 2]);
-    }
-
-    #[test]
     fn drr_drained_streams_are_dropped_eagerly() {
         // Regression (v0.0.36): a stream whose queue drained must leave
         // `rotation` even while other streams still hold frames. Streams
@@ -5848,12 +5721,10 @@ mod tests {
     #[test]
     fn drr_syn_never_yields_to_own_data() {
         // SYN creates the peer-side stream: it must lead even when its own
-        // DATA is already queued. Yielding it (like FIN/RST) makes the peer
-        // drop that DATA as unknown-stream — live-caught with full 64KB
-        // flows vanishing under burst while zero probes fired.
+        // DATA is already queued.
         let mut sched = Scheduler::new();
         sched.push(drr_frame(1, false, 100, 1));
-        sched.push(drr_frame_yield(1, true, false, 7, 2));
+        sched.push(drr_frame(1, true, 7, 2));
         sched.push(drr_frame(1, false, 100, 1));
         let mut order = Vec::new();
         while !sched.is_empty() {
@@ -6499,7 +6370,6 @@ pub const MAX_MUX_V2_CHUNK: usize = 129_600;
 pub const MAX_MUX_V2_WINDOW_KIB: u32 = 1024 * 1024;
 
 /// Wire version advertised in the VERSION frame payload (v2: Jumbo frames + 32-bit window + coalesced packets).
-#[allow(dead_code)]
 pub const MUX_PROTO_VERSION: u8 = 2;
 /// Initial per-stream receive window advertised in 3-byte VERSION (clamped to u16 KiB for v1 compatibility).
 #[inline(always)]
@@ -6518,7 +6388,6 @@ pub fn mux_window_refresh() -> usize {
 }
 /// Floor applied to a peer-advertised window so a broken/zero VERSION
 /// can never starve the sender (frames are at most 64 KiB).
-#[allow(dead_code)]
 pub const MUX_WINDOW_MIN_KIB: u16 = 64;
 /// Capacity for per-stream MUX data channel, adaptive to RAM tier.
 #[inline(always)]
@@ -6566,7 +6435,6 @@ impl TryFrom<u8> for MuxCommand {
 }
 
 /// VERSION payload: `[u8 version][u16 window_kib BE]` (3 bytes).
-#[allow(dead_code)]
 pub fn encode_version_payload(window_kib: u16) -> [u8; 3] {
     [
         MUX_PROTO_VERSION,
@@ -6577,7 +6445,6 @@ pub fn encode_version_payload(window_kib: u16) -> [u8; 3] {
 
 /// Decodes a VERSION payload; rejects truncation and out-of-range window
 /// (returns the floored window in KiB).
-#[allow(dead_code)]
 pub fn decode_version_payload(payload: &[u8]) -> Option<(u8, u16)> {
     if payload.len() != 3 {
         return None;
@@ -6587,14 +6454,12 @@ pub fn decode_version_payload(payload: &[u8]) -> Option<(u8, u16)> {
 }
 
 /// WINDOW payload: `[u32 credit_bytes BE]` (4 bytes).
-#[allow(dead_code)]
 pub fn encode_window_payload(credit: u32) -> [u8; 4] {
     credit.to_be_bytes()
 }
 
 /// Decodes a WINDOW payload; rejects truncation, zero and absurd credits
 /// (larger than the max possible window: u16 KiB => 64 MiB).
-#[allow(dead_code)]
 pub fn decode_window_payload(payload: &[u8]) -> Option<u32> {
     if payload.len() != 4 {
         return None;
@@ -6608,7 +6473,6 @@ pub fn decode_window_payload(payload: &[u8]) -> Option<u32> {
 
 /// Decodes a MUX v2 session-level (`stream_id = 0`) WINDOW payload advertising
 /// a 32-bit receive window in KiB (up to `MAX_MUX_V2_WINDOW_KIB` = 1 GiB).
-#[allow(dead_code)]
 pub fn decode_session_window_kib(payload: &[u8]) -> Option<u32> {
     if payload.len() != 4 {
         return None;
@@ -6661,7 +6525,7 @@ impl MuxHeader {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
         &buf[MUX_HEADER_LEN..MUX_HEADER_LEN + self.payload_len]
     }
@@ -6709,7 +6573,6 @@ pub struct MuxFrame {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OwnedMuxFrame {
     pub stream_id: u32,
     pub command: MuxCommand,
@@ -6766,7 +6629,6 @@ impl OwnedMuxFrame {
         self
     }
 
-    #[allow(dead_code)]
     pub fn into_storage(mut self) -> Vec<u8> {
         std::mem::take(&mut self.storage)
     }
@@ -6782,8 +6644,8 @@ impl Drop for OwnedMuxFrame {
 }
 
 
-#[allow(dead_code)]
 impl MuxFrame {
+    #[cfg(test)]
     pub fn new(
         stream_id: u32,
         command: MuxCommand,
@@ -6804,11 +6666,12 @@ impl MuxFrame {
         })
     }
 
+    #[cfg(test)]
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
         write_frame_parts(out, self.stream_id, self.command, &self.payload)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
         let header = MuxHeader::parse(buf)?;
         Ok(Self {
@@ -6818,6 +6681,7 @@ impl MuxFrame {
         })
     }
 
+    #[cfg(test)]
     pub fn decode_owned(buf: Vec<u8>) -> Result<OwnedMuxFrame, ProtocolError> {
         let header = match MuxHeader::parse(&buf) {
             Ok(h) => h,
@@ -6902,14 +6766,13 @@ impl MuxFrame {
 
 /// SYN payload: uint16 target length, target bytes, optional initial data.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct SynPayload {
     pub target: Vec<u8>,
     pub initial_data: Vec<u8>,
 }
 
-#[allow(dead_code)]
 impl SynPayload {
+    #[cfg(test)]
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         if self.target.len() > u16::MAX as usize {
             return Err(ProtocolError::TargetTooLarge(self.target.len()));
@@ -6968,6 +6831,7 @@ impl SynPayload {
         Ok((&payload[2..2 + target_len], &payload[2 + target_len..]))
     }
 
+    #[cfg(test)]
     pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
         let (target, initial_data) = Self::decode_slices(payload)?;
         Ok(Self {
@@ -6980,11 +6844,9 @@ impl SynPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     TruncatedHeader(usize),
-    #[allow(dead_code)]
     TruncatedSyn,
     UnknownCommand(u8),
     PayloadTooLarge(usize),
-    #[allow(dead_code)]
     TargetTooLarge(usize),
     LengthMismatch {
         declared: usize,
@@ -8077,7 +7939,7 @@ use crate::proxy::{
 };
 use crate::runtime::{
     apply_listener_options, apply_socket_options, check_udp_target_policy, dial_target,
-    drain_join_set, enforce_target_policy, record_known_udp_target, recycle_buf, relay_buf,
+    drain_join_set, enforce_target_policy, record_known_udp_target, relay_buf,
     resolve_borrowed_udp_target, wait_shutdown, RuntimeConfig,
 };
 use crate::udp_batch::{UdpBatchReader, UdpBatchWriter};
@@ -8345,7 +8207,7 @@ fn key_digest_hex_bytes(key: &str) -> [u8; 64] {
 
 /// SHA-256 of `key` as lowercase hex: the only key form a client puts on the
 /// wire, so a plaintext key never traverses an untrusted hop.
-#[allow(dead_code)]
+#[cfg(test)]
 fn key_digest_hex(key: &str) -> String {
     let bytes = key_digest_hex_bytes(key);
     String::from_utf8_lossy(&bytes).into_owned()
@@ -8389,7 +8251,7 @@ fn quic_auth_matches_str(presented: &str, configured: &str) -> bool {
         false
     }
 }
-#[allow(dead_code)]
+#[cfg(test)]
 fn quic_auth_matches(presented: &str, configured: &Zeroizing<String>) -> bool {
     quic_auth_matches_str(presented, configured.as_str())
 }
@@ -8456,7 +8318,7 @@ async fn read_len_prefixed_udp_buffered(
     Ok(Some(len))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn read_len_prefixed_udp(
     recv: &mut RecvStream,
     buf: &mut Vec<u8>,
@@ -8464,7 +8326,7 @@ async fn read_len_prefixed_udp(
     let mut empty: &[u8] = &[];
     read_len_prefixed_udp_buffered(recv, &mut empty, buf).await
 }
-#[allow(dead_code)]
+#[cfg(test)]
 async fn write_len_prefixed_udp(send: &mut SendStream, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_QUIC_UDP_PACKET {
         bail!("QUIC UDP payload too large")
@@ -8763,7 +8625,6 @@ async fn relay_quic(
             Ok(())
         }
         .await;
-        recycle_buf(buf).await;
         res
     }));
     let mut lw2 = lw;
@@ -8812,7 +8673,7 @@ async fn relay_quic(
     }
     .await;
     let _ = lw2.shutdown().await;
-    recycle_buf(buf).await;
+    drop(buf);
     if remote_eof {
         if !upload_done {
             let drain_wait = Duration::from_secs(cfg.connection_timeout.max(5));
@@ -9274,7 +9135,6 @@ async fn handle_server_stream(
             }
         }
         let _ = send.finish();
-        recycle_buf(buf).await;
         Result::<()>::Ok(())
     }));
     let mut buf = relay_buf(buffer_size).await;
@@ -9326,7 +9186,7 @@ async fn handle_server_stream(
     }
     .await;
     let _ = target_wr.shutdown().await;
-    recycle_buf(buf).await;
+    drop(buf);
     if recv_eof && !send_done {
         if timeout(drain_wait, &mut send_task).await.is_err() {
             send_task.abort();
@@ -9969,10 +9829,6 @@ pub(crate) async fn relay_buf(requested: usize) -> RelayBufGuard {
     RelayBufGuard(Some(vec![0u8; size]))
 }
 
-/// Returns a relay buffer to the pool (best-effort: over-capacity or
-/// oversized buffers are simply dropped).
-pub(crate) async fn recycle_buf(_buf: RelayBufGuard) {}
-
 /// Resolves when the operator requests shutdown (Ctrl+C everywhere,
 /// Ctrl+Break on Windows — the latter is what console-less training
 /// drivers can deliver to a child process group).
@@ -10367,7 +10223,6 @@ async fn target_to_mux(
                     .is_err()
                     {
                         crate::mux_writer::recycle_encode_buf(frame_scratch);
-                        recycle_buf(buf).await;
                         return false;
                     }
                     off = end
@@ -10380,7 +10235,6 @@ async fn target_to_mux(
         }
     };
     crate::mux_writer::recycle_encode_buf(frame_scratch);
-    recycle_buf(buf).await;
     clean_eof
 }
 /// Accumulates consumed bytes per stream and emits a WINDOW refund once
@@ -11415,7 +11269,6 @@ where
             Ok(())
         }
         .await;
-        recycle_buf(buf).await;
         if let Err(e) = res {
             let _ = dl_err_tx.send(e);
         }
@@ -11821,14 +11674,14 @@ mod lifecycle_tests {
         let a = relay_buf(128 * 1024).await;
         assert_eq!(a.len(), 128 * 1024);
         let ptr = a.as_ptr();
-        recycle_buf(a).await;
+        drop(a);
         let b = relay_buf(128 * 1024).await;
         assert_eq!(b.as_ptr(), ptr);
         // Oversized buffers bypass the pool.
         let big = relay_buf(4 * 1024 * 1024).await;
         assert_eq!(big.len(), 4 * 1024 * 1024);
-        recycle_buf(big).await;
-        recycle_buf(b).await;
+        drop(big);
+        drop(b);
         let c = relay_buf(128 * 1024).await;
         assert_eq!(c.as_ptr(), ptr);
     }
