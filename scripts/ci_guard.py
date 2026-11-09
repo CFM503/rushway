@@ -413,31 +413,32 @@ def wait_for_github_ci(head_sha: str, timeout_sec: int = 600):
     print(f"[CI] Waiting for GitHub Actions `RushWay CI` on commit {head_sha[:7]}...")
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs?head_sha={head_sha}&per_page=10",
-            headers=headers,
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            runs = json.loads(resp.read().decode()).get("workflow_runs", [])
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs?head_sha={head_sha}&per_page=10",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                runs = json.loads(resp.read().decode()).get("workflow_runs", [])
 
-        ci_runs = [r for r in runs if r.get("name") == "RushWay CI"]
-        if ci_runs:
-            run = ci_runs[0]
-            jreq = urllib.request.Request(run["jobs_url"], headers=headers)
-            with urllib.request.urlopen(jreq, timeout=15) as jresp:
-                jobs = json.loads(jresp.read().decode()).get("jobs", [])
-            for job in jobs:
-                if job["name"] == "test":
-                    status = job["status"]
-                    conclusion = job["conclusion"]
-                    if status == "completed":
-                        if conclusion == "success":
-                            print(f"[OK] GitHub Actions `RushWay CI` (`test` job) PASSED for {head_sha[:7]}!")
-                            return True
-                        else:
-                            print(f"[FAIL] GitHub Actions `RushWay CI` (`test` job) FAILED ({run['html_url']}):")
-                            print(fetch_job_error_log(job["id"], token))
-                            return False
+            ci_runs = [r for r in runs if r.get("name") == "RushWay CI"]
+            if ci_runs:
+                run = ci_runs[0]
+                jreq = urllib.request.Request(run["jobs_url"], headers=headers)
+                with urllib.request.urlopen(jreq, timeout=15) as jresp:
+                    jobs = json.loads(jresp.read().decode()).get("jobs", [])
+                for job in jobs:
+                    if job["status"] == "completed" and job["conclusion"] not in ("success", "skipped"):
+                        print(f"[FAIL] GitHub Actions `RushWay CI` (`{job['name']}` job) FAILED ({run['html_url']}):")
+                        print(fetch_job_error_log(job["id"], token))
+                        return False
+                if run.get("status") == "completed":
+                    if run.get("conclusion") == "success":
+                        print(f"[OK] GitHub Actions `RushWay CI` (all jobs) PASSED for {head_sha[:7]}!")
+                        return True
+                    return False
+        except Exception as exc:
+            print(f"[CI] Transient API poll error ({exc}), retrying...")
         time.sleep(8)
     raise TimeoutError(f"Timed out waiting for GitHub Actions CI on {head_sha[:7]}")
 
@@ -493,8 +494,9 @@ def main():
             print(f"[ABORT] Blocking tag `{tag}` push because `RushWay CI` failed on {sha[:7]}!")
             sys.exit(1)
         print(f"[RELEASE] `RushWay CI` verified green! Updating and pushing tag `{tag}`...")
+        subprocess.run(["git", "push", "origin", f":refs/tags/{tag}"], cwd=REPO_ROOT, check=False)
         subprocess.run(["git", "tag", "-f", tag, sha], cwd=REPO_ROOT, check=True)
-        subprocess.run(["git", "push", "-f", "origin", tag], cwd=REPO_ROOT, check=True)
+        subprocess.run(["git", "push", "origin", tag], cwd=REPO_ROOT, check=True)
         print(f"[OK] Release `{tag}` ({sha[:7]}) pushed and verified!")
 
 

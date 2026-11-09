@@ -6502,9 +6502,13 @@ mod imp {
     static STATE: Mutex<Option<(Guard, PathBuf)>> = Mutex::new(None);
 
     pub(crate) fn start(path: PathBuf, duration_secs: Option<u64>) -> Result<()> {
-        let guard = pprof::ProfilerGuardBuilder::default()
-            .frequency(99)
-            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        let builder = pprof::ProfilerGuardBuilder::default().frequency(99);
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
+        let guard = builder
             .build()
             .map_err(|e| anyhow!("failed to start CPU profiler: {e}"))?;
         {
