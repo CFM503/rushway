@@ -8117,13 +8117,17 @@ mod tests {
         assert_eq!(parsed.target.host, "example.com");
         assert_eq!(parsed.target.port, 80);
         assert!(!parsed.is_connect);
-        assert_eq!(parsed.initial_payload.unwrap(), get_req);
+        assert_eq!(
+            parsed.initial_payload.unwrap(),
+            b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        );
 
         let post_req = b"POST /api/test HTTP/1.1\r\nHost: api.example.com:8080\r\n\r\n";
         let parsed_post = parse_http_proxy_request(post_req).unwrap();
         assert_eq!(parsed_post.target.host, "api.example.com");
         assert_eq!(parsed_post.target.port, 8080);
         assert!(!parsed_post.is_connect);
+        assert_eq!(parsed_post.initial_payload.unwrap(), post_req);
     }
 
     #[tokio::test]
