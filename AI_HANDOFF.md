@@ -49,7 +49,7 @@ Each handoff entry must contain:
 | Layer | Supported Modes & Interop Guarantees (`RushWay v0.0.83` ↔ `GoWay v1.8.36`) |
 | :--- | :--- |
 | **Inbound Local Proxy** | Single-port auto-detection of **SOCKS5** (`CONNECT` + `UDP ASSOCIATE`), **HTTP `CONNECT`**, and **HTTP Origin-Form Proxy** (RFC 7230 origin-form rewrite with `Proxy-Authorization` & `Proxy-Connection` stripped). |
-| **Upstream Transports** | `ws://` (Plain WebSocket), `wss://` (TLS 1.2/1.3 WebSocket with 7-browser fingerprint rotation & `-fakehost` CDN IP fallback), `quic://` / `quic+tls://` (RFC 9000 Quinn with multi-connection pooling & deterministic Ed25519 `-k` cert pinning). |
+| **Upstream Transports** | `ws://` (Plain WebSocket), `wss://` (TLS 1.2/1.3 WebSocket with 7-browser fingerprint rotation & `-fakehost` CDN IP fallback), `quic://` / `quic+tls://` (RFC 9000 Quinn with multi-connection pooling, `webpki-roots` / `--no-verify-ssl` TLS verification, and `SHA-256(key)` / legacy plaintext stream auth). |
 | **Tunnel Handshake** | First WebSocket binary frame carries XOR-encrypted `"MUX\n"`, `"UDP\n"`, or `"host:port\n"` (prefixed with `<key> ` when `-k` is set); server replies with XOR-encrypted `"OK\n"`. All handshakes use 16 KiB `BufReader` (`read_http_headers_timeout_buf`) for single-syscall header parsing. |
 | **Multiplexing (`-mux`)** | **Pure MUX v2** (`MUX_PROTO_VERSION = 2`), default `8` parallel sessions (`-mux-sessions 1..64`), congestion-aware session selection (`active * 4 + writer_queued`). |
 | **Non-MUX (`-no-mux`)** | Pre-warmed 1:1 connection pool (`PlainNonMuxPool` / `NonMuxPool`), XOR-encrypted handshake followed by unencrypted data frames (GoWay `handleServer` / `handleClient` parity) with half-close `shutdown(Write)` support. |
@@ -87,12 +87,26 @@ Each handoff entry must contain:
 - **Cache-Line Isolated Telemetry (`mod stats`):** `active_conns`, `bytes_up`, and `bytes_down` each reside on a dedicated 64-byte cache line (`#[repr(align(64))] struct AlignedAtomicI64`), fed by 64 KiB `StatsBatcher` accumulators across all relay loops.
 
 ### 2.5 Security & Protocol Compliance Boundaries
-- **SSRF Defense-in-Depth (`is_blocked_local_ip`):** Rejects loopback, RFC1918 private, link-local, CGNAT (`100.64.0.0/10`), broadcast, unspecified (`0.0.0.0/8`), multicast, IPv4 Class E (`240.0.0.0/4`), IPv6 Unique Local (`fc00::/7`), NAT64 Well-Known Prefix (`64:ff9b::/96`), 6to4 (`2002::/16`), and `localhost` / `.localhost` domains across TCP and UDP (client pre-check + server post-DNS check to defeat DNS Rebinding).
+- **SSRF Defense-in-Depth (`is_blocked_local_ip`):** Rejects loopback, RFC1918 private, link-local, broadcast, unspecified (`0.0.0.0/8`), multicast, IPv4 Class E (`240.0.0.0/4`), IPv6 Unique Local (`fc00::/7`), NAT64 Well-Known Prefix (`64:ff9b::/96`), 6to4 (`2002::/16`), and `localhost` / `.localhost` domains across TCP and UDP (client pre-check + server post-DNS check to defeat DNS Rebinding). RFC 6598 CGNAT (`100.64.0.0/10`) and `198.18.0.0/15` are intentionally exempted for GoWay parity.
 - **UDP Return-Traffic Pinning:** `record_known_udp_target` normalizes dual-stack IPv4-mapped IPv6 addresses (`normalize_socket_addr`) and caches `last_allowed_src` so only authorized destination endpoints can send UDP packets back into the tunnel.
 
 ---
 
 ## 3. Chronological Relay Log
+
+### Release: v0.0.84 (2026-11-14) — UDP Epoll Readiness, Pool/QUIC Lifecycle & Boundary Hardening
+
+- **Objective:** Apply high-certainty bugfixes from the full-codebase audit without regressing GoWay wire compatibility, MUX 0-RTT latency, or hot-path throughput.
+- **Change:**
+  - `src/main.rs`:
+    - `udp_batch`: Wrapped `recv_batch_linux` / `send_batch_linux` in `sock.try_io(Interest::READABLE / WRITABLE, ...)`, added bounded `ConnectionReset` handling on non-Linux `try_recv_batch`, and guarded `UdpBatchWriter::push` / `flush` count invariants.
+    - `mux_pool` & `wss_client`: Added `capacity_notify.notified()` + 50ms sleep backoff on saturated-pool dial failures, validated WS/WSS paths against CR/LF/whitespace, filtered empty `fakehost`, and propagated `profile_idx` into `dial_cloudflare_fallback`.
+    - `runtime`, `mux_writer`, `tui`: Cleared `last_stream` on `handle_mux_parts` stream eviction, wrapped `writer_task`/`heartbeat_handle` in `AbortOnDrop`, fixed unbounded post-download read in `handle_server_tcp_parts`, capped `writer_loop` `w.shutdown()` to 2s, reserved undersized pooled encode buffers in `acquire_encode_buf_sized`, and released `save_log_file` lock before logging.
+    - `quic`: Evicted connections on `open_bi` error/timeout and called `endpoint.close` before `drain_join_set` in `run_server`.
+    - `proxy` & `main`: Normalized empty `-k`/`fakehost` via `sanitize_runtime_config` (plus CR/LF rejection), used earliest HTTP header terminator (`find_http_header_end`), rejected trailing garbage after bracketed IPv6 authorities, and added 3 regression unit tests.
+  - `.github/workflows/release.yml`: Added `cargo test --all-targets --all-features` to the release compilation gate.
+  - `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `AI_HANDOFF.md`: Synchronized to `v0.0.84` and corrected QUIC auth & CGNAT exemption documentation.
+- **Status:** Committed and pending CI + tag `v0.0.84` release verification.
 
 ### Release: v0.0.83 (2026-11-09) — Epoch 0 Baseline (`RushWay v0.0.83` ↔ `GoWay v1.8.36`)
 

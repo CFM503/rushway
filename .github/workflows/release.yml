@@ -51,6 +51,8 @@ jobs:
           toolchain: 1.88.0
       - name: cargo check
         run: cargo check --all-targets --all-features
+      - name: cargo test
+        run: cargo test --all-targets --all-features
 
   windows-x64:
     name: Build Windows x64

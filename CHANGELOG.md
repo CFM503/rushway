@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.84] - 2026-11-14
+
+### Linux UDP `try_io` Epoll Readiness Fix, Pool Backoff, QUIC Shutdown Ordering & Proxy/Config Hardening
+
+- **Linux UDP Batch Epoll Readiness Sync & Windows `ConnectionReset` Tolerance (`src/main.rs:udp_batch`) [BUG]** — Wrapped Linux `recvmmsg` and `sendmmsg` syscalls in `tokio::net::UdpSocket::try_io(Interest::READABLE / WRITABLE, ...)` so `WouldBlock` (`EAGAIN`) clears Tokio's edge-triggered readiness flag and prevents 100% CPU idle spin-loops. Added bounded `ErrorKind::ConnectionReset` tolerance in non-Linux `try_recv_batch` for Windows ICMP Port Unreachable resets, and guarded `UdpBatchWriter::push` / `flush` against stale `count == UDP_BATCH` on `writable().await` errors.
+- **Session Pool Backoff, `runtime` Tail-Hang & `mux_writer` Resilience (`src/main.rs:mux_pool`, `wss_client`, `runtime`, `mux_writer`, `tui`) [BUG/OPT]** — Added `capacity_notify.notified()` + 50ms backoff before `continue` in `MuxSessionPool::acquire` and `WssSessionPool::acquire` when live sessions are saturated and new dials fail fast. Cleared `last_stream` cache on all `handle_mux_parts` stream eviction paths, routed `handle_server_tcp_parts` post-download reads through the `timeout(drain_wait, ...)` branch, managed `writer_task` / `heartbeat_handle` with `AbortOnDrop`, bounded `writer_loop` `w.shutdown()` to 2s, ensured `acquire_encode_buf_sized` grows undersized pooled buffers, and dropped `tui::save_log_file` lock guard prior to tracing output.
+- **QUIC Pool Eviction & Graceful Server Shutdown (`src/main.rs:quic`) [BUG]** — Evicted connections from `QuicClientPool` (and invalidated DNS cache) on any `open_bi` timeout or error even before `close_reason()` latches, and closed the Quinn server `Endpoint` before calling `drain_join_set` so idle connections unblock immediately on shutdown.
+- **HTTP Proxy / WS Input Validation & `release.yml` Test Gate (`src/main.rs:proxy`, `common`, `wss_client`, `main`, `.github/workflows/release.yml`, `AI_HANDOFF.md`) [SEC/CI/DOC]** — Normalized empty `-k ""` and whitespace `--fakehost` to `None`, rejected CR/LF control characters in `--fakehost` and WS/WSS URL paths, prioritized the earliest `\r\n\r\n` vs `\n\n` HTTP header terminator, rejected trailing garbage after bracketed IPv6 authorities in `parse_authority_with_default`, unified `profile_idx` across Cloudflare fallback dials, synced `AI_HANDOFF.md` transport/SSRF notes, and added `cargo test --all-targets --all-features` to `.github/workflows/release.yml`.
+
 ## [v0.0.83] - 2026-11-09
 
 ### Full-Stack Protocol Hardening, `GoWay v1.8.36` Interop Baseline, Cross-Channel `SYN`-Before-`DATA` & `RST` Purge, Multi-Session QUIC Pooling & Zero-Latency UDP Batching

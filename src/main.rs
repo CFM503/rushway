@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.83";
+pub const APP_VERSION: &str = "0.0.84";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -991,6 +991,9 @@ pub(crate) fn split_ws_url(input: &str, scheme_error: &str) -> Result<(String, S
         Some((a, p)) => (a.to_string(), format!("/{}", p)),
         None => (rest.to_string(), "/".to_string()),
     };
+    if path.bytes().any(|b| matches!(b, b'\r' | b'\n' | b' ' | b'\t')) {
+        bail!("WS upstream path contains invalid whitespace or control characters");
+    }
     Ok((authority, path))
 }
 
@@ -1132,11 +1135,15 @@ pub(crate) async fn open_ws_upstream(
     } else {
         format!("{}:{}", target.host, target.port)
     };
-    let header_host = cfg.fakehost.as_deref().unwrap_or(&default_host_hdr);
-    let sni_base = cfg
+    let fakehost = cfg
         .fakehost
         .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let header_host = fakehost.unwrap_or(&default_host_hdr);
+    let sni_base = fakehost
         .map(extract_host_only)
+        .filter(|s| !s.is_empty())
         .unwrap_or(&target.host);
     let socket = connect_ws_with_fallback(cfg, &target.host, target.port).await?;
     crate::runtime::apply_socket_options(&socket, cfg);
@@ -4564,6 +4571,10 @@ impl MuxSessionPool {
                 Err(e) => {
                     self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
                     if has_live_sessions && tokio::time::Instant::now() < deadline {
+                        tokio::select! {
+                            _ = self.capacity_notify.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
                         continue;
                     }
                     recycle_encode_buf(initial_data);
@@ -4848,6 +4859,9 @@ pub(crate) fn acquire_encode_buf_sized(needed: usize) -> Vec<u8> {
             shard.len.store(pool.len(), Ordering::Relaxed);
             drop(pool);
             buf.clear();
+            if buf.capacity() < needed {
+                buf.reserve(needed - buf.len());
+            }
             return buf;
         }
         shard.len.store(0, Ordering::Relaxed);
@@ -5536,7 +5550,7 @@ async fn writer_loop<W>(
     for (_, q) in sched.streams.drain() {
         recycle_encode_bufs(q.frames);
     }
-    let _ = w.shutdown().await;
+    let _ = timeout(Duration::from_secs(2), w.shutdown()).await;
 }
 
 async fn write_batch<W>(w: &mut W, batch: &[Vec<u8>]) -> std::io::Result<()>
@@ -7714,15 +7728,17 @@ pub fn parse_authority_with_default(
         if !is_valid_target_host(host) {
             return Err(ProxyParseError::InvalidHttpRequest);
         }
-        let port = match authority.get(close + 1..).and_then(|t| t.strip_prefix(':')) {
-            Some(p) => {
-                let val = p.parse::<u16>().map_err(|_| ProxyParseError::InvalidPort)?;
-                if val == 0 {
-                    return Err(ProxyParseError::InvalidPort);
-                }
-                val
+        let tail = authority.get(close + 1..).unwrap_or("");
+        let port = if tail.is_empty() {
+            default_port
+        } else if let Some(p) = tail.strip_prefix(':') {
+            let val = p.parse::<u16>().map_err(|_| ProxyParseError::InvalidPort)?;
+            if val == 0 {
+                return Err(ProxyParseError::InvalidPort);
             }
-            None => default_port,
+            val
+        } else {
+            return Err(ProxyParseError::InvalidHttpRequest);
         };
         return Ok(TargetAddr {
             host: host.to_owned(),
@@ -7754,13 +7770,19 @@ pub fn parse_authority_with_default(
     }
 }
 
+fn find_http_header_end(buf: &[u8]) -> Option<usize> {
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|n| n + 4);
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|n| n + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 pub fn parse_http_connect(buf: &[u8]) -> Result<TargetAddr, ProxyParseError> {
-    let end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|n| n + 4)
-        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|n| n + 2))
-        .ok_or(ProxyParseError::Truncated)?;
+    let end = find_http_header_end(buf).ok_or(ProxyParseError::Truncated)?;
     if end > 8192 {
         return Err(ProxyParseError::HeaderTooLarge);
     }
@@ -7793,12 +7815,7 @@ pub struct HttpProxyRequest {
 }
 
 pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyParseError> {
-    let end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|n| n + 4)
-        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|n| n + 2))
-        .ok_or(ProxyParseError::Truncated)?;
+    let end = find_http_header_end(buf).ok_or(ProxyParseError::Truncated)?;
     if end > 8192 {
         return Err(ProxyParseError::HeaderTooLarge);
     }
@@ -8292,6 +8309,24 @@ mod tests {
         assert!(parse_target_authority("evil.com/path:80").is_err());
         assert!(parse_target_authority("evil\r\n.com:80").is_err());
         assert!(parse_authority_with_default("evil.com/path", 80).is_err());
+        assert_eq!(
+            parse_authority_with_default("[::1]evil.com", 80).unwrap_err(),
+            ProxyParseError::InvalidHttpRequest
+        );
+    }
+
+    #[test]
+    fn http_proxy_stops_at_earliest_lf_terminator() {
+        let req = concat!(
+            "GET http://a.com/ok HTTP/1.1\n",
+            "Host: a.com\n\n",
+            "GET /smuggled HTTP/1.1\r\n",
+            "Host: b.com\r\n\r\n",
+        );
+        let parsed = parse_http_proxy_request(req.as_bytes()).unwrap();
+        assert_eq!(parsed.target.host, "a.com");
+        let rewritten = String::from_utf8(parsed.initial_payload.unwrap()).unwrap();
+        assert!(rewritten.starts_with("GET /ok HTTP/1.1\r\nHost: a.com\r\n\r\nGET /smuggled"));
     }
 }
 } // mod proxy
@@ -8853,13 +8888,11 @@ impl QuicClientPool {
             match timeout(wait_timeout, connection.open_bi()).await {
                 Ok(Ok(pair)) => return Ok(pair),
                 Ok(Err(_)) | Err(_) => {
-                    if connection.close_reason().is_some() {
-                        dns::invalidate_host(&self.upstream_host);
-                        let mut guard = self.connections.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.retain(|c| {
-                            c.close_reason().is_none() && c.stable_id() != connection.stable_id()
-                        });
-                    }
+                    dns::invalidate_host(&self.upstream_host);
+                    let mut guard = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.retain(|c| {
+                        c.close_reason().is_none() && c.stable_id() != connection.stable_id()
+                    });
                 }
             }
         }
@@ -9495,8 +9528,8 @@ pub async fn run_server(cfg: RuntimeConfig) -> Result<()> {
             }
         }
     }
-    drain_join_set(&mut set).await;
     endpoint.close(0u32.into(), b"shutdown");
+    drain_join_set(&mut set).await;
     Ok(())
 }
 
@@ -10826,7 +10859,8 @@ where
 {
     // Hand the write half to the dedicated writer task; all MUX frames on
     // this session go through its serialized, coalescing queue.
-    let (writer, mut writer_task) = MuxFrameWriter::spawn(wr);
+    let (writer, writer_task) = MuxFrameWriter::spawn(wr);
+    let mut writer_task = crate::common::AbortOnDrop(writer_task);
     let mut writer_dead = false;
     let mut ok = *b"OK\n";
     cipher.apply(&mut ok);
@@ -10882,7 +10916,7 @@ where
     let mut last_stream: Option<CachedServerStream> = None;
 
     let writer_for_hb = writer.clone();
-    let mut heartbeat_handle = tokio::spawn(async move {
+    let mut heartbeat_handle = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
@@ -10896,7 +10930,7 @@ where
             let hlen = crate::ws::ws_header_into(&mut ping_buf, 0, 9, false);
             writer_for_hb.try_send_system(ping_buf[..hlen].to_vec());
         }
-    });
+    }));
 
     let session_res: Result<()> = async {
         loop {
@@ -11472,6 +11506,9 @@ where
                                     match timeout(Duration::from_millis(15), tx.reserve()).await {
                                         Ok(Ok(permit)) => permit.send(StreamCommand::Data(f)),
                                         Ok(Err(_)) => {
+                                            if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                                last_stream = None;
+                                            }
                                             crate::mux_writer::recycle_encode_buf(f.into_storage());
                                             let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                                             if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
@@ -11482,6 +11519,9 @@ where
                                             }
                                         }
                                         Err(_) => {
+                                            if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                                last_stream = None;
+                                            }
                                             crate::mux_writer::recycle_encode_buf(f.into_storage());
                                             tracing::warn!(stream_id = id, "mux RST: stream queue full; resetting stalled stream");
                                             send_reset_encrypted(&writer, &cipher, id);
@@ -11496,6 +11536,9 @@ where
                                     }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(StreamCommand::Data(f))) => {
+                                    if last_stream.as_ref().is_some_and(|c| c.0 == id) {
+                                        last_stream = None;
+                                    }
                                     crate::mux_writer::recycle_encode_buf(f.into_storage());
                                     let mut guard = streams.write().unwrap_or_else(|e| e.into_inner());
                                     if guard.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.gate, &gate)) {
@@ -11778,14 +11821,7 @@ where
                         if let Ok(e) = err_res {
                             return Err(e);
                         }
-                        crate::ws::read_frame_pong_channel(
-                            &mut rd,
-                            &pong_tx,
-                            false,
-                            &mut frame_buf,
-                            None,
-                        )
-                        .await
+                        continue;
                     }
                     r = crate::ws::read_frame_pong_channel(
                         &mut rd,
@@ -13261,8 +13297,14 @@ pub fn save_log_file() {
     let count = ring.len();
     drop(ring);
     match std::fs::write(&path, content) {
-        Ok(()) => tracing::info!(path = %path.display(), entries = count, "log file saved"),
-        Err(error) => tracing::warn!(path = %path.display(), %error, "failed to save log file"),
+        Ok(()) => {
+            drop(_guard);
+            tracing::info!(path = %path.display(), entries = count, "log file saved");
+        }
+        Err(error) => {
+            drop(_guard);
+            tracing::warn!(path = %path.display(), %error, "failed to save log file");
+        }
     }
 }
 
@@ -14084,12 +14126,19 @@ impl UdpBatchReader {
 
     #[cfg(target_os = "linux")]
     fn try_recv_batch(&mut self) -> io::Result<usize> {
-        recv_batch_linux(&self.sock, &mut self.bufs, &mut self.lens, &mut self.addrs)
+        let sock = &self.sock;
+        let bufs = &mut self.bufs;
+        let lens = &mut self.lens;
+        let addrs = &mut self.addrs;
+        sock.try_io(tokio::io::Interest::READABLE, || {
+            recv_batch_linux(sock, bufs, lens, addrs)
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     fn try_recv_batch(&mut self) -> io::Result<usize> {
         let mut count = 0;
+        let mut resets = 0;
         while count < UDP_BATCH {
             match self.sock.try_recv_from(&mut self.bufs[count]) {
                 Ok((n, addr)) => {
@@ -14102,6 +14151,15 @@ impl UdpBatchReader {
                         return Ok(count);
                     }
                     return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::ConnectionReset && resets < UDP_BATCH =>
+                {
+                    // On Windows unconnected UDP sockets, an outbound packet hitting an
+                    // unreachable port surfaces as WSAECONNRESET on the next recvfrom;
+                    // ignore transient resets so one dead peer cannot abort the relay.
+                    resets += 1;
+                    continue;
                 }
                 Err(e) => {
                     if count > 0 {
@@ -14148,6 +14206,9 @@ impl UdpBatchWriter {
 
     /// Appends a datagram to the batch. Flushes automatically when reaching [`UDP_BATCH`].
     pub(crate) async fn push(&mut self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
+        if self.count >= UDP_BATCH {
+            self.flush().await?;
+        }
         let dest = target_for_socket(addr, self.sock_is_v6);
         let idx = self.count;
         if self.bufs.is_empty() {
@@ -14172,7 +14233,10 @@ impl UdpBatchWriter {
         let mut total = 0;
         let mut offset = 0;
         while offset < self.count {
-            self.sock.writable().await?;
+            if let Err(e) = self.sock.writable().await {
+                self.count = 0;
+                return Err(e);
+            }
             let take = (self.count - offset).min(UDP_BATCH);
             let mut slice: [(&[u8], SocketAddr); UDP_BATCH] =
                 [(&[], SocketAddr::from(([0, 0, 0, 0], 0))); UDP_BATCH];
@@ -14182,7 +14246,11 @@ impl UdpBatchWriter {
             let slice_ref = &slice[..take];
 
             #[cfg(target_os = "linux")]
-            match send_batch_linux(&self.sock, slice_ref) {
+            match self
+                .sock
+                .try_io(tokio::io::Interest::WRITABLE, || {
+                    send_batch_linux(&self.sock, slice_ref)
+                }) {
                 Ok(n) if n > 0 => {
                     offset += n;
                     total += n;
@@ -16169,6 +16237,9 @@ fn parse_wss_url(input: &str) -> Result<(String, String, String)> {
     if authority.is_empty() {
         bail!("empty WSS upstream authority")
     }
+    if path.bytes().any(|b| matches!(b, b'\r' | b'\n' | b' ' | b'\t')) {
+        bail!("WSS upstream path contains invalid whitespace or control characters");
+    }
     let target =
         parse_authority_with_default(authority, 443).map_err(|e| anyhow!(e.to_string()))?;
     let connect_addr = if target.host.contains(':') {
@@ -16230,6 +16301,7 @@ async fn dial_cloudflare_fallback(
     primary_ip: std::net::IpAddr,
     tls_name: &str,
     cfg: &WssConfig,
+    profile_idx: usize,
 ) -> Result<tls::RushTlsStream> {
     tracing::debug!("[DNS] Resolving fakehost: {}", tls_name);
     let ips = match dns::resolve_all_ipv4(tls_name).await {
@@ -16250,14 +16322,7 @@ async fn dial_cloudflare_fallback(
             fallback_addr,
             tls_name
         );
-        match connect_tls_with_profile(
-            fallback_addr,
-            tls_name,
-            cfg,
-            crate::ws::pick_browser_profile_index(),
-        )
-        .await
-        {
+        match connect_tls_with_profile(fallback_addr, tls_name, cfg, profile_idx).await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
                 tracing::debug!(
@@ -16276,10 +16341,14 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
     let (dns_host, dns_port) = split_authority(&addr)?;
     let resolved = dns::resolve_socket(&dns_host, dns_port).await?;
 
-    let sni_hostname = cfg
+    let fakehost = cfg
         .fakehost
         .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let sni_hostname = fakehost
         .map(crate::common::extract_host_only)
+        .filter(|s| !s.is_empty())
         .unwrap_or(&host);
     let default_header_host = if dns_port == 443 {
         if host.contains(':') {
@@ -16290,7 +16359,7 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
     } else {
         addr.clone()
     };
-    let header_host = cfg.fakehost.as_deref().unwrap_or(&default_header_host);
+    let header_host = fakehost.unwrap_or(&default_header_host);
     let tls_name = sni_hostname;
     let profile_idx = crate::ws::pick_browser_profile_index();
 
@@ -16308,9 +16377,10 @@ pub(crate) async fn connect_wss_upstream(cfg: &WssConfig) -> Result<(TlsReader, 
         Err(primary_err) => {
             dns::invalidate_host(&dns_host);
             let is_ip_host = host.parse::<std::net::IpAddr>().is_ok();
-            if cfg.fakehost.is_some() && is_ip_host {
+            if fakehost.is_some() && is_ip_host {
                 tracing::warn!("[WSS] Primary upstream failed: {}", addr);
-                dial_cloudflare_fallback(dns_port, resolved.ip(), tls_name, cfg).await?
+                dial_cloudflare_fallback(dns_port, resolved.ip(), tls_name, cfg, profile_idx)
+                    .await?
             } else {
                 return Err(primary_err);
             }
@@ -16789,6 +16859,10 @@ impl WssSessionPool {
                         "WSS physical session creation on-demand failed"
                     );
                     if has_live_sessions && tokio::time::Instant::now() < deadline {
+                        tokio::select! {
+                            _ = self.capacity_notify.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
                         continue;
                     }
                     recycle_encode_buf(initial_data);
@@ -17758,6 +17832,7 @@ async fn main() -> Result<()> {
     if let Some(v) = args.fakehost.clone() {
         cfg.fakehost = Some(v);
     }
+    sanitize_runtime_config(&mut cfg)?;
     if let Some(v) = args.buffer_kib {
         cfg.buffer_size = v.saturating_mul(1024).max(16 * 1024);
     }
@@ -17870,6 +17945,24 @@ async fn main() -> Result<()> {
         let _ = out.flush();
     }
     result
+}
+
+fn sanitize_runtime_config(cfg: &mut RuntimeConfig) -> Result<()> {
+    if cfg.key.as_deref().is_some_and(str::is_empty) {
+        cfg.key = None;
+    }
+    if let Some(raw_fh) = cfg.fakehost.as_deref() {
+        if raw_fh.contains('\r') || raw_fh.contains('\n') {
+            bail!("invalid fakehost: contains CR/LF control characters");
+        }
+        let trimmed = raw_fh.trim();
+        if trimmed.is_empty() {
+            cfg.fakehost = None;
+        } else if trimmed.len() != raw_fh.len() {
+            cfg.fakehost = Some(trimmed.to_owned());
+        }
+    }
+    Ok(())
 }
 
 async fn run_forwarding(cfg: RuntimeConfig, args: &Args, mux_sessions: usize) -> Result<()> {
@@ -18117,5 +18210,17 @@ mod tests {
     fn default_max_connections_is_1500() {
         let cfg = RuntimeConfig::default();
         assert_eq!(cfg.max_connections, 1500);
+    }
+    #[test]
+    fn sanitize_runtime_config_filters_empty_and_rejects_crlf() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.key = Some(String::new());
+        cfg.fakehost = Some("   ".into());
+        sanitize_runtime_config(&mut cfg).unwrap();
+        assert_eq!(cfg.key, None);
+        assert_eq!(cfg.fakehost, None);
+
+        cfg.fakehost = Some("edge.example.com\r\nX-Injected: 1".into());
+        assert!(sanitize_runtime_config(&mut cfg).is_err());
     }
 }
