@@ -5,7 +5,7 @@
 // ============================================================================
 /// 当前程序发布版本号。
 /// 在此处统一修改即可全局生效（CLI `--version`、控制台 Banner、Web Dashboard 等）。
-pub const APP_VERSION: &str = "0.0.84";
+pub const APP_VERSION: &str = "0.0.85";
 pub const VERSION: &str = APP_VERSION;
 
 pub mod adaptive {
@@ -872,6 +872,11 @@ where
                     }
                 }
             };
+            if matches!(send_res, Some(Err(_)))
+                && last_stream.as_ref().is_some_and(|c| c.0 == id)
+            {
+                last_stream = None;
+            }
             match send_res {
                 Some(Ok(())) | None => {}
                 Some(Err((tx, gate, pending_ctrl, mpsc::error::TrySendError::Full(f)))) => {
@@ -3052,19 +3057,26 @@ const DNS_PORT: u16 = 53;
 const MAX_PACKET: usize = 4096;
 const CACHE_MAX_ENTRIES: usize = 4096;
 
+#[derive(Clone)]
+struct CachedDnsEntry<T> {
+    value: T,
+    expires: Instant,
+    stale_deadline: Instant,
+}
+
 static SERVER: RwLock<Option<IpAddr>> = RwLock::new(None);
-static CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::new();
-static ALL_V4_CACHE: OnceLock<RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>>> = OnceLock::new();
+static CACHE: OnceLock<RwLock<HashMap<String, CachedDnsEntry<IpAddr>>>> = OnceLock::new();
+static ALL_V4_CACHE: OnceLock<RwLock<HashMap<String, CachedDnsEntry<Vec<Ipv4Addr>>>>> = OnceLock::new();
 static IN_FLIGHT: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<Option<IpAddr>>>>>> =
     OnceLock::new();
 static IN_FLIGHT_V4: OnceLock<StdMutex<HashMap<String, watch::Receiver<Option<Option<Vec<Ipv4Addr>>>>>>> =
     OnceLock::new();
 
-fn cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
+fn cache() -> &'static RwLock<HashMap<String, CachedDnsEntry<IpAddr>>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn all_v4_cache() -> &'static RwLock<HashMap<String, (Vec<Ipv4Addr>, Instant)>> {
+fn all_v4_cache() -> &'static RwLock<HashMap<String, CachedDnsEntry<Vec<Ipv4Addr>>>> {
     ALL_V4_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -3076,18 +3088,16 @@ fn in_flight_v4() -> &'static StdMutex<HashMap<String, watch::Receiver<Option<Op
     IN_FLIGHT_V4.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// Insert into a bounded cache map: once the entry cap is reached the whole
-/// table is cleared before inserting. Clearing everything instead of evicting
-/// per-entry trades cache hit-rate for simplicity and a hard bound on memory
-/// growth.
+/// Insert into a bounded cache map, pruning expired stale entries first and
+/// evicting a quarter of the table if the hard cap is still reached.
 fn bounded_insert<K: Hash + Eq + Clone, T>(
-    map: &mut HashMap<K, (T, Instant)>,
+    map: &mut HashMap<K, CachedDnsEntry<T>>,
     key: K,
-    value: (T, Instant),
+    value: T,
+    now: Instant,
 ) {
     if map.len() >= CACHE_MAX_ENTRIES {
-        let now = Instant::now();
-        map.retain(|_, (_, expires)| *expires > now);
+        map.retain(|_, entry| entry.stale_deadline > now);
         if map.len() >= CACHE_MAX_ENTRIES {
             let victims: Vec<K> = map
                 .keys()
@@ -3099,7 +3109,29 @@ fn bounded_insert<K: Hash + Eq + Clone, T>(
             }
         }
     }
-    map.insert(key, value);
+    let expires = now + CACHE_TTL;
+    map.insert(
+        key,
+        CachedDnsEntry {
+            value,
+            expires,
+            stale_deadline: expires + STALE_TTL,
+        },
+    );
+}
+
+/// Defers the next background SWR refresh attempt after a failure without
+/// extending `stale_deadline`, preserving the fixed `STALE_TTL` upper bound.
+fn bump_stale_cooldown<T>(
+    map: &mut HashMap<String, CachedDnsEntry<T>>,
+    key: &str,
+    now: Instant,
+) {
+    if let Some(entry) = map.get_mut(key) {
+        if entry.expires <= now && now < entry.stale_deadline {
+            entry.expires = (now + STALE_RETRY_COOLDOWN).min(entry.stale_deadline);
+        }
+    }
 }
 
 pub(crate) async fn configure(server: Option<String>) -> Result<()> {
@@ -3154,12 +3186,13 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
     // Fast path: synchronous read lock, zero tokio yield, zero heap allocation on lowercase cache hit.
     // Stale-While-Revalidate: if expired within STALE_TTL, return the cached IP in 0ms and refresh in background.
     if let Ok(guard) = cache().read() {
-        if let Some(&(ip, expires)) = guard.get(key.as_ref()) {
+        if let Some(entry) = guard.get(key.as_ref()) {
             let now = Instant::now();
-            if expires > now {
-                return Ok(ip);
+            if entry.expires > now {
+                return Ok(entry.value);
             }
-            if now.duration_since(expires) < STALE_TTL {
+            if now < entry.stale_deadline {
+                let stale_ip = entry.value;
                 drop(guard);
                 let already_inflight = in_flight()
                     .lock()
@@ -3171,7 +3204,7 @@ pub(crate) async fn resolve_host(host: &str) -> Result<IpAddr> {
                         let _ = resolve_host_fresh(&bg_key, &bg_key, bg_key.clone()).await;
                     });
                 }
-                return Ok(ip);
+                return Ok(stale_ip);
             }
         }
     }
@@ -3192,9 +3225,9 @@ async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAd
         {
             let mut inflight = in_flight().lock().unwrap_or_else(|e| e.into_inner());
             if let Ok(guard) = cache().read() {
-                if let Some(&(ip, expires)) = guard.get(&key) {
-                    if expires > Instant::now() {
-                        return Ok(ip);
+                if let Some(entry) = guard.get(&key) {
+                    if entry.expires > Instant::now() {
+                        return Ok(entry.value);
                     }
                 }
             }
@@ -3250,7 +3283,7 @@ async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAd
     match query_result {
         Ok(resolved) => {
             let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
-            bounded_insert(&mut guard, key.clone(), (resolved, Instant::now() + CACHE_TTL));
+            bounded_insert(&mut guard, key.clone(), resolved, Instant::now());
             if let Some(sender) = tx {
                 let _ = sender.send(Some(Some(resolved)));
             }
@@ -3258,12 +3291,7 @@ async fn resolve_host_fresh(clean: &str, host: &str, key: String) -> Result<IpAd
         }
         Err(e) => {
             if let Ok(mut guard) = cache().write() {
-                let now = Instant::now();
-                if let Some(entry) = guard.get_mut(&key) {
-                    if entry.1 <= now && now.duration_since(entry.1) < STALE_TTL {
-                        entry.1 = now + STALE_RETRY_COOLDOWN;
-                    }
-                }
+                bump_stale_cooldown(&mut guard, &key, Instant::now());
             }
             if let Some(sender) = tx {
                 let _ = sender.send(Some(None));
@@ -3294,13 +3322,13 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
     // Fast path: synchronous read lock, zero tokio yield, zero key allocation on lowercase cache hit
     let mut stale_fallback: Option<Vec<Ipv4Addr>> = None;
     if let Ok(guard) = all_v4_cache().read() {
-        if let Some((ips, expires)) = guard.get(key.as_ref()) {
+        if let Some(entry) = guard.get(key.as_ref()) {
             let now = Instant::now();
-            if *expires > now && !ips.is_empty() {
-                return Ok(ips.clone());
+            if entry.expires > now && !entry.value.is_empty() {
+                return Ok(entry.value.clone());
             }
-            if !ips.is_empty() && now.duration_since(*expires) < STALE_TTL {
-                stale_fallback = Some(ips.clone());
+            if !entry.value.is_empty() && now < entry.stale_deadline {
+                stale_fallback = Some(entry.value.clone());
             }
         }
     }
@@ -3312,9 +3340,9 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         {
             let mut inflight = in_flight_v4().lock().unwrap_or_else(|e| e.into_inner());
             if let Ok(guard) = all_v4_cache().read() {
-                if let Some((ips, expires)) = guard.get(&key) {
-                    if *expires > Instant::now() && !ips.is_empty() {
-                        return Ok(ips.clone());
+                if let Some(entry) = guard.get(&key) {
+                    if entry.expires > Instant::now() && !entry.value.is_empty() {
+                        return Ok(entry.value.clone());
                     }
                 }
             }
@@ -3384,19 +3412,14 @@ pub(crate) async fn resolve_all_ipv4(host: &str) -> Result<Vec<Ipv4Addr>> {
         }
         if let Some(stale) = stale_fallback {
             if let Ok(mut guard) = all_v4_cache().write() {
-                let now = Instant::now();
-                if let Some(entry) = guard.get_mut(&key) {
-                    if entry.1 <= now && now.duration_since(entry.1) < STALE_TTL {
-                        entry.1 = now + STALE_RETRY_COOLDOWN;
-                    }
-                }
+                bump_stale_cooldown(&mut guard, &key, Instant::now());
             }
             return Ok(stale);
         }
         bail!("no IPv4 addresses resolved for {host}");
     }
     let mut guard = all_v4_cache().write().unwrap_or_else(|e| e.into_inner());
-    bounded_insert(&mut guard, key.clone(), (unique.clone(), Instant::now() + CACHE_TTL));
+    bounded_insert(&mut guard, key.clone(), unique.clone(), Instant::now());
     if let Some(ref leader_tx) = tx {
         let _ = leader_tx.send(Some(Some(unique.clone())));
     }
@@ -3955,26 +3978,61 @@ mod tests {
     async fn stale_dns_cooldown_prevents_retry_storm() {
         let host = "nonexistent-swr-test-cooldown.invalid";
         let cached_ip: IpAddr = "198.51.100.42".parse().unwrap();
+        let now = Instant::now();
+        let fixed_deadline = now + STALE_TTL;
         {
             let mut guard = cache().write().unwrap();
             guard.insert(
                 host.to_string(),
-                (cached_ip, Instant::now() - Duration::from_secs(5)),
+                CachedDnsEntry {
+                    value: cached_ip,
+                    expires: now - Duration::from_secs(5),
+                    stale_deadline: fixed_deadline,
+                },
             );
         }
         // Directly invoke resolve_host_fresh for an invalid domain: it must fail
-        // and advance the stale entry's expiration by STALE_RETRY_COOLDOWN.
+        // and advance the stale entry's expiration by STALE_RETRY_COOLDOWN without
+        // extending stale_deadline.
         let res = resolve_host_fresh(host, host, host.to_string()).await;
         assert!(res.is_err());
-        let refreshed_expires = {
+        let refreshed = {
             let guard = cache().read().unwrap();
-            guard.get(host).copied().unwrap().1
+            guard.get(host).cloned().unwrap()
         };
         assert!(
-            refreshed_expires > Instant::now(),
+            refreshed.expires > Instant::now(),
             "failed SWR refresh must set retry cooldown in the future"
         );
+        assert_eq!(
+            refreshed.stale_deadline, fixed_deadline,
+            "failed SWR refresh must never extend stale_deadline"
+        );
         invalidate_host(host);
+    }
+
+    #[test]
+    fn stale_dns_cooldown_caps_at_and_expires_after_stale_deadline() {
+        let mut map = HashMap::new();
+        let ip: IpAddr = "198.51.100.43".parse().unwrap();
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(3);
+        map.insert(
+            "cap.invalid".to_string(),
+            CachedDnsEntry {
+                value: ip,
+                expires: t0 - Duration::from_secs(1),
+                stale_deadline: deadline,
+            },
+        );
+        bump_stale_cooldown(&mut map, "cap.invalid", t0);
+        let entry = &map["cap.invalid"];
+        assert_eq!(entry.expires, deadline);
+        assert_eq!(entry.stale_deadline, deadline);
+
+        let after_deadline = deadline + Duration::from_secs(1);
+        bump_stale_cooldown(&mut map, "cap.invalid", after_deadline);
+        assert_eq!(map["cap.invalid"].expires, deadline);
     }
 }
 } // mod dns
@@ -5289,14 +5347,15 @@ impl Scheduler {
     }
 
     fn remove_stream(&mut self, sid: &u32) {
-        if let Some(mut q) = self.streams.remove(sid) {
-            self.total = self.total.saturating_sub(q.frames.len());
-            if !q.frames.is_empty() {
-                recycle_encode_bufs(q.frames.drain(..));
-            }
-            if self.free_queues.len() < FREE_STREAM_QUEUES_CAP && q.frames.capacity() <= 64 {
-                self.free_queues.push(q.frames);
-            }
+        let Some(mut q) = self.streams.remove(sid) else {
+            return;
+        };
+        self.total = self.total.saturating_sub(q.frames.len());
+        if !q.frames.is_empty() {
+            recycle_encode_bufs(q.frames.drain(..));
+        }
+        if self.free_queues.len() < FREE_STREAM_QUEUES_CAP && q.frames.capacity() <= 64 {
+            self.free_queues.push(q.frames);
         }
         if let Some(idx) = self.rotation.iter().position(|s| s == sid) {
             self.rotation.remove(idx);
@@ -5375,6 +5434,16 @@ pub(crate) fn encode_mux_ws_frame(
     Ok(())
 }
 
+#[inline]
+fn push_ctrl_frame(sched: &mut Scheduler, rst_streams: &mut Vec<u32>, frame: OutboundFrame) {
+    if frame.is_rst {
+        if let Some(sid) = frame.stream_id {
+            rst_streams.push(sid);
+        }
+    }
+    sched.push(frame);
+}
+
 async fn writer_loop<W>(
     mut w: W,
     mut ctrl_rx: mpsc::Receiver<OutboundFrame>,
@@ -5391,14 +5460,7 @@ async fn writer_loop<W>(
         // High-priority control lane drains first unconditionally (never gated by bulk DATA queue cap).
         while !ctrl_closed {
             match ctrl_rx.try_recv() {
-                Ok(frame) => {
-                    if frame.is_rst {
-                        if let Some(sid) = frame.stream_id {
-                            rst_streams.push(sid);
-                        }
-                    }
-                    sched.push(frame);
-                }
+                Ok(frame) => push_ctrl_frame(&mut sched, &mut rst_streams, frame),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     ctrl_closed = true;
@@ -5417,24 +5479,24 @@ async fn writer_loop<W>(
                 }
             }
         }
-        // Purge any in-flight DATA frames that were sitting in data_rx when RST / drop_stream
-        // was drained from ctrl_rx above, preventing DATA from being emitted after RST.
-        for sid in rst_streams.drain(..) {
-            sched.remove_stream(&sid);
-        }
         // Re-drain ctrl_rx immediately after data_rx before popping from sched:
         // if a task enqueued SYN (on ctrl_tx) followed by DATA (on data_tx) while
         // writer_loop was between the two loops above, this guarantees SYN is in
         // sched.priority before sched.next() pops any frame.
         while !ctrl_closed {
             match ctrl_rx.try_recv() {
-                Ok(frame) => sched.push(frame),
+                Ok(frame) => push_ctrl_frame(&mut sched, &mut rst_streams, frame),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     ctrl_closed = true;
                     break;
                 }
             }
+        }
+        // Purge any in-flight DATA frames pulled from data_rx whose RST / drop_stream
+        // arrived on ctrl_rx during this or the preceding select/batch iteration.
+        for sid in rst_streams.drain(..) {
+            sched.remove_stream(&sid);
         }
 
         if sched.is_empty() {
@@ -5444,7 +5506,7 @@ async fn writer_loop<W>(
             tokio::select! {
                 biased;
                 maybe_frame = ctrl_rx.recv(), if !ctrl_closed => match maybe_frame {
-                    Some(frame) => sched.push(frame),
+                    Some(frame) => push_ctrl_frame(&mut sched, &mut rst_streams, frame),
                     None => ctrl_closed = true,
                 },
                 maybe_frame = data_rx.recv(), if !data_closed => match maybe_frame {
@@ -5482,7 +5544,7 @@ async fn writer_loop<W>(
         while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES && !ctrl_closed {
             match ctrl_rx.try_recv() {
                 Ok(frame) => {
-                    sched.push(frame);
+                    push_ctrl_frame(&mut sched, &mut rst_streams, frame);
                     if let Some(f) = sched.next() {
                         bytes += f.len();
                         batch.push(f);
@@ -5519,7 +5581,7 @@ async fn writer_loop<W>(
                 biased;
                 maybe_frame = ctrl_rx.recv(), if !ctrl_closed => match maybe_frame {
                     Some(frame) => {
-                        sched.push(frame);
+                        push_ctrl_frame(&mut sched, &mut rst_streams, frame);
                         continue;
                     }
                     None => {
@@ -7852,9 +7914,17 @@ pub fn parse_http_proxy_request(buf: &[u8]) -> Result<HttpProxyRequest, ProxyPar
     let mut target_port = 80u16;
     let mut rewritten_path: Option<String> = None;
 
-    let scheme_rest = if uri.len() >= 7 && uri[..7].eq_ignore_ascii_case("http://") {
+    let scheme_rest = if uri
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"http://"))
+    {
         Some((&uri[7..], 80u16))
-    } else if uri.len() >= 8 && uri[..8].eq_ignore_ascii_case("https://") {
+    } else if uri
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"https://"))
+    {
         Some((&uri[8..], 443u16))
     } else {
         None
@@ -8024,16 +8094,21 @@ where
     let mut buf = Vec::with_capacity(512);
     buf.extend_from_slice(&scratch[..n]);
     let mut complete = has_http_header_terminator(&buf);
+    let mut hit_eof = false;
     while !complete && buf.len() < 8192 {
         let prev_len = buf.len();
         let max_to_read = (8192 - prev_len).min(scratch.len());
         let r = stream.read(&mut scratch[..max_to_read]).await?;
         if r == 0 {
+            hit_eof = true;
             break;
         }
         buf.extend_from_slice(&scratch[..r]);
         let scan_start = prev_len.saturating_sub(3);
         complete = has_http_header_terminator(&buf[scan_start..]);
+    }
+    if !complete && !hit_eof && buf.len() >= 8192 {
+        return Err(anyhow::anyhow!(ProxyParseError::HeaderTooLarge.to_string()));
     }
     let req = parse_http_proxy_request(&buf).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(ClientProxyRequest {
@@ -8327,6 +8402,38 @@ mod tests {
         assert_eq!(parsed.target.host, "a.com");
         let rewritten = String::from_utf8(parsed.initial_payload.unwrap()).unwrap();
         assert!(rewritten.starts_with("GET /ok HTTP/1.1\r\nHost: a.com\r\n\r\nGET /smuggled"));
+    }
+
+    #[test]
+    fn http_proxy_handles_multibyte_utf8_uri_without_panic() {
+        let req_7 = "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(parse_http_proxy_request(req_7.as_bytes()).is_ok());
+
+        // Multibyte UTF-8 right across byte index 7 and 8 must not panic.
+        let bad_6_plus_2 = "GET /aaaaa\u{00e9} HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(parse_http_proxy_request(bad_6_plus_2.as_bytes()).is_ok());
+        let bad_7_plus_2 = "GET /aaaaaa\u{00e9} HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(parse_http_proxy_request(bad_7_plus_2.as_bytes()).is_ok());
+        let host_split = "GET aaaaaa\u{00e9} HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(parse_http_proxy_request(host_split.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_client_proxy_request_reports_oversized_header_too_large() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(16384);
+        tokio::spawn(async move {
+            let payload = vec![b'x'; 8500];
+            let _ = client.write_all(&payload).await;
+        });
+        let err = read_client_proxy_request(&mut server)
+            .await
+            .expect_err("oversized proxy header should error");
+        assert!(
+            err.to_string().contains("proxy header too large"),
+            "unexpected error: {err}"
+        );
     }
 }
 } // mod proxy
@@ -8966,7 +9073,10 @@ async fn relay_quic(
         }
         header_buf.extend_from_slice(target.as_bytes());
         header_buf.push(b'\n');
-        send.write_all(&header_buf).await?;
+        if let Err(error) = send.write_all(&header_buf).await {
+            let _ = quic_reject_local(&mut local, req.is_socks5).await;
+            return Err(error.into());
+        }
         let mut no_response = false;
         match timeout(hs_timeout, read_quic_line_with_extra(&mut recv, 8192)).await {
             Ok(Ok((line, extra))) => {
@@ -9589,9 +9699,14 @@ async fn handle_server_stream(
     let mut send_task = crate::common::AbortOnDrop(tokio::spawn(async move {
         let mut buf = relay_buf(buffer_size).await;
         let mut stats_batch = crate::stats::StatsBatcher::new();
+        let mut target_errored = false;
         loop {
             match target_rd.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    target_errored = true;
+                    break;
+                }
                 Ok(n) => {
                     stats_batch.add_down(n);
                     if send.write_all(&buf[..n]).await.is_err() {
@@ -9600,7 +9715,11 @@ async fn handle_server_stream(
                 }
             }
         }
-        let _ = send.finish();
+        if target_errored {
+            let _ = send.reset(0u32.into());
+        } else {
+            let _ = send.finish();
+        }
         Result::<()>::Ok(())
     }));
     let mut buf = relay_buf(buffer_size).await;
@@ -17786,9 +17905,6 @@ async fn main() -> Result<()> {
     // GoWay gates terminal escapes on ModeCharDevice; mirror that so piped
     // output stays clean and `-tui` degrades gracefully.
     let tui_active = args.tui && tui::stdout_is_tty();
-    if args.tui && !tui_active {
-        tracing::warn!("-tui requested but stdout is not a terminal; falling back to log output");
-    }
     let ux_layer = tui::UxLayer::new(tui_active, args.log_file.is_some());
     if tui_active {
         tracing_subscriber::registry()
@@ -17805,6 +17921,9 @@ async fn main() -> Result<()> {
     }
     if let Some(path) = args.log_file.clone() {
         tui::configure_log_file(path);
+    }
+    if args.tui && !tui_active {
+        tracing::warn!("-tui requested but stdout is not a terminal; falling back to log output");
     }
     let mut cfg = if let Some(path) = args.config.clone() {
         load_json(path).await?

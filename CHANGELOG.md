@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.0.85] - 2026-11-14
+
+### UTF-8 Prefix Panic Fix, Fixed DNS SWR Stale Cap, MUX Reader/Writer & QUIC Error Handling
+
+- **HTTP Proxy UTF-8 Panic & Oversized Header Detection (`src/main.rs:proxy`) [BUG]** — Replaced raw `&uri[..7]` / `&uri[..8]` string slicing in `parse_http_proxy_request` with `.as_bytes().get(..7)` / `.get(..8)` ASCII comparisons so multibyte UTF-8 characters near indices 7–8 cannot panic. Updated `read_client_proxy_request` to return `ProxyParseError::HeaderTooLarge` (`"proxy header too large"`) instead of misreporting `Truncated` when `>= 8192` bytes arrive without EOF or header terminator, and added unit tests `http_proxy_handles_multibyte_utf8_uri_without_panic` and `read_client_proxy_request_reports_oversized_header_too_large`.
+- **MUX Reader Cache Invalidation & Writer `RST` Purge Coverage (`src/main.rs:common`, `mux_writer`) [BUG/OPT]** — Cleared `last_stream` in `mux_client_reader_loop` when a fast-path `try_send` / `send_timeout` fails so evicted/closed streams do not remain cached for repeated 15ms HoL blocks. Extracted `push_ctrl_frame` in `writer_loop`, ran `rst_streams.drain(..)` after the post-`data_rx` `ctrl_rx` drain so reset signals arriving during `biased; select!` still purge queued `DATA` in the same turn, and made `Scheduler::remove_stream` return early when `streams.remove(sid)` is `None`.
+- **DNS SWR Failure-Cooldown Hard Cap (`src/main.rs:dns`) [BUG]** — Added `CachedDnsEntry<T>` (`expires`, fixed `stale_deadline = expires + STALE_TTL`), `bounded_insert`, and `bump_stale_cooldown` across `CACHE` and `ALL_V4_CACHE`, preventing background refresh failures from infinitely resetting the stale expiry deadline. Updated `stale_dns_cooldown_prevents_retry_storm` and added `stale_dns_cooldown_caps_at_and_expires_after_stale_deadline`.
+- **QUIC Error Propagation & Early `-tui` Warning Fix (`src/main.rs:quic`, `main`) [BUG/OPT]** — Invoked `quic_reject_local` in `relay_quic` when `send.write_all(&header_buf)` fails, switched `handle_server_stream` downstream target read `Err(_)` teardown from `send.finish()` to `send.reset(0u32.into())`, and moved the non-TTY `-tui` `tracing::warn!` after `tracing_subscriber` initialization and `tui::configure_log_file`.
+
 ## [v0.0.84] - 2026-11-14
 
 ### Linux UDP `try_io` Epoll Readiness Fix, Pool Backoff, QUIC Shutdown Ordering & Proxy/Config Hardening

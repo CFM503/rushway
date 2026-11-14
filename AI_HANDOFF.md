@@ -94,6 +94,19 @@ Each handoff entry must contain:
 
 ## 3. Chronological Relay Log
 
+### Release: v0.0.85 (2026-11-14) — UTF-8 Proxy Safety, Fixed DNS SWR Cap, MUX/QUIC Teardown & Diagnostics
+
+- **Objective:** Address all verified Round 2 audit findings without altering GoWay wire compatibility, hot-path throughput, or local socket semantics.
+- **Change:**
+  - `src/main.rs`:
+    - `proxy`: Replaced byte-indexed `&uri[..7]` / `&uri[..8]` in `parse_http_proxy_request` with `.as_bytes().get(...)`, surfaced `ProxyParseError::HeaderTooLarge` in `read_client_proxy_request` on `>= 8192`-byte non-EOF headers without a terminator, and added unit tests `http_proxy_handles_multibyte_utf8_uri_without_panic` and `read_client_proxy_request_reports_oversized_header_too_large`.
+    - `common`: Invalidated `last_stream` in `mux_client_reader_loop` when fast-path channel delivery returns `Some(Err(_))`.
+    - `dns`: Introduced `CachedDnsEntry<T>` (`expires` + immutable `stale_deadline`), `bounded_insert`, and `bump_stale_cooldown` across `CACHE` and `ALL_V4_CACHE` so failed stale refreshes cannot extend cache lifetime indefinitely; added `stale_dns_cooldown_caps_at_and_expires_after_stale_deadline`.
+    - `mux_writer`: Added `push_ctrl_frame` helper, drained `rst_streams` after the post-`data_rx` `ctrl_rx` drain in `writer_loop`, and returned early in `Scheduler::remove_stream` on `None`.
+    - `quic` & `main`: Sent `quic_reject_local` on header write failure in `relay_quic`, reset QUIC `send` stream with `0u32` on target read error in `handle_server_stream`, and moved the non-TTY `-tui` warning after subscriber/log-file initialization.
+  - `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `AI_HANDOFF.md`: Synchronized to `v0.0.85`.
+- **Status:** Committed and pending CI + tag `v0.0.85` release verification.
+
 ### Release: v0.0.84 (2026-11-14) — UDP Epoll Readiness, Pool/QUIC Lifecycle & Boundary Hardening
 
 - **Objective:** Apply high-certainty bugfixes from the full-codebase audit without regressing GoWay wire compatibility, MUX 0-RTT latency, or hot-path throughput.
@@ -106,7 +119,7 @@ Each handoff entry must contain:
     - `proxy` & `main`: Normalized empty `-k`/`fakehost` via `sanitize_runtime_config` (plus CR/LF rejection), used earliest HTTP header terminator (`find_http_header_end`), rejected trailing garbage after bracketed IPv6 authorities, and added 3 regression unit tests.
   - `.github/workflows/release.yml`: Added `cargo test --all-targets --all-features` to the release compilation gate.
   - `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `AI_HANDOFF.md`: Synchronized to `v0.0.84` and corrected QUIC auth & CGNAT exemption documentation.
-- **Status:** Committed and pending CI + tag `v0.0.84` release verification.
+- **Status:** Released (`v0.0.84`, superseded by `v0.0.85`).
 
 ### Release: v0.0.83 (2026-11-09) — Epoch 0 Baseline (`RushWay v0.0.83` ↔ `GoWay v1.8.36`)
 
